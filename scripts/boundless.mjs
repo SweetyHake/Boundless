@@ -2432,6 +2432,7 @@ class MegaWorld1000 {
 
   async _fetchManifest(url) {
     if (!url) return null;
+    url = String(url).replaceAll("modules/sh-megamap/", `modules/${MODULE_ID}/`);
     if (this.manifestCache.has(url)) return this.manifestCache.get(url);
     let data = await fetch(`${url}?v=${Date.now()}`).then(r => r.json());
     // Chunked world manifests (`boundless-chunked-v1`) stream sectors/overlays lazily per-chunk; never expand all 36 provinces into RAM upfront!
@@ -5222,6 +5223,109 @@ class MegaWorld1000 {
     return this.tokenStreamer.restoreLegacyVirtualTokens(scene);
   }
 
+  /**
+   * Migrate any legacy `sh-megamap` scene flags, level flags, user fog flags, and localStorage entries
+   * into `boundless` (rewriting `modules/sh-megamap/` asset paths recursively) and remount active scene.
+   */
+  async migrateLegacyScenes() {
+    const LEGACY_ID = "sh-megamap";
+    const rewritePaths = (val) => {
+      if (typeof val === "string") {
+        return val.includes(`modules/${LEGACY_ID}/`)
+          ? val.replaceAll(`modules/${LEGACY_ID}/`, `modules/${MODULE_ID}/`)
+          : val;
+      }
+      if (Array.isArray(val)) return val.map(rewritePaths);
+      if (val && typeof val === "object") {
+        const out = {};
+        for (const [k, v] of Object.entries(val)) out[k] = rewritePaths(v);
+        return out;
+      }
+      return val;
+    };
+
+    // 1. Migrate client-side localStorage (camera positions & individual fog)
+    try {
+      const toMove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(`${LEGACY_ID}.`)) toMove.push(k);
+      }
+      for (const oldKey of toMove) {
+        const newKey = `${MODULE_ID}.${oldKey.slice(LEGACY_ID.length + 1)}`;
+        if (localStorage.getItem(newKey) === null) {
+          localStorage.setItem(newKey, localStorage.getItem(oldKey));
+        }
+        localStorage.removeItem(oldKey);
+      }
+    } catch {}
+
+    // 2. Migrate current user's personal fog flags
+    try {
+      const uLegacy = game.user?.flags?.[LEGACY_ID];
+      if (uLegacy) {
+        const merged = foundry.utils.mergeObject(
+          rewritePaths(foundry.utils.deepClone(uLegacy)),
+          foundry.utils.deepClone(game.user.flags?.[MODULE_ID] || {}),
+          { inplace: false }
+        );
+        await game.user.update({
+          [`flags.${MODULE_ID}`]: merged,
+          [`flags.-=${LEGACY_ID}`]: null
+        });
+      }
+    } catch {}
+
+    if (!game.user?.isActiveGM) return { scenes: 0, levels: 0 };
+
+    let migratedScenes = 0;
+    let migratedLevels = 0;
+    let activeSceneTouched = false;
+
+    for (const scene of game.scenes || []) {
+      const legacyScene = scene.flags?.[LEGACY_ID];
+      const curScene = scene.flags?.[MODULE_ID];
+      const curHasOldPath = curScene && JSON.stringify(curScene).includes(`modules/${LEGACY_ID}/`);
+
+      if (legacyScene || curHasOldPath) {
+        const base = legacyScene ? rewritePaths(foundry.utils.deepClone(legacyScene)) : {};
+        const cur = curScene ? rewritePaths(foundry.utils.deepClone(curScene)) : {};
+        const merged = foundry.utils.mergeObject(base, cur, { inplace: false });
+        const upd = { [`flags.${MODULE_ID}`]: merged };
+        if (legacyScene) upd[`flags.-=${LEGACY_ID}`] = null;
+        await scene.update(upd);
+        migratedScenes++;
+        if (canvas?.scene?.id === scene.id) activeSceneTouched = true;
+      }
+
+      // Migrate every Level on the scene (`level.flags["sh-megamap"]` or stale paths inside `inlineManifest`)
+      for (const level of scene.levels || []) {
+        const legacyLvl = level.flags?.[LEGACY_ID];
+        const curLvl = level.flags?.[MODULE_ID];
+        const lvlHasOldPath = curLvl && JSON.stringify(curLvl).includes(`modules/${LEGACY_ID}/`);
+        if (!legacyLvl && !lvlHasOldPath) continue;
+
+        const base = legacyLvl ? rewritePaths(foundry.utils.deepClone(legacyLvl)) : {};
+        const cur = curLvl ? rewritePaths(foundry.utils.deepClone(curLvl)) : {};
+        const merged = foundry.utils.mergeObject(base, cur, { inplace: false });
+        const upd = { [`flags.${MODULE_ID}`]: merged };
+        if (legacyLvl) upd[`flags.-=${LEGACY_ID}`] = null;
+        await level.update(upd);
+        migratedLevels++;
+        if (canvas?.scene?.id === scene.id) activeSceneTouched = true;
+      }
+    }
+
+    if (activeSceneTouched && canvas?.ready && canvas.scene) {
+      await this.mount(canvas.scene);
+    }
+
+    if (migratedScenes > 0 || migratedLevels > 0) {
+      console.log(`${MODULE_ID} | Migrated legacy sh-megamap data: ${migratedScenes} scene(s), ${migratedLevels} level(s).`);
+    }
+    return { scenes: migratedScenes, levels: migratedLevels };
+  }
+
   unmount() {
     if (this.active) this._saveCameraNow();
     this.active = false;
@@ -5373,18 +5477,7 @@ Hooks.once("init", () => {
 
 Hooks.once("ready", async () => {
   controller._ensureSocket();
-  // One-time silent migration for existing scenes created under legacy `sh-megamap` flags
-  if (game.user?.isActiveGM) {
-    for (const scene of game.scenes || []) {
-      const legacy = scene.flags?.["sh-megamap"];
-      if (!legacy || scene.flags?.[MODULE_ID]) continue;
-      const migrated = foundry.utils.deepClone(legacy);
-      if (typeof migrated.manifestUrl === "string") {
-        migrated.manifestUrl = migrated.manifestUrl.replaceAll("modules/sh-megamap/", "modules/boundless/");
-      }
-      await scene.update({ [`flags.${MODULE_ID}`]: migrated });
-    }
-  }
+  await controller.migrateLegacyScenes();
 });
 
 Hooks.on("canvasReady", (c) => {
