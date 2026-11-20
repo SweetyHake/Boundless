@@ -495,10 +495,21 @@ export class TokenStreamer {
 
   onTokenUpdated(doc, changes) {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
-    if ("x" in changes || "y" in changes || "level" in changes) {
+    const moved = "x" in changes || "y" in changes || "level" in changes;
+    const lightChanged = "light" in changes;
+    if (moved) {
       this._indexDoc(doc);
-      // If a previously unmounted NPC moved into the current viewport, queue its native draw
-      if (this._lastVp && (!doc._object || doc._object.destroyed)) {
+    }
+    if (moved || lightChanged) {
+      const needsMount = !doc._object || doc._object.destroyed;
+      if (needsMount && lightChanged && isAlwaysMountedTokenDoc(doc) && doc.viewed) {
+        if (!this._queuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
+          this._drawQueue.unshift({ doc, distSq: 0 });
+          this._queuedIds.add(doc.id);
+          this._scheduleDrawPump();
+        }
+      } else if (moved && this._lastVp && needsMount) {
+        // If a previously unmounted NPC moved into the current viewport, queue its native draw
         this._lastStreamKey = "";
         this.scheduleSync(this._lastVp, true);
       }

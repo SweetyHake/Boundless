@@ -213,12 +213,25 @@ export class ChunkStreamer {
       key: ck,
       sectorKeys,
       overlayIds,
+      data,
       lastUsedMs: performance.now()
     });
     this._enforceLru(st);
 
     // Trigger non-blocking incremental GPU light baking for this chunk + refresh local overlays/sim/doors
     this.controller?.onChunkLoaded?.(layer, ck, data);
+  }
+
+  /** Re-queue GPU light baking for all currently resident chunks (e.g. after GM wall/light edits). */
+  requeueAllLoadedChunks() {
+    if (!this.controller?.lightBatch || this.states.size === 0) return;
+    for (const [, st] of this.states) {
+      for (const [ck, rec] of st.loaded) {
+        if (rec?.data) {
+          this.controller.lightBatch.queueChunkBake(st.layer, ck, rec.data);
+        }
+      }
+    }
   }
 
   _evictChunk(st, ck, notifyController) {

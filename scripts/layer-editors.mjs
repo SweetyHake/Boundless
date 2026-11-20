@@ -265,12 +265,17 @@ export class VirtualLayerEditors {
       x: item.x,
       y: item.y,
       elevation: item.elevation,
+      rotation: item.rotation || 0,
+      hidden: Boolean(item.hidden),
+      walls: item.walls !== false,
       levels: [item.levelId],
       config: {
         dim: item.dim,
         bright: item.bright,
+        angle: item.angle ?? 360,
         color: item.color || null,
         alpha: item.alpha ?? 0.5,
+        darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
         animation: { type: item.anim || null, speed: 3, intensity: 3 }
       }
     }, { parent: canvas.scene });
@@ -281,6 +286,18 @@ export class VirtualLayerEditors {
 
     const placeable = canvas.lighting.createObject(doc);
     Object.defineProperty(placeable, "isFilteredOut", { value: false, configurable: true });
+    // Prevent virtual editor placeables from spawning duplicate native PointLightSources (which would
+    // double-brighten lights and shine through virtual walls outside the active sim-bubble!).
+    // MegaLightBatch + dynamicLights already render the exact wall-shadowed light.
+    placeable.initializeLightSource = () => {};
+    placeable._refreshField = function () {
+      if (!this.field) return;
+      this.field.clear();
+      const shape = this.document?.shape;
+      if (!shape) return;
+      const s = canvas.dimensions?.uiScale || 1;
+      this.field.lineStyle(2 * s, 0xEEEEEE, 0.4).drawShape(shape);
+    };
 
     const entry = { id, key: item.lKey, levelId: item.levelId, sk: item.sk, idx: item.idx, placeable, doc };
     this.lightsByKey.set(item.lKey, entry);
@@ -399,7 +416,13 @@ export class VirtualLayerEditors {
         color: colorCss,
         alpha: cfg.alpha ?? 0.5,
         anim: cfg.animation?.type || "",
-        elevation: entry.doc.elevation ?? 0
+        elevation: entry.doc.elevation ?? 0,
+        hidden: Boolean(entry.doc.hidden),
+        walls: entry.doc.walls !== false,
+        angle: cfg.angle ?? 360,
+        rotation: entry.doc.rotation ?? 0,
+        darkMin: cfg.darkness?.min ?? 0,
+        darkMax: cfg.darkness?.max ?? 1
       };
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, nextState);

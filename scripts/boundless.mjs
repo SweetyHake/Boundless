@@ -123,7 +123,7 @@ void main() {
       + 0.08 * sin(t * 4.13 + 2.7);
     float n = clamp(s, 0.0, 1.0) * 0.27;
     pulse = 0.55 + n;
-    effRatio = aParams.y * 0.9 + n * 0.222;
+    effRatio = aParams.y > 0.001 ? clamp(aParams.y * 0.9 + n * 0.222, 0.0, 1.0) : 0.0;
   }
 
   vOffset = aOffset;
@@ -207,8 +207,8 @@ void main() {
   if (uHasDarknessTexture) {
     float darkness = texture2D(uDarknessLevelTexture, vSamplerUvs).r;
     bg = mix(uAmbientDaylight, uAmbientDarkness, darkness);
-    brightCol = mix(bg, uAmbientBrightest, uWeights.w * vWeight);
-    dimCol = mix(bg, brightCol, uWeights.z);
+    brightCol = max(bg, mix(bg, uAmbientBrightest, uWeights.w * vWeight));
+    dimCol = max(bg, mix(bg, brightCol, uWeights.z));
   } else {
     bg = uStaticBg;
     brightCol = vWeight >= 0.999 ? uStaticBright : mix(bg, uStaticBright, vWeight);
@@ -252,7 +252,7 @@ const vec3 BT709 = vec3(0.2126, 0.7152, 0.0722);
 float perceivedBrightness(vec3 c) { return sqrt(dot(BT709, c * c)); }
 
 void main() {
-  if (vColorAlpha <= 0.001) discard;
+  if (vColorAlpha <= 0.001 || dot(vColor, vColor) <= 0.0001) discard;
   float dist = length(vOffset);
   if (dist >= 1.0) discard;
 
@@ -325,7 +325,7 @@ class MegaLightBatch {
 
   // Per-chunk streamed light batches + continental orbital macro glow layer (`boundless-chunked-v1`)
   chunkBatches = new Map(); // "${levelId}::${chunkKey}" -> { key, levelId, geometry, illumMesh, colorMesh, sectorBounds, allIndices, visibleIndices, visibleIndexCount, indexBuffer, weightArray, weightBuffer, weightsDirty, depthElevArray, depthElevBuffer, lightIds, activeCount, lastVisKey }
-  macroBatch = null;        // { geometry, illumMesh, colorMesh, count }
+  macroBatch = null;        // { geometry, illumMesh, colorMesh, weightArray, weightBuffer, lastAlpha, count }
   _chunkBakeQueue = [];
   _chunkBakeGen = 0;
   _chunkBakeRaf = null;
@@ -334,6 +334,13 @@ class MegaLightBatch {
   _buildPxPerFt = 20;
   _resolveWallFn = null;
   _resolveLightFn = null;
+  _isSuppressedFn = null;
+  _hasLevelEditsFn = null;
+  _onBatchChanged = null;
+  _depthElevCheckMap = new Map(); // elevation -> last mapped depthElevation [0..1]
+  _currentDarkness = 0;
+  _hasDarknessRangedLights = false;
+  _frozenTime = 0;
 
   _ensureShaders() {
     if (this.illumShader && this.colorShader) return;
@@ -424,6 +431,7 @@ class MegaLightBatch {
 
     const weights = new Float32Array(vc);
     weights.fill(1.0);
+    const weightBuffer = new PIXI.Buffer(weights, false, false);
     const depthElevs = new Float32Array(vc);
     depthElevs.fill(1.0);
     const IdxArr = vc > 65535 ? Uint32Array : Uint16Array;
@@ -433,7 +441,7 @@ class MegaLightBatch {
       .addAttribute("aOffset", new Float32Array(offsets), 2)
       .addAttribute("aParams", new Float32Array(params), 4)
       .addAttribute("aColor", new Float32Array(colors), 3)
-      .addAttribute("aWeight", new PIXI.Buffer(weights, false, false), 1)
+      .addAttribute("aWeight", weightBuffer, 1)
       .addAttribute("aDepthElev", new PIXI.Buffer(depthElevs, false, false), 1)
       .addIndex(new IdxArr(indices));
 
@@ -451,7 +459,35 @@ class MegaLightBatch {
     colorMesh.cullable = false;
     colorMesh.visible = false;
 
-    this.macroBatch = { geometry, illumMesh, colorMesh, count: macroLightsList.length };
+    this.macroBatch = {
+      geometry, illumMesh, colorMesh,
+      weightArray: weights, weightBuffer, lastAlpha: 1.0,
+      count: macroLightsList.length
+    };
+  }
+
+  _collectNativeWallEdges(levelId, EdgeCls) {
+    const nativeEdges = [];
+    if (canvas.scene?.walls) {
+      for (const w of canvas.scene.walls) {
+        if (w.light === 0) continue;
+        if (w.door && w.ds === 1) continue;
+        if (w.levels?.size && !w.levels.has(levelId)) continue;
+        const [x1, y1, x2, y2] = w.c;
+        nativeEdges.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+          id: `nw_${levelId}_${w.id}`, type: "wall",
+          move: w.move, sight: w.sight, light: w.light, sound: w.sound, direction: w.dir || 0
+        }));
+      }
+    }
+    return nativeEdges;
+  }
+
+  _computeEffectiveWeight(meta) {
+    if (this.hideIndoorLights && meta.isIndoor) return 0.0;
+    const d = this._currentDarkness;
+    if (d < meta.darkMin || d > meta.darkMax) return 0.0;
+    return meta.baseWeight;
   }
 
   /**
@@ -460,13 +496,19 @@ class MegaLightBatch {
    * @param {Array<{level: Level, spec: object}>} visibleLevelLayers
    * @param {number} pxPerFt
    */
-  build(visibleLevelLayers, pxPerFt, resolveWallFn = null, resolveLightFn = null) {
+  build(visibleLevelLayers, pxPerFt, resolveWallFn = null, resolveLightFn = null, opts = {}) {
+    const prevHideIndoor = this.hideIndoorLights;
     this.destroy();
+    this.hideIndoorLights = prevHideIndoor;
     if (!visibleLevelLayers?.length || !canvas?.level) return;
 
     this._buildPxPerFt = pxPerFt;
     this._resolveWallFn = resolveWallFn;
     this._resolveLightFn = resolveLightFn;
+    this._isSuppressedFn = opts.isSuppressedFn || null;
+    this._hasLevelEditsFn = opts.hasLevelEditsFn || null;
+    this._onBatchChanged = opts.onBatchChanged || null;
+    this._currentDarkness = canvas.environment?.darknessLevel ?? 0;
 
     const EdgeCls = foundry.canvas.geometry.edges.Edge;
     const CSP = foundry.canvas.geometry.ClockwiseSweepPolygon;
@@ -505,9 +547,11 @@ class MegaLightBatch {
 
       const levelId = level.id;
       const defaultLightElev = (level.elevation?.base ?? level.elevation?.bottom ?? 0) + 6;
+      const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
+      const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
 
-      // Fast instanced light baking for superGrid worlds (e.g. 6000x6000 = 6x6 provinces -> 22,860 shadowed lights in ~120ms)
-      if (spec._superGridBase && spec.superGrid) {
+      // Fast instanced light baking for unmodified superGrid worlds (e.g. 6000x6000 = 6x6 provinces -> 22,860 shadowed lights in ~120ms)
+      if (spec._superGridBase && spec.superGrid && !hasEditsOnLevel) {
         const sg = spec.superGrid;
         const baseSpec = spec._superGridBase;
         const baseSectors = baseSpec.sectors || {};
@@ -710,9 +754,11 @@ class MegaLightBatch {
 
                 const vCount = vertCursor - vStart;
                 const lightId = `${levelId}::${sk}_${bl.li}`;
+                const suppressed = Boolean(this._isSuppressedFn?.(lightId));
                 this.lightMetaById.set(lightId, {
                   id: lightId, levelId, elevation: bl.elevation, sk, lx, ly, dimPx: bl.dimPx, vStart, vCount,
-                  weight: 1.0, baseWeight: 1.0, isIndoor: bl.isIndoor,
+                  weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor: bl.isIndoor,
+                  walls: true, angle: 360, rotation: 0, darkMin: 0, darkMax: 1,
                   raw: [lx, ly, bl.dimFt, bl.brightFt, bl.colorHex, bl.alpha, bl.anim, bl.elevation]
                 });
                 if (lx - bl.dimPx < minX) minX = lx - bl.dimPx;
@@ -730,21 +776,6 @@ class MegaLightBatch {
           }
         }
         continue;
-      }
-
-      // Collect native WallDocuments already living on this level so GPU lights respect GM-drawn walls too
-      const nativeEdges = [];
-      if (canvas.scene?.walls) {
-        for (const w of canvas.scene.walls) {
-          if (w.light === 0) continue;
-          if (w.door && w.ds === 1) continue;
-          if (w.levels?.size && !w.levels.has(levelId)) continue;
-          const [x1, y1, x2, y2] = w.c;
-          nativeEdges.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-            id: `nw_${levelId}_${w.id}`, type: "wall",
-            move: w.move, sight: w.sight, light: w.light, sound: w.sound, direction: w.dir || 0
-          }));
-        }
       }
 
       // Pre-build static light-blocking Edge arrays per sector for this level
@@ -842,19 +873,31 @@ class MegaLightBatch {
 
         for (let li = 0; li < sec.l.length; li++) {
           const raw = sec.l[li];
+          const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
           const resolved = resolveLightFn
             ? resolveLightFn(levelId, sk, li, raw, level)
             : {
                 x: raw[0], y: raw[1], dim: raw[2], bright: raw[3],
                 color: raw[4], alpha: raw[5] ?? 0.5, anim: raw[6] || "",
-                elevation: Number.isFinite(raw[7]) ? raw[7] : defaultLightElev
+                elevation: Number.isFinite(raw[7]) ? raw[7] : defaultLightElev,
+                hidden: Boolean(extra?.hidden),
+                walls: extra?.walls !== false,
+                angle: extra?.angle ?? 360,
+                rotation: extra?.rotation ?? 0,
+                darkMin: extra?.darkMin ?? 0,
+                darkMax: extra?.darkMax ?? 1
               };
-          if (!resolved) continue;
+          if (!resolved || resolved.hidden) continue;
           const lx = resolved.x, ly = resolved.y;
           const dimFt = resolved.dim, brightFt = resolved.bright;
           const colorHex = resolved.color, alpha = resolved.alpha, anim = resolved.anim;
           const dimPx = Math.max(dimFt || 0, brightFt || 0) * pxPerFt;
-          if (dimPx <= 0) continue;
+          const angle = resolved.angle ?? 360;
+          const rotation = resolved.rotation ?? 0;
+          const useWalls = resolved.walls !== false;
+          const darkMin = resolved.darkMin ?? 0;
+          const darkMax = resolved.darkMax ?? 1;
+          if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
           const effectiveRaw = [lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation];
@@ -872,22 +915,26 @@ class MegaLightBatch {
           const vStart = vertCursor;
 
           let hasNearbyWall = false;
-          for (const e of localEdges) {
-            if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
-                Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
-              hasNearbyWall = true;
-              break;
+          if (useWalls) {
+            for (const e of localEdges) {
+              if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+                  Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+                hasNearbyWall = true;
+                break;
+              }
             }
           }
 
           let builtPoly = false;
-          if (hasNearbyWall) {
+          if ((useWalls && hasNearbyWall) || angle < 360) {
             const poly = new CSP();
             poly.initialize({ x: lx, y: ly }, {
               type: "light",
               level: fakeLevel,
-              edgeTypes: { wall: true },
+              edgeTypes: { wall: useWalls },
               radius: dimPx,
+              angle,
+              rotation,
               density: 32,
               hasLimitedRadius: true,
               useThreshold: true
@@ -942,9 +989,13 @@ class MegaLightBatch {
               }
             }
           }
+          if (darkMin > 0 || darkMax < 1) this._hasDarknessRangedLights = true;
+          const suppressed = Boolean(this._isSuppressedFn?.(lightId));
           this.lightMetaById.set(lightId, {
             id: lightId, levelId, elevation, sk, lx, ly, dimPx, vStart, vCount,
-            weight: 1.0, baseWeight: 1.0, isIndoor, raw: effectiveRaw
+            weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor,
+            walls: useWalls, angle, rotation, darkMin, darkMax,
+            raw: effectiveRaw
           });
 
           if (lx - dimPx < minX) minX = lx - dimPx;
@@ -974,6 +1025,16 @@ class MegaLightBatch {
     weights.fill(1.0);
     const depthElevs = new Float32Array(vertCursor);
     depthElevs.fill(1.0);
+
+    // Apply initial effective weights (suppressed dynamicLights, hideIndoorLights, darkness range) before GPU upload
+    let initialActive = 0;
+    for (const meta of this.lightMetaById.values()) {
+      const eff = this._computeEffectiveWeight(meta);
+      meta.weight = eff;
+      if (eff !== 1.0) weights.fill(eff, meta.vStart, meta.vStart + meta.vCount);
+      if (eff > 0.001) initialActive++;
+    }
+    this.activeLightsCount = initialActive;
 
     const IdxArray = vertCursor > 65535 ? Uint32Array : Uint16Array;
     this.allIndices = new IdxArray(indicesArr);
@@ -1011,12 +1072,11 @@ class MegaLightBatch {
     this.colorMesh.cullable = false;
     this.colorMesh.size = this.visibleIndexCount;
 
+    const hasVis = this.visibleIndexCount > 0 && this.activeLightsCount > 0;
+    this.illumMesh.visible = hasVis;
+    this.colorMesh.visible = hasVis;
+
     this.syncDepthElevations(false);
-    if (this.hideIndoorLights) {
-      const want = this.hideIndoorLights;
-      this.hideIndoorLights = false;
-      this.setIndoorLightsHidden(want);
-    }
   }
 
   /**
@@ -1028,7 +1088,10 @@ class MegaLightBatch {
     const hasMonolithic = Boolean(this.depthElevArray && this.depthElevBuffer);
     const hasChunks = this.chunkBatches.size > 0;
     if (!hasMonolithic && !hasChunks) return;
-    if (!this.useDepthTexture) return;
+    if (!this.useDepthTexture) {
+      this._depthElevCheckMap.clear();
+      return;
+    }
 
     const depthMask = canvas.masks?.depth;
     if (!depthMask) return;
@@ -1036,10 +1099,12 @@ class MegaLightBatch {
     depthMask._elevationDirty = true;
     depthMask._update?.();
 
+    this._depthElevCheckMap.clear();
     let monoChanged = false;
     const dirtyChunkBatches = new Set();
     for (const meta of this.lightMetaById.values()) {
       const mapped = depthMask.mapElevation(meta.elevation);
+      this._depthElevCheckMap.set(meta.elevation, mapped);
       if (meta.batch) {
         const arr = meta.batch.depthElevArray;
         if (arr && Math.abs(arr[meta.vStart] - mapped) > 0.0001) {
@@ -1058,6 +1123,18 @@ class MegaLightBatch {
     }
     for (const batch of dirtyChunkBatches) {
       batch.depthElevBuffer?.update();
+    }
+  }
+
+  _checkDepthElevationsDirty() {
+    if (!this.useDepthTexture || this._depthElevCheckMap.size === 0) return;
+    const depthMask = canvas.masks?.depth;
+    if (!depthMask) return;
+    for (const [elev, lastMapped] of this._depthElevCheckMap) {
+      if (Math.abs(depthMask.mapElevation(elev) - lastMapped) > 0.0001) {
+        this.syncDepthElevations(true);
+        return;
+      }
     }
   }
 
@@ -1123,12 +1200,30 @@ class MegaLightBatch {
 
     const EdgeCls = foundry.canvas.geometry.edges.Edge;
     const sectors = chunkData.sectors;
+    const allLevelSectors = layer.spec?.sectors || sectors;
     const overlays = chunkData.overlays || layer.spec?.overlays || {};
     const sectorEntries = Object.entries(sectors).filter(([, s]) => s?.l?.length);
     if (sectorEntries.length === 0) return;
 
+    const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
+    const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId));
+
+    // Include walls from chunk sectors AND already-loaded neighboring sectors so chunk borders stay seamless
+    const neededWallSectors = new Set(Object.keys(sectors));
+    for (const [sk] of sectorEntries) {
+      const [sx, sy] = sk.split("_").map(Number);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nsk = `${sx + dx}_${sy + dy}`;
+          if (allLevelSectors[nsk]) neededWallSectors.add(nsk);
+        }
+      }
+    }
+
     const sectorEdges = new Map();
-    for (const [sk, sec] of Object.entries(sectors)) {
+    for (const sk of neededWallSectors) {
+      const sec = sectors[sk] || allLevelSectors[sk];
+      if (!sec) continue;
       const arr = [];
       if (sec.w) {
         for (let wi = 0; wi < sec.w.length; wi++) {
@@ -1160,11 +1255,12 @@ class MegaLightBatch {
     }
 
     const b = chunkData.bounds || { x: 0, y: 0, w: layer.worldPx || 100000, h: layer.worldPx || 100000 };
+    const padB = LIGHT_PAD_WORLD_PX;
     const outerBounds = [
-      new EdgeCls({ x: b.x, y: b.y }, { x: b.x + b.w, y: b.y }, { id: "cb_t", type: "outerBounds" }),
-      new EdgeCls({ x: b.x + b.w, y: b.y }, { x: b.x + b.w, y: b.y + b.h }, { id: "cb_r", type: "outerBounds" }),
-      new EdgeCls({ x: b.x + b.w, y: b.y + b.h }, { x: b.x, y: b.y + b.h }, { id: "cb_b", type: "outerBounds" }),
-      new EdgeCls({ x: b.x, y: b.y + b.h }, { x: b.x, y: b.y }, { id: "cb_l", type: "outerBounds" })
+      new EdgeCls({ x: b.x - padB, y: b.y - padB }, { x: b.x + b.w + padB, y: b.y - padB }, { id: "cb_t", type: "outerBounds" }),
+      new EdgeCls({ x: b.x + b.w + padB, y: b.y - padB }, { x: b.x + b.w + padB, y: b.y + b.h + padB }, { id: "cb_r", type: "outerBounds" }),
+      new EdgeCls({ x: b.x + b.w + padB, y: b.y + b.h + padB }, { x: b.x - padB, y: b.y + b.h + padB }, { id: "cb_b", type: "outerBounds" }),
+      new EdgeCls({ x: b.x - padB, y: b.y + b.h + padB }, { x: b.x - padB, y: b.y - padB }, { id: "cb_l", type: "outerBounds" })
     ];
     const localEdgeStore = {
       _list: [],
@@ -1195,7 +1291,10 @@ class MegaLightBatch {
       levelId,
       level,
       sectors,
+      allLevelSectors,
       overlays,
+      nativeEdges,
+      hasEditsOnLevel,
       bakedPolys: chunkData.bakedPolys || null,
       sectorEntries,
       sectorEdges,
@@ -1244,7 +1343,7 @@ class MegaLightBatch {
       while (job.secIdx < job.sectorEntries.length && (performance.now() - startMs) < budgetMs) {
         const [sk, sec] = job.sectorEntries[job.secIdx++];
         const [sx, sy] = sk.split("_").map(Number);
-        const localEdges = [];
+        const localEdges = job.nativeEdges.length ? job.nativeEdges.slice() : [];
         for (let dy = -1; dy <= 1; dy++) {
           for (let dx = -1; dx <= 1; dx++) {
             const arr = job.sectorEdges.get(`${sx + dx}_${sy + dy}`);
@@ -1258,13 +1357,29 @@ class MegaLightBatch {
 
         for (let li = 0; li < sec.l.length; li++) {
           const raw = sec.l[li];
+          const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
           const resolved = this._resolveLightFn
             ? this._resolveLightFn(job.levelId, sk, li, raw, job.level)
-            : { x: raw[0], y: raw[1], dim: raw[2], bright: raw[3], color: raw[4], alpha: raw[5] ?? 0.5, anim: raw[6] || "", elevation: Number.isFinite(raw[7]) ? raw[7] : defaultLightElev };
-          if (!resolved) continue;
+            : {
+                x: raw[0], y: raw[1], dim: raw[2], bright: raw[3],
+                color: raw[4], alpha: raw[5] ?? 0.5, anim: raw[6] || "",
+                elevation: Number.isFinite(raw[7]) ? raw[7] : defaultLightElev,
+                hidden: Boolean(extra?.hidden),
+                walls: extra?.walls !== false,
+                angle: extra?.angle ?? 360,
+                rotation: extra?.rotation ?? 0,
+                darkMin: extra?.darkMin ?? 0,
+                darkMax: extra?.darkMax ?? 1
+              };
+          if (!resolved || resolved.hidden) continue;
           const lx = resolved.x, ly = resolved.y;
           const dimPx = Math.max(resolved.dim || 0, resolved.bright || 0) * pxPerFt;
-          if (dimPx <= 0) continue;
+          const angle = resolved.angle ?? 360;
+          const rotation = resolved.rotation ?? 0;
+          const useWalls = resolved.walls !== false;
+          const darkMin = resolved.darkMin ?? 0;
+          const darkMax = resolved.darkMax ?? 1;
+          if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
           const ratio = Math.min(1, ((resolved.bright || 0) * pxPerFt) / dimPx);
@@ -1288,7 +1403,8 @@ class MegaLightBatch {
           };
 
           let builtPoly = false;
-          const prebaked = job.bakedPolys?.[`${sk}_${li}`];
+          const canUsePrebaked = !job.hasEditsOnLevel && job.nativeEdges.length === 0 && useWalls && angle >= 360;
+          const prebaked = canUsePrebaked ? job.bakedPolys?.[`${sk}_${li}`] : null;
           if (Array.isArray(prebaked) && prebaked.length >= 6) {
             const nPts = prebaked.length >> 1;
             const cIdx = pushV(0, 0);
@@ -1298,21 +1414,25 @@ class MegaLightBatch {
             builtPoly = true;
           } else {
             let hasNearbyWall = false;
-            for (let ei = 0; ei < localEdges.length; ei++) {
-              const e = localEdges[ei];
-              if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
-                  Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
-                hasNearbyWall = true;
-                break;
+            if (useWalls) {
+              for (let ei = 0; ei < localEdges.length; ei++) {
+                const e = localEdges[ei];
+                if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+                    Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+                  hasNearbyWall = true;
+                  break;
+                }
               }
             }
-            if (hasNearbyWall) {
+            if ((useWalls && hasNearbyWall) || angle < 360) {
               const poly = new CSP();
               poly.initialize({ x: lx, y: ly }, {
                 type: "light",
                 level: job.fakeLevel,
-                edgeTypes: { wall: true },
+                edgeTypes: { wall: useWalls },
                 radius: dimPx,
+                angle,
+                rotation,
                 density: 32,
                 hasLimitedRadius: true,
                 useThreshold: true
@@ -1349,7 +1469,7 @@ class MegaLightBatch {
           if (elevation < topElev && job.overlays) {
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
               for (let dx = -1; dx <= 1 && !isIndoor; dx++) {
-                const oList = job.sectors[`${sx + dx}_${sy + dy}`]?.o;
+                const oList = (job.sectors[`${sx + dx}_${sy + dy}`] || job.allLevelSectors[`${sx + dx}_${sy + dy}`])?.o;
                 if (!oList?.length) continue;
                 for (const oid of oList) {
                   if (isPointUnderRoofSpec(lx, ly, job.overlays[oid])) {
@@ -1361,12 +1481,16 @@ class MegaLightBatch {
             }
           }
 
+          if (darkMin > 0 || darkMax < 1) this._hasDarknessRangedLights = true;
+          const lightId = `${job.levelId}::${sk}_${li}`;
+          const suppressed = Boolean(this._isSuppressedFn?.(lightId));
           job.metas.push({
-            id: `${job.levelId}::${sk}_${li}`,
+            id: lightId,
             levelId: job.levelId,
             elevation, sk, lx, ly, dimPx,
             vStart, vCount: job.vertCursor - vStart,
-            weight: 1.0, baseWeight: 1.0, isIndoor,
+            weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor,
+            walls: useWalls, angle, rotation, darkMin, darkMax,
             raw: [lx, ly, resolved.dim, resolved.bright, resolved.color, aVal, resolved.anim, elevation]
           });
           if (lx - dimPx < minX) minX = lx - dimPx;
@@ -1405,6 +1529,7 @@ class MegaLightBatch {
       depthMask._update?.();
       for (const meta of job.metas) {
         const mapped = depthMask.mapElevation(meta.elevation);
+        this._depthElevCheckMap.set(meta.elevation, mapped);
         depthElevs.fill(mapped, meta.vStart, meta.vStart + meta.vCount);
       }
     } else {
@@ -1458,7 +1583,7 @@ class MegaLightBatch {
       depthElevArray: depthElevs,
       depthElevBuffer,
       lightIds: [],
-      activeCount: job.metas.length,
+      activeCount: 0,
       lastVisKey: ""
     };
 
@@ -1466,10 +1591,13 @@ class MegaLightBatch {
       meta.batch = batch;
       batch.lightIds.push(meta.id);
       this.lightMetaById.set(meta.id, meta);
-      if (this.hideIndoorLights && meta.isIndoor) {
-        meta.weight = 0;
-        batch.activeCount--;
-        weights.fill(0, meta.vStart, meta.vStart + meta.vCount);
+      const eff = this._computeEffectiveWeight(meta);
+      meta.weight = eff;
+      if (eff > 0.001) {
+        batch.activeCount++;
+      }
+      if (eff !== 1.0) {
+        weights.fill(eff, meta.vStart, meta.vStart + meta.vCount);
         batch.weightsDirty = true;
       }
     }
@@ -1487,8 +1615,11 @@ class MegaLightBatch {
     if (effects) this._attachSingleBatch(batch, effects);
     if (this._lastVp) {
       const vp = this._lastVp;
-      this._cullBatch(batch, vp.x0 - LIGHT_PAD_WORLD_PX, vp.y0 - LIGHT_PAD_WORLD_PX, vp.x1 + LIGHT_PAD_WORLD_PX, vp.y1 + LIGHT_PAD_WORLD_PX, vp.scale >= 0.035);
+      const showDetail = !this.macroBatch || vp.scale >= 0.035;
+      this._cullBatch(batch, vp.x0 - LIGHT_PAD_WORLD_PX, vp.y0 - LIGHT_PAD_WORLD_PX, vp.x1 + LIGHT_PAD_WORLD_PX, vp.y1 + LIGHT_PAD_WORLD_PX, showDetail);
+      this._updateMacroCrossfade(vp.scale);
     }
+    this._onBatchChanged?.();
   }
 
   detachChunk(levelId, chunkKey) {
@@ -1515,6 +1646,52 @@ class MegaLightBatch {
     batch.colorMesh?.parent?.removeChild(batch.colorMesh);
     batch.colorMesh?.destroy({ children: false });
     batch.geometry?.destroy();
+    if (this._lastVp) this._updateMacroCrossfade(this._lastVp.scale);
+    this._onBatchChanged?.();
+  }
+
+  _updateMacroCrossfade(scale) {
+    const mb = this.macroBatch;
+    if (!mb) return;
+    const showMacro = scale < 0.07;
+    if (!showMacro) {
+      mb.illumMesh.visible = false;
+      mb.colorMesh.visible = false;
+      return;
+    }
+    // Smoothly fade macro orbital glow out across [0.035..0.068] when detailed chunks are mounted
+    // so macroBatch and chunkBatches never double-brighten via SCREEN blending.
+    const targetAlpha = this.chunkBatches.size > 0
+      ? (1.0 - smoothstep(0.035, 0.068, scale))
+      : 1.0;
+    if (Math.abs(targetAlpha - mb.lastAlpha) > 0.015) {
+      mb.lastAlpha = targetAlpha;
+      mb.weightArray.fill(targetAlpha);
+      mb.weightBuffer.update();
+    }
+    const vis = targetAlpha > 0.01;
+    mb.illumMesh.visible = vis;
+    mb.colorMesh.visible = vis;
+  }
+
+  hasVisibleLights() {
+    if (this.illumMesh?.visible || this.colorMesh?.visible) return true;
+    if (this.macroBatch?.illumMesh?.visible || this.macroBatch?.colorMesh?.visible) return true;
+    for (const batch of this.chunkBatches.values()) {
+      if (batch.illumMesh?.visible || batch.colorMesh?.visible) return true;
+    }
+    return false;
+  }
+
+  countAttachedColorMeshes(coloration) {
+    if (!coloration) return 0;
+    let count = 0;
+    if (this.colorMesh?.parent === coloration) count++;
+    if (this.macroBatch?.colorMesh?.parent === coloration) count++;
+    for (const batch of this.chunkBatches.values()) {
+      if (batch.colorMesh?.parent === coloration) count++;
+    }
+    return count;
   }
 
   updateViewport(vp) {
@@ -1524,11 +1701,9 @@ class MegaLightBatch {
     const x1 = vp.x1 + LIGHT_PAD_WORLD_PX;
     const y1 = vp.y1 + LIGHT_PAD_WORLD_PX;
 
-    // 1. Orbital macro glow layer for chunked continental worlds (scale < 0.07)
+    // 1. Orbital macro glow layer for chunked continental worlds (smooth crossfade out over [0.035..0.068])
     if (this.macroBatch) {
-      const showMacro = vp.scale < 0.07;
-      this.macroBatch.illumMesh.visible = showMacro;
-      this.macroBatch.colorMesh.visible = showMacro;
+      this._updateMacroCrossfade(vp.scale);
     }
 
     // 2. Streamed per-chunk detailed shadowed light batches (active when zoomed below orbital scale)
@@ -1586,10 +1761,17 @@ class MegaLightBatch {
     }
   }
 
+  _getEffectiveShaderTime() {
+    if (canvas.effects?.animateLightSources === false) return this._frozenTime;
+    this._frozenTime = (canvas.app?.ticker?.lastTime || 0) * 0.001;
+    return this._frozenTime;
+  }
+
   _updateIllumUniforms() {
     const u = this.illumShader?.uniforms;
     if (!u || !canvas?.ready) return;
-    u.uTime = (canvas.app?.ticker?.lastTime || 0) * 0.001;
+    this._checkDepthElevationsDirty();
+    u.uTime = this._getEffectiveShaderTime();
     u.uStageScale = canvas.stage?.scale?.x || 1;
     u.uScreenDimensions[0] = canvas.screenDimensions?.[0] || 1;
     u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
@@ -1647,8 +1829,9 @@ class MegaLightBatch {
   _updateColorUniforms() {
     const u = this.colorShader?.uniforms;
     if (!u || !canvas?.ready) return;
+    this._checkDepthElevationsDirty();
     const scale = canvas.stage?.scale?.x || 1;
-    u.uTime = (canvas.app?.ticker?.lastTime || 0) * 0.001;
+    u.uTime = this._getEffectiveShaderTime();
     u.uStageScale = scale;
     u.uScreenDimensions[0] = canvas.screenDimensions?.[0] || 1;
     u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
@@ -1672,7 +1855,7 @@ class MegaLightBatch {
   }
 
   _applyMetaEffectiveWeight(meta) {
-    const eff = (this.hideIndoorLights && meta.isIndoor) ? 0.0 : meta.baseWeight;
+    const eff = this._computeEffectiveWeight(meta);
     if (Math.abs(meta.weight - eff) <= 0.0005) return;
     const wasActive = meta.weight > 0.001;
     const isActive = eff > 0.001;
@@ -1689,6 +1872,21 @@ class MegaLightBatch {
       this.weightArray.fill(eff, meta.vStart, meta.vStart + meta.vCount);
       this.weightsDirty = true;
     }
+  }
+
+  syncDarknessLevel(darkness) {
+    const next = Number.isFinite(darkness) ? darkness : 0;
+    const changed = Math.abs(next - this._currentDarkness) > 0.0001;
+    this._currentDarkness = next;
+    if (!changed || !this._hasDarknessRangedLights) return false;
+    if (!this.weightArray && this.chunkBatches.size === 0) return false;
+    for (const meta of this.lightMetaById.values()) {
+      if (meta.darkMin > 0 || meta.darkMax < 1) {
+        this._applyMetaEffectiveWeight(meta);
+      }
+    }
+    this.flushWeights();
+    return true;
   }
 
   setLightWeight(lightId, weight) {
@@ -1741,11 +1939,12 @@ class MegaLightBatch {
       if (this.illumMesh) this.illumMesh.visible = hasVisible;
       if (this.colorMesh) this.colorMesh.visible = hasVisible;
     }
+    const showDetail = !this.macroBatch || !this._lastVp || this._lastVp.scale >= 0.035;
     for (const batch of this.chunkBatches.values()) {
       if (!batch.weightsDirty || !batch.weightBuffer) continue;
       batch.weightBuffer.update();
       batch.weightsDirty = false;
-      const hasVisible = batch.visibleIndexCount > 0 && batch.activeCount > 0;
+      const hasVisible = showDetail && batch.visibleIndexCount > 0 && batch.activeCount > 0;
       batch.illumMesh.visible = hasVisible;
       batch.colorMesh.visible = hasVisible;
     }
@@ -1763,7 +1962,7 @@ class MegaLightBatch {
         const insertIdx = Math.min(1, coloration.children.length);
         coloration.addChildAt(batch.colorMesh, insertIdx);
       }
-      coloration.visible = true;
+      if (batch.colorMesh.visible) coloration.visible = true;
     }
   }
 
@@ -1779,21 +1978,21 @@ class MegaLightBatch {
       this._attachSingleBatch(batch, effects);
     }
 
-    if (!this.illumMesh || !this.colorMesh) return;
-    const illumLights = effects.illumination?.lights;
-    if (illumLights && this.illumMesh.parent !== illumLights) {
-      illumLights.addChildAt(this.illumMesh, 0);
+    if (this.illumMesh && this.colorMesh) {
+      const illumLights = effects.illumination?.lights;
+      if (illumLights && this.illumMesh.parent !== illumLights) {
+        illumLights.addChildAt(this.illumMesh, 0);
+      }
+      const coloration = effects.coloration;
+      if (coloration) {
+        if (this.colorMesh.parent !== coloration) {
+          const insertIdx = Math.min(1, coloration.children.length);
+          coloration.addChildAt(this.colorMesh, insertIdx);
+        }
+      }
     }
-
-    const coloration = effects.coloration;
-    if (coloration) {
-      if (this.colorMesh.parent !== coloration) {
-        const insertIdx = Math.min(1, coloration.children.length);
-        coloration.addChildAt(this.colorMesh, insertIdx);
-      }
-      if (this.activeLightsCount > 0 && this.visibleIndexCount > 0) {
-        coloration.visible = true;
-      }
+    if (effects.coloration && this.hasVisibleLights()) {
+      effects.coloration.visible = true;
     }
   }
 
@@ -1806,6 +2005,11 @@ class MegaLightBatch {
     this._chunkBakeRaf = null;
     this._effects = null;
     this._lastVp = null;
+    this._depthElevCheckMap.clear();
+    this._hasDarknessRangedLights = false;
+    this._isSuppressedFn = null;
+    this._hasLevelEditsFn = null;
+    this._onBatchChanged = null;
 
     if (this.macroBatch) {
       this.macroBatch.illumMesh?.parent?.removeChild(this.macroBatch.illumMesh);
@@ -2629,10 +2833,23 @@ class MegaWorld1000 {
     const col = effects.coloration;
     if (col) {
       const hasPost = Boolean(lightingOpts?.coloration?.postProcessingModes?.length);
-      const hasOtherSources = col.children.length > (this.lightBatch.colorMesh?.parent === col ? 2 : 1);
-      const hasBatchLights = this.lightBatch.visibleIndexCount > 0 && this.lightBatch.activeLightsCount > 0;
+      const ourMeshes = this.lightBatch.countAttachedColorMeshes(col);
+      // Foundry's CanvasColorationEffects always keeps 1 internal #background child
+      const hasOtherSources = col.children.length > (1 + ourMeshes);
+      const hasBatchLights = this.lightBatch.hasVisibleLights();
       col.visible = hasBatchLights || hasOtherSources || hasPost;
     }
+  }
+
+  _getLightBatchBuildOpts() {
+    return {
+      isSuppressedFn: (lid) => this.dynamicLights.has(lid),
+      hasLevelEditsFn: (levelId) =>
+        Boolean(this.wallEdits.get(levelId)?.size) || Boolean(this.lightEdits.get(levelId)?.size),
+      onBatchChanged: () => {
+        if (this.active && canvas?.effects) this._optimizeEffectsLayers(canvas.effects);
+      }
+    };
   }
 
   async mount(scene) {
@@ -2707,15 +2924,17 @@ class MegaWorld1000 {
 
     // Build unified GPU light batch across all visible Boundless levels (monolithic or chunked macroLights)
     const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+    const hasAnyOverlays = layers.some(l => l.spec?.overlays && (Array.isArray(l.spec.overlays) ? l.spec.overlays.length > 0 : Object.keys(l.spec.overlays).length > 0));
+    // Keep indoor lights suppressed briefly until pixel-accurate bakedRoofMask finishes (or roofs mount in depthMask)
+    this._waitingForRoofsBeforeIndoor = hasAnyOverlays;
+    this.lightBatch.hideIndoorLights = hasAnyOverlays;
     this.lightBatch.build(
       layers,
       pxPerFt,
       (lid, kind, sk, idx, raw) => this.resolveVirtualWall(lid, kind, sk, idx, raw),
-      (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl)
+      (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
+      this._getLightBatchBuildOpts()
     );
-    // Keep indoor lights suppressed briefly until pixel-accurate bakedRoofMask finishes (or roofs mount in depthMask)
-    this._waitingForRoofsBeforeIndoor = true;
-    this.lightBatch.setIndoorLightsHidden(true);
     this.lightBatch.attachTo(canvas.effects);
 
     // Asynchronously bake 2048x2048 pixel-accurate roof alpha mask so macro lighting (localZ < 5) matches depthMask 1:1
@@ -3968,8 +4187,15 @@ class MegaWorld1000 {
     if (!this.active) return;
     this._capFilterResolution(effects?.coloration?.filter, 1.0);
     this._capFilterResolution(effects?.illumination?.filter, 1.0);
+    const darkness = canvas.environment?.darknessLevel ?? 0;
+    const rangedChanged = this.lightBatch.syncDarknessLevel(darkness);
     this.lightBatch.attachTo(effects);
     this._optimizeEffectsLayers(effects);
+    if (rangedChanged) {
+      queueMicrotask(() => {
+        if (this.active) this.updateSimAndLightBubbles(false);
+      });
+    }
     if (this.visibleLevelLayers.length) {
       this.audioStreamer.update(
         this.visibleLevelLayers,
@@ -3987,21 +4213,110 @@ class MegaWorld1000 {
     try {
       const EdgeCls = foundry.canvas.geometry.edges.Edge;
       const LightCls = CONFIG.Canvas.lightSourceClass;
+      const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+      const darkness = canvas.environment?.darknessLevel ?? 0;
 
-      // 1. Physics Wall Edges per Level (`level.edges`): ONLY around active tokens (controlled, player-owned,
-      //    light-emitting, or active visionSources) and open doors so 150-500 idle NPCs never bloat level.edges
+      // 1. Collect Dynamic PointLightSources FIRST so we guarantee their full light radius has wall edges in `level.edges`
+      //    When macro bakedRoofMask is active (localZ < 5, roofs unloaded from CanvasDepthMask), keep lights in MegaLightBatch
+      //    so native PointLightSources never bleed through baked roofs near tokens.
+      const neededDynLights = new Set();
+      const suppressAllDynForMacroRoof = Boolean(this.lightBatch.useBakedRoofMask);
+      const suppressIndoorDyn = Boolean(this.lightBatch.hideIndoorLights);
+
+      const isMetaEligibleDyn = (meta) => {
+        if (!meta) return false;
+        if (suppressIndoorDyn && meta.isIndoor) return false;
+        if (darkness < (meta.darkMin ?? 0) || darkness > (meta.darkMax ?? 1)) return false;
+        return true;
+      };
+
+      if (!suppressAllDynForMacroRoof) {
+        // 1a. Open-door lights (always included, never starved by vision light cap)
+        for (const door of this.openDoors.values()) {
+          const layer = this.levelLayers.get(door.levelId);
+          if (!layer?.spec?.sectors) continue;
+          const { simGrid, simSectorPx, spec } = layer;
+          const sx0 = Math.max(0, Math.floor((door.x - LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
+          for (let sy = sy0; sy <= sy1; sy++) {
+            for (let sx = sx0; sx <= sx1; sx++) {
+              const sk = `${sx}_${sy}`;
+              const sec = spec.sectors[sk];
+              if (!sec?.l?.length) continue;
+              for (let li = 0; li < sec.l.length; li++) {
+                const lid = `${door.levelId}::${sk}_${li}`;
+                const meta = this.lightBatch.lightMetaById.get(lid);
+                if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
+                  neededDynLights.add(lid);
+                }
+              }
+            }
+          }
+        }
+
+        // 1b. Nearest lights to active visionSources (skip when box-selecting a crowd > 6 visionSources)
+        const MAX_VISION_DYN_LIGHTS = 24;
+        if (canvas.effects?.visionSources?.size && canvas.effects.visionSources.size <= 6) {
+          const visionCandidates = new Map(); // lid -> minDistSq
+          for (const vs of canvas.effects.visionSources) {
+            if (!vs?.active) continue;
+            const vsLevelId = vs.data?.level || canvas.level?.id;
+            const layer = this.levelLayers.get(vsLevelId);
+            if (!layer?.spec?.sectors) continue;
+            const { simGrid, simSectorPx, spec } = layer;
+            const vRad = Math.min(MAX_LOS_RADIUS_PX, Math.max(vs.radius || 0, 60 * pxPerFt));
+            const sx0 = Math.max(0, Math.floor((vs.x - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy0 = Math.max(0, Math.floor((vs.y - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sx1 = Math.min(simGrid - 1, Math.floor((vs.x + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy1 = Math.min(simGrid - 1, Math.floor((vs.y + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            for (let sy = sy0; sy <= sy1; sy++) {
+              for (let sx = sx0; sx <= sx1; sx++) {
+                const sk = `${sx}_${sy}`;
+                const sec = spec.sectors[sk];
+                if (!sec?.l?.length) continue;
+                for (let li = 0; li < sec.l.length; li++) {
+                  const lid = `${vsLevelId}::${sk}_${li}`;
+                  if (neededDynLights.has(lid)) continue;
+                  const meta = this.lightBatch.lightMetaById.get(lid);
+                  if (!isMetaEligibleDyn(meta)) continue;
+                  const dx = meta.lx - vs.x;
+                  const dy = meta.ly - vs.y;
+                  const maxD = vRad + meta.dimPx;
+                  const distSq = dx * dx + dy * dy;
+                  if (distSq <= maxD * maxD) {
+                    const prev = visionCandidates.get(lid);
+                    if (prev === undefined || distSq < prev) visionCandidates.set(lid, distSq);
+                  }
+                }
+              }
+            }
+          }
+          if (visionCandidates.size > 0) {
+            const sorted = Array.from(visionCandidates.entries()).sort((a, b) => a[1] - b[1]);
+            const take = Math.min(MAX_VISION_DYN_LIGHTS, sorted.length);
+            for (let i = 0; i < take; i++) neededDynLights.add(sorted[i][0]);
+          }
+        }
+      }
+
+      // 2. Physics Wall Edges per Level (`level.edges`): around active tokens (controlled, player-owned,
+      //    light-emitting, active visionSources), open doors, and every active dynamic PointLightSource
       const neededSim = new Map(); // "${levelId}::${sx}_${sy}" -> { layer, sk }
-      const addSimBubble = (levelId, wx, wy) => {
+      const addSimBubble = (levelId, wx, wy, radiusPx = 0) => {
         const layer = this.levelLayers.get(levelId);
         if (!layer?.spec?.sectors) return;
         const { simGrid, simSectorPx, spec } = layer;
-        const tsx = Math.floor(wx / simSectorPx);
-        const tsy = Math.floor(wy / simSectorPx);
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const x = tsx + dx, y = tsy + dy;
+        const effRad = Math.max(simSectorPx, radiusPx || 0);
+        const sx0 = Math.max(0, Math.floor((wx - effRad) / simSectorPx));
+        const sy0 = Math.max(0, Math.floor((wy - effRad) / simSectorPx));
+        const sx1 = Math.min(simGrid - 1, Math.floor((wx + effRad) / simSectorPx));
+        const sy1 = Math.min(simGrid - 1, Math.floor((wy + effRad) / simSectorPx));
+        for (let y = sy0; y <= sy1; y++) {
+          for (let x = sx0; x <= sx1; x++) {
             const sk = `${x}_${y}`;
-            if (x >= 0 && x < simGrid && y >= 0 && y < simGrid && spec.sectors[sk]) {
+            if (spec.sectors[sk]) {
               neededSim.set(`${levelId}::${sk}`, { layer, sk });
             }
           }
@@ -4014,10 +4329,10 @@ class MegaWorld1000 {
 
       for (const tok of canvas.tokens.placeables) {
         const doc = tok.document;
+        const lightRadPx = Math.max(doc?.light?.dim || 0, doc?.light?.bright || 0) * pxPerFt;
         const isCoreActor = Boolean(doc?.hasPlayerOwner)
           || Boolean(tok.vision?.active)
-          || (doc?.light?.dim > 0)
-          || (doc?.light?.bright > 0);
+          || lightRadPx > 0;
         let isActiveActor = isCoreActor;
         if (!isActiveActor && tok.controlled) {
           if (!isBulkSelection || bulkControlledAdded < 8) {
@@ -4026,29 +4341,27 @@ class MegaWorld1000 {
           }
         }
         if (!isActiveActor) continue;
-        addSimBubble(doc?.level || canvas.level?.id, tok.center.x, tok.center.y);
+        const visRadPx = tok.vision?.active ? Math.min(MAX_LOS_RADIUS_PX, tok.vision.radius || 0) : 0;
+        addSimBubble(doc?.level || canvas.level?.id, tok.center.x, tok.center.y, Math.max(lightRadPx, visRadPx));
       }
 
       if (canvas.effects?.visionSources?.size) {
         for (const vs of canvas.effects.visionSources) {
           if (!vs?.active) continue;
-          addSimBubble(vs.data?.level || canvas.level?.id, vs.x, vs.y);
+          const vRad = Math.min(MAX_LOS_RADIUS_PX, vs.radius || 0);
+          addSimBubble(vs.data?.level || canvas.level?.id, vs.x, vs.y, vRad);
         }
       }
 
       for (const door of this.openDoors.values()) {
-        const layer = this.levelLayers.get(door.levelId);
-        if (!layer?.spec?.sectors) continue;
-        const { simGrid, simSectorPx, spec } = layer;
-        const sx0 = Math.max(0, Math.floor((door.x - LIGHT_PAD_WORLD_PX) / simSectorPx));
-        const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
-        const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
-        const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
-        for (let sy = sy0; sy <= sy1; sy++) {
-          for (let sx = sx0; sx <= sx1; sx++) {
-            const sk = `${sx}_${sy}`;
-            if (spec.sectors[sk]) neededSim.set(`${door.levelId}::${sk}`, { layer, sk });
-          }
+        addSimBubble(door.levelId, door.x, door.y, LIGHT_PAD_WORLD_PX);
+      }
+
+      // Guarantee every active dynamic PointLightSource has all wall sectors within its full radius
+      for (const lid of neededDynLights) {
+        const meta = this.lightBatch.lightMetaById.get(lid);
+        if (meta && meta.walls !== false) {
+          addSimBubble(meta.levelId, meta.lx, meta.ly, meta.dimPx + 100);
         }
       }
 
@@ -4116,72 +4429,6 @@ class MegaWorld1000 {
         }
       }
 
-      // 2. Dynamic PointLightSources: ONLY for lights affected by open doors or within active visionSources
-      // When macro bakedRoofMask is active (localZ < 5, roofs unloaded from CanvasDepthMask), keep lights in MegaLightBatch
-      // so native PointLightSources never bleed through baked roofs near tokens.
-      const neededDynLights = new Set();
-      const suppressAllDynForMacroRoof = Boolean(this.lightBatch.useBakedRoofMask);
-      const suppressIndoorDyn = Boolean(this.lightBatch.hideIndoorLights);
-
-      if (!suppressAllDynForMacroRoof) {
-        for (const door of this.openDoors.values()) {
-          const layer = this.levelLayers.get(door.levelId);
-          if (!layer?.spec?.sectors) continue;
-          const { simGrid, simSectorPx, spec } = layer;
-          const sx0 = Math.max(0, Math.floor((door.x - LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
-          for (let sy = sy0; sy <= sy1; sy++) {
-            for (let sx = sx0; sx <= sx1; sx++) {
-              const sk = `${sx}_${sy}`;
-              const sec = spec.sectors[sk];
-              if (!sec?.l?.length) continue;
-              for (let li = 0; li < sec.l.length; li++) {
-                const lid = `${door.levelId}::${sk}_${li}`;
-                const meta = this.lightBatch.lightMetaById.get(lid);
-                if (meta && !(suppressIndoorDyn && meta.isIndoor) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
-                  neededDynLights.add(lid);
-                }
-              }
-            }
-          }
-        }
-
-        // Skip converting hundreds of city lights into heavy native PointLightSources when box-selecting a crowd (> 6 visionSources):
-        // MegaLightBatch already renders every shadowed city light in 2 draw calls at 144 FPS.
-        const MAX_VISION_DYN_LIGHTS = 24;
-        if (canvas.effects?.visionSources?.size && canvas.effects.visionSources.size <= 6) {
-          const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
-          for (const vs of canvas.effects.visionSources) {
-            if (neededDynLights.size >= MAX_VISION_DYN_LIGHTS) break;
-            const vsLevelId = vs.data?.level || canvas.level?.id;
-            const layer = this.levelLayers.get(vsLevelId);
-            if (!layer?.spec?.sectors) continue;
-            const { simGrid, simSectorPx, spec } = layer;
-            const vRad = Math.min(MAX_LOS_RADIUS_PX, Math.max(vs.radius || 0, 60 * pxPerFt));
-            const sx0 = Math.max(0, Math.floor((vs.x - vRad) / simSectorPx));
-            const sy0 = Math.max(0, Math.floor((vs.y - vRad) / simSectorPx));
-            const sx1 = Math.min(simGrid - 1, Math.floor((vs.x + vRad) / simSectorPx));
-            const sy1 = Math.min(simGrid - 1, Math.floor((vs.y + vRad) / simSectorPx));
-            for (let sy = sy0; sy <= sy1 && neededDynLights.size < MAX_VISION_DYN_LIGHTS; sy++) {
-              for (let sx = sx0; sx <= sx1 && neededDynLights.size < MAX_VISION_DYN_LIGHTS; sx++) {
-                const sk = `${sx}_${sy}`;
-                const sec = spec.sectors[sk];
-                if (!sec?.l?.length) continue;
-                for (let li = 0; li < sec.l.length && neededDynLights.size < MAX_VISION_DYN_LIGHTS; li++) {
-                  const lid = `${vsLevelId}::${sk}_${li}`;
-                  const meta = this.lightBatch.lightMetaById.get(lid);
-                  if (meta && !(suppressIndoorDyn && meta.isIndoor) && Math.hypot(meta.lx - vs.x, meta.ly - vs.y) <= vRad + meta.dimPx) {
-                    neededDynLights.add(lid);
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
       const dynKey = Array.from(neededDynLights).sort().join("|");
       let lightsChanged = false;
 
@@ -4197,7 +4444,6 @@ class MegaWorld1000 {
           }
         }
 
-        const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
         for (const lid of neededDynLights) {
           if (this.dynamicLights.has(lid)) {
             if (edgesChanged) {
@@ -4212,8 +4458,10 @@ class MegaWorld1000 {
           const ls = new LightCls({ sourceId: `MegaLight.${lid}` });
           ls.initialize({
             x: lx, y: ly, level: meta.levelId, elevation: meta.elevation,
-            walls: true, vision: false,
-            dim: dimFt * pxPerFt, bright: brightFt * pxPerFt,
+            walls: meta.walls !== false, vision: false,
+            angle: meta.angle ?? 360,
+            rotation: meta.rotation ?? 0,
+            dim: (dimFt || 0) * pxPerFt, bright: (brightFt || 0) * pxPerFt,
             color, alpha,
             animation: anim ? { type: anim, speed: 3, intensity: 3 } : {}
           });
@@ -4273,6 +4521,11 @@ class MegaWorld1000 {
       sy,
       ptA: { x: x1, y: y1 },
       ptB: { x: x2, y: y2 },
+      move: seg.move ?? 20,
+      sight: seg.sight ?? 20,
+      light: seg.light ?? 20,
+      sound: seg.sound ?? 20,
+      dir: seg.dir || 0,
       doorType: seg.door,
       defaultDs: seg.ds,
       doorSound: seg.doorSound || ""
@@ -4328,7 +4581,14 @@ class MegaWorld1000 {
       this.openDoors.set(dKey, { levelId, x: dx, y: dy, sx, sy, eid });
     } else {
       if (this.simSectors.has(`${levelId}::${sx}_${sy}`)) {
-        level?.edges?.set(eid, new EdgeCls(ptA, ptB, { id: eid, type: "wall", move: 20, sight: 20, light: 20, sound: 20 }));
+        level?.edges?.set(eid, new EdgeCls(ptA, ptB, {
+          id: eid, type: "wall",
+          move: info.move ?? 20,
+          sight: info.sight ?? 20,
+          light: info.light ?? 20,
+          sound: info.sound ?? 20,
+          direction: info.dir || 0
+        }));
       }
       this.openDoors.delete(dKey);
     }
@@ -4574,15 +4834,28 @@ class MegaWorld1000 {
         dim: ov.dim ?? 0, bright: ov.bright ?? 0,
         color: ov.color ?? null, alpha: ov.alpha ?? 0.5,
         anim: ov.anim || "",
-        elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev
+        elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev,
+        hidden: Boolean(ov.hidden),
+        walls: ov.walls !== false,
+        angle: ov.angle ?? 360,
+        rotation: ov.rotation ?? 0,
+        darkMin: ov.darkMin ?? 0,
+        darkMax: ov.darkMax ?? 1
       };
     }
-    const [x, y, dim, bright, color, alpha, anim, customElev] = raw;
+    const [x, y, dim, bright, color, alpha, anim, customElev, extra] = raw;
+    const ex = extra && typeof extra === "object" ? extra : null;
     return {
       levelId, sk, idx, lKey,
       x, y, dim: dim || 0, bright: bright || 0,
       color: color ?? null, alpha: alpha ?? 0.5, anim: anim || "",
-      elevation: Number.isFinite(customElev) ? customElev : defaultElev
+      elevation: Number.isFinite(customElev) ? customElev : defaultElev,
+      hidden: Boolean(ex?.hidden),
+      walls: ex?.walls !== false,
+      angle: ex?.angle ?? 360,
+      rotation: ex?.rotation ?? 0,
+      darkMin: ex?.darkMin ?? 0,
+      darkMax: ex?.darkMax ?? 1
     };
   }
 
@@ -4597,8 +4870,8 @@ class MegaWorld1000 {
     for (const [, ls] of this.dynamicLights) ls.destroy();
     this.dynamicLights.clear();
     this.lastDynLightKey = "";
+    // scheduleLightBatchRebuild runs updateSimAndLightBubbles(true) strictly AFTER rebuilding lightMetaById
     this.scheduleLightBatchRebuild();
-    this.updateSimAndLightBubbles(true);
     this.layerEditors.syncLighting(true);
   }
 
@@ -4696,8 +4969,14 @@ class MegaWorld1000 {
         this.visibleLevelLayers,
         pxPerFt,
         (lid, kind, sk, idx, raw) => this.resolveVirtualWall(lid, kind, sk, idx, raw),
-        (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl)
+        (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
+        this._getLightBatchBuildOpts()
       );
+      // Re-queue GPU light baking for all resident chunks on chunked worlds so edits never wipe chunk lights
+      this.chunkStreamer.requeueAllLoadedChunks();
+      this._syncIndoorLightVisibility();
+      this.lightBatch.syncDarknessLevel(canvas.environment?.darknessLevel ?? 0);
+      this.updateSimAndLightBubbles(true);
       this.lightBatch.attachTo(canvas.effects);
       this.lightBatch.updateViewport(this.getViewportWorldRect(0.28));
       this._depthElevSyncNeeded = true;
@@ -4840,17 +5119,17 @@ class MegaWorld1000 {
    * Bake native Foundry TileDocuments, WallDocuments, and AmbientLightDocuments on a Level
    * into an inline Boundless spatial sector manifest on `level.flags["boundless"]`.
    */
-  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = 40 } = {}) {
+  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null } = {}) {
     const scene = canvas.scene;
     const level = scene?.levels?.get(levelId);
     if (!scene || !level) throw new Error(`Level "${levelId}" not found.`);
 
     const worldPx = Math.max(scene.width || 100000, scene.height || 100000);
-    const simSectorPx = Math.ceil(worldPx / simGrid);
-    const pxPerFt = (scene.grid?.size || 100) / (scene.grid?.distance || 5);
+    const resolvedSimGrid = simGrid || Math.max(4, Math.min(40, Math.ceil(worldPx / 2500)));
+    const simSectorPx = Math.ceil(worldPx / resolvedSimGrid);
     const sectors = {};
     const ensureSec = (sx, sy) => {
-      const k = `${Math.max(0, Math.min(simGrid - 1, sx))}_${Math.max(0, Math.min(simGrid - 1, sy))}`;
+      const k = `${Math.max(0, Math.min(resolvedSimGrid - 1, sx))}_${Math.max(0, Math.min(resolvedSimGrid - 1, sy))}`;
       return (sectors[k] ??= { w: [], d: [], l: [], t: [], o: [], s: [] });
     };
 
@@ -4929,9 +5208,20 @@ class MegaWorld1000 {
     const lightIdsToDelete = [];
     for (const l of scene.lights) {
       if (l.levels?.size && !l.levels.has(levelId)) continue;
+      // Keep negative (darkness) sources as native AmbientLightDocuments since MegaLightBatch renders additive light
+      if (l.config?.negative) continue;
       const sec = ensureSec(Math.floor(l.x / simSectorPx), Math.floor(l.y / simSectorPx));
       const colorCss = l.config?.color ? foundry.utils.Color.from(l.config.color).css : null;
-      sec.l.push([
+      const extra = {};
+      if (l.hidden) extra.hidden = true;
+      if (l.walls === false) extra.walls = false;
+      if ((l.config?.angle ?? 360) < 360) {
+        extra.angle = l.config.angle;
+        if (l.rotation) extra.rotation = l.rotation;
+      }
+      if ((l.config?.darkness?.min ?? 0) > 0) extra.darkMin = l.config.darkness.min;
+      if ((l.config?.darkness?.max ?? 1) < 1) extra.darkMax = l.config.darkness.max;
+      const tuple = [
         l.x, l.y,
         l.config?.dim || 0,
         l.config?.bright || 0,
@@ -4939,7 +5229,9 @@ class MegaWorld1000 {
         l.config?.alpha ?? 0.5,
         l.config?.animation?.type || "",
         l.elevation
-      ]);
+      ];
+      if (Object.keys(extra).length) tuple.push(extra);
+      sec.l.push(tuple);
       lightIdsToDelete.push(l.id);
     }
 
@@ -4962,7 +5254,7 @@ class MegaWorld1000 {
       soundIdsToDelete.push(snd.id);
     }
 
-    const inlineManifest = { worldPx, simGrid, simSectorPx, tiles, sectors };
+    const inlineManifest = { worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors };
     const existingCfg = foundry.utils.deepClone(level.flags?.[MODULE_ID] || {});
     await level.update({ [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true, inlineManifest } });
 
@@ -5531,10 +5823,11 @@ Hooks.on("updateToken", (doc, changes) => {
   controller.tokenStreamer.onTokenUpdated(doc, changes);
   const posChanged = "x" in changes || "y" in changes || "level" in changes;
   const elevChanged = "elevation" in changes;
-  if (posChanged || elevChanged) {
-    if (controller._hasMultiElevationDepth()) controller._depthDirty = true;
-    if (posChanged) controller.updateSimAndLightBubbles(false);
-    controller._roofTokenOccDirty = true;
+  const lightChanged = "light" in changes;
+  if (posChanged || elevChanged || lightChanged) {
+    if ((posChanged || elevChanged) && controller._hasMultiElevationDepth()) controller._depthDirty = true;
+    if (posChanged || lightChanged) controller.updateSimAndLightBubbles(false);
+    if (posChanged || elevChanged) controller._roofTokenOccDirty = true;
     if (posChanged && controller.needsOcclusionRefreshNear(doc)) {
       canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
     }
