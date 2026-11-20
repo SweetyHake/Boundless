@@ -2411,6 +2411,7 @@ class MegaWorld1000 {
   prewarmArea(worldX, worldY, targetScale) {
     if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready) return;
     this.chunkStreamer.prewarmPoint(worldX, worldY);
+    this.tokenStreamer.prewarmTarget(worldX, worldY, targetScale);
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
     const safeScale = Math.max(0.01, targetScale || 0.45);
     const halfW = (sw / safeScale) * 0.55;
@@ -3135,6 +3136,8 @@ class MegaWorld1000 {
     this.poiManager.updateScale(vp.scale);
     this.atmosphere.updateScale(vp.scale);
     this.fogManager.updateViewportCulling(vp);
+    // Keep token frustum culling & GPU Impostor Atlas synced even during camera flight (<0.05ms)
+    this.tokenStreamer.scheduleSync(vp);
     if (!this.isCameraFlying) {
       this.audioStreamer.update(
         this.visibleLevelLayers,
@@ -3143,7 +3146,6 @@ class MegaWorld1000 {
       );
       this.wallEditor.syncViewport(false, vp);
       this.layerEditors.syncViewport(false, vp);
-      this.tokenStreamer.scheduleSync(vp);
     }
     this._depthDirty = true;
 
@@ -3456,6 +3458,7 @@ class MegaWorld1000 {
     if (!this.active || !canvas?.ready) return;
 
     this.atmosphere.tick(dtMs);
+    this.tokenStreamer.step(dtMs);
 
     // Keep CanvasDepthMask synced whenever any mounted roof fades in/out (hoverFade, ALT, token inside, or v14 Region Surface)
     // Also dynamically reveal interior z=6 tiles + wallsMesh on z=5 when a roof is occluded so ALT / tokens / Regions expose real interiors instead of baked pyramid roofs
@@ -4191,6 +4194,7 @@ class MegaWorld1000 {
     const rangedChanged = this.lightBatch.syncDarknessLevel(darkness);
     this.lightBatch.attachTo(effects);
     this._optimizeEffectsLayers(effects);
+    this.tokenStreamer.onVisibilityChanged();
     if (rangedChanged) {
       queueMicrotask(() => {
         if (this.active) this.updateSimAndLightBubbles(false);
@@ -4990,6 +4994,7 @@ class MegaWorld1000 {
     // React to native Foundry v14 Scene fog mode (DISABLED / INDIVIDUAL / SHARED) & tokenVision changes
     if (changes?.fog || "tokenVision" in (changes || {})) {
       this.fogManager.mount(scene);
+      this.tokenStreamer.onVisibilityChanged();
     }
 
     const flagChanges = changes?.flags?.[MODULE_ID];
@@ -5275,6 +5280,57 @@ class MegaWorld1000 {
     };
   }
 
+  /**
+   * Check whether a world point at elevation `tokElev` sits beneath a baked pyramid roof
+   * (or unloaded virtual tile with `minZ > lastTargetZ`) when no native roofMesh is currently covering it.
+   */
+  isPointUnderBakedRoof(lid, tx, ty, tokElev = 0) {
+    const layer = this.levelLayers.get(lid);
+    if (!layer?.spec) return false;
+    const { simGrid, simSectorPx, spec, level } = layer;
+    const topElev = level.elevation?.top ?? 20;
+    const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
+    const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
+
+    // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
+    if (tokElev < topElev && spec.overlays && spec.sectors) {
+      const viewedBottom = canvas.level?.elevation?.bottom ?? 0;
+      const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
+      if (!hideRoofsForUpperView) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const oList = spec.sectors[`${sx + dx}_${sy + dy}`]?.o;
+            if (!oList?.length) continue;
+            for (const oid of oList) {
+              const ovSpec = spec.overlays[oid];
+              if (!isPointUnderRoofSpec(tx, ty, ovSpec)) continue;
+              const mountedRoof = this.activeOverlays.get(`${lid}::${oid}`)?.roofMesh;
+              if (!mountedRoof || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Check zoomed-out virtual tiles with minZ > current targetZ that sit above this point
+    const sec = spec.sectors?.[`${sx}_${sy}`];
+    if (sec?.t?.length && spec.tiles?.length) {
+      for (const tid of sec.t) {
+        const tSpec = this.resolveVirtualTile(lid, tid, spec.tiles[tid], level);
+        if (!tSpec || (tSpec.elevation ?? 0) <= tokElev) continue;
+        if (tSpec.minZ !== undefined && layer.lastTargetZ < tSpec.minZ) {
+          if (tx >= tSpec.x && tx <= tSpec.x + tSpec.w && ty >= tSpec.y && ty <= tSpec.y + tSpec.h) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
   syncRoofTokenOcclusion() {
     if (!this.active || !canvas?.tokens?.placeables) return;
 
@@ -5283,58 +5339,8 @@ class MegaWorld1000 {
       if (!tok || tok.destroyed || tok.isPreview || tok.controlled) continue;
       const doc = tok.document;
       const lid = doc?.level || canvas.level?.id;
-      const layer = this.levelLayers.get(lid);
-      if (!layer?.spec) continue;
-
-      const { simGrid, simSectorPx, spec, level } = layer;
-      const topElev = level.elevation?.top ?? 20;
       const tokElev = doc?.elevation ?? 0;
-      const tx = tok.center.x, ty = tok.center.y;
-      const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
-      const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
-
-      let hiddenByBakedRoof = false;
-
-      // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
-      if (tokElev < topElev && spec.overlays && spec.sectors) {
-        const viewedBottom = canvas.level?.elevation?.bottom ?? 0;
-        const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
-        if (!hideRoofsForUpperView) {
-          for (let dy = -1; dy <= 1 && !hiddenByBakedRoof; dy++) {
-            for (let dx = -1; dx <= 1 && !hiddenByBakedRoof; dx++) {
-              const oList = spec.sectors[`${sx + dx}_${sy + dy}`]?.o;
-              if (!oList?.length) continue;
-              for (const oid of oList) {
-                const ovSpec = spec.overlays[oid];
-                if (!isPointUnderRoofSpec(tx, ty, ovSpec)) continue;
-                const mountedRoof = this.activeOverlays.get(`${lid}::${oid}`)?.roofMesh;
-                // If native roofMesh at elev=20 is NOT currently covering this building, suppress token so it doesn't poke through the flat pyramid roof
-                if (!mountedRoof || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
-                  hiddenByBakedRoof = true;
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // 2. Check zoomed-out virtual tiles with minZ > current targetZ that sit above this token
-      const sec = spec.sectors?.[`${sx}_${sy}`];
-      if (!hiddenByBakedRoof && sec?.t?.length && spec.tiles?.length) {
-        for (const tid of sec.t) {
-          const tSpec = this.resolveVirtualTile(lid, tid, spec.tiles[tid], level);
-          if (!tSpec || (tSpec.elevation ?? 0) <= tokElev) continue;
-          if (tSpec.minZ !== undefined && layer.lastTargetZ < tSpec.minZ) {
-            if (tx >= tSpec.x && tx <= tSpec.x + tSpec.w && ty >= tSpec.y && ty <= tSpec.y + tSpec.h) {
-              hiddenByBakedRoof = true;
-              break;
-            }
-          }
-        }
-      }
-
-      if (hiddenByBakedRoof) {
+      if (this.isPointUnderBakedRoof(lid, tok.center.x, tok.center.y, tokElev)) {
         nextHidden.add(tok);
         if (tok.renderable) tok.renderable = false;
         if (tok.mesh && !tok.mesh.destroyed && tok.mesh.renderable) tok.mesh.renderable = false;
@@ -5352,6 +5358,7 @@ class MegaWorld1000 {
       }
     }
     this._roofHiddenTokens = nextHidden;
+    this.tokenStreamer.onVisibilityChanged();
     if (restoredAny && this.tokenStreamer.enabled) {
       this.tokenStreamer.scheduleSync(null, false);
     }
@@ -5795,6 +5802,7 @@ Hooks.on("controlToken", () => {
     _controlTokenQueued = false;
     if (!controller.active) return;
     controller.updateSimAndLightBubbles(false);
+    controller.tokenStreamer.onVisibilityChanged();
     controller._roofTokenOccDirty = true;
   });
 });
@@ -5815,6 +5823,7 @@ Hooks.on("sightRefresh", () => {
     controller.fogManager.revealFromActiveVision();
     controller.wallEditor.refreshDoorVisibility();
     controller.updateSimAndLightBubbles(false);
+    controller.tokenStreamer.onVisibilityChanged();
   });
 });
 

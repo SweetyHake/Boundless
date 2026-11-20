@@ -1,13 +1,20 @@
+import { TokenImpostorLayer } from "./token-impostors.mjs";
+
 const MODULE_ID = "boundless";
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
-const MOUNT_MIN_SCALE = 0.075;      // Below ~0.075x (orbital view), skip drawing offscreen/tiny NPC placeables
+const MOUNT_ENTER_SCALE = 0.11;     // Start streaming native NPC placeables when descending past 0.11x (11px/token)
+const MOUNT_EXIT_SCALE = 0.085;     // Hysteresis exit: hand back to GPU Impostor Atlas below 0.085x
 const MOUNT_VP_PAD_PX = 1600;       // Pre-draw native tokens 16 cells outside viewport edge
 const CULL_VP_PAD_PX = 450;         // Frustum culling margin for `renderable` toggle
 const LOD_DETAIL_MIN_SCALE = 0.22;  // Below 0.22x hide tiny unreadable nameplate/tooltip/bars/effects
 const UNMOUNT_MIN_DIST_PX = 10000;  // Distance outside viewport before LRU-evicting offscreen PIXI placeable
 const MAX_MOUNTED_NPCS = 160;       // Client-side PIXI placeable budget (TokenDocuments stay 100% intact in DB!)
+const WARM_ORBIT_KEEP = 48;         // Keep a warm cache of 48 recently seen NPCs when zooming briefly to orbit
 const DRAW_FRAME_BUDGET_MS = 4.5;   // Max main-thread time spent calling native Token#draw() per animation frame
-const MAX_DRAWS_PER_FRAME = 3;      // Hard cap per rAF so crowded cities stream in smoothly at 144 FPS
+const FLIGHT_PREWARM_BUDGET_MS = 2.0; // Low frame budget while camera is flying so 144 FPS flight stays silky
+const MAX_DRAWS_PER_FRAME = 6;      // Cap per rAF once textures are pre-decoded in parallel
+const CROSSFADE_MS = 160;           // Smooth over-composite Impostor -> Native fade duration
+const PREDECODE_LOOKAHEAD = 6;      // Parallel off-blocking texture pre-decode batch size
 
 function getSectorCoords(x, y) {
   return [
@@ -81,18 +88,18 @@ export function installLazyTokenLayerPatch() {
 }
 
 /**
- * Pure Client-Side Lazy Native TokenLayer Streamer (0 DB writes, 0 proxies, 100% native compatibility).
+ * Pure Client-Side Lazy Native TokenLayer Streamer + Dynamic Impostor Atlas (0 DB writes, 100% native compatibility).
  * - Every `TokenDocument` lives permanently in `scene.tokens` (zero fake `preCreate`/`create`/`deleteToken` hooks ->
  *   100% compatibility with `cs-hero-box`, `multiple-rings`, `midi-qol`, `dae`, `auraeffects`, `showstopper`, rotations, FoW).
- * - Maintains an O(1) spatial hash of all `scene.tokens` by `_source.x / _source.y`.
- * - Streams native `Token#draw()` (full Dynamic Token Ring, Hero in a Box pop-outs, shaders, bars, rotations) strictly
- *   inside each client's viewport with a 4.5ms/frame rAF budget and async texture pre-decoding.
- * - Applies zoom LOD (hiding unreadable nameplates/bars below 0.22x), strict frustum `renderable` culling, and
- *   client-only LRU eviction of distant offscreen PIXI placeables (leaving `TokenDocument` untouched in DB).
+ * - Above tactical zoom, `TokenImpostorLayer` renders all visible tokens in 1 GPU draw call inside `canvas.primary`
+ *   using a dynamic 64x64 Texture Atlas (with strict Foundry v14 FoW/vision/roof gating).
+ * - When zooming in (or prewarming a `flyTo` landing zone), native `Token#draw()` streams in with parallel texture
+ *   pre-decoding and a 160ms over-composite crossfade via `mesh.unoccludedAlpha` (never mutating `tok.alpha`/`mesh.alpha`).
  */
 export class TokenStreamer {
   constructor(controller) {
     this.controller = controller;
+    this.impostors = new TokenImpostorLayer(controller, this);
     this.enabled = false;
     this.sceneId = null;
 
@@ -103,12 +110,19 @@ export class TokenStreamer {
     /** @type {Map<string, number>} docId -> lastVisibleTimestampMs (for client-side LRU eviction) */
     this.lastSeenMs = new Map();
 
-    /** @type {Array<{ doc: any, distSq: number }>} */
+    /** @type {Array<{ doc: any, distSq: number, isPrewarm?: boolean }>} */
     this._drawQueue = [];
     /** @type {Set<string>} */
     this._queuedIds = new Set();
     /** @type {Set<string>} */
     this._drawingIds = new Set();
+    /** @type {Set<string>} */
+    this._decodedTexSrcs = new Set();
+    /** @type {Map<string, Promise>} */
+    this._inflightTexLoads = new Map();
+    /** @type {Map<string, { tok: any, doc: any, t: number, dur: number, hasUnoccluded: boolean, targetOccluded: number, isTranslucent: boolean }>} */
+    this._activeFades = new Map();
+
     this._rafId = null;
     this._pumping = false;
     this._evictTimer = null;
@@ -116,6 +130,8 @@ export class TokenStreamer {
     this._lastVp = null;
     this._lastLodDetail = null;
     this._lastStreamKey = "";
+    this._nativeTokensActive = false;
+    this._flightPrewarmTarget = null;
   }
 
   _indexDoc(doc) {
@@ -153,6 +169,17 @@ export class TokenStreamer {
     this.lastSeenMs.delete(docId);
   }
 
+  _finishFadeImmediate(docId) {
+    const fade = this._activeFades.get(docId);
+    if (!fade) return;
+    this._activeFades.delete(docId);
+    if (fade.hasUnoccluded && fade.tok?.mesh && !fade.tok.mesh.destroyed) {
+      fade.tok.mesh.unoccludedAlpha = 1.0;
+      fade.tok.mesh.occludedAlpha = fade.targetOccluded;
+    }
+    this.impostors.setFadeOverride(docId, null);
+  }
+
   mount(scene) {
     this.unmount();
     if (!isLazyTokenLayerActiveForScene(scene)) return;
@@ -160,12 +187,16 @@ export class TokenStreamer {
     this.enabled = true;
     this.sceneId = scene.id;
     this._gen++;
+    const curScale = canvas?.stage?.scale?.x ?? 1;
+    this._nativeTokensActive = curScale >= MOUNT_ENTER_SCALE;
 
     // Build O(1) spatial hash of all native TokenDocuments without touching `doc.actor`
     const iterable = scene.tokens?.values?.() ?? scene.tokens ?? [];
     for (const doc of iterable) {
       this._indexDoc(doc);
     }
+
+    this.impostors.mount(scene);
   }
 
   unmount() {
@@ -181,15 +212,25 @@ export class TokenStreamer {
       clearTimeout(this._evictTimer);
       this._evictTimer = null;
     }
+    for (const docId of Array.from(this._activeFades.keys())) {
+      this._finishFadeImmediate(docId);
+    }
+    this._activeFades.clear();
+    this.impostors.unmount();
+
     this._drawQueue = [];
     this._queuedIds.clear();
     this._drawingIds.clear();
+    this._decodedTexSrcs.clear();
+    this._inflightTexLoads.clear();
     this.sectorIndex.clear();
     this.docSector.clear();
     this.lastSeenMs.clear();
     this._lastVp = null;
     this._lastLodDetail = null;
     this._lastStreamKey = "";
+    this._nativeTokensActive = false;
+    this._flightPrewarmTarget = null;
   }
 
   getStats() {
@@ -205,8 +246,107 @@ export class TokenStreamer {
       mountedPlaceables,
       renderableCount,
       queuedDraws: this._drawQueue.length,
-      sectors: this.sectorIndex.size
+      activeFades: this._activeFades.size,
+      sectors: this.sectorIndex.size,
+      impostors: this.impostors.getStats()
     };
+  }
+
+  /**
+   * Called each frame from `controller.stepCrossfades(dtMs)`.
+   * Drives smooth 160ms over-composite Impostor -> Native crossfades and flushes dirty Impostor Atlas/VBO buffers.
+   */
+  step(dtMs) {
+    if (!this.enabled) return;
+
+    if (this._activeFades.size > 0) {
+      const dt = Math.min(50, Math.max(1, dtMs || 16.6));
+      for (const [docId, fade] of Array.from(this._activeFades.entries())) {
+        const tok = fade.tok;
+        if (!tok || tok.destroyed || !tok.mesh || tok.mesh.destroyed) {
+          this._activeFades.delete(docId);
+          this.impostors.setFadeOverride(docId, null);
+          continue;
+        }
+        fade.t = Math.min(1.0, fade.t + dt / fade.dur);
+        const t = fade.t;
+
+        if (fade.hasUnoccluded) {
+          tok.mesh.unoccludedAlpha = t;
+          tok.mesh.occludedAlpha = fade.targetOccluded * t;
+          // Over-composite for opaque tokens (impostor stays 1.0 under native mesh until t=0.85 so ground never bleeds through)
+          const impMult = fade.isTranslucent
+            ? (1.0 - t)
+            : (t < 0.85 ? 1.0 : Math.max(0.0, 1.0 - (t - 0.85) / 0.15));
+          this.impostors.setFadeOverride(docId, impMult);
+        } else {
+          // Zero-mutation fallback: native renders immediately at native alpha while impostor dissolves beneath it
+          this.impostors.setFadeOverride(docId, 1.0 - t);
+        }
+
+        if (t >= 1.0) {
+          this._finishFadeImmediate(docId);
+        }
+      }
+    }
+
+    this.impostors.tick();
+  }
+
+  /**
+   * Pre-decode textures and silently mount nearest tokens around a `flyTo` landing point
+   * while camera is in flight (<= 2ms/frame budget), eliminating post-landing token pop-in.
+   */
+  prewarmTarget(worldX, worldY, targetScale) {
+    if (!this.enabled || !canvas?.ready || !canvas.scene?.tokens) return;
+    if ((targetScale || 0) < MOUNT_EXIT_SCALE) return;
+
+    const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
+    const safeScale = Math.max(MOUNT_EXIT_SCALE, targetScale || 0.45);
+    const halfW = (sw / safeScale) * 0.58 + 400;
+    const halfH = (sh / safeScale) * 0.58 + 400;
+    const x0 = worldX - halfW;
+    const y0 = worldY - halfH;
+    const x1 = worldX + halfW;
+    const y1 = worldY + halfH;
+    this._flightPrewarmTarget = { x0, y0, x1, y1, cx: worldX, cy: worldY };
+
+    const sx0 = Math.floor(x0 / TOKEN_SECTOR_PX);
+    const sy0 = Math.floor(y0 / TOKEN_SECTOR_PX);
+    const sx1 = Math.floor(x1 / TOKEN_SECTOR_PX);
+    const sy1 = Math.floor(y1 / TOKEN_SECTOR_PX);
+
+    const candidates = [];
+    const scene = canvas.scene;
+    for (let sy = sy0; sy <= sy1; sy++) {
+      for (let sx = sx0; sx <= sx1; sx++) {
+        const ids = this.sectorIndex.get(`${sx}_${sy}`);
+        if (!ids) continue;
+        for (const docId of ids) {
+          if (this._queuedIds.has(docId) || this._drawingIds.has(docId)) continue;
+          const doc = scene.tokens.get(docId);
+          if (!doc || !doc.viewed) continue;
+          const existing = doc._object;
+          if (existing && !existing.destroyed && existing.parent === canvas.tokens?.objects) continue;
+          const dx = Number(doc._source?.x ?? doc.x ?? 0);
+          const dy = Number(doc._source?.y ?? doc.y ?? 0);
+          if (dx < x0 || dx > x1 || dy < y0 || dy > y1) continue;
+          const distSq = (dx - worldX) ** 2 + (dy - worldY) ** 2;
+          candidates.push({ doc, distSq, isPrewarm: true });
+        }
+      }
+    }
+
+    if (!candidates.length) return;
+    candidates.sort((a, b) => a.distSq - b.distSq);
+    const take = Math.min(48, candidates.length);
+    for (let i = 0; i < take; i++) {
+      const c = candidates[i];
+      this._drawQueue.push(c);
+      this._queuedIds.add(c.doc.id);
+    }
+    this._primeQueueTextures();
+    this._scheduleDrawPump();
   }
 
   /**
@@ -222,7 +362,11 @@ export class TokenStreamer {
     if (!curVp) return;
 
     const now = performance.now();
-    const showTokens = curVp.scale >= MOUNT_MIN_SCALE;
+    // Hysteresis prevents rapid mount/unmount thrashing around the transition zoom level
+    if (curVp.scale >= MOUNT_ENTER_SCALE) this._nativeTokensActive = true;
+    else if (curVp.scale < MOUNT_EXIT_SCALE) this._nativeTokensActive = false;
+    const showTokens = this._nativeTokensActive;
+
     const showDetail = curVp.scale >= LOD_DETAIL_MIN_SCALE;
     const lodChanged = showDetail !== this._lastLodDetail;
     this._lastLodDetail = showDetail;
@@ -233,9 +377,10 @@ export class TokenStreamer {
     const cullY1 = curVp.y1 + CULL_VP_PAD_PX;
     const grid = canvas.grid?.size || 100;
 
-    // 1. Fast frustum `renderable` culling & zoom LOD on currently mounted native tokens
+    // 1. Fast frustum `renderable` culling & zoom LOD on currently mounted native tokens (runs even during camera flight!)
     const roofHidden = this.controller?._roofHiddenTokens;
     const placeables = canvas.tokens.placeables;
+    let anyRenderableToggled = false;
     for (let i = 0; i < placeables.length; i++) {
       const tok = placeables[i];
       if (!tok || tok.destroyed || tok.isPreview) continue;
@@ -250,9 +395,22 @@ export class TokenStreamer {
 
       const blockedByRoof = Boolean(roofHidden?.has?.(tok));
       const wantRenderable = keepVisible && !blockedByRoof;
-      if (tok.renderable !== wantRenderable) tok.renderable = wantRenderable;
-      if (tok.mesh && !tok.mesh.destroyed && tok.mesh.renderable !== wantRenderable) {
-        tok.mesh.renderable = wantRenderable;
+      if (tok.renderable !== wantRenderable) {
+        if (!wantRenderable && this._activeFades.has(doc.id)) {
+          this._finishFadeImmediate(doc.id);
+        }
+        tok.renderable = wantRenderable;
+        anyRenderableToggled = true;
+      }
+      if (tok.mesh && !tok.mesh.destroyed) {
+        if (tok.mesh.renderable !== wantRenderable) {
+          tok.mesh.renderable = wantRenderable;
+          anyRenderableToggled = true;
+        }
+        // Foundry v14 Token#_refreshVisibility sets mesh.visible = visible && renderable; restore it when returning to view
+        if (wantRenderable && tok.visible !== false && tok.mesh.visible === false) {
+          tok.mesh.visible = true;
+        }
       }
 
       // LOD: hide tiny unreadable sub-elements at far macro zoom (< 0.22x) to cut draw calls & Canvas2D cost
@@ -264,8 +422,14 @@ export class TokenStreamer {
       }
     }
 
-    // Skip spawning/evicting placeables while camera is flying across the continent
+    if (anyRenderableToggled || force) {
+      this.impostors.markVisibilityDirty();
+    }
+
+    // Skip spawning/evicting transit placeables while camera is flying across the continent
+    // (impostors & prewarmTarget keep both flight and landing seamless!)
     if (this.controller?.isCameraFlying) return;
+    this._flightPrewarmTarget = null;
 
     const mountX0 = curVp.x0 - MOUNT_VP_PAD_PX;
     const mountY0 = curVp.y0 - MOUNT_VP_PAD_PX;
@@ -315,12 +479,52 @@ export class TokenStreamer {
 
       if (addedAny) {
         this._drawQueue.sort((a, b) => a.distSq - b.distSq);
+        this._primeQueueTextures();
         this._scheduleDrawPump();
       }
     }
 
     // 3. Client-side LRU eviction of distant offscreen PIXI placeables (zero DB changes!)
     this._evictDistantPlaceables(curVp, showTokens);
+  }
+
+  _getDocTexSrc(doc) {
+    return doc?._source?.texture?.src ?? doc?.texture?.src ?? "";
+  }
+
+  _isTexReady(src) {
+    if (!src) return true;
+    if (this._decodedTexSrcs.has(src)) return true;
+    try {
+      if (globalThis.PIXI?.Assets?.cache?.has?.(src)) {
+        this._decodedTexSrcs.add(src);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  /** Kick off parallel non-blocking texture pre-decodes for the top queued tokens. */
+  _primeQueueTextures() {
+    const loadTexFn = globalThis.foundry?.canvas?.loadTexture ?? globalThis.loadTexture;
+    if (typeof loadTexFn !== "function" || this._drawQueue.length === 0) return;
+
+    const gen = this._gen;
+    const limit = Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length);
+    for (let i = 0; i < limit; i++) {
+      const src = this._getDocTexSrc(this._drawQueue[i]?.doc);
+      if (!src || this._isTexReady(src) || this._inflightTexLoads.has(src)) continue;
+      const p = Promise.resolve(loadTexFn(src))
+        .catch(() => null)
+        .finally(() => {
+          this._inflightTexLoads.delete(src);
+          this._decodedTexSrcs.add(src);
+          if (this.enabled && gen === this._gen && this._drawQueue.length > 0) {
+            this._scheduleDrawPump();
+          }
+        });
+      this._inflightTexLoads.set(src, p);
+    }
   }
 
   _scheduleDrawPump() {
@@ -336,36 +540,83 @@ export class TokenStreamer {
 
   async _pumpDrawQueue() {
     if (this._pumping || !this.enabled || !canvas?.ready || !canvas.tokens?.objects) return;
-    if (this.controller?.isCameraFlying) return;
+    const isFlying = Boolean(this.controller?.isCameraFlying);
+    if (isFlying && !this._flightPrewarmTarget) return;
 
     this._pumping = true;
     const gen = this._gen;
     const layer = canvas.tokens;
     const curVp = this._lastVp;
+    const prewarmBox = this._flightPrewarmTarget;
+    const budgetMs = isFlying ? FLIGHT_PREWARM_BUDGET_MS : DRAW_FRAME_BUDGET_MS;
+    const maxDraws = isFlying ? 2 : MAX_DRAWS_PER_FRAME;
     const startMs = performance.now();
     let drawnThisFrame = 0;
     let anyVisionDrawn = false;
+    let deferredWaitingTex = 0;
 
     try {
+      this._primeQueueTextures();
+
       while (
         this._drawQueue.length > 0 &&
-        drawnThisFrame < MAX_DRAWS_PER_FRAME &&
-        (performance.now() - startMs) < DRAW_FRAME_BUDGET_MS
+        drawnThisFrame < maxDraws &&
+        (performance.now() - startMs) < budgetMs
       ) {
-        const item = this._drawQueue.shift();
+        // Pick first ready-texture item within lookahead so cold textures never stall already-decoded tokens
+        let pickIdx = 0;
+        const scanMax = Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length);
+        for (let i = 0; i < scanMax; i++) {
+          const cand = this._drawQueue[i];
+          if (isFlying && !cand?.isPrewarm) continue;
+          if (this._isTexReady(this._getDocTexSrc(cand?.doc))) {
+            pickIdx = i;
+            break;
+          }
+        }
+
+        const item = this._drawQueue[pickIdx];
+        if (isFlying && !item?.isPrewarm) {
+          this._drawQueue.splice(pickIdx, 1);
+          if (item?.doc?.id) this._queuedIds.delete(item.doc.id);
+          continue;
+        }
+
         const doc = item?.doc;
-        if (!doc) continue;
+        if (!doc) {
+          this._drawQueue.splice(pickIdx, 1);
+          continue;
+        }
+
+        // If texture is currently loading in parallel, let it finish without stalling the frame
+        const texSrc = this._getDocTexSrc(doc);
+        if (texSrc && !this._isTexReady(texSrc) && this._inflightTexLoads.has(texSrc)) {
+          deferredWaitingTex++;
+          if (deferredWaitingTex >= Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length)) break;
+          // Rotate to back of lookahead window
+          this._drawQueue.splice(pickIdx, 1);
+          this._drawQueue.splice(Math.min(PREDECODE_LOOKAHEAD - 1, this._drawQueue.length), 0, item);
+          continue;
+        }
+
+        this._drawQueue.splice(pickIdx, 1);
         this._queuedIds.delete(doc.id);
 
         if (!doc.parent || doc.parent.id !== this.sceneId || !doc.viewed) continue;
-        // Drop stale queue items if camera already panned far away
-        if (curVp && curVp.scale < MOUNT_MIN_SCALE && !isAlwaysMountedTokenDoc(doc)) continue;
-        if (curVp) {
-          const dx = Number(doc._source?.x ?? doc.x ?? 0);
-          const dy = Number(doc._source?.y ?? doc.y ?? 0);
-          const pad = MOUNT_VP_PAD_PX * 1.6;
-          if (dx < curVp.x0 - pad || dx > curVp.x1 + pad || dy < curVp.y0 - pad || dy > curVp.y1 + pad) {
-            continue;
+
+        const dx = Number(doc._source?.x ?? doc.x ?? 0);
+        const dy = Number(doc._source?.y ?? doc.y ?? 0);
+
+        if (item.isPrewarm && prewarmBox) {
+          if (dx < prewarmBox.x0 || dx > prewarmBox.x1 || dy < prewarmBox.y0 || dy > prewarmBox.y1) continue;
+        } else {
+          // Drop stale queue items if camera already zoomed out or panned far away
+          if (curVp && !this._nativeTokensActive && !isAlwaysMountedTokenDoc(doc)) continue;
+          if (curVp) {
+            const pad = MOUNT_VP_PAD_PX * 1.6;
+            if (dx < curVp.x0 - pad || dx > curVp.x1 + pad || dy < curVp.y0 - pad || dy > curVp.y1 + pad) {
+              continue;
+            }
           }
         }
 
@@ -374,13 +625,18 @@ export class TokenStreamer {
 
         this._drawingIds.add(doc.id);
         try {
-          // Pre-decode texture asynchronously before native Token#draw() to avoid synchronous GPU upload stall
-          const texSrc = doc._source?.texture?.src ?? doc.texture?.src;
           const loadTexFn = globalThis.foundry?.canvas?.loadTexture ?? globalThis.loadTexture;
-          if (texSrc && typeof loadTexFn === "function") {
+          if (texSrc && !this._isTexReady(texSrc) && typeof loadTexFn === "function") {
             await loadTexFn(texSrc);
+            this._decodedTexSrcs.add(texSrc);
           }
           if (!this.enabled || gen !== this._gen || !canvas?.ready || doc.parent?.id !== this.sceneId) return;
+
+          // Keep impostor visible beneath while native token draws & fades in
+          const shouldFade = !item.isPrewarm && this.impostors.mounted;
+          if (shouldFade) {
+            this.impostors.setFadeOverride(doc.id, 1.0);
+          }
 
           doc._destroyed = false;
           const obj = (doc._object && !doc._object.destroyed) ? doc._object : layer.createObject(doc);
@@ -395,6 +651,30 @@ export class TokenStreamer {
           if (doc._source?.sight?.enabled && (doc.baseActor?.hasPlayerOwner || obj.controlled)) {
             anyVisionDrawn = true;
           }
+
+          // Start smooth 160ms over-composite crossfade via mesh.unoccludedAlpha (never touches tok.alpha or mesh.alpha!)
+          if (shouldFade && obj.mesh && !obj.mesh.destroyed) {
+            const hasUnoccluded = "unoccludedAlpha" in obj.mesh;
+            const targetOccluded = Number.isFinite(obj.mesh.occludedAlpha) ? obj.mesh.occludedAlpha : 0.5;
+            const isTranslucent = Boolean(doc._source?.hidden || (Number(doc.alpha ?? doc._source?.alpha ?? 1) < 0.99));
+            if (hasUnoccluded) {
+              obj.mesh.unoccludedAlpha = 0.0;
+              obj.mesh.occludedAlpha = 0.0;
+            }
+            this._activeFades.set(doc.id, {
+              tok: obj,
+              doc,
+              t: 0,
+              dur: hasUnoccluded ? CROSSFADE_MS : 120,
+              hasUnoccluded,
+              targetOccluded,
+              isTranslucent
+            });
+          } else {
+            this.impostors.setFadeOverride(doc.id, null);
+            this.impostors.markVisibilityDirty();
+          }
+
           // Apply current LOD detail state immediately to newly drawn token
           const showDetail = (this._lastVp?.scale ?? 1) >= LOD_DETAIL_MIN_SCALE;
           if (!showDetail) {
@@ -405,6 +685,7 @@ export class TokenStreamer {
           }
           drawnThisFrame++;
         } catch (err) {
+          this.impostors.setFadeOverride(doc.id, null);
           console.warn(`${MODULE_ID} | Lazy Token#draw() failed for ${doc.id}:`, err);
         } finally {
           this._drawingIds.delete(doc.id);
@@ -419,7 +700,8 @@ export class TokenStreamer {
       }
     } finally {
       this._pumping = false;
-      if (this._drawQueue.length > 0 && this.enabled && gen === this._gen) {
+      const hasReadyOrPending = this._drawQueue.length > 0 && deferredWaitingTex < this._drawQueue.length;
+      if (hasReadyOrPending && this.enabled && gen === this._gen) {
         this._scheduleDrawPump();
       }
     }
@@ -430,7 +712,8 @@ export class TokenStreamer {
     if (!layer?.objects?.children) return;
 
     const placeables = layer.placeables;
-    if (showTokens && placeables.length <= MAX_MOUNTED_NPCS) return;
+    const targetKeep = showTokens ? MAX_MOUNTED_NPCS : WARM_ORBIT_KEEP;
+    if (placeables.length <= targetKeep) return;
 
     const evictX0 = vp.x0 - UNMOUNT_MIN_DIST_PX;
     const evictY0 = vp.y0 - UNMOUNT_MIN_DIST_PX;
@@ -455,12 +738,12 @@ export class TokenStreamer {
     if (candidates.length === 0) return;
     candidates.sort((a, b) => a.lastSeen - b.lastSeen);
 
-    const targetKeep = showTokens ? MAX_MOUNTED_NPCS : 0;
     const maxToEvict = Math.min(24, Math.max(0, placeables.length - targetKeep));
     let evicted = 0;
     for (let i = 0; i < candidates.length && i < maxToEvict; i++) {
       const { tok, doc } = candidates[i];
       try {
+        this._finishFadeImmediate(doc.id);
         layer.objects.removeChild(tok);
         tok.destroy({ children: true });
         // Restore `_destroyed = false` so the live TokenDocument stays 100% healthy and re-drawable when camera returns!
@@ -470,6 +753,10 @@ export class TokenStreamer {
       } catch (err) {
         console.warn(`${MODULE_ID} | Failed to evict offscreen Token placeable ${doc.id}:`, err);
       }
+    }
+
+    if (evicted > 0) {
+      this.impostors.markVisibilityDirty();
     }
 
     // If more distant placeables remain above budget (e.g. after zooming out to orbital view), drain smoothly
@@ -491,14 +778,30 @@ export class TokenStreamer {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
     this._indexDoc(doc);
     this.lastSeenMs.set(doc.id, performance.now());
+    this.impostors.upsertToken(doc);
   }
 
   onTokenUpdated(doc, changes) {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
     const moved = "x" in changes || "y" in changes || "level" in changes;
     const lightChanged = "light" in changes;
+    const visualChanged = moved
+      || "elevation" in changes
+      || "hidden" in changes
+      || "alpha" in changes
+      || "texture" in changes
+      || "rotation" in changes
+      || "lockRotation" in changes
+      || "width" in changes
+      || "height" in changes
+      || "ring" in changes
+      || "disposition" in changes;
+
     if (moved) {
       this._indexDoc(doc);
+    }
+    if (visualChanged) {
+      this.impostors.upsertToken(doc);
     }
     if (moved || lightChanged) {
       const needsMount = !doc._object || doc._object.destroyed;
@@ -506,6 +809,7 @@ export class TokenStreamer {
         if (!this._queuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
           this._drawQueue.unshift({ doc, distSq: 0 });
           this._queuedIds.add(doc.id);
+          this._primeQueueTextures();
           this._scheduleDrawPump();
         }
       } else if (moved && this._lastVp && needsMount) {
@@ -518,9 +822,16 @@ export class TokenStreamer {
 
   onTokenDeleted(doc) {
     if (!this.enabled || !doc) return;
+    this._finishFadeImmediate(doc.id);
     this._unindexDoc(doc.id);
     this._queuedIds.delete(doc.id);
     this._drawingIds.delete(doc.id);
+    this.impostors.removeToken(doc.id);
+  }
+
+  onVisibilityChanged() {
+    if (!this.enabled) return;
+    this.impostors.markVisibilityDirty();
   }
 
   /* ------------------------- Utility: Migrate / Populate Native Tokens ------------------------- */
