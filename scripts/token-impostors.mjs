@@ -22,6 +22,7 @@ uniform float uStageScale;
 
 varying vec2 vLocal;
 varying vec2 vSamplerUvs;
+varying vec2 vCenterScreenUv;
 varying vec2 vWorldPos;
 varying vec4 vAtlasRect;
 varying vec2 vFlip;
@@ -44,6 +45,7 @@ void main() {
     vAlpha = 0.0;
     vLocal = vec2(2.0);
     vSamplerUvs = vec2(0.0);
+    vCenterScreenUv = vec2(0.0);
     vWorldPos = vec2(0.0);
     vAtlasRect = vec4(0.0);
     vFlip = vec2(1.0);
@@ -63,9 +65,12 @@ void main() {
   vec2 rotPt = vec2(localPt.x * c - localPt.y * s, localPt.x * s + localPt.y * c);
   vec2 worldPos = aCenter + rotPt;
   vec3 tPos = translationMatrix * vec3(worldPos, 1.0);
+  vec3 cPos = translationMatrix * vec3(aCenter, 1.0);
+  vec2 safeDims = max(uScreenDimensions, vec2(1.0));
 
   vLocal = aCorner;
-  vSamplerUvs = tPos.xy / max(uScreenDimensions, vec2(1.0));
+  vSamplerUvs = tPos.xy / safeDims;
+  vCenterScreenUv = cPos.xy / safeDims;
   vWorldPos = worldPos;
   vAtlasRect = aAtlasRect;
   vFlip = aFlipAndPad.xy;
@@ -94,6 +99,7 @@ uniform float uRoofElev;
 
 varying vec2 vLocal;
 varying vec2 vSamplerUvs;
+varying vec2 vCenterScreenUv;
 varying vec2 vWorldPos;
 varying vec4 vAtlasRect;
 varying vec2 vFlip;
@@ -108,8 +114,9 @@ void main() {
 
   // 1. GPU Vision Mask safety net: never leak non-owned enemies inside explored-only FoW
   if (uUseVisionMask && vNeedsVision > 0.5) {
-    float vis = texture2D(uVisionTex, vSamplerUvs).r;
-    if (vis < 0.05) discard;
+    float visPix = texture2D(uVisionTex, clamp(vSamplerUvs, vec2(0.0), vec2(1.0))).r;
+    float visCenter = texture2D(uVisionTex, clamp(vCenterScreenUv, vec2(0.0), vec2(1.0))).r;
+    if (max(visPix, visCenter) < 0.05) discard;
   }
 
   // 2. Pixel-accurate baked roof mask when native roof meshes are unloaded on macro zoom
@@ -286,6 +293,7 @@ export class TokenImpostorLayer {
     this.geometry = null;
     this.capacity = 0;
     this.count = 0;
+    this.activeVisibleCount = 0;
     this.docIndexById = new Map(); // docId -> slotIndex [0..count-1]
     this.docIds = [];              // slotIndex -> docId
     this.docKeyById = new Map();   // docId -> slotKey
@@ -367,6 +375,7 @@ export class TokenImpostorLayer {
 
     this.capacity = 0;
     this.count = 0;
+    this.activeVisibleCount = 0;
     this.docIndexById.clear();
     this.docIds = [];
     this.docKeyById.clear();
@@ -532,7 +541,7 @@ export class TokenImpostorLayer {
 
     const PrimaryCanvasGroup = foundry.canvas?.groups?.PrimaryCanvasGroup;
     const mesh = new PIXI.Mesh(this.geometry, this.shader);
-    mesh.name = "BoundlessTokenImpostors";
+    mesh.name = "Level.BoundlessTokenImpostors";
     mesh.blendMode = PIXI.BLEND_MODES.NORMAL;
     mesh.eventMode = "none";
     mesh.cullable = false;
@@ -541,7 +550,7 @@ export class TokenImpostorLayer {
     mesh.sort = -1000;
     mesh.zIndex = -1000;
     mesh.size = this.count * 6;
-    mesh.visible = this.count > 0;
+    mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
 
     if (oldMesh) {
       oldMesh.parent?.removeChild(oldMesh);
@@ -883,8 +892,9 @@ export class TokenImpostorLayer {
       this._upsertDocInternal(list[i]);
     }
     if (this.mesh) {
+      this.mesh.elevation = canvas.level?.elevation?.bottom ?? 0;
       this.mesh.size = this.count * 6;
-      this.mesh.visible = this.count > 0;
+      this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
     }
     this._visibilityDirty = true;
     this.refreshVisibility(true);
@@ -945,6 +955,9 @@ export class TokenImpostorLayer {
     const idx = this.docIndexById.get(docId);
     if (idx === undefined) return;
 
+    const wasVisible = this.stateArr && this.stateArr[idx * 16] > 0.002;
+    if (wasVisible) this.activeVisibleCount = Math.max(0, this.activeVisibleCount - 1);
+
     this._registerDocKey(docId, null);
     this.fadeOverrides.delete(docId);
     this.docIndexById.delete(docId);
@@ -971,8 +984,9 @@ export class TokenImpostorLayer {
     this.docIds.length = lastIdx;
     this.count = lastIdx;
     if (this.mesh) {
+      this.mesh.elevation = canvas.level?.elevation?.bottom ?? 0;
       this.mesh.size = this.count * 6;
-      this.mesh.visible = this.count > 0;
+      this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
     }
   }
 
@@ -995,22 +1009,61 @@ export class TokenImpostorLayer {
     const tokenVision = Boolean(canvas.visibility?.tokenVision ?? canvas.scene?.tokenVision);
     const isGM = Boolean(game.user?.isGM);
     const visionBoxes = [];
+    const visionSourceDocIds = new Set();
     let hasActiveVision = false;
 
     if (tokenVision) {
       for (const vs of canvas.effects?.visionSources || []) {
         if (!vs?.active) continue;
         hasActiveVision = true;
-        const r = Math.max(vs.radius || 0, 200);
-        visionBoxes.push({ x: vs.x, y: vs.y, r });
+        const srcDocId = vs.object?.document?.id;
+        if (srcDocId) visionSourceDocIds.add(srcDocId);
+
+        let losBounds = null;
+        try {
+          const b = vs.los?.getBounds?.();
+          if (b && Number.isFinite(b.x) && Number.isFinite(b.y) && b.width > 0 && b.height > 0) {
+            losBounds = b;
+          }
+        } catch {}
+
+        // Foundry v14 PointVisionSource: `vs.radius` is ONLY darkvision/basic sight range (often 0 for humans!);
+        // daylight / lit visibility uses `vs.lightRadius` / `vs.los` / `detectionModes.lightPerception.range` (often Infinity).
+        const docModes = vs.object?.document?.detectionModes;
+        const unlimitedLight = Boolean(
+          docModes?.lightPerception?.enabled &&
+          (docModes.lightPerception.range === null || docModes.lightPerception.range === undefined || !Number.isFinite(docModes.lightPerception.range))
+        );
+        const unlimitedBasic = Boolean(
+          docModes?.basicSight?.enabled &&
+          (docModes.basicSight.range === null || docModes.basicSight.range === undefined || !Number.isFinite(docModes.basicSight.range))
+        );
+        let r = Math.max(
+          Number(vs.radius) || 0,
+          Number(vs.lightRadius) || 0,
+          Number(vs.data?.radius) || 0,
+          Number(vs.data?.lightRadius) || 0,
+          Number(vs.data?.externalRadius) || 0,
+          200
+        );
+        if (unlimitedLight || unlimitedBasic) r = Infinity;
+
+        visionBoxes.push({ x: vs.x, y: vs.y, r, bounds: losBounds });
       }
       for (const ls of canvas.effects?.lightSources || []) {
         if (!ls?.active || !ls.data?.vision) continue;
-        const r = Math.max(ls.radius || 0, 200);
-        visionBoxes.push({ x: ls.x, y: ls.y, r });
+        let losBounds = null;
+        try {
+          const b = ls.los?.getBounds?.();
+          if (b && Number.isFinite(b.x) && Number.isFinite(b.y) && b.width > 0 && b.height > 0) {
+            losBounds = b;
+          }
+        } catch {}
+        const r = Math.max(Number(ls.radius) || 0, Number(ls.data?.dim) || 0, Number(ls.data?.bright) || 0, 200);
+        visionBoxes.push({ x: ls.x, y: ls.y, r, bounds: losBounds });
       }
     }
-    return { tokenVision, isGM, hasActiveVision, visionBoxes };
+    return { tokenVision, isGM, hasActiveVision, visionBoxes, visionSourceDocIds };
   }
 
   _computeTokenAlpha(doc, visCtx) {
@@ -1021,17 +1074,28 @@ export class TokenImpostorLayer {
     if (isHidden && !visCtx.isGM) return { alpha: 0, needsVision: 1, isParty };
 
     const owned = isOwnedByCurrentUserSafe(doc);
-    const needsVision = (visCtx.tokenVision && !visCtx.isGM && !owned) ? 1.0 : 0.0;
+    const isVisionSource = Boolean(visCtx.visionSourceDocIds?.has?.(doc.id));
+    const needsVision = (visCtx.tokenVision && !visCtx.isGM && !owned && !isVisionSource) ? 1.0 : 0.0;
 
-    // If a native Token placeable is currently visible and renderable (and not actively crossfading in), suppress impostor
+    // Never render a GPU impostor beneath an already-mounted active native Token!
+    // If Foundry or Showstopper intentionally hid the native token/mesh (e.g. camera occlusion above lens,
+    // hidden flag, filter), the impostor MUST stay hidden too — only render when unmounted or culled for macro zoom.
     const obj = doc._object;
     const hasFadeOverride = this.fadeOverrides.has(doc.id);
-    const nativeVisible = Boolean(
-      obj && !obj.destroyed && obj.renderable && obj.visible !== false &&
-      obj.mesh && !obj.mesh.destroyed && obj.mesh.renderable && obj.mesh.visible !== false
+    const isMountedOnLayer = Boolean(obj && !obj.destroyed && obj.parent === canvas.tokens?.objects);
+    const hiddenByShowstopper = Boolean(
+      obj && !obj.destroyed &&
+      Number.isFinite(Number(obj._ssOcclusionAlpha)) &&
+      Number(obj._ssOcclusionAlpha) <= 0.05
     );
-    if (nativeVisible && !hasFadeOverride) {
-      return { alpha: 0, needsVision, isParty };
+    if (isMountedOnLayer) {
+      if (obj.visible === false || hiddenByShowstopper) {
+        return { alpha: 0, needsVision, isParty };
+      }
+      const nativeActive = Boolean(obj.renderable && (!obj.mesh || (!obj.mesh.destroyed && obj.mesh.renderable)));
+      if (nativeActive && !hasFadeOverride) {
+        return { alpha: 0, needsVision, isParty };
+      }
     }
 
     const grid = canvas.grid?.size || 100;
@@ -1050,14 +1114,14 @@ export class TokenImpostorLayer {
     }
 
     // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW!)
-    if (visCtx.tokenVision) {
+    if (visCtx.tokenVision && !isVisionSource) {
       if (!visCtx.isGM && !owned) {
         if (!visCtx.hasActiveVision) return { alpha: 0, needsVision, isParty };
-        if (!this._passesVisionCheck(cx, cy, elev, visCtx.visionBoxes)) {
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes)) {
           return { alpha: 0, needsVision, isParty };
         }
       } else if (visCtx.isGM && visCtx.hasActiveVision && !obj?.controlled) {
-        if (!this._passesVisionCheck(cx, cy, elev, visCtx.visionBoxes)) {
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes)) {
           return { alpha: 0, needsVision, isParty };
         }
       }
@@ -1071,13 +1135,29 @@ export class TokenImpostorLayer {
     return { alpha, needsVision, isParty };
   }
 
-  _passesVisionCheck(cx, cy, elev, visionBoxes) {
+  _passesVisionCheck(cx, cy, elev, w, h, visionBoxes) {
+    const pad = Math.max(w || 100, h || 100, 100);
     let inAnyBox = false;
     for (let i = 0; i < visionBoxes.length; i++) {
       const b = visionBoxes[i];
+      if (b.bounds) {
+        if (
+          cx >= b.bounds.x - pad && cx <= b.bounds.x + b.bounds.width + pad &&
+          cy >= b.bounds.y - pad && cy <= b.bounds.y + b.bounds.height + pad
+        ) {
+          inAnyBox = true;
+          break;
+        }
+        continue;
+      }
+      if (!Number.isFinite(b.r)) {
+        inAnyBox = true;
+        break;
+      }
       const dx = cx - b.x;
       const dy = cy - b.y;
-      if (dx * dx + dy * dy <= b.r * b.r) {
+      const rr = b.r + pad;
+      if (dx * dx + dy * dy <= rr * rr) {
         inAnyBox = true;
         break;
       }
@@ -1086,7 +1166,8 @@ export class TokenImpostorLayer {
     const tv = canvas.visibility?.testVisibility;
     if (typeof tv !== "function") return true;
     try {
-      return Boolean(tv.call(canvas.visibility, { x: cx, y: cy, elevation: elev }, { tolerance: 0 }));
+      const tolerance = Math.max(2, Math.min(w || 100, h || 100) * 0.35);
+      return Boolean(tv.call(canvas.visibility, { x: cx, y: cy, elevation: elev }, { tolerance }));
     } catch {
       return false;
     }
@@ -1099,6 +1180,8 @@ export class TokenImpostorLayer {
     const ctx = visCtx || this._collectVisionCheckers();
     const st = this._computeTokenAlpha(doc, ctx);
     const o = idx * 16;
+    const prevVisible = this.stateArr[o] > 0.002;
+    const nextVisible = st.alpha > 0.002;
     if (
       Math.abs(this.stateArr[o] - st.alpha) > 0.001 ||
       this.stateArr[o + 1] !== st.needsVision ||
@@ -1106,11 +1189,21 @@ export class TokenImpostorLayer {
     ) {
       this._writeQuad4(this.stateArr, idx, st.alpha, st.needsVision, st.isParty, 0);
       this._bufDirty.state = true;
+      if (prevVisible !== nextVisible) {
+        this.activeVisibleCount = Math.max(0, this.activeVisibleCount + (nextVisible ? 1 : -1));
+        if (this.mesh) {
+          this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
+        }
+      }
     }
   }
 
   refreshVisibility(force = false) {
-    if (!this.mounted || !canvas?.scene?.tokens || this.count === 0) return;
+    if (!this.mounted || !canvas?.scene?.tokens || this.count === 0) {
+      this.activeVisibleCount = 0;
+      if (this.mesh) this.mesh.visible = false;
+      return;
+    }
     const now = performance.now();
     if (!force && !this._visibilityDirty && (now - this._lastVisSyncMs) < 120) return;
     this._visibilityDirty = false;
@@ -1118,9 +1211,17 @@ export class TokenImpostorLayer {
 
     const visCtx = this._collectVisionCheckers();
     const tokens = canvas.scene.tokens;
+    let visCount = 0;
     for (let i = 0; i < this.count; i++) {
       const doc = tokens.get(this.docIds[i]);
-      if (doc) this._updateSingleTokenState(doc, visCtx);
+      if (doc) {
+        this._updateSingleTokenState(doc, visCtx);
+        if (this.stateArr[i * 16] > 0.002) visCount++;
+      }
+    }
+    this.activeVisibleCount = visCount;
+    if (this.mesh) {
+      this.mesh.visible = this.count > 0 && visCount > 0;
     }
   }
 

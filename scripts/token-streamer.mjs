@@ -1,7 +1,21 @@
 import { TokenImpostorLayer } from "./token-impostors.mjs";
 
 const MODULE_ID = "boundless";
+const SHOWSTOPPER_ID = "showstopper";
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
+
+function getShowstopperMovementApi() {
+  try {
+    const mod = globalThis.game?.modules?.get?.(SHOWSTOPPER_ID);
+    if (mod && !mod.active) return null;
+    return mod?.api?.tokenMovement
+      || globalThis.showstopper?.tokenMovement
+      || globalThis.showstopper?.api?.tokenMovement
+      || null;
+  } catch {
+    return null;
+  }
+}
 const MOUNT_ENTER_SCALE = 0.11;     // Start streaming native NPC placeables when descending past 0.11x (11px/token)
 const MOUNT_EXIT_SCALE = 0.085;     // Hysteresis exit: hand back to GPU Impostor Atlas below 0.085x
 const MOUNT_VP_PAD_PX = 1600;       // Pre-draw native tokens 16 cells outside viewport edge
@@ -407,10 +421,15 @@ export class TokenStreamer {
           tok.mesh.renderable = wantRenderable;
           anyRenderableToggled = true;
         }
-        // Foundry v14 Token#_refreshVisibility sets mesh.visible = visible && renderable; restore it when returning to view
-        if (wantRenderable && tok.visible !== false && tok.mesh.visible === false) {
+        // Foundry v14 Token#_refreshVisibility sets mesh.visible = visible && renderable; restore it when returning to view,
+        // unless Showstopper intentionally hid the token (e.g. flying above camera lens occlusion).
+        const hiddenByShowstopper = Number.isFinite(Number(tok._ssOcclusionAlpha)) && Number(tok._ssOcclusionAlpha) <= 0.01;
+        if (wantRenderable && tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) {
           tok.mesh.visible = true;
         }
+      }
+      if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed && tok._ssJumpShadow.renderable !== wantRenderable) {
+        tok._ssJumpShadow.renderable = wantRenderable;
       }
 
       // LOD: hide tiny unreadable sub-elements at far macro zoom (< 0.22x) to cut draw calls & Canvas2D cost
@@ -422,7 +441,11 @@ export class TokenStreamer {
       }
     }
 
-    if (anyRenderableToggled || force) {
+    if (anyRenderableToggled) {
+      // Flush impostor state synchronously in the same frame so Native <-> Impostor handoff has zero 1-frame blink
+      this.impostors.refreshVisibility(true);
+      this.impostors.flush();
+    } else if (force) {
       this.impostors.markVisibilityDirty();
     }
 
@@ -683,6 +706,20 @@ export class TokenStreamer {
             if (obj.bars) obj.bars.renderable = false;
             if (obj.effects) obj.effects.renderable = false;
           }
+
+          // Sync Showstopper elevation perspective / hover / shadow for newly streamed elevated tokens
+          const ssApi = getShowstopperMovementApi();
+          if (ssApi?.getTokenMovementSetting?.("vertical")) {
+            const baseElev = Number.isFinite(Number(canvas?.level?.elevation?.base))
+              ? Number(canvas.level.elevation.base)
+              : (Number(canvas?.level?.elevation?.bottom) || 0);
+            const tokElev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
+            const obsElev = Number(ssApi.getObserverElevation?.() ?? baseElev);
+            if (Math.abs(tokElev - baseElev) > 0.05 || Math.abs(obsElev - baseElev) > 0.05) {
+              try { ssApi.syncTokenFlyHover?.(obj); } catch {}
+              this.controller?._scheduleShowstopperDofSync?.();
+            }
+          }
           drawnThisFrame++;
         } catch (err) {
           this.impostors.setFadeOverride(doc.id, null);
@@ -738,12 +775,23 @@ export class TokenStreamer {
     if (candidates.length === 0) return;
     candidates.sort((a, b) => a.lastSeen - b.lastSeen);
 
+    const ssApi = getShowstopperMovementApi();
     const maxToEvict = Math.min(24, Math.max(0, placeables.length - targetKeep));
     let evicted = 0;
     for (let i = 0; i < candidates.length && i < maxToEvict; i++) {
       const { tok, doc } = candidates[i];
       try {
         this._finishFadeImmediate(doc.id);
+        // Clean up Showstopper jump/fly shadow & DoF filter references before destroying offscreen placeable
+        if (ssApi?.clearJumpStateForToken) {
+          try { ssApi.clearJumpStateForToken(tok, { destroyShadow: true }); } catch {}
+        } else if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) {
+          try {
+            tok._ssJumpShadow.parent?.removeChild?.(tok._ssJumpShadow);
+            tok._ssJumpShadow.destroy?.();
+          } catch {}
+          tok._ssJumpShadow = null;
+        }
         layer.objects.removeChild(tok);
         tok.destroy({ children: true });
         // Restore `_destroyed = false` so the live TokenDocument stays 100% healthy and re-drawable when camera returns!
@@ -827,6 +875,14 @@ export class TokenStreamer {
     this._queuedIds.delete(doc.id);
     this._drawingIds.delete(doc.id);
     this.impostors.removeToken(doc.id);
+  }
+
+  onTokenDrawn(tok) {
+    if (!this.enabled || !tok?.document) return;
+    const doc = tok.document;
+    if (doc.parent?.id !== this.sceneId) return;
+    this.impostors.upsertToken(doc);
+    this.impostors.flush();
   }
 
   onVisibilityChanged() {

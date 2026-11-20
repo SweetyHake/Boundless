@@ -1,6 +1,55 @@
 const MODULE_ID = "boundless";
-const POI_FADE_START_SCALE = 0.16; // Begin fading in below this scale
-const POI_FADE_FULL_SCALE = 0.07;  // 100% visible at or below this scale
+
+// 3-tier hierarchical POI zoom visibility & landing defaults:
+// 1) major  (Region / Capital)  -> visible from orbit; clicking lands at macro overview (0.085x) where sub-pins appear
+// 2) minor  (District / Area)   -> appears as you descend into a region/capital (0.026..0.44x); lands at district/site view
+// 3) detail (Building / Tavern) -> appears once inside a city/district (0.07..0.74x); lands close-up (0.68x)
+export const POI_TIER_DEFAULTS = Object.freeze({
+  major: {
+    minScale: 0,
+    fadeInEnd: 0,
+    fadeOutStart: 0.115,
+    maxScale: 0.175,
+    defaultTargetScale: 0.085
+  },
+  minor: {
+    minScale: 0.025,
+    fadeInEnd: 0.055,
+    fadeOutStart: 0.30,
+    maxScale: 0.44,
+    defaultTargetScale: 0.26
+  },
+  detail: {
+    minScale: 0.070,
+    fadeInEnd: 0.125,
+    fadeOutStart: 0.56,
+    maxScale: 0.74,
+    defaultTargetScale: 0.68
+  }
+});
+
+export function normalizePoiKind(kind) {
+  if (kind === "detail") return "detail";
+  if (kind === "minor") return "minor";
+  return "major";
+}
+
+function computePoiTierAlpha(poi, stageScale) {
+  const tierKey = normalizePoiKind(poi?.kind);
+  const def = POI_TIER_DEFAULTS[tierKey];
+  const minS = Number.isFinite(poi?.minScale) ? poi.minScale : def.minScale;
+  const maxS = Number.isFinite(poi?.maxScale) ? poi.maxScale : def.maxScale;
+  const fadeInEnd = Number.isFinite(poi?.minScale)
+    ? (minS > 0 ? minS * 1.85 : 0)
+    : def.fadeInEnd;
+  const fadeOutStart = Number.isFinite(poi?.maxScale)
+    ? maxS * 0.72
+    : def.fadeOutStart;
+
+  const aIn = minS > 0 ? smoothstep(minS, Math.max(minS + 0.005, fadeInEnd), stageScale) : 1.0;
+  const aOut = maxS > 0 ? smoothstep(maxS, Math.min(maxS - 0.005, fadeOutStart), stageScale) : 1.0;
+  return aIn * aOut;
+}
 
 // Van Wijk & Nuij (2003) smooth zoom-and-pan curve parameters
 const FLY_DEFAULT_RHO = 1.38;
@@ -11,6 +60,161 @@ const FLY_CANCEL_KEYS = new Set([
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "KeyW", "KeyA", "KeyS", "KeyD"
 ]);
+
+export const POI_ICON_META = Object.freeze({
+  city: { labelKey: "BOUNDLESS.PoiIcons.City", fa: "fa-chess-rook", defaultColor: "#f5c96b" },
+  village: { labelKey: "BOUNDLESS.PoiIcons.Village", fa: "fa-house-chimney", defaultColor: "#e6c37a" },
+  castle: { labelKey: "BOUNDLESS.PoiIcons.Castle", fa: "fa-fort-awesome", defaultColor: "#f0a85a" },
+  tavern: { labelKey: "BOUNDLESS.PoiIcons.Tavern", fa: "fa-beer-mug-empty", defaultColor: "#ffae66" },
+  dungeon: { labelKey: "BOUNDLESS.PoiIcons.Dungeon", fa: "fa-dungeon", defaultColor: "#c49bff" },
+  camp: { labelKey: "BOUNDLESS.PoiIcons.Camp", fa: "fa-campground", defaultColor: "#ff8c78" },
+  port: { labelKey: "BOUNDLESS.PoiIcons.Port", fa: "fa-anchor", defaultColor: "#8ad4f5" },
+  nature: { labelKey: "BOUNDLESS.PoiIcons.Nature", fa: "fa-tree", defaultColor: "#8fe0a8" },
+  bridge: { labelKey: "BOUNDLESS.PoiIcons.Bridge", fa: "fa-bridge", defaultColor: "#9cd4ff" },
+  landmark: { labelKey: "BOUNDLESS.PoiIcons.Landmark", fa: "fa-compass", defaultColor: "#ffd275" },
+  pin: { labelKey: "BOUNDLESS.PoiIcons.Pin", fa: "fa-location-dot", defaultColor: "#f5c96b" }
+});
+
+export function inferPoiIcon(poi) {
+  if (poi?.icon && POI_ICON_META[poi.icon]) return poi.icon;
+  const n = String(poi?.name || "").toLowerCase();
+  if (/столиц|град|город|capital|city|town/.test(n)) return "city";
+  if (/цитадел|бастион|замок|крепост|застав|форпост|предел|рубеж|citadel|castle|keep|fort|outpost|bastion/.test(n)) return "castle";
+  if (/таверн|трактир|постоял|tavern|inn/.test(n)) return "tavern";
+  if (/руин|курган|разлом|каньон|пещер|подземел|склеп|гробниц|ruin|dungeon|crypt|cave|barrow|rift|canyon/.test(n)) return "dungeon";
+  if (/лагер|караван|стоянк|camp|caravan/.test(n)) return "camp";
+  if (/порт|гаван|залив|бухт|мыс|берег|фьорд|port|harbor|bay|cove|cape|coast|fjord/.test(n)) return "port";
+  if (/мост|тракт|переправ|bridge|road|crossing/.test(n)) return "bridge";
+  if (/деревн|оазис|пруд|террас|посел|village|hamlet|oasis|terrace/.test(n)) return "village";
+  if (/сад|рощ|чащ|лес|долин|луг|топ|болот|холм|дюн|garden|grove|forest|wood|valley|meadow|marsh|swamp|hill|dune/.test(n)) return "nature";
+  if (/маяк|колодец|хребет|край|башн|lighthouse|well|ridge|peak|tower/.test(n)) return "landmark";
+  return poi?.kind === "major" ? "city" : "pin";
+}
+
+function drawPoiGlyph(g, iconKey, r, color) {
+  g.lineStyle(0);
+  g.beginFill(color, 1);
+
+  switch (iconKey) {
+    case "city": {
+      // Three-tower city silhouette
+      g.drawRect(-r * 0.28, -r * 0.65, r * 0.56, r * 1.35);
+      g.drawPolygon([-r * 0.32, -r * 0.65, 0, -r * 1.05, r * 0.32, -r * 0.65]);
+      g.drawRect(-r * 0.82, -r * 0.25, r * 0.44, r * 0.95);
+      g.drawPolygon([-r * 0.86, -r * 0.25, -r * 0.6, -r * 0.6, -r * 0.34, -r * 0.25]);
+      g.drawRect(r * 0.38, -r * 0.25, r * 0.44, r * 0.95);
+      g.drawPolygon([r * 0.34, -r * 0.25, r * 0.6, -r * 0.6, r * 0.86, -r * 0.25]);
+      break;
+    }
+    case "village": {
+      // Cozy cottage with pitched roof
+      g.drawPolygon([0, -r * 0.92, r * 0.88, -r * 0.08, -r * 0.88, -r * 0.08]);
+      g.drawRect(-r * 0.62, -r * 0.1, r * 1.24, r * 0.82);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.95);
+      g.drawRect(-r * 0.18, r * 0.18, r * 0.36, r * 0.54);
+      break;
+    }
+    case "castle": {
+      // Crenellated fortress tower
+      g.drawRect(-r * 0.72, -r * 0.42, r * 1.44, r * 1.14);
+      g.drawRect(-r * 0.78, -r * 0.82, r * 0.38, r * 0.42);
+      g.drawRect(-r * 0.19, -r * 0.82, r * 0.38, r * 0.42);
+      g.drawRect(r * 0.4, -r * 0.82, r * 0.38, r * 0.42);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.95);
+      g.drawRoundedRect(-r * 0.24, r * 0.08, r * 0.48, r * 0.66, r * 0.22);
+      break;
+    }
+    case "tavern": {
+      // Tankard / mug silhouette
+      g.drawRoundedRect(-r * 0.56, -r * 0.55, r * 0.92, r * 1.24, r * 0.15);
+      g.drawCircle(-r * 0.34, -r * 0.62, r * 0.26);
+      g.drawCircle(0, -r * 0.7, r * 0.28);
+      g.drawCircle(r * 0.26, -r * 0.6, r * 0.22);
+      g.endFill();
+      g.lineStyle(r * 0.24, color, 1);
+      g.drawRoundedRect(r * 0.28, -r * 0.32, r * 0.44, r * 0.68, r * 0.2);
+      return;
+    }
+    case "dungeon": {
+      // Gothic ruin arch / cavern entrance
+      g.drawRoundedRect(-r * 0.78, -r * 0.82, r * 1.56, r * 1.54, r * 0.74);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.95);
+      g.drawRoundedRect(-r * 0.42, -r * 0.36, r * 0.84, r * 1.12, r * 0.4);
+      g.endFill();
+      g.beginFill(color, 0.9);
+      g.drawPolygon([0, -r * 0.22, r * 0.16, r * 0.04, 0, r * 0.3, -r * 0.16, r * 0.04]);
+      break;
+    }
+    case "camp": {
+      // Pointed tent with crossed poles
+      g.drawPolygon([0, -r * 0.82, r * 0.88, r * 0.72, -r * 0.88, r * 0.72]);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.95);
+      g.drawPolygon([0, r * 0.02, r * 0.34, r * 0.74, -r * 0.34, r * 0.74]);
+      g.endFill();
+      g.lineStyle(r * 0.18, color, 1);
+      g.moveTo(-r * 0.22, -r * 0.96);
+      g.lineTo(r * 0.16, -r * 0.58);
+      g.moveTo(r * 0.22, -r * 0.96);
+      g.lineTo(-r * 0.16, -r * 0.58);
+      return;
+    }
+    case "port": {
+      // Anchor
+      g.endFill();
+      g.lineStyle(r * 0.22, color, 1);
+      g.drawCircle(0, -r * 0.64, r * 0.22);
+      g.moveTo(0, -r * 0.42);
+      g.lineTo(0, r * 0.68);
+      g.moveTo(-r * 0.46, -r * 0.16);
+      g.lineTo(r * 0.46, -r * 0.16);
+      g.arc(0, r * 0.12, r * 0.62, 0.18 * Math.PI, 0.82 * Math.PI);
+      return;
+    }
+    case "nature": {
+      // Layered pine tree
+      g.drawPolygon([0, -r * 0.96, r * 0.56, -r * 0.24, -r * 0.56, -r * 0.24]);
+      g.drawPolygon([0, -r * 0.5, r * 0.78, r * 0.38, -r * 0.78, r * 0.38]);
+      g.drawRect(-r * 0.16, r * 0.36, r * 0.32, r * 0.46);
+      break;
+    }
+    case "bridge": {
+      // Arched stone bridge
+      g.drawRect(-r * 0.88, -r * 0.38, r * 1.76, r * 0.98);
+      g.drawRect(-r * 0.92, -r * 0.58, r * 1.84, r * 0.22);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.95);
+      g.drawCircle(0, r * 0.64, r * 0.56);
+      break;
+    }
+    case "landmark": {
+      // 4-point compass star
+      g.drawPolygon([
+        0, -r * 0.96,
+        r * 0.24, -r * 0.24,
+        r * 0.96, 0,
+        r * 0.24, r * 0.24,
+        0, r * 0.96,
+        -r * 0.24, r * 0.24,
+        -r * 0.96, 0,
+        -r * 0.24, -r * 0.24
+      ]);
+      break;
+    }
+    default: {
+      // Classic diamond gem
+      g.drawPolygon([0, -r * 0.86, r * 0.66, 0, 0, r * 0.86, -r * 0.66, 0]);
+      g.endFill();
+      g.beginFill(0x130f0b, 0.85);
+      g.drawCircle(0, 0, r * 0.22);
+      break;
+    }
+  }
+  g.endFill();
+}
 
 function smoothstep(edge0, edge1, x) {
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
@@ -42,6 +246,18 @@ function cubicBezier(x1, y1, x2, y2, t) {
 // Smooth, unhurried cruise with an ultra-silky landing deceleration
 function easeCameraFlight(t) {
   return cubicBezier(0.36, 0.0, 0.22, 1.0, t);
+}
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function loc(key, fallback = "") {
+  return game.i18n?.has?.(key) ? game.i18n.localize(key) : (fallback || key);
 }
 
 /**
@@ -124,27 +340,211 @@ function buildFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScal
   };
 }
 
-function getDefault1000Pois() {
-  const loc = (k, fb) => game.i18n?.has?.(k) ? game.i18n.localize(k) : fb;
+function getProvinceSubPoiTemplates() {
   return [
-    { id: "def_city", name: loc("BOUNDLESS.DefaultPOI.City", "Столица"), x: 24000, y: 47200, targetScale: 0.45, color: "#f5c96b", kind: "major" },
-    { id: "def_citadel", name: loc("BOUNDLESS.DefaultPOI.Citadel", "Цитадель"), x: 17600, y: 40100, targetScale: 0.55, color: "#f0a85a", kind: "minor" },
-    { id: "def_gardens", name: loc("BOUNDLESS.DefaultPOI.Gardens", "Сады"), x: 29100, y: 40400, targetScale: 0.55, color: "#9ee08c", kind: "minor" },
-    { id: "def_bridge", name: loc("BOUNDLESS.DefaultPOI.Bridge", "Речной мост"), x: 36500, y: 47900, targetScale: 0.55, color: "#8ad4f5", kind: "minor" },
-    { id: "def_village", name: loc("BOUNDLESS.DefaultPOI.Village", "Деревня у озера"), x: 71500, y: 49600, targetScale: 0.5, color: "#f5c96b", kind: "major" },
-    { id: "def_owlwell", name: loc("BOUNDLESS.DefaultPOI.OwlWell", "Колодец Совы"), x: 52400, y: 69300, targetScale: 0.6, color: "#c9b3ff", kind: "minor" },
-    { id: "def_goblin", name: loc("BOUNDLESS.DefaultPOI.GoblinCamp", "Лагерь гоблинов"), x: 59500, y: 76550, targetScale: 0.6, color: "#ff8c78", kind: "minor" },
-    { id: "def_north", name: loc("BOUNDLESS.DefaultPOI.NorthOutpost", "Северный форпост"), x: 51300, y: 18800, targetScale: 0.6, color: "#f0b47a", kind: "minor" }
+    { suffix: "citadel", name: loc("BOUNDLESS.DefaultPOI.Citadel", "Цитадель"), x: 17600, y: 40100, targetScale: 0.45, color: "#f0a85a", kind: "minor", icon: "castle" },
+    { suffix: "gardens", name: loc("BOUNDLESS.DefaultPOI.Gardens", "Королевские сады"), x: 29100, y: 40400, targetScale: 0.45, color: "#9ee08c", kind: "minor", icon: "nature" },
+    { suffix: "bridge", name: loc("BOUNDLESS.DefaultPOI.Bridge", "Речной мост"), x: 36500, y: 47900, targetScale: 0.48, color: "#8ad4f5", kind: "minor", icon: "bridge" },
+    { suffix: "plaza", name: loc("BOUNDLESS.DefaultPOI.MainPlaza", "Главная площадь"), x: 24000, y: 48200, targetScale: 0.24, color: "#f5c96b", kind: "minor", icon: "landmark" },
+    { suffix: "tavern_east", name: loc("BOUNDLESS.DefaultPOI.TavernEast", "Таверна «Золотой ковш»"), x: 28673, y: 52000, targetScale: 0.68, color: "#ffae66", kind: "detail", icon: "tavern" },
+    { suffix: "tavern_north", name: loc("BOUNDLESS.DefaultPOI.TavernNorth", "Таверна «Синий грифон»"), x: 20805, y: 41503, targetScale: 0.68, color: "#ffae66", kind: "detail", icon: "tavern" },
+    { suffix: "tavern_west", name: loc("BOUNDLESS.DefaultPOI.TavernWest", "Таверна у Западных ворот"), x: 16785, y: 51488, targetScale: 0.68, color: "#ffae66", kind: "detail", icon: "tavern" },
+    { suffix: "village", name: loc("BOUNDLESS.DefaultPOI.Village", "Деревня у озера"), x: 74500, y: 50500, targetScale: 0.11, color: "#f5c96b", kind: "minor", icon: "village" },
+    { suffix: "sawmill", name: loc("BOUNDLESS.DefaultPOI.Sawmill", "Лесопилка"), x: 71500, y: 49600, targetScale: 0.58, color: "#e6c37a", kind: "detail", icon: "village" },
+    { suffix: "lake_inn", name: loc("BOUNDLESS.DefaultPOI.LakeInn", "Трактир у озера"), x: 81051, y: 53119, targetScale: 0.68, color: "#ffae66", kind: "detail", icon: "tavern" },
+    { suffix: "owlwell", name: loc("BOUNDLESS.DefaultPOI.OwlWell", "Колодец Совы"), x: 52400, y: 69300, targetScale: 0.52, color: "#c9b3ff", kind: "minor", icon: "landmark" },
+    { suffix: "goblin", name: loc("BOUNDLESS.DefaultPOI.GoblinCamp", "Лагерь гоблинов"), x: 59500, y: 76550, targetScale: 0.52, color: "#ff8c78", kind: "minor", icon: "camp" },
+    { suffix: "north", name: loc("BOUNDLESS.DefaultPOI.NorthOutpost", "Северный форпост"), x: 51300, y: 18800, targetScale: 0.52, color: "#f0b47a", kind: "minor", icon: "castle" }
   ];
+}
+
+export function getDefault1000Pois() {
+  const subs = getProvinceSubPoiTemplates();
+  return [
+    { id: "def_city", name: loc("BOUNDLESS.DefaultPOI.City", "Столица"), x: 24000, y: 47200, targetScale: 0.085, color: "#f5c96b", kind: "major", icon: "city" },
+    { id: "def_village", name: loc("BOUNDLESS.DefaultPOI.Village", "Деревня у озера"), x: 74500, y: 50500, targetScale: 0.11, color: "#f5c96b", kind: "major", icon: "village" },
+    ...subs
+      .filter(s => s.suffix !== "village")
+      .map(s => ({ id: `def_${s.suffix}`, ...s }))
+  ];
+}
+
+function rectsOverlap(a, b, pad = 0) {
+  return !(
+    a.x1 + pad < b.x0 - pad ||
+    a.x0 - pad > b.x1 + pad ||
+    a.y1 + pad < b.y0 - pad ||
+    a.y0 - pad > b.y1 + pad
+  );
+}
+
+/**
+ * Shared DialogV2 modal for creating or editing a POI pin (used both from map right-click/tool and SceneConfig).
+ */
+export async function openPoiEditorDialog(controller, scene, initial = {}) {
+  const DialogV2 = foundry.applications.api.DialogV2;
+  const isEdit = Boolean(initial.id);
+  const currentScale = canvas.ready && canvas.scene?.id === scene?.id
+    ? Math.max(0.15, Math.min(1.5, Number(canvas.stage.scale.x.toFixed(2))))
+    : 0.45;
+  const defaultIcon = inferPoiIcon(initial);
+  const defaultKind = normalizePoiKind(initial.kind || (isEdit ? "major" : "minor"));
+  const defaultColor = initial.color || POI_ICON_META[defaultIcon]?.defaultColor || "#f5c96b";
+  const tierDef = POI_TIER_DEFAULTS[defaultKind];
+  const defaultScale = Number(initial.targetScale ?? initial.scale ?? (isEdit ? currentScale : tierDef.defaultTargetScale)) || tierDef.defaultTargetScale;
+
+  const iconOptions = Object.entries(POI_ICON_META).map(([key, meta]) => {
+    const sel = key === defaultIcon ? "selected" : "";
+    return `<option value="${escapeHtml(key)}" ${sel}>${escapeHtml(loc(meta.labelKey, key))}</option>`;
+  }).join("");
+
+  const journalOptions = [
+    `<option value="">${escapeHtml(loc("BOUNDLESS.Config.PoiJournalNone", "— Не привязан —"))}</option>`,
+    ...Array.from(game.journal || []).map(j => {
+      const sel = j.uuid === initial.journalUuid ? "selected" : "";
+      return `<option value="${escapeHtml(j.uuid)}" ${sel}>${escapeHtml(j.name)}</option>`;
+    })
+  ].join("");
+
+  const content = `
+    <div class="boundless-poi-dialog">
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiNamePrompt", "Название локации"))}</label>
+        <div class="form-fields">
+          <input type="text" name="name" value="${escapeHtml(initial.name || loc("BOUNDLESS.Config.PoiDefaultName", "Новая локация"))}" autofocus>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiSubtitle", "Подзаголовок"))}</label>
+        <div class="form-fields">
+          <input type="text" name="subtitle" value="${escapeHtml(initial.subtitle || "")}" placeholder="${escapeHtml(loc("BOUNDLESS.Config.PoiSubtitlePlaceholder", "Необязательно"))}">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiCategory", "Иконка и уровень"))}</label>
+        <div class="form-fields">
+          <select name="icon">${iconOptions}</select>
+          <select name="kind">
+            <option value="major" ${defaultKind === "major" ? "selected" : ""}>${escapeHtml(loc("BOUNDLESS.Config.PoiKindMajor", "Регион / Столица (издалека)"))}</option>
+            <option value="minor" ${defaultKind === "minor" ? "selected" : ""}>${escapeHtml(loc("BOUNDLESS.Config.PoiKindMinor", "Локация / Район (средний зум)"))}</option>
+            <option value="detail" ${defaultKind === "detail" ? "selected" : ""}>${escapeHtml(loc("BOUNDLESS.Config.PoiKindDetail", "Здание / Точка (вблизи)"))}</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiColorScale", "Цвет и масштаб прилёта"))}</label>
+        <div class="form-fields">
+          <input type="color" name="color" value="${escapeHtml(defaultColor)}">
+          <input type="number" name="targetScale" value="${escapeHtml(defaultScale)}" min="0.02" max="2.5" step="0.01">
+          <button type="button" class="boundless-use-cur-scale" title="${escapeHtml(loc("BOUNDLESS.Config.PoiUseCurrentScale", "Взять текущий масштаб камеры"))}">
+            <i class="fa-solid fa-magnifying-glass"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiJournal", "Журнал"))}</label>
+        <div class="form-fields">
+          <select name="journalUuid">${journalOptions}</select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>${escapeHtml(loc("BOUNDLESS.Config.PoiHidden", "Скрытая (только для мастера)"))}</label>
+        <div class="form-fields">
+          <input type="checkbox" name="hidden" ${initial.hidden ? "checked" : ""}>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const title = isEdit
+    ? loc("BOUNDLESS.Config.PoiEditTitle", "Редактировать метку локации")
+    : loc("BOUNDLESS.Config.PoiAddHere", "Добавить метку локации");
+
+  const res = await DialogV2.prompt({
+    window: { title },
+    content,
+    render: (_event, dialog) => {
+      const el = dialog?.element || dialog;
+      const scaleBtn = el?.querySelector?.(".boundless-use-cur-scale");
+      const scaleInput = el?.querySelector?.('input[name="targetScale"]');
+      const kindSelect = el?.querySelector?.('select[name="kind"]');
+      let scaleManuallyEdited = isEdit;
+      scaleInput?.addEventListener("input", () => { scaleManuallyEdited = true; });
+      kindSelect?.addEventListener("change", () => {
+        if (scaleManuallyEdited || !scaleInput) return;
+        const k = normalizePoiKind(kindSelect.value);
+        scaleInput.value = String(POI_TIER_DEFAULTS[k].defaultTargetScale);
+      });
+      scaleBtn?.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        if (canvas.ready && scaleInput) {
+          scaleManuallyEdited = true;
+          scaleInput.value = String(Math.max(0.02, Math.min(2.5, Number(canvas.stage.scale.x.toFixed(3)))));
+        }
+      });
+    },
+    ok: {
+      label: isEdit ? loc("BOUNDLESS.Config.PoiSave", "Сохранить") : loc("BOUNDLESS.Config.PoiCreate", "Создать"),
+      callback: (_event, button) => {
+        const f = button.form.elements;
+        const kind = normalizePoiKind(f.kind?.value);
+        const fallbackScale = POI_TIER_DEFAULTS[kind].defaultTargetScale;
+        return {
+          name: f.name?.value?.trim() || loc("BOUNDLESS.Config.PoiDefaultName", "Новая локация"),
+          subtitle: f.subtitle?.value?.trim() || "",
+          icon: f.icon?.value || "pin",
+          kind,
+          color: f.color?.value || defaultColor,
+          targetScale: Math.max(0.02, Math.min(2.5, Number(f.targetScale?.value) || fallbackScale)),
+          journalUuid: f.journalUuid?.value || "",
+          hidden: Boolean(f.hidden?.checked)
+        };
+      }
+    },
+    rejectClose: false
+  });
+
+  if (!res) return null;
+
+  if (isEdit) {
+    await controller.updatePOI(initial.id, res, scene);
+    return { ...initial, ...res };
+  }
+
+  const pivot = canvas.ready && canvas.scene?.id === scene.id
+    ? canvas.stage.pivot
+    : { x: (scene.width || 100000) * 0.5, y: (scene.height || 100000) * 0.5 };
+
+  return controller.addPOI({
+    ...res,
+    x: Number.isFinite(initial.x) ? Math.round(initial.x) : Math.round(pivot.x),
+    y: Number.isFinite(initial.y) ? Math.round(initial.y) : Math.round(pivot.y),
+    levelId: initial.levelId ?? (canvas.scene?.id === scene.id ? canvas.level?.id : null)
+  }, scene);
 }
 
 export class PoiManager {
   controller = null;
   container = null;
-  pins = []; // [{ poi, root, bg, label, hovered }]
+  pins = []; // [{ poi, root, medalGroup, pillGroup, hitBoxFull, hitBoxCompact, hovered, dragging, isMajor, iconKey, ... }]
   enabled = true;
+  placementActive = false;
   lastScale = -1;
+  lastPivotX = NaN;
+  lastPivotY = NaN;
+  _layoutDirty = true;
   _flight = null;
+  _dragState = null;
+  _contextMenuEl = null;
+  _placementHintEl = null;
+  _placementListeners = null;
+  _superGridInfo = null;        // { cols, rows, regionPx } when using superGrid manifest defaults
+  _superGridSubProvinces = new Map(); // "col_row" -> { lastUsedMs, entries: [] }
 
   constructor(controller = null) {
     this.controller = controller;
@@ -158,19 +558,31 @@ export class PoiManager {
 
     this.container = new PIXI.Container();
     this.container.zIndex = 650;
+    this.container.sortableChildren = true;
     this.container.eventMode = "passive";
     this.container.interactiveChildren = true;
     canvas.controls.addChild(this.container);
 
     this.rebuild(scene, manifest);
-    this.updateScale(canvas.stage?.scale?.x || 1);
+    this.updateViewport();
   }
 
   resolvePois(scene, manifest) {
     const cfg = scene?.flags?.[MODULE_ID] || {};
-    const customPois = Array.isArray(cfg.pois) ? cfg.pois : null;
-    if (customPois && customPois.length > 0) return customPois;
-    if (Array.isArray(manifest?.pois) && manifest.pois.length > 0) return manifest.pois;
+    if (Array.isArray(cfg.pois)) return cfg.pois;
+    if (Array.isArray(manifest?.pois) && manifest.pois.length > 0) {
+      // On continental superGrid worlds (e.g. 6000x6000), province pins should land at city overview (0.085x)
+      // so sub-location pins appear inside the province instead of diving straight onto rooftops
+      if (manifest.superGrid) {
+        return manifest.pois.map(p => ({
+          ...p,
+          kind: "major",
+          _isSecondaryProvince: p.kind === "minor",
+          targetScale: Number.isFinite(p.targetScale) ? p.targetScale : 0.085
+        }));
+      }
+      return manifest.pois;
+    }
     // Built-in 1000x1000 map defaults when no custom POIs are set
     if (manifest?.worldCells === 1000 || (canvas.dimensions?.width === 100000 && canvas.dimensions?.height === 100000)) {
       return getDefault1000Pois();
@@ -178,7 +590,20 @@ export class PoiManager {
     return [];
   }
 
+  _clearSuperGridSubPins() {
+    for (const bucket of this._superGridSubProvinces.values()) {
+      for (const p of bucket.entries) {
+        p.root.parent?.removeChild(p.root);
+        p.root.destroy({ children: true });
+      }
+    }
+    this._superGridSubProvinces.clear();
+  }
+
   rebuild(scene = canvas.scene, manifest = null) {
+    this._closeContextMenu();
+    this._cancelDrag();
+    this._clearSuperGridSubPins();
     if (!this.container) return;
     for (const p of this.pins) {
       p.root.parent?.removeChild(p.root);
@@ -193,136 +618,783 @@ export class PoiManager {
       return;
     }
 
-    const viewedLevelId = canvas.level?.id;
-    const pois = this.resolvePois(scene, manifest);
+    const activeManifest = manifest ?? this.controller?.manifest;
+    const sg = (!Array.isArray(cfg.pois) && activeManifest?.superGrid) ? activeManifest.superGrid : null;
+    this._superGridInfo = sg
+      ? { cols: sg.cols || 6, rows: sg.rows || 6, regionPx: sg.regionPx || 100000 }
+      : null;
 
-    for (const poi of pois) {
+    const viewedLevelId = canvas.level?.id;
+    const pois = this.resolvePois(scene, activeManifest);
+
+    for (let i = 0; i < pois.length; i++) {
+      const poi = pois[i];
       if (!poi || !Number.isFinite(poi.x) || !Number.isFinite(poi.y)) continue;
       if (poi.hidden && !game.user.isGM) continue;
       if (poi.levelId && viewedLevelId && poi.levelId !== viewedLevelId && !canvas.level?.visibility?.levels?.has(poi.levelId)) {
         continue;
       }
-      this._createPin(poi);
+      this.pins.push(this._createPin(poi, i));
     }
 
+    this._layoutDirty = true;
     this.lastScale = -1;
-    this.updateScale(canvas.stage?.scale?.x || 1);
+    this.updateViewport();
   }
 
-  _createPin(poi) {
-    const isMajor = poi.kind === "major";
-    const accentHex = poi.hidden ? 0xb87aff : foundry.utils.Color.from(poi.color || "#f5c96b").valueOf();
-    const fontSize = isMajor ? 15 : 12.5;
+  _syncSuperGridSubPins(stageScale, wt, sw, sh) {
+    if (!this._superGridInfo || !this.container) return;
+    // Only materialize sub-location pins for provinces currently on screen when descending below 0.022x
+    if (stageScale < 0.022 && !this.placementActive) return;
+
+    const { cols, rows, regionPx } = this._superGridInfo;
+    const xMinWorld = (0 - wt.tx) / Math.max(wt.a, 1e-5);
+    const xMaxWorld = (sw - wt.tx) / Math.max(wt.a, 1e-5);
+    const yMinWorld = (0 - wt.ty) / Math.max(wt.d, 1e-5);
+    const yMaxWorld = (sh - wt.ty) / Math.max(wt.d, 1e-5);
+
+    const c0 = Math.max(0, Math.floor(xMinWorld / regionPx));
+    const c1 = Math.min(cols - 1, Math.floor(xMaxWorld / regionPx));
+    const r0 = Math.max(0, Math.floor(yMinWorld / regionPx));
+    const r1 = Math.min(rows - 1, Math.floor(yMaxWorld / regionPx));
+
+    // Avoid spawning across all 36 provinces if somehow zoomed out with placementActive
+    if ((c1 - c0 + 1) * (r1 - r0 + 1) > 9) return;
+
+    const now = performance.now();
+    const templates = getProvinceSubPoiTemplates();
+
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const key = `${c}_${r}`;
+        const existing = this._superGridSubProvinces.get(key);
+        if (existing) {
+          existing.lastUsedMs = now;
+          continue;
+        }
+        const ox = c * regionPx;
+        const oy = r * regionPx;
+        const entries = [];
+        for (let i = 0; i < templates.length; i++) {
+          const tpl = templates[i];
+          const subPoi = {
+            id: `sg_${key}_${tpl.suffix}`,
+            name: tpl.name,
+            x: ox + tpl.x,
+            y: oy + tpl.y,
+            targetScale: tpl.targetScale,
+            color: tpl.color,
+            kind: tpl.kind,
+            icon: tpl.icon,
+            _virtualSub: true
+          };
+          entries.push(this._createPin(subPoi, 1000 + i));
+        }
+        this._superGridSubProvinces.set(key, { lastUsedMs: now, entries });
+      }
+    }
+
+    // LRU evict distant province sub-pins (keep up to 6 recent provinces in VRAM)
+    if (this._superGridSubProvinces.size > 6) {
+      const sorted = Array.from(this._superGridSubProvinces.entries()).sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
+      while (sorted.length > 6) {
+        const [evictKey, bucket] = sorted.shift();
+        for (const p of bucket.entries) {
+          p.root.parent?.removeChild(p.root);
+          p.root.destroy({ children: true });
+        }
+        this._superGridSubProvinces.delete(evictKey);
+      }
+    }
+  }
+
+  _createPin(poi, orderIndex = 0) {
+    const tier = normalizePoiKind(poi.kind);
+    const isMajor = tier === "major" && !poi._isSecondaryProvince;
+    const isDetail = tier === "detail";
+    const iconKey = inferPoiIcon(poi);
+    const baseColorStr = poi.hidden ? "#b87aff" : (poi.color || POI_ICON_META[iconKey]?.defaultColor || "#f5c96b");
+    const accentHex = foundry.utils.Color.from(baseColorStr).valueOf();
+    const hasJournal = Boolean(poi.journalUuid);
+    const hasSubtitle = Boolean(poi.subtitle);
 
     const root = new PIXI.Container();
     root.position.set(poi.x, poi.y);
     root.eventMode = "static";
     root.cursor = "pointer";
 
-    const style = new PIXI.TextStyle({
+    // --- 1. Anchor + Medal group (always shown in both full & compact decluttered modes) ---
+    const medalGroup = new PIXI.Container();
+    const medalR = isMajor ? 13.5 : (isDetail ? 9.2 : 11);
+    const medalY = -(medalR + (isDetail ? 7 : 9));
+    const medalG = new PIXI.Graphics();
+    const glyphG = new PIXI.Graphics();
+    glyphG.position.set(0, medalY);
+    medalGroup.addChild(medalG, glyphG);
+
+    const drawMedal = (hover) => {
+      medalG.clear();
+      // Subtle ambient glow on hover
+      if (hover) {
+        medalG.beginFill(accentHex, 0.22);
+        medalG.drawCircle(0, medalY, medalR + 6);
+        medalG.endFill();
+      }
+
+      // Drop shadow under anchor & medal
+      medalG.beginFill(0x000000, 0.52);
+      medalG.drawCircle(0, medalY + 2, medalR + 2.5);
+      medalG.endFill();
+
+      // Stem connecting exact coordinate (0, 0) to medal
+      medalG.lineStyle(1.6, accentHex, hover ? 1.0 : 0.78);
+      medalG.moveTo(0, -4);
+      medalG.lineTo(0, medalY + medalR);
+
+      // Exact coordinate diamond anchor at (0, 0)
+      medalG.lineStyle(1.5, accentHex, hover ? 1.0 : 0.9);
+      medalG.beginFill(hover ? accentHex : 0x14100c, 0.95);
+      medalG.drawPolygon([0, -5, 4.5, 0, 0, 5, -4.5, 0]);
+      medalG.endFill();
+
+      // Medal outer rim & dark interior
+      medalG.lineStyle(hover ? 2.2 : 1.5, accentHex, hover ? 1.0 : 0.9);
+      medalG.beginFill(hover ? 0x1d1711 : 0x130f0b, 0.94);
+      medalG.drawCircle(0, medalY, medalR);
+      medalG.endFill();
+
+      // Inner delicate ring for major locations
+      if (isMajor) {
+        medalG.lineStyle(0.8, accentHex, hover ? 0.55 : 0.35);
+        medalG.drawCircle(0, medalY, medalR - 2.6);
+      }
+
+      // Vector category glyph
+      glyphG.clear();
+      drawPoiGlyph(glyphG, iconKey, medalR * 0.55, hover ? 0xfff6e0 : accentHex);
+    };
+    drawMedal(false);
+
+    // --- 2. Pill label group (hidden in compact decluttered mode, revealed on hover) ---
+    const pillGroup = new PIXI.Container();
+    const textResolution = Math.min(2, window.devicePixelRatio || 2);
+
+    const titleStyle = new PIXI.TextStyle({
       fontFamily: "Signika, Palatino Linotype, serif",
-      fontSize,
-      fontWeight: isMajor ? "700" : "600",
-      fill: poi.hidden ? "#e2c8ff" : "#f7ebd2",
+      fontSize: isMajor ? 14.5 : (isDetail ? 11.5 : 12.5),
+      fontWeight: isMajor ? "700" : (isDetail ? "500" : "600"),
+      fill: poi.hidden ? "#e8d2ff" : (isDetail ? "#efe3cc" : "#faf0dc"),
       dropShadow: true,
       dropShadowColor: "#000000",
       dropShadowBlur: 3,
       dropShadowDistance: 1,
-      letterSpacing: isMajor ? 0.6 : 0.3
+      letterSpacing: isMajor ? 0.5 : (isDetail ? 0.15 : 0.25)
     });
 
-    const label = new PIXI.Text(poi.name || "", style);
+    const label = new PIXI.Text(poi.name || "", titleStyle);
+    label.resolution = textResolution;
     label.anchor.set(0.5, 0.5);
 
-    const padX = isMajor ? 14 : 10;
-    const padY = isMajor ? 6 : 4;
-    const boxW = Math.max(44, label.width + padX * 2);
-    const boxH = label.height + padY * 2;
-    const pillY = -(boxH * 0.5 + 12);
+    let subLabel = null;
+    if (hasSubtitle) {
+      const subStyle = new PIXI.TextStyle({
+        fontFamily: "Signika, sans-serif",
+        fontSize: 10.5,
+        fontWeight: "400",
+        fill: "#cfc4b2",
+        dropShadow: true,
+        dropShadowColor: "#000000",
+        dropShadowBlur: 2,
+        dropShadowDistance: 1
+      });
+      subLabel = new PIXI.Text(poi.subtitle, subStyle);
+      subLabel.resolution = textResolution;
+      subLabel.anchor.set(0.5, 0.5);
+    }
 
-    const bg = new PIXI.Graphics();
-    const drawBg = (hover) => {
-      bg.clear();
-      // Diamond anchor marker at exact POI coordinate (0, 0)
-      bg.lineStyle(1.5, accentHex, hover ? 1.0 : 0.85);
-      bg.beginFill(hover ? accentHex : 0x16120e, 0.92);
-      bg.drawPolygon([0, -6, 5, 0, 0, 6, -5, 0]);
-      bg.endFill();
+    const padX = isMajor ? 14 : (isDetail ? 9 : 11);
+    const padY = isMajor ? 5.5 : (isDetail ? 3 : 4);
+    const badgeExtraRight = (hasJournal ? 12 : 0) + (poi.hidden ? 12 : 0);
+    const contentW = Math.max(label.width, subLabel ? subLabel.width : 0) + badgeExtraRight;
+    const contentH = label.height + (subLabel ? subLabel.height + 1 : 0);
+    const boxW = Math.max(52, contentW + padX * 2);
+    const boxH = contentH + padY * 2;
+    const pillY = medalY - medalR - boxH * 0.5 - 6;
 
-      // Pill badge above marker
-      bg.lineStyle(hover ? 2 : 1.25, accentHex, hover ? 1.0 : 0.78);
-      bg.beginFill(0x110e0b, hover ? 0.92 : 0.78);
-      bg.drawRoundedRect(-boxW * 0.5, pillY - boxH * 0.5, boxW, boxH, 6);
-      bg.endFill();
+    const pillBg = new PIXI.Graphics();
+    const drawPill = (hover) => {
+      pillBg.clear();
+      // Drop shadow
+      pillBg.beginFill(0x000000, 0.45);
+      pillBg.drawRoundedRect(-boxW * 0.5, pillY - boxH * 0.5 + 2.5, boxW, boxH, 7);
+      pillBg.endFill();
+
+      // Main dark plate
+      pillBg.lineStyle(hover ? 2 : 1.25, accentHex, hover ? 1.0 : 0.8);
+      pillBg.beginFill(hover ? 0x19140f : 0x100d0a, hover ? 0.94 : 0.84);
+      pillBg.drawRoundedRect(-boxW * 0.5, pillY - boxH * 0.5, boxW, boxH, 7);
+      pillBg.endFill();
+
+      // Subtle inner highlight line along top edge
+      pillBg.lineStyle(0.8, 0xffffff, hover ? 0.16 : 0.08);
+      pillBg.moveTo(-boxW * 0.5 + 8, pillY - boxH * 0.5 + 1.5);
+      pillBg.lineTo(boxW * 0.5 - 8, pillY - boxH * 0.5 + 1.5);
+
+      // Decorative side diamonds for major landmarks
+      if (isMajor) {
+        pillBg.lineStyle(0);
+        pillBg.beginFill(accentHex, hover ? 1.0 : 0.88);
+        const sx = boxW * 0.5;
+        pillBg.drawPolygon([-sx, pillY - 3, -sx + 3, pillY, -sx, pillY + 3, -sx - 3, pillY]);
+        pillBg.drawPolygon([sx, pillY - 3, sx + 3, pillY, sx, pillY + 3, sx - 3, pillY]);
+        pillBg.endFill();
+      }
+
+      // Small scroll/book dot on right side if linked to a JournalEntry
+      let iconCursorX = boxW * 0.5 - 10;
+      if (hasJournal) {
+        pillBg.lineStyle(1, accentHex, 0.9);
+        pillBg.beginFill(accentHex, 0.25);
+        pillBg.drawRoundedRect(iconCursorX - 4, pillY - 4.5, 8, 9, 1.5);
+        pillBg.endFill();
+        iconCursorX -= 12;
+      }
+      if (poi.hidden) {
+        pillBg.lineStyle(1.2, 0xd9b3ff, 0.9);
+        pillBg.drawCircle(iconCursorX, pillY, 3.5);
+        pillBg.moveTo(iconCursorX - 4.5, pillY + 4.5);
+        pillBg.lineTo(iconCursorX + 4.5, pillY - 4.5);
+      }
     };
-    drawBg(false);
-    label.position.set(0, pillY);
+    drawPill(false);
 
-    root.addChild(bg, label);
-    root.hitArea = new PIXI.Rectangle(-boxW * 0.5 - 4, pillY - boxH * 0.5 - 4, boxW + 8, boxH + 22);
+    const textOffsetX = -badgeExtraRight * 0.4;
+    if (subLabel) {
+      label.position.set(textOffsetX, pillY - subLabel.height * 0.5 - 0.5);
+      subLabel.position.set(textOffsetX, pillY + label.height * 0.5 + 0.5);
+      pillGroup.addChild(pillBg, label, subLabel);
+    } else {
+      label.position.set(textOffsetX, pillY);
+      pillGroup.addChild(pillBg, label);
+    }
 
-    const entry = { poi, root, bg, label, hovered: false, isMajor };
+    root.addChild(medalGroup, pillGroup);
+
+    const fullTopY = pillY - boxH * 0.5;
+    const hitFull = new PIXI.Rectangle(-boxW * 0.5 - 5, fullTopY - 4, boxW + 10, (4 - fullTopY) + 8);
+    const hitCompact = new PIXI.Rectangle(-(medalR + 6), medalY - medalR - 6, (medalR + 6) * 2, (4 - (medalY - medalR)) + 10);
+    root.hitArea = hitFull;
+
+    const entry = {
+      poi,
+      tier,
+      orderIndex,
+      iconKey,
+      root,
+      medalGroup,
+      pillGroup,
+      drawMedal,
+      drawPill,
+      hitFull,
+      hitCompact,
+      boxW,
+      boxH,
+      pillY,
+      medalR,
+      medalY,
+      fullTopY,
+      hovered: false,
+      dragging: false,
+      isMajor,
+      isDetail,
+      mode: "full" // "full" | "compact" | "hidden"
+    };
 
     root.on("pointerover", () => {
       entry.hovered = true;
-      drawBg(true);
-      this._applyPinTransform(entry, canvas.stage?.scale?.x || 1);
-      root.zIndex = 10;
+      drawMedal(true);
+      drawPill(true);
+      pillGroup.visible = true;
+      root.hitArea = hitFull;
+      root.zIndex = 500;
       this.container.sortDirty = true;
-    });
-    root.on("pointerout", () => {
-      entry.hovered = false;
-      drawBg(false);
       this._applyPinTransform(entry, canvas.stage?.scale?.x || 1);
-      root.zIndex = isMajor ? 2 : 1;
-      this.container.sortDirty = true;
-    });
-    root.on("pointerdown", (ev) => {
-      if (ev.button !== 0) return;
-      ev.stopPropagation();
-      this.flyTo(poi);
     });
 
-    root.zIndex = isMajor ? 2 : 1;
-    this.container.sortableChildren = true;
+    root.on("pointerout", () => {
+      entry.hovered = false;
+      drawMedal(false);
+      drawPill(false);
+      if (entry.mode === "compact") {
+        pillGroup.visible = false;
+        root.hitArea = hitCompact;
+      }
+      root.zIndex = isMajor ? 30 : (isDetail ? 10 : 20);
+      this.container.sortDirty = true;
+      this._applyPinTransform(entry, canvas.stage?.scale?.x || 1);
+    });
+
+    root.on("pointerdown", (ev) => {
+      if (ev.button === 2) {
+        ev.stopPropagation();
+        ev.preventDefault?.();
+        ev.originalEvent?.preventDefault?.();
+        this._openContextMenu(entry, ev);
+        return;
+      }
+      if (ev.button !== 0) return;
+      ev.stopPropagation();
+      this._closeContextMenu();
+
+      if (ev.shiftKey && poi.journalUuid) {
+        this._openLinkedJournal(poi.journalUuid);
+        return;
+      }
+
+      const canDrag = game.user?.isGM && !poi._virtualSub && (ev.altKey || this.placementActive);
+      if (canDrag) {
+        this._startPinDrag(entry, ev);
+      } else {
+        this.flyTo(poi);
+      }
+    });
+
+    root.on("rightdown", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault?.();
+    });
+
+    root.on("rightup", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault?.();
+    });
+
+    root.zIndex = isMajor ? 30 : (isDetail ? 10 : 20);
     this.container.addChild(root);
-    this.pins.push(entry);
+    return entry;
+  }
+
+  async _openLinkedJournal(uuid) {
+    if (!uuid) return;
+    try {
+      const doc = await fromUuid(uuid);
+      if (!doc) return;
+      if (doc.testUserPermission && !doc.testUserPermission(game.user, "OBSERVER") && !game.user.isGM) {
+        ui.notifications?.warn?.(loc("BOUNDLESS.Config.PoiJournalNoAccess", "Нет доступа к этому журналу."));
+        return;
+      }
+      doc.sheet?.render?.(true);
+    } catch (err) {
+      console.warn(`[${MODULE_ID}] Failed to open linked journal:`, err);
+    }
+  }
+
+  _startPinDrag(entry, ev) {
+    this._cancelDrag();
+    const startClientX = ev.clientX ?? ev.global?.x ?? 0;
+    const startClientY = ev.clientY ?? ev.global?.y ?? 0;
+    let moved = false;
+
+    const toWorld = (clientX, clientY) => {
+      const view = canvas.app?.view || canvas.app?.canvas;
+      if (!view) return null;
+      const rect = view.getBoundingClientRect();
+      const sx = clientX - rect.left;
+      const sy = clientY - rect.top;
+      return canvas.stage.toLocal(new PIXI.Point(sx, sy));
+    };
+
+    const onMove = (moveEv) => {
+      const dist = Math.hypot(moveEv.clientX - startClientX, moveEv.clientY - startClientY);
+      if (!moved && dist < 5) return;
+      if (!moved) {
+        moved = true;
+        entry.dragging = true;
+        entry.root.zIndex = 600;
+        this.container.sortDirty = true;
+      }
+      const pt = toWorld(moveEv.clientX, moveEv.clientY);
+      if (pt) {
+        entry.root.position.set(pt.x, pt.y);
+      }
+    };
+
+    const onUp = async (upEv) => {
+      cleanup();
+      if (!moved) {
+        if (!this.placementActive) this.flyTo(entry.poi);
+        return;
+      }
+      const pt = toWorld(upEv.clientX, upEv.clientY);
+      const nx = Math.round(pt ? pt.x : entry.root.position.x);
+      const ny = Math.round(pt ? pt.y : entry.root.position.y);
+      entry.poi.x = nx;
+      entry.poi.y = ny;
+      await this.controller?.updatePOI?.(entry.poi.id, { x: nx, y: ny });
+    };
+
+    const cleanup = () => {
+      entry.dragging = false;
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onUp, true);
+      if (this._dragState?.cleanup === cleanup) this._dragState = null;
+      this._layoutDirty = true;
+      this.updateViewport();
+    };
+
+    this._dragState = { entry, cleanup };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true);
+  }
+
+  _cancelDrag() {
+    if (this._dragState) {
+      this._dragState.cleanup();
+      this._dragState = null;
+    }
+  }
+
+  _closeContextMenu() {
+    if (this._contextMenuEl) {
+      this._contextMenuEl.remove();
+      this._contextMenuEl = null;
+    }
+    if (this._contextMenuDismiss) {
+      window.removeEventListener("pointerdown", this._contextMenuDismiss, true);
+      window.removeEventListener("wheel", this._contextMenuDismiss, true);
+      window.removeEventListener("keydown", this._contextMenuKey, true);
+      this._contextMenuDismiss = null;
+      this._contextMenuKey = null;
+    }
+  }
+
+  _openContextMenu(entry, ev) {
+    this._closeContextMenu();
+    const poi = entry.poi;
+    const isGM = Boolean(game.user?.isGM);
+    const items = [];
+
+    items.push({
+      id: "fly",
+      icon: "fa-crosshairs",
+      label: loc("BOUNDLESS.Config.PoiFly", "Перелететь"),
+      run: () => this.flyTo(poi)
+    });
+
+    if (poi.journalUuid) {
+      items.push({
+        id: "journal",
+        icon: "fa-book-open",
+        label: loc("BOUNDLESS.Config.PoiOpenJournal", "Открыть журнал"),
+        run: () => this._openLinkedJournal(poi.journalUuid)
+      });
+    }
+
+    if (isGM && !poi._virtualSub) {
+      items.push({ divider: true });
+      items.push({
+        id: "edit",
+        icon: "fa-pen-to-square",
+        label: loc("BOUNDLESS.Config.PoiEdit", "Редактировать"),
+        run: () => openPoiEditorDialog(this.controller, canvas.scene, poi)
+      });
+      items.push({
+        id: "toggleHidden",
+        icon: poi.hidden ? "fa-eye" : "fa-eye-slash",
+        label: poi.hidden
+          ? loc("BOUNDLESS.Config.PoiShowPlayers", "Показать игрокам")
+          : loc("BOUNDLESS.Config.PoiHidePlayers", "Скрыть от игроков"),
+        run: () => this.controller?.updatePOI?.(poi.id, { hidden: !poi.hidden })
+      });
+      items.push({
+        id: "delete",
+        icon: "fa-trash",
+        danger: true,
+        label: loc("BOUNDLESS.Config.PoiDelete", "Удалить"),
+        run: () => this.controller?.removePOI?.(poi.id)
+      });
+    }
+
+    const menu = document.createElement("div");
+    menu.className = "boundless-poi-menu";
+    menu.innerHTML = `
+      <div class="boundless-poi-menu-header">${escapeHtml(poi.name || "")}</div>
+      ${items.map(it => it.divider
+        ? `<div class="boundless-poi-menu-divider"></div>`
+        : `<button type="button" class="boundless-poi-menu-item${it.danger ? " is-danger" : ""}" data-act="${escapeHtml(it.id)}">
+             <i class="fa-solid ${escapeHtml(it.icon)}"></i>
+             <span>${escapeHtml(it.label)}</span>
+           </button>`
+      ).join("")}
+    `;
+
+    document.body.appendChild(menu);
+    const clientX = ev.clientX ?? ev.data?.originalEvent?.clientX ?? (window.innerWidth * 0.5);
+    const clientY = ev.clientY ?? ev.data?.originalEvent?.clientY ?? (window.innerHeight * 0.5);
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, clientX + 4));
+    const top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, clientY + 4));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    menu.addEventListener("click", (clickEv) => {
+      const btn = clickEv.target.closest("button[data-act]");
+      if (!btn) return;
+      clickEv.stopPropagation();
+      const item = items.find(i => i.id === btn.dataset.act);
+      this._closeContextMenu();
+      item?.run?.();
+    });
+
+    this._contextMenuEl = menu;
+    this._contextMenuDismiss = (downEv) => {
+      if (menu.contains(downEv.target)) return;
+      this._closeContextMenu();
+    };
+    this._contextMenuKey = (keyEv) => {
+      if (keyEv.code === "Escape") this._closeContextMenu();
+    };
+    setTimeout(() => {
+      if (this._contextMenuEl !== menu) return;
+      window.addEventListener("pointerdown", this._contextMenuDismiss, true);
+      window.addEventListener("wheel", this._contextMenuDismiss, true);
+      window.addEventListener("keydown", this._contextMenuKey, true);
+    }, 0);
+  }
+
+  setPlacementActive(active) {
+    const next = Boolean(active && game.user?.isGM && this.controller?.active);
+    if (next === this.placementActive) return;
+    this.placementActive = next;
+    const view = canvas.app?.view || canvas.app?.canvas;
+
+    if (next) {
+      if (view) view.style.cursor = "crosshair";
+      this._showPlacementHint(true);
+
+      const onPointerDown = (ev) => {
+        if (!this.placementActive || ev.button !== 0) return;
+        if (ev.target !== view) return;
+        // Ignore clicks on existing pins (handled by PIXI pin pointerdown for dragging)
+        const rect = view.getBoundingClientRect();
+        const sx = ev.clientX - rect.left;
+        const sy = ev.clientY - rect.top;
+        const worldPt = canvas.stage.toLocal(new PIXI.Point(sx, sy));
+        for (const p of this.pins) {
+          if (!p.root.visible) continue;
+          const wt = canvas.stage.worldTransform;
+          const px = wt.a * p.poi.x + wt.tx;
+          const py = wt.d * p.poi.y + wt.ty;
+          const hb = p.root.hitArea;
+          if (hb && sx >= px + hb.x && sx <= px + hb.x + hb.width && sy >= py + hb.y && sy <= py + hb.y + hb.height) {
+            return;
+          }
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+        openPoiEditorDialog(this.controller, canvas.scene, {
+          x: Math.round(worldPt.x),
+          y: Math.round(worldPt.y),
+          levelId: canvas.level?.id || null
+        });
+      };
+
+      const onKeyDown = (ev) => {
+        if (ev.code === "Escape" && this.placementActive) {
+          this.setPlacementActive(false);
+          ui.controls?.render?.();
+        }
+      };
+
+      view?.addEventListener("pointerdown", onPointerDown, true);
+      window.addEventListener("keydown", onKeyDown, true);
+      this._placementListeners = { onPointerDown, onKeyDown, view };
+    } else {
+      if (this._placementListeners) {
+        this._placementListeners.view?.removeEventListener("pointerdown", this._placementListeners.onPointerDown, true);
+        window.removeEventListener("keydown", this._placementListeners.onKeyDown, true);
+        if (this._placementListeners.view && this._placementListeners.view.style.cursor === "crosshair") {
+          this._placementListeners.view.style.cursor = "";
+        }
+        this._placementListeners = null;
+      }
+      this._showPlacementHint(false);
+    }
+
+    this._layoutDirty = true;
+    this.updateViewport();
+  }
+
+  _showPlacementHint(show) {
+    if (!show) {
+      this._placementHintEl?.remove();
+      this._placementHintEl = null;
+      return;
+    }
+    if (this._placementHintEl) return;
+    const el = document.createElement("div");
+    el.className = "boundless-tool-hint";
+    el.innerHTML = `<i class="fa-solid fa-map-pin"></i><span>${escapeHtml(loc("BOUNDLESS.PoiToolHint", "Режим меток: ЛКМ по карте — создать, перетащить метку — переместить, ПКМ — меню, Esc — выход."))}</span>`;
+    document.body.appendChild(el);
+    this._placementHintEl = el;
   }
 
   _applyPinTransform(entry, stageScale) {
     const inv = 1 / Math.max(stageScale, 0.0005);
-    const hoverBoost = entry.hovered ? 1.08 : 1.0;
-    entry.root.scale.set(inv * hoverBoost);
+    const boost = entry.dragging ? 1.12 : (entry.hovered ? 1.07 : 1.0);
+    entry.root.scale.set(inv * boost);
   }
 
   updateScale(stageScale) {
-    if (!this.container || !this.enabled || !this.pins.length) return;
-    if (Math.abs(stageScale - this.lastScale) < 0.00005) return;
-    this.lastScale = stageScale;
+    this.updateViewport(null, stageScale);
+  }
 
-    // Fade in smoothly as camera zooms out below POI_FADE_START_SCALE (0.16 -> 0.07)
-    const globalAlpha = smoothstep(POI_FADE_START_SCALE, POI_FADE_FULL_SCALE, stageScale);
-    if (globalAlpha <= 0.01) {
-      this.container.visible = false;
+  /**
+   * Scale pins inversely to zoom, apply 3-tier hierarchical zoom visibility (major -> minor -> detail),
+   * lazy-spawn superGrid province sub-pins, and run fast O(N log N) screen-space decluttering.
+   */
+  updateViewport(_vp = null, overrideScale = null) {
+    if (!this.container || !this.enabled || !canvas?.stage) return;
+    if (!this.pins.length && !this._superGridInfo) return;
+
+    const stageScale = overrideScale ?? (canvas.stage.scale?.x || 1);
+    const pivot = canvas.stage.pivot;
+    const px = pivot?.x || 0;
+    const py = pivot?.y || 0;
+
+    if (
+      !this._layoutDirty &&
+      Math.abs(stageScale - this.lastScale) < 0.00005 &&
+      Math.abs(px - this.lastPivotX) < 1 &&
+      Math.abs(py - this.lastPivotY) < 1
+    ) {
       return;
     }
+    this.lastScale = stageScale;
+    this.lastPivotX = px;
+    this.lastPivotY = py;
+    this._layoutDirty = false;
 
-    this.container.visible = true;
-    for (const entry of this.pins) {
+    const wt = canvas.stage.worldTransform;
+    const [sw = window.innerWidth, sh = window.innerHeight] = canvas.screenDimensions || [];
+
+    // Lazily populate sub-location pins for visible superGrid provinces when descending
+    if (this._superGridInfo) {
+      this._syncSuperGridSubPins(stageScale, wt, sw, sh);
+    }
+
+    // Collect base pins + active superGrid sub-pins
+    const allEntries = this._superGridSubProvinces.size > 0
+      ? [...this.pins, ...Array.from(this._superGridSubProvinces.values()).flatMap(b => b.entries)]
+      : this.pins;
+
+    // 1. Project pins to screen space, evaluate per-tier zoom visibility & cull offscreen
+    const onScreen = [];
+    for (const entry of allEntries) {
       const poi = entry.poi;
-      // Minor pins fade out slightly earlier on extreme zoom-out (<0.02) so major landmarks stay readable
-      let a = globalAlpha;
-      if (!entry.isMajor && stageScale < 0.025) {
-        a *= smoothstep(0.012, 0.025, stageScale);
-      }
-      if (poi.hidden) a *= 0.8;
-      if (a <= 0.01) {
+      const sx = wt.a * poi.x + wt.tx;
+      const sy = wt.d * poi.y + wt.ty;
+      if (!entry.dragging && (sx < -240 || sx > sw + 240 || sy < -180 || sy > sh + 180)) {
         entry.root.visible = false;
         continue;
       }
-      entry.root.visible = true;
-      entry.root.alpha = a;
-      this._applyPinTransform(entry, stageScale);
+
+      let a = this.placementActive ? 0.96 : computePoiTierAlpha(poi, stageScale);
+      if (!this.placementActive && poi._isSecondaryProvince && stageScale < 0.020) {
+        a *= smoothstep(0.009, 0.020, stageScale);
+      }
+      if (poi.hidden) a *= 0.85;
+      if (a <= 0.01 && !entry.hovered && !entry.dragging) {
+        entry.root.visible = false;
+        continue;
+      }
+      onScreen.push({ entry, sx, sy, alpha: Math.max(0.05, a) });
+    }
+
+    if (onScreen.length === 0) {
+      this.container.visible = false;
+      return;
+    }
+    this.container.visible = true;
+
+    // 2. Priority sort: dragged/hovered -> active tier (higher alpha wins during crossfade) -> major > minor > detail -> index
+    const tierWeight = (e) => (e.isMajor ? 3 : (e.isDetail ? 1 : 2));
+    onScreen.sort((a, b) => {
+      const pa = (a.entry.dragging ? 8 : 0) + (a.entry.hovered ? 4 : 0);
+      const pb = (b.entry.dragging ? 8 : 0) + (b.entry.hovered ? 4 : 0);
+      if (pa !== pb) return pb - pa;
+      // When zoomed in past major overview (>0.10x), give sub-locations priority over fading major labels
+      if (stageScale > 0.10) {
+        if (Math.abs(b.alpha - a.alpha) > 0.18) return b.alpha - a.alpha;
+      }
+      const twDiff = tierWeight(b.entry) - tierWeight(a.entry);
+      if (twDiff !== 0) return twDiff;
+      return a.entry.orderIndex - b.entry.orderIndex;
+    });
+
+    // 3. Screen-space greedy decluttering: full pill -> compact medal -> hidden
+    const occupiedFull = [];
+    const occupiedMedals = [];
+    const margin = 6;
+
+    for (const item of onScreen) {
+      const { entry, sx, sy, alpha } = item;
+      const fullRect = {
+        x0: sx - entry.boxW * 0.5,
+        y0: sy + entry.fullTopY,
+        x1: sx + entry.boxW * 0.5,
+        y1: sy + 6
+      };
+      const medalRect = {
+        x0: sx - entry.medalR,
+        y0: sy + entry.medalY - entry.medalR,
+        x1: sx + entry.medalR,
+        y1: sy + 6
+      };
+
+      if (entry.hovered || entry.dragging) {
+        entry.mode = "full";
+        entry.root.visible = true;
+        entry.root.alpha = 1;
+        entry.pillGroup.visible = true;
+        entry.root.hitArea = entry.hitFull;
+        this._applyPinTransform(entry, stageScale);
+        occupiedFull.push(fullRect);
+        occupiedMedals.push(medalRect);
+        continue;
+      }
+
+      const blocksFull = occupiedFull.some(r => rectsOverlap(fullRect, r, margin))
+        || occupiedMedals.some(r => rectsOverlap(fullRect, r, 3));
+
+      if (!blocksFull) {
+        entry.mode = "full";
+        entry.root.visible = true;
+        entry.root.alpha = alpha;
+        entry.pillGroup.visible = true;
+        entry.root.hitArea = entry.hitFull;
+        this._applyPinTransform(entry, stageScale);
+        occupiedFull.push(fullRect);
+        occupiedMedals.push(medalRect);
+        continue;
+      }
+
+      const blocksMedal = occupiedMedals.some(r => rectsOverlap(medalRect, r, 4));
+      if (!blocksMedal || this.placementActive) {
+        entry.mode = "compact";
+        entry.root.visible = true;
+        entry.root.alpha = alpha * 0.92;
+        entry.pillGroup.visible = false;
+        entry.root.hitArea = entry.hitCompact;
+        this._applyPinTransform(entry, stageScale);
+        occupiedMedals.push(medalRect);
+        continue;
+      }
+
+      entry.mode = "hidden";
+      entry.root.visible = false;
     }
   }
 
@@ -351,15 +1423,28 @@ export class PoiManager {
     const activeMinScale = canvas.dimensions?.scale?.min ?? worldMinScale;
     const maxScale = canvas.dimensions?.scale?.max ?? 2.5;
 
-    const rawTargetScale = options.scale ?? poi.targetScale ?? 0.45;
+    const x0 = canvas.stage.pivot.x;
+    const y0 = canvas.stage.pivot.y;
+    const scale0 = canvas.stage.scale.x || 1;
+
+    const tierKey = normalizePoiKind(poi.kind);
+    const tierDefaultScale = POI_TIER_DEFAULTS[tierKey].defaultTargetScale;
+    let rawTargetScale = options.scale ?? poi.targetScale ?? poi.scale ?? tierDefaultScale;
+
+    // Multi-step drill-down: if clicking a major/minor overview pin we are already hovering near at its landing scale,
+    // glide one step deeper into the location!
+    if (options.scale === undefined && tierKey !== "detail") {
+      const dist = Math.hypot((poi.x ?? 0) - x0, (poi.y ?? 0) - y0);
+      if (dist < 4200 && scale0 >= rawTargetScale * 0.82 && scale0 < 0.55) {
+        rawTargetScale = Math.min(0.68, Math.max(scale0 * 2.4, rawTargetScale * 2.8));
+      }
+    }
+
     const clampedTargetScale = Math.max(activeMinScale, Math.min(maxScale, rawTargetScale));
     const constrained = canvas._constrainView
       ? canvas._constrainView({ x: poi.x, y: poi.y, scale: clampedTargetScale })
       : { x: poi.x, y: poi.y, scale: clampedTargetScale };
 
-    const x0 = canvas.stage.pivot.x;
-    const y0 = canvas.stage.pivot.y;
-    const scale0 = canvas.stage.scale.x || 1;
     const x1 = constrained.x;
     const y1 = constrained.y;
     const scale1 = constrained.scale;
@@ -368,9 +1453,13 @@ export class PoiManager {
       return false;
     }
 
+    if (options.instant) {
+      canvas.pan({ x: x1, y: y1, scale: scale1 });
+      return true;
+    }
+
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
     const viewportSize = Math.hypot(sw, sh) * 0.65;
-    // Allow parabolic arc to soar above tokenMinScale during flight; restored cleanly on landing/cancel
     const flightMinScale = Math.min(activeMinScale, worldMinScale);
 
     const path = buildFlightPath({
@@ -475,7 +1564,12 @@ export class PoiManager {
   }
 
   unmount() {
+    this.setPlacementActive(false);
+    this._closeContextMenu();
+    this._cancelDrag();
     this.cancelFlight();
+    this._clearSuperGridSubPins();
+    this._superGridInfo = null;
     if (this.container) {
       this.container.parent?.removeChild(this.container);
       this.container.destroy({ children: true });
@@ -483,5 +1577,29 @@ export class PoiManager {
     }
     this.pins = [];
     this.lastScale = -1;
+    this.lastPivotX = NaN;
+    this.lastPivotY = NaN;
+    this._layoutDirty = true;
   }
+}
+
+export function registerPoiControls(controller) {
+  Hooks.on("getSceneControlButtons", (controls) => {
+    const notes = controls?.notes;
+    if (!notes?.tools) return;
+
+    const poiMgr = controller.poiManager;
+    notes.tools.boundlessPoiTool = {
+      name: "boundlessPoiTool",
+      order: 6.5,
+      title: "BOUNDLESS.PoiTool",
+      icon: "fa-solid fa-map-pin",
+      toggle: true,
+      active: Boolean(poiMgr?.placementActive),
+      visible: Boolean(game.user?.isGM && controller.active && poiMgr?.enabled),
+      onChange: (_event, active) => {
+        poiMgr?.setPlacementActive(Boolean(active));
+      }
+    };
+  });
 }

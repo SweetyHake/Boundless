@@ -1,4 +1,5 @@
-import { PoiManager } from "./poi.mjs";
+import { PoiManager, registerPoiControls } from "./poi.mjs";
+import { CharacterPinManager } from "./character-pins.mjs";
 import { ChunkedFogManager, registerFogControls } from "./chunked-fog.mjs";
 import { MacroAtmosphereLayer } from "./macro-atmosphere.mjs";
 import { MegaAudioStreamer } from "./audio-streamer.mjs";
@@ -8,6 +9,7 @@ import { TokenStreamer, installLazyTokenLayerPatch } from "./token-streamer.mjs"
 import { ChunkStreamer } from "./chunk-streamer.mjs";
 import { TileWorkerPool, isWorkerDecodableUrl } from "./tile-worker-pool.mjs";
 import { registerConfigUI } from "./config-ui.mjs";
+import { bakeSceneToBoundless } from "./scene-baker.mjs";
 
 const MODULE_ID = "boundless";
 const SOCKET_NAME = `module.${MODULE_ID}`;
@@ -19,6 +21,47 @@ const FOUNDRY_DEFAULT_ATTENUATION = 0.277992; // Exact Foundry v14 computedAtten
 const WORLD_MIN_SCALE = 0.008;        // Seamless full-world zoom-out
 const CAMERA_STORAGE_PREFIX = "boundless.camera";
 const CAMERA_SAVE_DEBOUNCE_MS = 250;
+const SHOWSTOPPER_ID = "showstopper";
+const SUPPORT_SOLE_KERNEL = [
+  [0, 0, 4],
+  [-0.7, -0.7, 1.5],
+  [0.7, -0.7, 1.5],
+  [0.7, 0.7, 1.5],
+  [-0.7, 0.7, 1.5]
+];
+
+function getShowstopperMovementApi() {
+  try {
+    const mod = globalThis.game?.modules?.get?.(SHOWSTOPPER_ID);
+    if (mod && !mod.active) return null;
+    return mod?.api?.tokenMovement
+      || globalThis.showstopper?.tokenMovement
+      || globalThis.showstopper?.api?.tokenMovement
+      || null;
+  } catch {
+    return null;
+  }
+}
+
+function meshContainsPointPixelSafe(mesh, x, y, alphaThreshold = 0.25) {
+  if (!mesh || mesh.destroyed) return false;
+  if (typeof mesh.containsPixel === "function") {
+    try {
+      return Boolean(mesh.containsPixel(x, y, alphaThreshold));
+    } catch {}
+  }
+  const b = mesh.canvasBounds;
+  if (b) {
+    const minX = Number.isFinite(b.x) ? b.x : b.minX;
+    const minY = Number.isFinite(b.y) ? b.y : b.minY;
+    const maxX = Number.isFinite(b.x) && Number.isFinite(b.width) ? (b.x + b.width) : b.maxX;
+    const maxY = Number.isFinite(b.y) && Number.isFinite(b.height) ? (b.y + b.height) : b.maxY;
+    if (Number.isFinite(minX) && Number.isFinite(maxX)) {
+      return x >= minX && x <= maxX && y >= minY && y <= maxY;
+    }
+  }
+  return false;
+}
 
 function smoothstep(edge0, edge1, x) {
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
@@ -92,6 +135,7 @@ varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
+varying float vIsMacro;
 
 void main() {
   if (aWeight <= 0.001 || aParams.x <= 0.0) {
@@ -135,6 +179,7 @@ void main() {
   vWeight = aWeight;
   vDepthElev = aDepthElev;
   vDimPx = aParams.x;
+  vIsMacro = aParams.w < -1.5 ? 1.0 : 0.0;
 
   gl_Position = vec4((projectionMatrix * tPos).xy, 0.0, 1.0);
 }
@@ -170,6 +215,7 @@ varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
+varying float vIsMacro;
 
 vec3 switchColor(vec3 innerColor, vec3 outerColor, float dist, float ratio, float att) {
   float attStr = att * 0.7;
@@ -190,7 +236,7 @@ void main() {
               * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
     if (depthMask <= 0.001) discard;
   }
-  if (uUseBakedRoofMask && vDimPx < 5000.0) {
+  if (uUseBakedRoofMask && vIsMacro < 0.5) {
     vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
@@ -215,9 +261,16 @@ void main() {
     dimCol = vWeight >= 0.999 ? uStaticDim : mix(bg, brightCol, uWeights.z);
   }
 
-  vec3 finalCol = switchColor(brightCol, dimCol, dist, vRatio, uAttenuation);
-  float edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
-  vec3 outCol = mix(bg, finalCol, edgeFade);
+  vec3 outCol;
+  if (vIsMacro > 0.5) {
+    // Soft Gaussian orbital settlement glow (never a harsh spotlight disc over forests/lakes)
+    float macroFalloff = exp(-3.6 * dist * dist) * smoothstep(1.0, 0.72, dist);
+    outCol = mix(bg, dimCol, macroFalloff * 0.65 * vWeight);
+  } else {
+    vec3 finalCol = switchColor(brightCol, dimCol, dist, vRatio, uAttenuation);
+    float edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
+    outCol = mix(bg, finalCol, edgeFade);
+  }
 
   gl_FragColor = vec4(outCol, 1.0);
 }
@@ -247,6 +300,7 @@ varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
+varying float vIsMacro;
 
 const vec3 BT709 = vec3(0.2126, 0.7152, 0.0722);
 float perceivedBrightness(vec3 c) { return sqrt(dot(BT709, c * c)); }
@@ -263,7 +317,7 @@ void main() {
               * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
     if (depthMask <= 0.001) discard;
   }
-  if (uUseBakedRoofMask && vDimPx < 5000.0) {
+  if (uUseBakedRoofMask && vIsMacro < 0.5) {
     vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
@@ -279,7 +333,12 @@ void main() {
   // Gently prevent dark roofs from completely eating distant city glow on extreme macro zoom (<0.14)
   reflection = mix(reflection, max(reflection, 0.38), uMacroLift);
 
-  float edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
+  float edgeFade;
+  if (vIsMacro > 0.5) {
+    edgeFade = exp(-3.6 * dist * dist) * smoothstep(1.0, 0.72, dist) * 0.55;
+  } else {
+    edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
+  }
   vec3 outCol = vColor * vColorAlpha * reflection * edgeFade;
 
   gl_FragColor = vec4(outCol, 1.0);
@@ -406,9 +465,9 @@ class MegaLightBatch {
     for (let i = 0; i < macroLightsList.length; i++) {
       const m = macroLightsList[i];
       if (!m || m.length < 3) continue;
-      const lx = m[0], ly = m[1], rad = m[2];
+      const lx = m[0], ly = m[1], rad = m[2] * 0.68;
       const colorHex = m[3] || "#ffaa44";
-      const alpha = m[4] ?? 0.45;
+      const alpha = Math.min(0.45, (m[4] ?? 0.45) * 0.55);
       let r = 1, g = 0.72, b = 0.35;
       if (colorHex) {
         const c = foundry.utils.Color.from(colorHex);
@@ -422,7 +481,7 @@ class MegaLightBatch {
       for (const [ox, oy] of corners) {
         centers.push(lx, ly);
         offsets.push(ox, oy);
-        params.push(rad, 0.35, alpha, -1.0);
+        params.push(rad, 0.0, alpha, -2.0);
         colors.push(r, g, b);
       }
       indices.push(v0, v1, v2, v0, v2, v3);
@@ -1653,16 +1712,15 @@ class MegaLightBatch {
   _updateMacroCrossfade(scale) {
     const mb = this.macroBatch;
     if (!mb) return;
-    const showMacro = scale < 0.07;
+    const showMacro = scale < 0.036;
     if (!showMacro) {
       mb.illumMesh.visible = false;
       mb.colorMesh.visible = false;
       return;
     }
-    // Smoothly fade macro orbital glow out across [0.035..0.068] when detailed chunks are mounted
-    // so macroBatch and chunkBatches never double-brighten via SCREEN blending.
+    // Smoothly fade orbital glow out across [0.018..0.035] once detailed chunks are mounted
     const targetAlpha = this.chunkBatches.size > 0
-      ? (1.0 - smoothstep(0.035, 0.068, scale))
+      ? (1.0 - smoothstep(0.018, 0.035, scale))
       : 1.0;
     if (Math.abs(targetAlpha - mb.lastAlpha) > 0.015) {
       mb.lastAlpha = targetAlpha;
@@ -1708,7 +1766,7 @@ class MegaLightBatch {
 
     // 2. Streamed per-chunk detailed shadowed light batches (active when zoomed below orbital scale)
     if (this.chunkBatches.size > 0) {
-      const showDetail = !this.macroBatch || vp.scale >= 0.035;
+      const showDetail = !this.macroBatch || vp.scale >= 0.020;
       for (const batch of this.chunkBatches.values()) {
         this._cullBatch(batch, x0, y0, x1, y1, showDetail);
       }
@@ -1939,7 +1997,7 @@ class MegaLightBatch {
       if (this.illumMesh) this.illumMesh.visible = hasVisible;
       if (this.colorMesh) this.colorMesh.visible = hasVisible;
     }
-    const showDetail = !this.macroBatch || !this._lastVp || this._lastVp.scale >= 0.035;
+    const showDetail = !this.macroBatch || !this._lastVp || this._lastVp.scale >= 0.020;
     for (const batch of this.chunkBatches.values()) {
       if (!batch.weightsDirty || !batch.weightBuffer) continue;
       batch.weightBuffer.update();
@@ -2262,10 +2320,11 @@ class LRUTextureManager {
     }
   }
 
-  clear() {
+  clear(includePinned = false) {
     this.workerPool.cancelAll();
+    if (includePinned) this.pinned.clear();
     for (const [src] of Array.from(this.lru.entries())) {
-      if (!this.pinned.has(src)) this._disposeEntry(src);
+      if (includePinned || !this.pinned.has(src)) this._disposeEntry(src);
     }
     this.promises.clear();
   }
@@ -2337,8 +2396,9 @@ class MegaWorld1000 {
   _origIfVoidEnabled = null;
   _hiddenNativeLevelBg = new Map(); // levelId -> PrimarySpriteMesh
 
-  // Subsystems: POI fast-travel pins, high-res chunked Fog of War, spatial ambient audio, door socket sync
+  // Subsystems: POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, spatial ambient audio, door socket sync
   poiManager = new PoiManager(this);
+  charPins = new CharacterPinManager(this);
   fogManager = new ChunkedFogManager();
   atmosphere = new MacroAtmosphereLayer();
   audioStreamer = new MegaAudioStreamer();
@@ -2434,7 +2494,7 @@ class MegaWorld1000 {
       for (const z of levelsToWarm) {
         if (urls.length >= maxBudget) break;
         const nTiles = this._getPyramidGridSize(layer, z);
-        const tileWorldSize = bounds.w / nTiles;
+        const tileWorldSize = this._getPyramidTileSize(layer, z);
         const padFactor = z === destZ ? 0.9 : 0.4;
         const bx0 = Math.max(bounds.x, worldX - halfW * padFactor);
         const by0 = Math.max(bounds.y, worldY - halfH * padFactor);
@@ -2444,8 +2504,8 @@ class MegaWorld1000 {
 
         const tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
         const ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-        const tx1 = Math.min(nTiles - 1, Math.floor((bx1 - bounds.x) / tileWorldSize));
-        const ty1 = Math.min(nTiles - 1, Math.floor((by1 - bounds.y) / tileWorldSize));
+        const tx1 = Math.min(nTiles - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+        const ty1 = Math.min(nTiles - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
 
         for (let ty = ty0; ty <= ty1 && urls.length < maxBudget; ty++) {
           for (let tx = tx0; tx <= tx1 && urls.length < maxBudget; tx++) {
@@ -2519,6 +2579,11 @@ class MegaWorld1000 {
       return (sg.cols || 6) * (1 << (z - (macroMaxZ + 1)));
     }
     return 1 << z;
+  }
+
+  _getPyramidTileSize(layer, z) {
+    const span = Math.max(layer.bounds?.w || layer.worldPx || 100000, layer.bounds?.h || layer.worldPx || 100000);
+    return span / this._getPyramidGridSize(layer, z);
   }
 
   _computeTargetZ(layer, scale) {
@@ -2977,8 +3042,9 @@ class MegaWorld1000 {
     // Restore persisted door states from scene flags before mounting bubbles & door icons
     this._restoreDoorStates(scene);
 
-    // Mount POI fast-travel pins, high-res chunked Fog of War, macro atmosphere, native wall/door/layer editors, token virtualization streamer, and spatial ambient audio
+    // Mount POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, macro atmosphere, native wall/door/layer editors, token virtualization streamer, and spatial ambient audio
     this.poiManager.mount(scene, this.manifest);
+    this.charPins.mount(scene);
     this.fogManager.mount(scene);
     this.atmosphere.mount(scene);
     this.wallEditor.mount();
@@ -2999,11 +3065,13 @@ class MegaWorld1000 {
   acquireMesh() {
     if (this.meshPool.length > 0) {
       const m = this.meshPool.pop();
+      m.name = null;
       m.visible = true;
       m.angle = 0;
       m.tint = 0xffffff;
       m.textureAlphaThreshold = 0.75;
       m._occludedBySameElevationSurfaces = true;
+      m._ssDofBlurPx = 0;
       return m;
     }
     const PrimarySpriteMesh = foundry.canvas.primary.PrimarySpriteMesh;
@@ -3016,12 +3084,79 @@ class MegaWorld1000 {
 
   retireMesh(m) {
     if (!m) return;
+    // Clear any Showstopper Depth-of-Field filter state before pooling so reused meshes never inherit stale blur
+    m.name = null;
+    m._ssDofBlurPx = 0;
+    if (m._ssDofBlurFilter) {
+      if (Array.isArray(m.filters)) {
+        const next = m.filters.filter(f => f !== m._ssDofBlurFilter);
+        m.filters = next.length > 0 ? next : null;
+      }
+    }
+    if (m._ssSetFilterArea) {
+      m.filterArea = null;
+      m._ssSetFilterArea = false;
+    }
     m.parent?.removeChild(m);
     if (this.meshPool.length < 360) {
       this.meshPool.push(m);
     } else {
       m.destroy();
     }
+  }
+
+  /**
+   * Apply Showstopper elevation Depth-of-Field blur immediately to a newly streamed mesh
+   * and queue a coalesced perspective sync so meshes streamed mid-flight match the focal plane on frame 1.
+   */
+  _syncShowstopperMeshDof(m) {
+    if (!m || m.destroyed) return;
+    const ssApi = getShowstopperMovementApi();
+    if (!ssApi) return;
+    try {
+      if (!ssApi.getTokenMovementSetting?.("vertical") || !ssApi.getTokenMovementSetting?.("verticalBlur")) return;
+      const baseElev = Number.isFinite(Number(canvas?.level?.elevation?.base))
+        ? Number(canvas.level.elevation.base)
+        : (Number(canvas?.level?.elevation?.bottom) || 0);
+      const obsElev = Number(ssApi.getObserverElevation?.());
+      if (!Number.isFinite(obsElev) || Math.abs(obsElev - baseElev) <= 0.05) return;
+      if (typeof ssApi.computeElevationPerspective === "function") {
+        const grid = canvas?.grid?.size ?? 100;
+        const sceneDist = Number(canvas?.scene?.grid?.distance ?? canvas?.grid?.distance) || 5;
+        const obsPersp = ssApi.computeElevationPerspective(obsElev, obsElev, {
+          gridSize: grid, gridDistance: sceneDist, tokenSize: grid, hoverBlend: 1, baseElevation: baseElev
+        });
+        const mElev = Number.isFinite(Number(m.elevation)) ? Number(m.elevation) : baseElev;
+        const mPersp = ssApi.computeElevationPerspective(mElev, obsElev, {
+          gridSize: grid, gridDistance: sceneDist, tokenSize: grid, hoverBlend: 0, baseElevation: baseElev
+        });
+        const blurPx = (Number(mPersp?.dofBlurPx) || 0) * (Number(obsPersp?.cameraOcclusionAlpha) ?? 1);
+        m._ssDofBlurPx = blurPx > 0.22 ? blurPx : 0;
+      }
+      this._scheduleShowstopperDofSync();
+    } catch {}
+  }
+
+  _scheduleShowstopperDofSync() {
+    if (this._ssDofSyncQueued) return;
+    const ssApi = getShowstopperMovementApi();
+    if (!ssApi?.syncElevationPerspective) return;
+    this._ssDofSyncQueued = true;
+    queueMicrotask(() => {
+      this._ssDofSyncQueued = false;
+      if (!this.active || !canvas?.ready) return;
+      try {
+        ssApi.syncElevationPerspective({ immediate: true });
+      } catch {}
+    });
+  }
+
+  invalidateShowstopperSurfaces() {
+    const ssApi = getShowstopperMovementApi();
+    if (!ssApi?.invalidateSupportingSurfaces) return;
+    try {
+      ssApi.invalidateSupportingSurfaces();
+    } catch {}
   }
 
   resolvePyramidTile(layer, z, x, y) {
@@ -3133,7 +3268,8 @@ class MegaWorld1000 {
     this.chunkStreamer.update(vp);
     this.lightBatch.updateViewport(vp);
     this._optimizeEffectsLayers(canvas.effects);
-    this.poiManager.updateScale(vp.scale);
+    this.poiManager.updateViewport(vp);
+    this.charPins.updateViewport();
     this.atmosphere.updateScale(vp.scale);
     this.fogManager.updateViewportCulling(vp);
     // Keep token frustum culling & GPU Impostor Atlas synced even during camera flight (<0.05ms)
@@ -3169,11 +3305,11 @@ class MegaWorld1000 {
         let tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;
         if (targetZ > 0 && overlapsBounds) {
           const nTiles = this._getPyramidGridSize(layer, targetZ);
-          const tileWorldSize = bounds.w / nTiles;
+          const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
           tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
           ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-          tx1 = Math.min(nTiles - 1, Math.floor((bx1 - bounds.x) / tileWorldSize));
-          ty1 = Math.min(nTiles - 1, Math.floor((by1 - bounds.y) / tileWorldSize));
+          tx1 = Math.min(nTiles - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+          ty1 = Math.min(nTiles - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
         }
 
         const pyrKey = `${overlapsBounds ? 1 : 0}_${targetZ}_${tx0}_${ty0}_${tx1}_${ty1}`;
@@ -3259,7 +3395,7 @@ class MegaWorld1000 {
 
   ensureTile(layer, spec, instant = false) {
     const { bounds } = layer;
-    const sizePx = bounds.w / this._getPyramidGridSize(layer, spec.z);
+    const sizePx = this._getPyramidTileSize(layer, spec.z);
     const x0 = bounds.x + spec.x * sizePx;
     const y0 = bounds.y + spec.y * sizePx;
 
@@ -3305,6 +3441,7 @@ class MegaWorld1000 {
     const levelElev = layer.level.elevation?.bottom ?? 0;
 
     const m = this.acquireMesh();
+    m.name = `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
     m.anchor.set(0, 0);
     m.texture = tex;
     m.tint = e.tint ?? 0xffffff;
@@ -3336,6 +3473,7 @@ class MegaWorld1000 {
     e.ready = true;
     canvas.primary.addChild(m);
     m.updateCanvasTransform?.();
+    this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
     this._depthDirty = true;
@@ -3427,6 +3565,7 @@ class MegaWorld1000 {
       const cur = this.activeOverlays.get(fullId);
       if (!this.active || !cur || cur.wallsMesh || !tWalls) return;
       const wallsMesh = this.acquireMesh();
+      wallsMesh.name = `Tile.BoundlessWalls.${fullId}`;
       wallsMesh.anchor.set(0.5, 0.5);
       wallsMesh.texture = tWalls;
       wallsMesh.tint = ovSpec.tint ?? 0xffffff;
@@ -3448,6 +3587,7 @@ class MegaWorld1000 {
       wallsMesh.visible = localZ >= 6 || revealOnZ5;
       canvas.primary.addChild(wallsMesh);
       wallsMesh.updateCanvasTransform?.();
+      this._syncShowstopperMeshDof(wallsMesh);
       cur.wallsMesh = wallsMesh;
       canvas.primary.sortDirty = true;
       this._tilesDirty = true;
@@ -3488,7 +3628,7 @@ class MegaWorld1000 {
             if (layer.hasPyramid && layer.maxZoomZ >= revealZ && ov.ovSpec) {
               const { bounds } = layer;
               const nTiles = this._getPyramidGridSize(layer, revealZ);
-              const tileWorldSize = bounds.w / nTiles;
+              const tileWorldSize = this._getPyramidTileSize(layer, revealZ);
               const halfW = (ov.ovSpec.w || 0) * 0.55;
               const halfH = (ov.ovSpec.h || 0) * 0.55;
               const tx0 = Math.max(0, Math.floor((ov.ovSpec.cx - halfW - bounds.x) / tileWorldSize));
@@ -3750,34 +3890,31 @@ class MegaWorld1000 {
     const regionH = isSuperGrid ? (targetLayer.spec.superGrid.regionPx || 100000) : (targetLayer.bounds?.h || 100000);
 
     return this._bakeRoofMaskFromList(ovList, {
-      originX, originY, regionW, regionH, repeat: isSuperGrid, sceneId, mountedLevelId
+      originX,
+      originY,
+      regionW,
+      regionH,
+      repeat: isSuperGrid,
+      roofMaskUrl: targetLayer.spec?.roofMaskUrl || null,
+      sceneId,
+      mountedLevelId
     });
   }
 
-  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
+  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofMaskUrl = null, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
     const renderer = canvas?.app?.renderer;
-    if (!renderer || !ovList?.length) return;
+    if (!renderer || (!ovList?.length && !roofMaskUrl)) return;
 
+    const MAX_SPRITE_MASK_URLS = 24;
     const roofUrls = new Set();
-    for (const ov of ovList) {
+    for (const ov of ovList || []) {
       if (ov?.roof && !ov.walls?.includes("anchor_")) roofUrls.add(ov.roof);
     }
-    if (!roofUrls.size) return;
+    if (!roofUrls.size && !roofMaskUrl) return;
 
     const gen = ++this._roofMaskGen;
     this._roofMaskBaking = true;
     try {
-      // Load & pin the small set of unique roof textures (17 files) so both the mask and localZ>=5 roof meshes are instant
-      const urlList = Array.from(roofUrls);
-      const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
-      if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) return;
-
-      const texByUrl = new Map();
-      for (let i = 0; i < urlList.length; i++) {
-        if (loaded[i]) texByUrl.set(urlList[i], loaded[i]);
-      }
-      if (!texByUrl.size) return;
-
       const maxTex = renderer.gl?.getParameter?.(renderer.gl.MAX_TEXTURE_SIZE) || 2048;
       const maskSize = maxTex >= 2048 ? 2048 : 1024;
       const rt = PIXI.RenderTexture.create({
@@ -3789,19 +3926,94 @@ class MegaWorld1000 {
       });
 
       const container = new PIXI.Container();
-      container.scale.set(maskSize / Math.max(1, regionW), maskSize / Math.max(1, regionH));
 
-      for (const ov of ovList) {
-        if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
-        const tex = texByUrl.get(ov.roof);
-        if (!tex) continue;
-        const sp = new PIXI.Sprite(tex);
-        sp.anchor.set(0.5, 0.5);
-        sp.position.set(ov.cx - originX, ov.cy - originY);
-        sp.width = ov.w;
-        sp.height = ov.h;
-        sp.angle = ov.rot || 0;
-        container.addChild(sp);
+      if (roofMaskUrl) {
+        // Prebaked single-file roof alpha mask supplied by exporter (0 per-house texture loads!)
+        const maskTex = await this.texMgr.load(roofMaskUrl, { mipmap: false, isPinned: false });
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+          rt.destroy(true);
+          container.destroy({ children: true });
+          return;
+        }
+        if (maskTex) {
+          const sp = new PIXI.Sprite(maskTex);
+          sp.width = maskSize;
+          sp.height = maskSize;
+          container.addChild(sp);
+        }
+      } else if (roofUrls.size <= MAX_SPRITE_MASK_URLS) {
+        // Small reusable template roof set (e.g. <= 24 shared textures): load & pin for instant pixel-exact mask + z>=5 roofs
+        const urlList = Array.from(roofUrls);
+        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+          rt.destroy(true);
+          container.destroy({ children: true });
+          return;
+        }
+        const texByUrl = new Map();
+        for (let i = 0; i < urlList.length; i++) {
+          if (loaded[i]) texByUrl.set(urlList[i], loaded[i]);
+        }
+        if (!texByUrl.size) {
+          rt.destroy(true);
+          container.destroy({ children: true });
+          return;
+        }
+        container.scale.set(maskSize / Math.max(1, regionW), maskSize / Math.max(1, regionH));
+        for (const ov of ovList) {
+          if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
+          const tex = texByUrl.get(ov.roof);
+          if (!tex) continue;
+          const sp = new PIXI.Sprite(tex);
+          sp.anchor.set(0.5, 0.5);
+          sp.position.set(ov.cx - originX, ov.cy - originY);
+          sp.width = ov.w;
+          sp.height = ov.h;
+          sp.angle = ov.rot || 0;
+          container.addChild(sp);
+        }
+      } else {
+        // Large city with hundreds/thousands of unique roof textures (e.g. Kartograf exports):
+        // NEVER preload or pin all roof textures at once (would blow VRAM!). Bake the macro roof mask
+        // directly from manifest footprint geometry in ~2ms (0 network / 0 extra VRAM); individual roofs
+        // stream strictly per-viewport at localZ >= 5 via syncOverlayMeshes() + LRUTextureManager.
+        const sx = maskSize / Math.max(1, regionW);
+        const sy = maskSize / Math.max(1, regionH);
+        const gfx = new PIXI.Graphics();
+        gfx.beginFill(0xffffff, 1.0);
+        for (const ov of ovList) {
+          if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
+          const poly = Array.isArray(ov.poly) && ov.poly.length >= 6 ? ov.poly
+            : (Array.isArray(ov.footprint) && ov.footprint.length >= 6 ? ov.footprint : null);
+          if (poly) {
+            const pts = new Array(poly.length);
+            for (let i = 0; i < poly.length; i += 2) {
+              pts[i] = (poly[i] - originX) * sx;
+              pts[i + 1] = (poly[i + 1] - originY) * sy;
+            }
+            gfx.drawPolygon(pts);
+          } else {
+            const hw = (ov.w || 0) * 0.5;
+            const hh = (ov.h || 0) * 0.5;
+            if (hw <= 0 || hh <= 0) continue;
+            const rad = ((ov.rot || 0) * Math.PI) / 180;
+            const c = Math.cos(rad);
+            const s = Math.sin(rad);
+            const cx = ov.cx - originX;
+            const cy = ov.cy - originY;
+            const c0x = (cx + (-hw * c - -hh * s)) * sx;
+            const c0y = (cy + (-hw * s + -hh * c)) * sy;
+            const c1x = (cx + (hw * c - -hh * s)) * sx;
+            const c1y = (cy + (hw * s + -hh * c)) * sy;
+            const c2x = (cx + (hw * c - hh * s)) * sx;
+            const c2y = (cy + (hw * s + hh * c)) * sy;
+            const c3x = (cx + (-hw * c - hh * s)) * sx;
+            const c3y = (cy + (-hw * s + hh * c)) * sy;
+            gfx.drawPolygon([c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y]);
+          }
+        }
+        gfx.endFill();
+        container.addChild(gfx);
       }
 
       renderer.render(container, { renderTexture: rt, clear: true });
@@ -4013,6 +4225,7 @@ class MegaWorld1000 {
 
     if (tWalls) {
       wallsMesh = this.acquireMesh();
+      wallsMesh.name = `Tile.BoundlessWalls.${fullId}`;
       wallsMesh.anchor.set(0.5, 0.5);
       wallsMesh.texture = tWalls;
       wallsMesh.tint = ovTint;
@@ -4032,11 +4245,13 @@ class MegaWorld1000 {
       wallsMesh.visible = localZNow >= 6;
       canvas.primary.addChild(wallsMesh);
       wallsMesh.updateCanvasTransform?.();
+      this._syncShowstopperMeshDof(wallsMesh);
     }
 
     if (tRoof) {
       const canRevealNow = localZNow >= 5;
       roofMesh = this.acquireMesh();
+      roofMesh.name = `Tile.BoundlessRoof.${fullId}`;
       roofMesh.anchor.set(0.5, 0.5);
       roofMesh.texture = tRoof;
       roofMesh.tint = ovTint;
@@ -4059,9 +4274,11 @@ class MegaWorld1000 {
       roofMesh.textureAlphaThreshold = 0.75;
       canvas.primary.addChild(roofMesh);
       roofMesh.updateCanvasTransform?.();
+      this._syncShowstopperMeshDof(roofMesh);
     }
 
     this.activeOverlays.set(fullId, { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof });
+    if (roofMesh) this.invalidateShowstopperSurfaces();
     return true;
   }
 
@@ -4140,6 +4357,7 @@ class MegaWorld1000 {
         if (!this.active || !tex || !this.levelLayers.has(lid)) return;
 
         const m = this.acquireMesh();
+        m.name = `Tile.BoundlessVirtual.${fullId}`;
         const ax = tSpec.anchorX ?? 0.5;
         const ay = tSpec.anchorY ?? 0.5;
         m.anchor.set(ax, ay);
@@ -4172,7 +4390,9 @@ class MegaWorld1000 {
 
         canvas.primary.addChild(m);
         m.updateCanvasTransform?.();
-        this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src });
+        this._syncShowstopperMeshDof(m);
+        this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src, tSpec });
+        this.invalidateShowstopperSurfaces();
         canvas.primary.sortDirty = true;
         this._occlusionDirty = true;
         this._depthDirty = true;
@@ -5027,11 +5247,19 @@ class MegaWorld1000 {
       }
     }
 
-    if ("pois" in flagChanges || "showPois" in flagChanges) {
+    if ("pois" in flagChanges || "-=pois" in flagChanges || "showPois" in flagChanges) {
       if (flagChanges.showPois !== false && !this.poiManager.container) {
         this.poiManager.mount(scene, this.manifest);
       } else {
         this.poiManager.rebuild(scene, this.manifest);
+      }
+    }
+
+    if ("showCharacterPins" in flagChanges) {
+      if (flagChanges.showCharacterPins !== false && !this.charPins.container) {
+        this.charPins.mount(scene);
+      } else {
+        this.charPins.rebuild(scene);
       }
     }
 
@@ -5057,20 +5285,33 @@ class MegaWorld1000 {
 
   // ===== Public Level, POI & Virtual Tile API =====
 
+  getEffectivePOIs(scene = canvas.scene) {
+    if (!scene) return [];
+    const resolved = this.poiManager.resolvePois(scene, scene.id === canvas.scene?.id ? this.manifest : null);
+    return foundry.utils.deepClone(resolved || []);
+  }
+
   async addPOI(poiSpec, scene = canvas.scene) {
     if (!scene) return null;
-    const existing = Array.isArray(scene.flags?.[MODULE_ID]?.pois)
-      ? foundry.utils.deepClone(scene.flags[MODULE_ID].pois)
-      : [];
+    const existing = this.getEffectivePOIs(scene).map(p => {
+      const clean = { ...p };
+      delete clean._isSecondaryProvince;
+      delete clean._virtualSub;
+      return clean;
+    });
+    const kind = poiSpec.kind === "detail" ? "detail" : (poiSpec.kind === "minor" ? "minor" : "major");
     const entry = {
       id: poiSpec.id || foundry.utils.randomID(),
       name: poiSpec.name || game.i18n.localize("BOUNDLESS.Config.PoiDefaultName"),
+      subtitle: poiSpec.subtitle || "",
       x: Math.round(poiSpec.x ?? (scene.width || 100000) * 0.5),
       y: Math.round(poiSpec.y ?? (scene.height || 100000) * 0.5),
       levelId: poiSpec.levelId || null,
-      targetScale: poiSpec.targetScale || 0.45,
+      targetScale: Number(poiSpec.targetScale ?? poiSpec.scale) || (kind === "major" ? 0.085 : (kind === "detail" ? 0.68 : 0.26)),
       color: poiSpec.color || "#f5c96b",
-      kind: poiSpec.kind || "major",
+      kind,
+      icon: poiSpec.icon || "",
+      journalUuid: poiSpec.journalUuid || "",
       hidden: Boolean(poiSpec.hidden)
     };
     existing.push(entry);
@@ -5078,13 +5319,39 @@ class MegaWorld1000 {
     return entry;
   }
 
+  async updatePOI(poiId, patch, scene = canvas.scene) {
+    if (!scene || !poiId || !patch) return null;
+    const existing = this.getEffectivePOIs(scene);
+    const idx = existing.findIndex(p => p.id === poiId);
+    if (idx < 0) return null;
+    const updated = { ...existing[idx], ...patch, id: poiId };
+    if ("x" in patch) updated.x = Math.round(patch.x);
+    if ("y" in patch) updated.y = Math.round(patch.y);
+    if ("targetScale" in patch) {
+      updated.targetScale = Number(patch.targetScale) || 0.45;
+      delete updated.scale;
+    }
+    existing[idx] = updated;
+    await scene.update({ [`flags.${MODULE_ID}.pois`]: existing });
+    return updated;
+  }
+
   async removePOI(poiId, scene = canvas.scene) {
     if (!scene || !poiId) return false;
-    const existing = Array.isArray(scene.flags?.[MODULE_ID]?.pois)
-      ? scene.flags[MODULE_ID].pois.filter(p => p.id !== poiId)
-      : [];
+    const existing = this.getEffectivePOIs(scene).filter(p => p.id !== poiId);
     await scene.update({ [`flags.${MODULE_ID}.pois`]: existing });
     return true;
+  }
+
+  async resetPOIs(scene = canvas.scene) {
+    if (!scene) return false;
+    await scene.update({ [`flags.${MODULE_ID}.-=pois`]: null });
+    return true;
+  }
+
+  async flyToCharacter(userOrActorId = null, options = {}) {
+    if (!this.active || !canvas?.ready) return false;
+    return this.charPins.focusCharacter(userOrActorId, options);
   }
 
   async flyTo(target, options = {}) {
@@ -5121,15 +5388,13 @@ class MegaWorld1000 {
   }
 
   /**
-   * Bake native Foundry TileDocuments, WallDocuments, and AmbientLightDocuments on a Level
-   * into an inline Boundless spatial sector manifest on `level.flags["boundless"]`.
+   * Collect and serialize native Foundry TileDocuments, WallDocuments, AmbientLightDocuments (non-negative),
+   * and AmbientSoundDocuments belonging to a Level into Boundless spatial sectors.
    */
-  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null } = {}) {
-    const scene = canvas.scene;
-    const level = scene?.levels?.get(levelId);
-    if (!scene || !level) throw new Error(`Level "${levelId}" not found.`);
-
-    const worldPx = Math.max(scene.width || 100000, scene.height || 100000);
+  collectLevelSpatialData(scene, level, { simGrid = null } = {}) {
+    const levelId = level.id;
+    const dims = scene.getDimensions?.();
+    const worldPx = Math.max(dims?.width || scene.width || 100000, dims?.height || scene.height || 100000);
     const resolvedSimGrid = simGrid || Math.max(4, Math.min(40, Math.ceil(worldPx / 2500)));
     const simSectorPx = Math.ceil(worldPx / resolvedSimGrid);
     const sectors = {};
@@ -5259,6 +5524,41 @@ class MegaWorld1000 {
       soundIdsToDelete.push(snd.id);
     }
 
+    return {
+      worldPx,
+      simGrid: resolvedSimGrid,
+      simSectorPx,
+      tiles,
+      sectors,
+      tileIdsToDelete,
+      wallIdsToDelete,
+      lightIdsToDelete,
+      soundIdsToDelete
+    };
+  }
+
+  /**
+   * Bake an existing Foundry Scene (background pyramid + walls/doors/lights/sounds/tiles) into WebP files
+   * + `pyramid_manifest.json` in the world data folder directly from the browser.
+   */
+  bakeSceneToPyramid(scene = canvas.scene, options = {}) {
+    return bakeSceneToBoundless(this, scene, options);
+  }
+
+  /**
+   * Bake native Foundry TileDocuments, WallDocuments, and AmbientLightDocuments on a Level
+   * into an inline Boundless spatial sector manifest on `level.flags["boundless"]`.
+   */
+  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null } = {}) {
+    const scene = canvas.scene;
+    const level = scene?.levels?.get(levelId);
+    if (!scene || !level) throw new Error(`Level "${levelId}" not found.`);
+
+    const {
+      worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors,
+      tileIdsToDelete, wallIdsToDelete, lightIdsToDelete, soundIdsToDelete
+    } = this.collectLevelSpatialData(scene, level, { simGrid });
+
     const inlineManifest = { worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors };
     const existingCfg = foundry.utils.deepClone(level.flags?.[MODULE_ID] || {});
     await level.update({ [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true, inlineManifest } });
@@ -5331,6 +5631,141 @@ class MegaWorld1000 {
     return false;
   }
 
+  /**
+   * Resolve the highest solid Boundless surface (building roof overlay or virtual tile)
+   * supporting a token at `(x, y)` with elevation `elev`. Used by Showstopper's
+   * elevation/perspective/falling system so tokens standing on Boundless roofs or
+   * virtual platforms rest solidly instead of hovering or falling to `0 ft`.
+   */
+  getSupportingSurfaceAt(x, y, elev = 0, levelId = null, rCore = 20) {
+    if (!this.active || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(elev)) return null;
+    const lid = levelId || canvas?.level?.id || null;
+    const layers = lid && this.levelLayers.has(lid)
+      ? [this.levelLayers.get(lid)]
+      : Array.from(this.levelLayers.values());
+    if (!layers.length) return null;
+
+    let best = null;
+    let bestElev = -Infinity;
+    const radius = Math.max(4, Number(rCore) || 20);
+
+    for (const layer of layers) {
+      if (!layer?.spec) continue;
+      const curLid = layer.level?.id;
+      const { simGrid, simSectorPx, spec, level } = layer;
+      const topElev = Number.isFinite(Number(level?.elevation?.top)) ? Number(level.elevation.top) : 20;
+      const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(x / simSectorPx)));
+      const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(y / simSectorPx)));
+
+      // 1) Baked building roofs (`spec.overlays` -> `roofMesh` at `topElev`)
+      if (topElev <= elev + 0.05 && topElev > bestElev + 0.001 && spec.overlays && spec.sectors) {
+        let hitRoofId = null;
+        for (let dy = -1; dy <= 1 && !hitRoofId; dy++) {
+          for (let dx = -1; dx <= 1 && !hitRoofId; dx++) {
+            const oList = spec.sectors[`${sx + dx}_${sy + dy}`]?.o;
+            if (!oList?.length) continue;
+            for (const oid of oList) {
+              const ovSpec = spec.overlays[oid];
+              if (!ovSpec?.roof || ovSpec.walls?.includes("anchor_")) continue;
+              const halfMax = Math.max(ovSpec.w || 0, ovSpec.h || 0) * 0.72 + radius;
+              if (Math.abs(x - ovSpec.cx) > halfMax || Math.abs(y - ovSpec.cy) > halfMax) continue;
+
+              const fullId = `${curLid}::${oid}`;
+              const mountedRoof = this.activeOverlays.get(fullId)?.roofMesh;
+              if (mountedRoof && !mountedRoof.destroyed && mountedRoof.visible !== false) {
+                let hitWeight = 0;
+                for (let k = 0; k < SUPPORT_SOLE_KERNEL.length; k++) {
+                  const [kx, ky, w] = SUPPORT_SOLE_KERNEL[k];
+                  if (meshContainsPointPixelSafe(mountedRoof, x + kx * radius, y + ky * radius, 0.25)) {
+                    hitWeight += w;
+                    if (hitWeight >= 5) break;
+                  }
+                }
+                if (hitWeight >= 5) {
+                  hitRoofId = fullId;
+                  break;
+                }
+              } else if (isPointUnderRoofSpec(x, y, ovSpec)) {
+                hitRoofId = fullId;
+                break;
+              }
+            }
+          }
+        }
+        if (hitRoofId) {
+          bestElev = topElev;
+          best = {
+            elevation: topElev,
+            level: level || null,
+            sourceType: "tile",
+            sourceId: hitRoofId,
+            isLargePlatform: true
+          };
+        }
+      }
+
+      // 2) Virtual tiles (`spec.tiles` indexed per sector `sectors[sk].t`)
+      if (spec.tiles?.length && spec.sectors) {
+        const seenTiles = new Set();
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const tList = spec.sectors[`${sx + dx}_${sy + dy}`]?.t;
+            if (!tList?.length) continue;
+            for (const tid of tList) {
+              if (seenTiles.has(tid)) continue;
+              seenTiles.add(tid);
+              const tSpec = this.resolveVirtualTile(curLid, tid, spec.tiles[tid], level);
+              if (!tSpec || tSpec.hidden) continue;
+              if (tSpec.surfaceMode === "ignore" || tSpec.walkable === false) continue;
+              const alpha = Number(tSpec.alpha ?? 1);
+              if (tSpec.surfaceMode !== "solid" && alpha < 0.35) continue;
+
+              const tElev = Number.isFinite(Number(tSpec.elevation)) ? Number(tSpec.elevation) : (Number(level?.elevation?.bottom) || 0);
+              if (tElev > elev + 0.05 || tElev <= bestElev + 0.001) continue;
+
+              const minX = tSpec.x - radius;
+              const maxX = tSpec.x + (tSpec.w || 0) + radius;
+              const minY = tSpec.y - radius;
+              const maxY = tSpec.y + (tSpec.h || 0) + radius;
+              if (x < minX || x > maxX || y < minY || y > maxY) continue;
+
+              const fullId = `${curLid}::${tid}`;
+              const mountedMesh = this.activeVirtualTiles.get(fullId)?.mesh;
+              let supported = false;
+              if (mountedMesh && !mountedMesh.destroyed && mountedMesh.visible !== false) {
+                const alphaThr = tSpec.surfaceMode === "solid" ? 0.05 : Math.min(0.85, 0.25 / Math.max(0.35, alpha));
+                let hitWeight = 0;
+                for (let k = 0; k < SUPPORT_SOLE_KERNEL.length; k++) {
+                  const [kx, ky, w] = SUPPORT_SOLE_KERNEL[k];
+                  if (meshContainsPointPixelSafe(mountedMesh, x + kx * radius, y + ky * radius, alphaThr)) {
+                    hitWeight += w;
+                    if (hitWeight >= 5) break;
+                  }
+                }
+                supported = hitWeight >= 5;
+              } else {
+                supported = (x >= tSpec.x && x <= tSpec.x + (tSpec.w || 0) && y >= tSpec.y && y <= tSpec.y + (tSpec.h || 0));
+              }
+
+              if (supported) {
+                bestElev = tElev;
+                best = {
+                  elevation: tElev,
+                  level: level || null,
+                  sourceType: "tile",
+                  sourceId: fullId,
+                  isLargePlatform: true
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return best;
+  }
+
   syncRoofTokenOcclusion() {
     if (!this.active || !canvas?.tokens?.placeables) return;
 
@@ -5339,11 +5774,18 @@ class MegaWorld1000 {
       if (!tok || tok.destroyed || tok.isPreview || tok.controlled) continue;
       const doc = tok.document;
       const lid = doc?.level || canvas.level?.id;
-      const tokElev = doc?.elevation ?? 0;
+      const rawElev = Number(doc?.elevation ?? 0);
+      const visElev = Number.isFinite(Number(tok._ssJumpState?.elevation))
+        ? Number(tok._ssJumpState.elevation)
+        : (Number.isFinite(Number(tok._ssVisualElevation)) ? Number(tok._ssVisualElevation) : rawElev);
+      const tokElev = Math.max(rawElev, visElev);
       if (this.isPointUnderBakedRoof(lid, tok.center.x, tok.center.y, tokElev)) {
         nextHidden.add(tok);
         if (tok.renderable) tok.renderable = false;
         if (tok.mesh && !tok.mesh.destroyed && tok.mesh.renderable) tok.mesh.renderable = false;
+        if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed && tok._ssJumpShadow.renderable) {
+          tok._ssJumpShadow.renderable = false;
+        }
       }
     }
 
@@ -5354,6 +5796,7 @@ class MegaWorld1000 {
       if (tok && !tok.destroyed) {
         tok.renderable = true;
         if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = true;
+        if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
         restoredAny = true;
       }
     }
@@ -5641,6 +6084,7 @@ class MegaWorld1000 {
     this.isCameraFlying = false;
 
     this.poiManager.unmount();
+    this.charPins.unmount();
     this.fogManager.unmount();
     this.atmosphere.unmount();
     // Unmount in reverse patch order so scene.updateEmbeddedDocuments / deleteEmbeddedDocuments restore cleanly
@@ -5754,7 +6198,7 @@ class MegaWorld1000 {
 
     this.levelLayers.clear();
     this.visibleLevelLayers = [];
-    this.texMgr.clear();
+    this.texMgr.clear(true);
     this.lastSimKey = "";
     this.lastDynLightKey = "";
     this.lastTargetZ = -1;
@@ -5766,6 +6210,7 @@ class MegaWorld1000 {
 
 const controller = new MegaWorld1000();
 registerConfigUI(controller);
+registerPoiControls(controller);
 registerFogControls(controller);
 registerWallEditorControls(controller);
 registerLayerEditorControls(controller);
@@ -5775,6 +6220,8 @@ Hooks.once("init", () => {
 });
 
 Hooks.once("ready", async () => {
+  const mod = game.modules?.get?.(MODULE_ID);
+  if (mod) mod.api = controller;
   controller._ensureSocket();
   await controller.migrateLegacyScenes();
 });
@@ -5810,6 +6257,7 @@ Hooks.on("controlToken", () => {
 Hooks.on("lightingRefresh", (effects) => {
   if (!controller.active) return;
   controller.onLightingRefresh(effects);
+  controller.tokenStreamer.onVisibilityChanged();
 });
 
 let _sightRefreshQueued = false;
@@ -5830,6 +6278,7 @@ Hooks.on("sightRefresh", () => {
 Hooks.on("updateToken", (doc, changes) => {
   if (!controller.active) return;
   controller.tokenStreamer.onTokenUpdated(doc, changes);
+  controller.charPins.onTokenUpdated(doc, changes);
   const posChanged = "x" in changes || "y" in changes || "level" in changes;
   const elevChanged = "elevation" in changes;
   const lightChanged = "light" in changes;
@@ -5843,9 +6292,15 @@ Hooks.on("updateToken", (doc, changes) => {
   }
 });
 
+Hooks.on("drawToken", (tok) => {
+  if (!controller.active) return;
+  controller.tokenStreamer.onTokenDrawn(tok);
+});
+
 Hooks.on("createToken", (doc) => {
   if (!controller.active) return;
   controller.tokenStreamer.onTokenCreated(doc);
+  controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
   controller._syncInterfaceVoidFilter();
   controller.updateSimAndLightBubbles(false);
@@ -5855,9 +6310,38 @@ Hooks.on("createToken", (doc) => {
 Hooks.on("deleteToken", (doc) => {
   if (!controller.active) return;
   controller.tokenStreamer.onTokenDeleted(doc);
+  controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
   controller._syncInterfaceVoidFilter();
   controller.updateSimAndLightBubbles(false);
+});
+
+Hooks.on("updateUser", (_user, changes) => {
+  if (!controller.active) return;
+  if ("character" in changes || "color" in changes) {
+    controller.charPins.onUserOrActorUpdated();
+  }
+});
+
+Hooks.on("updateActor", (_actor, changes) => {
+  if (!controller.active) return;
+  if ("img" in changes || "name" in changes || "ownership" in changes) {
+    controller.charPins.onUserOrActorUpdated();
+  }
+});
+
+Hooks.on("collapseSidebar", () => {
+  if (!controller.active) return;
+  controller.charPins._lastSidebarCheckMs = 0;
+  setTimeout(() => controller.charPins.updateViewport(), 120);
+});
+
+window.addEventListener("resize", () => {
+  if (!controller.active) return;
+  controller.poiManager._layoutDirty = true;
+  controller.poiManager.updateViewport();
+  controller.charPins._lastSidebarCheckMs = 0;
+  controller.charPins.updateViewport();
 });
 
 // React seamlessly to native TileDocuments added/edited/removed on any level (floors blocking lower-level lights, roofs, etc.)

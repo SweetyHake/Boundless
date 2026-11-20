@@ -1,5 +1,5 @@
 const MODULE_ID = "boundless";
-const CHUNK_STREAM_MIN_SCALE = 0.042; // Below ~0.042x (orbital view), macro pyramid + macroLights handle rendering with 0 chunk fetches
+const CHUNK_STREAM_MIN_SCALE = 0.022; // Below ~0.022x (true continental orbit), macro pyramid + soft Gaussian macroLights handle rendering with 0 chunk fetches
 const CHUNK_VP_PAD_PX = 14000;        // Prefetch neighboring chunks 140 cells outside screen edge
 const CHUNK_TOKEN_PAD_PX = 8000;      // Keep chunks loaded within 80 cells around every active token
 const MAX_LOADED_CHUNKS = 8;          // LRU RAM + VRAM budget per level (~2-3 MB RAM total regardless of world size)
