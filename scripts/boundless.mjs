@@ -43,6 +43,10 @@ function getShowstopperMovementApi() {
   }
 }
 
+function isTextureUsable(tex) {
+  return Boolean(tex && !tex.destroyed && tex.baseTexture && !tex.baseTexture.destroyed);
+}
+
 function meshContainsPointPixelSafe(mesh, x, y, alphaThreshold = 0.25) {
   if (!mesh || mesh.destroyed) return false;
   if (typeof mesh.containsPixel === "function") {
@@ -2214,6 +2218,11 @@ class LRUTextureManager {
   getSync(src) {
     const tex = this.lru.get(src);
     if (tex) {
+      if (!isTextureUsable(tex)) {
+        this.lru.delete(src);
+        this.workerOwned.delete(src);
+        return null;
+      }
       this.lru.delete(src);
       this.lru.set(src, tex);
     }
@@ -3386,6 +3395,21 @@ class MegaWorld1000 {
         if (ov.srcWalls) inUse.add(ov.srcWalls);
         if (ov.srcRoof) inUse.add(ov.srcRoof);
       }
+      for (let i = 0; i < this.pendingOverlayMounts.length; i++) {
+        const po = this.pendingOverlayMounts[i];
+        if (po?.ovSpec?.walls) inUse.add(po.ovSpec.walls);
+        if (po?.ovSpec?.roof) inUse.add(po.ovSpec.roof);
+      }
+      for (const fullKey of this.overlayPending) {
+        const cleanKey = fullKey.endsWith(":w") ? fullKey.slice(0, -2) : fullKey;
+        const sep = cleanKey.indexOf("::");
+        if (sep > 0) {
+          const l = this.levelLayers.get(cleanKey.slice(0, sep));
+          const ovSpec = l?.spec?.overlays?.[Number(cleanKey.slice(sep + 2))];
+          if (ovSpec?.walls) inUse.add(ovSpec.walls);
+          if (ovSpec?.roof) inUse.add(ovSpec.roof);
+        }
+      }
       for (const [, vt] of this.activeVirtualTiles) {
         if (vt.src) inUse.add(vt.src);
       }
@@ -3435,7 +3459,7 @@ class MegaWorld1000 {
   }
 
   _mountTileMesh(e, tex, instant) {
-    if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0)) return;
+    if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0) || !isTextureUsable(tex)) return;
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const layer = e.layer;
     const levelElev = layer.level.elevation?.bottom ?? 0;
@@ -3563,7 +3587,7 @@ class MegaWorld1000 {
     this.texMgr.load(existing.srcWalls, { mipmap: true }).then((tWalls) => {
       this.overlayPending.delete(`${fullId}:w`);
       const cur = this.activeOverlays.get(fullId);
-      if (!this.active || !cur || cur.wallsMesh || !tWalls) return;
+      if (!this.active || !cur || cur.wallsMesh || !isTextureUsable(tWalls)) return;
       const wallsMesh = this.acquireMesh();
       wallsMesh.name = `Tile.BoundlessWalls.${fullId}`;
       wallsMesh.anchor.set(0.5, 0.5);
@@ -4211,7 +4235,7 @@ class MegaWorld1000 {
   }
 
   _mountOverlayMeshes(item, curVp) {
-    const { fullId, lid, oid, layer, ovSpec, topElev, tWalls, tRoof } = item;
+    const { fullId, lid, oid, layer, ovSpec, topElev } = item;
     if (!this.active || !this.levelLayers.has(lid) || this.activeOverlays.has(fullId)) return false;
     if (ovSpec.cx + ovSpec.w < curVp.x0 || ovSpec.cx - ovSpec.w > curVp.x1 ||
         ovSpec.cy + ovSpec.h < curVp.y0 || ovSpec.cy - ovSpec.h > curVp.y1) return false;
@@ -4219,6 +4243,15 @@ class MegaWorld1000 {
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const localZNow = layer.lastTargetZ - layer.zOffset;
     if (localZNow < 5) return false;
+
+    const tWalls = isTextureUsable(item.tWalls) ? item.tWalls : (item.tWalls && ovSpec.walls ? this.texMgr.getSync(ovSpec.walls) : null);
+    const tRoof = isTextureUsable(item.tRoof) ? item.tRoof : (item.tRoof && ovSpec.roof ? this.texMgr.getSync(ovSpec.roof) : null);
+    if ((item.tWalls && !tWalls) || (item.tRoof && !tRoof)) {
+      layer.lastOverlayKey = "";
+      return false;
+    }
+    if (!tWalls && !tRoof) return false;
+
     const ovTint = ovSpec.tint ?? 0xffffff;
     let wallsMesh = null;
     let roofMesh = null;
@@ -4354,7 +4387,7 @@ class MegaWorld1000 {
       this.virtualTilePending.add(fullId);
       this.texMgr.load(tSpec.src, { mipmap: true }).then(tex => {
         this.virtualTilePending.delete(fullId);
-        if (!this.active || !tex || !this.levelLayers.has(lid)) return;
+        if (!this.active || !isTextureUsable(tex) || !this.levelLayers.has(lid)) return;
 
         const m = this.acquireMesh();
         m.name = `Tile.BoundlessVirtual.${fullId}`;
