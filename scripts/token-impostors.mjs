@@ -1,22 +1,19 @@
 const MODULE_ID = "boundless";
-const CELL_PX = 64;
+const CELL_PX = 128;
 const PAD_PX = 4;
-const CONTENT_PX = CELL_PX - PAD_PX * 2; // 56x56 art inside 64x64 cell -> 4px guard band against mip bleed
-const INITIAL_ATLAS_PX = 1024;           // 16x16 = 256 unique portraits (~5.3 MB VRAM)
-const MAX_ATLAS_PX = 2048;               // 32x32 = 1024 unique portraits (~21.3 MB VRAM)
-const MAX_CONCURRENT_DECODES = 4;
-const PARTY_MIN_SCREEN_RADIUS = 11.0;    // Readable ~22px medallion on orbital view for PCs only
+const CONTENT_PX = CELL_PX - PAD_PX * 2; // 120x120 crisp art inside 128x128 cell (4px guard band against mip bleed)
+const ATLAS_PX = 2048;                   // 16x16 = 256 unique crisp 128x128 token portraits (~16 MB VRAM)
+const MAX_CONCURRENT_DECODES = 6;
 
 const IMPOSTOR_VERT = `
 precision highp float;
 
 attribute vec2 aCenter;
 attribute vec2 aCorner;
-attribute vec4 aSizeInfo;  // x: halfSizeWorld, y: minScreenPx (0 for NPCs), z: rotationRad, w: elevation
+attribute vec4 aSizeInfo;  // x: halfWWorld, y: halfHWorld, z: rotationRad, w: elevation
 attribute vec4 aAtlasRect; // x: u0, y: v0, z: uSpan, w: hasSlot (0/1)
-attribute vec3 aRingColor;
-attribute vec3 aAvgColor;
-attribute vec4 aState;     // x: alpha (<=0 culled), y: needsVisionMask, z: isParty, w: ringEnabled
+attribute vec4 aFlipAndPad;// x: signX (+1/-1), y: signY (+1/-1), z: scaleMult, w: unused
+attribute vec4 aState;     // x: alpha (<=0 culled), y: needsVisionMask, z: isParty, w: unused
 
 uniform mat3 translationMatrix;
 uniform mat3 projectionMatrix;
@@ -27,65 +24,56 @@ varying vec2 vLocal;
 varying vec2 vSamplerUvs;
 varying vec2 vWorldPos;
 varying vec4 vAtlasRect;
-varying vec3 vRingColor;
-varying vec3 vAvgColor;
+varying vec2 vFlip;
 varying float vAlpha;
 varying float vScreenRadius;
 varying float vRot;
 varying float vElevation;
 varying float vNeedsVision;
-varying float vIsParty;
-varying float vRingEnabled;
 
 void main() {
   float scale = max(uStageScale, 0.0005);
   float baseAlpha = aState.x;
   float isParty = aState.z;
 
-  // Regular NPCs stay strictly world-space and fade gently away on deep orbit (< 2.5px) instead of forming radar clutter.
-  // Party PCs remain readable as subtle medallions on orbital zoom and smoothly shrink to 1:1 token size by scale 0.125.
-  float npcOrbitFade = mix(smoothstep(0.024, 0.052, scale), 1.0, isParty);
-  float finalAlpha = baseAlpha * npcOrbitFade;
+  // Gently dissolve sub-2.5px NPCs on extreme continental orbit so distant cities stay clean
+  float orbitFade = mix(smoothstep(0.022, 0.048, scale), 1.0, isParty * smoothstep(0.012, 0.030, scale));
+  float finalAlpha = baseAlpha * orbitFade;
 
-  if (finalAlpha <= 0.002 || aSizeInfo.x <= 0.0) {
+  if (finalAlpha <= 0.002 || aSizeInfo.x <= 0.0 || aSizeInfo.y <= 0.0) {
     vAlpha = 0.0;
     vLocal = vec2(2.0);
     vSamplerUvs = vec2(0.0);
     vWorldPos = vec2(0.0);
     vAtlasRect = vec4(0.0);
-    vRingColor = vec3(0.0);
-    vAvgColor = vec3(0.0);
+    vFlip = vec2(1.0);
     vScreenRadius = 0.0;
     vRot = 0.0;
     vElevation = 0.0;
     vNeedsVision = 0.0;
-    vIsParty = 0.0;
-    vRingEnabled = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
 
-  float medalBlend = isParty * (1.0 - smoothstep(0.075, 0.125, scale));
-  float minWorldHalf = (aSizeInfo.y * medalBlend) / scale;
-  float effHalf = max(aSizeInfo.x, minWorldHalf);
-  float quadHalf = effHalf * 1.12;
-
-  vec2 worldPos = aCenter + aCorner * quadHalf;
+  // Respect token texture scale (e.g. pop-out / oversized Hero in a Box art) and rotate in world space
+  float sm = max(aFlipAndPad.z, 0.25);
+  vec2 localPt = aCorner * vec2(aSizeInfo.x, aSizeInfo.y) * sm;
+  float c = cos(aSizeInfo.z);
+  float s = sin(aSizeInfo.z);
+  vec2 rotPt = vec2(localPt.x * c - localPt.y * s, localPt.x * s + localPt.y * c);
+  vec2 worldPos = aCenter + rotPt;
   vec3 tPos = translationMatrix * vec3(worldPos, 1.0);
 
-  vLocal = aCorner * 1.12;
+  vLocal = aCorner;
   vSamplerUvs = tPos.xy / max(uScreenDimensions, vec2(1.0));
   vWorldPos = worldPos;
   vAtlasRect = aAtlasRect;
-  vRingColor = aRingColor;
-  vAvgColor = aAvgColor;
+  vFlip = aFlipAndPad.xy;
   vAlpha = finalAlpha;
-  vScreenRadius = effHalf * scale;
+  vScreenRadius = max(aSizeInfo.x, aSizeInfo.y) * sm * scale;
   vRot = aSizeInfo.z;
   vElevation = aSizeInfo.w;
   vNeedsVision = aState.y;
-  vIsParty = isParty;
-  vRingEnabled = aState.w;
 
   gl_Position = vec4((projectionMatrix * tPos).xy, 0.0, 1.0);
 }
@@ -108,15 +96,12 @@ varying vec2 vLocal;
 varying vec2 vSamplerUvs;
 varying vec2 vWorldPos;
 varying vec4 vAtlasRect;
-varying vec3 vRingColor;
-varying vec3 vAvgColor;
+varying vec2 vFlip;
 varying float vAlpha;
 varying float vScreenRadius;
 varying float vRot;
 varying float vElevation;
 varying float vNeedsVision;
-varying float vIsParty;
-varying float vRingEnabled;
 
 void main() {
   if (vAlpha <= 0.002) discard;
@@ -138,92 +123,69 @@ void main() {
     }
   }
 
-  float r = length(vLocal);
-  float aa = clamp(1.35 / max(vScreenRadius, 1.0), 0.015, 0.25);
-
-  // Subtle grounded drop shadow slightly offset downwards
-  float shadowDist = length(vLocal - vec2(0.0, 0.08));
-  float shadowAlpha = (1.0 - smoothstep(0.84, 1.10, shadowDist)) * 0.36;
-
-  float hasSlot = vAtlasRect.w;
-  float portraitMix = smoothstep(2.8, 7.2, vScreenRadius) * hasSlot;
-
-  // Sample rotated atlas slot (strictly clamped inside the 56x56 inner content rect)
-  vec4 texSample = vec4(0.0);
-  if (portraitMix > 0.001) {
-    float c = cos(-vRot);
-    float s = sin(-vRot);
-    vec2 rotLocal = vec2(vLocal.x * c - vLocal.y * s, vLocal.x * s + vLocal.y * c);
-    vec2 localUv = rotLocal * 0.5 + 0.5;
-    if (localUv.x >= 0.0 && localUv.x <= 1.0 && localUv.y >= 0.0 && localUv.y <= 1.0) {
-      vec2 clamped = clamp(localUv, vec2(0.01), vec2(0.99));
-      vec2 atlasUv = vAtlasRect.xy + clamped * vAtlasRect.z;
-      texSample = texture2D(uAtlas, atlasUv);
-    }
-  }
-
-  // Free-form transparent token art (no dynamic ring and not an orbital party medallion)
-  if (vRingEnabled < 0.5 && vIsParty < 0.5 && portraitMix > 0.45) {
-    // texSample is premultiplied; blend cleanly over soft ground shadow
-    vec3 shadowRgb = vec3(0.02, 0.02, 0.03) * shadowAlpha;
-    vec3 rgb = texSample.rgb + shadowRgb * (1.0 - texSample.a);
-    float outA = texSample.a + shadowAlpha * (1.0 - texSample.a);
-    if (outA <= 0.005) discard;
-    gl_FragColor = vec4(rgb, outA) * vAlpha;
+  // While atlas slot is decoding (first ~30ms), show only a very subtle grounded shadow silhouette (never bright neon rings)
+  if (vAtlasRect.w < 0.5) {
+    float r = length(vLocal);
+    float shadow = (1.0 - smoothstep(0.35, 0.85, r)) * 0.22 * vAlpha;
+    if (shadow <= 0.004) discard;
+    gl_FragColor = vec4(vec3(0.05, 0.05, 0.06) * shadow, shadow);
     return;
   }
 
-  // Circular token / Dynamic Ring / orbital medallion / instant placeholder while atlas slot loads
-  float discMask = 1.0 - smoothstep(0.98 - aa, 0.98 + aa, r);
-  float rimWidth = clamp(1.35 / max(vScreenRadius, 1.0), 0.065, 0.22);
-  float innerRadius = 0.98 - rimWidth;
-  float innerMask = 1.0 - smoothstep(innerRadius - aa, innerRadius + aa, r);
+  vec2 localUv = vLocal * vFlip * 0.5 + 0.5;
+  if (localUv.x < 0.0 || localUv.x > 1.0 || localUv.y < 0.0 || localUv.y > 1.0) discard;
 
-  // Soft interior fill: portrait smoothly morphing from avg color as token grows past 3..7px
-  vec3 fillRgb = mix(vAvgColor, vRingColor * 0.62, 0.18);
-  if (portraitMix > 0.001) {
-    vec3 straightTex = texSample.a > 0.01 ? (texSample.rgb / texSample.a) : fillRgb;
-    vec3 overFill = mix(fillRgb, straightTex, texSample.a);
-    fillRgb = mix(fillRgb, overFill, portraitMix);
-  }
+  // Sample strictly inside the padded 120x120 art rect in the atlas (texture is premultiplied alpha)
+  vec2 clamped = clamp(localUv, vec2(0.004), vec2(0.996));
+  vec2 atlasUv = vAtlasRect.xy + clamped * vAtlasRect.z;
+  vec4 tex = texture2D(uAtlas, atlasUv);
+  if (tex.a <= 0.01) discard;
 
-  // Subtle rim bevel highlight
-  float bevel = 0.88 + 0.18 * clamp(-vLocal.y * 0.5 + 0.5, 0.0, 1.0);
-  vec3 rimRgb = vRingColor * bevel;
-  vec3 bodyRgb = mix(rimRgb, fillRgb, innerMask);
-
-  // Composite disc over grounded shadow (premultiplied output)
-  vec3 outRgb = bodyRgb * discMask + vec3(0.02, 0.02, 0.03) * shadowAlpha * (1.0 - discMask);
-  float outA = discMask + shadowAlpha * (1.0 - discMask);
-  if (outA <= 0.005) discard;
-
-  gl_FragColor = vec4(outRgb, outA) * vAlpha;
+  gl_FragColor = tex * vAlpha;
 }
 `;
 
-function getDispositionRingColor(doc, isParty) {
-  if (isParty) return [0.96, 0.79, 0.39]; // Warm gold for PCs
-  const ringCol = doc._source?.ring?.enabled ? doc._source?.ring?.colors?.ring : null;
-  if (ringCol) {
-    try {
-      const c = foundry.utils.Color.from(ringCol);
-      if (c?.rgb) return [c.rgb[0], c.rgb[1], c.rgb[2]];
-    } catch {}
+function parseCssColor(val, fallback) {
+  if (!val) return fallback;
+  try {
+    return foundry.utils.Color.from(val).css || fallback;
+  } catch {
+    return fallback;
   }
-  const disp = doc._source?.disposition ?? doc.disposition ?? 0;
-  if (disp === 1) return [0.40, 0.85, 0.54];   // Friendly
-  if (disp === -1) return [0.88, 0.35, 0.32];  // Hostile
-  if (disp === -2) return [0.62, 0.44, 0.91];  // Secret
-  return [0.88, 0.76, 0.36];                   // Neutral
 }
 
-function getSafeTokenArtSrc(doc) {
-  const srcRing = doc._source?.ring;
-  if (srcRing?.enabled) {
-    const subj = srcRing.subject?.texture || doc.ring?.subject?.texture;
-    if (subj) return subj;
-  }
-  return doc._source?.texture?.src || doc.texture?.src || doc.baseActor?.img || "";
+function getTokenRenderSpec(doc) {
+  const srcObj = doc._source || {};
+  const ringEnabled = Boolean(srcObj.ring?.enabled);
+  const subjectTex = ringEnabled ? (srcObj.ring?.subject?.texture || doc.ring?.subject?.texture || "") : "";
+  const baseTex = srcObj.texture?.src || doc.texture?.src || doc.baseActor?.img || "";
+  const artSrc = subjectTex || baseTex;
+
+  const sx = Number(srcObj.texture?.scaleX ?? doc.texture?.scaleX ?? 1) || 1;
+  const sy = Number(srcObj.texture?.scaleY ?? doc.texture?.scaleY ?? 1) || 1;
+  const flipX = sx < 0 ? -1 : 1;
+  const flipY = sy < 0 ? -1 : 1;
+  const texScale = ringEnabled ? 1.0 : Math.min(2.5, Math.max(0.25, Math.max(Math.abs(sx), Math.abs(sy))));
+
+  const ringColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.ring, "#b9b4a4") : "";
+  const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, "#26282e") : "";
+  const subjectScale = ringEnabled ? Math.min(2.2, Math.max(0.5, Number(srcObj.ring?.subject?.scale) || 1)) : 1;
+
+  const slotKey = ringEnabled
+    ? `R|${artSrc}|${ringColor}|${bgColor}|${subjectScale.toFixed(2)}`
+    : `T|${artSrc}`;
+
+  return {
+    slotKey,
+    artSrc,
+    ringEnabled,
+    ringColor,
+    bgColor,
+    subjectScale,
+    flipX,
+    flipY,
+    texScale
+  };
 }
 
 function isPartyTokenDoc(doc) {
@@ -246,8 +208,8 @@ function isOwnedByCurrentUserSafe(doc) {
 
 /**
  * Single-draw-call Dynamic Texture Atlas Token Impostor Layer mounted inside `canvas.primary`.
- * - Eliminates token pop-in from empty air when descending from orbital/sky zoom.
- * - Zero `doc.actor` touches (preserves Foundry v14 lazy `ActorDelta`).
+ * - Renders authentic 128x128 baked token art (including Foundry v14 Dynamic Token Rings) 1:1 with native Tokens.
+ * - Zero neon disposition circles, zero `doc.actor` touches (preserves lazy `ActorDelta`).
  * - Strict Foundry v14 visibility enforcement (CPU `testVisibility` + GPU `uVisionTex` + baked roof mask).
  */
 export class TokenImpostorLayer {
@@ -258,13 +220,13 @@ export class TokenImpostorLayer {
     this.mounted = false;
     this.sceneId = null;
 
-    // Dynamic texture atlas (Canvas2D -> PIXI.Texture, starts 1024x1024, auto-grows to 2048x2048)
-    this.atlasSize = INITIAL_ATLAS_PX;
+    // Dynamic 2048x2048 texture atlas (256 slots of 128x128 with 4px padding)
+    this.atlasSize = ATLAS_PX;
     this.atlasCanvas = null;
     this.atlasCtx = null;
     this.atlasTexture = null;
     this.atlasDirty = false;
-    this.slotsBySrc = new Map(); // src -> { col, row, u0, v0, uSpan, avgRgb, ready, failed }
+    this.slotsByKey = new Map(); // slotKey -> { col, row, u0, v0, uSpan, spec, ready, failed }
     this.nextSlotIdx = 0;
     this._decodeQueue = [];
     this._decodeQueuedSet = new Set();
@@ -279,32 +241,29 @@ export class TokenImpostorLayer {
     this.count = 0;
     this.docIndexById = new Map(); // docId -> slotIndex [0..count-1]
     this.docIds = [];              // slotIndex -> docId
-    this.docSrcById = new Map();   // docId -> art src
-    this.docsBySrc = new Map();    // src -> Set<docId>
+    this.docKeyById = new Map();   // docId -> slotKey
+    this.docsByKey = new Map();    // slotKey -> Set<docId>
 
     // Backing typed arrays & PIXI buffers
     this.centerArr = null;
     this.cornerArr = null;
     this.sizeInfoArr = null;
     this.atlasRectArr = null;
-    this.ringColorArr = null;
-    this.avgColorArr = null;
+    this.flipAndPadArr = null;
     this.stateArr = null;
     this.indexArr = null;
 
     this.centerBuf = null;
     this.sizeInfoBuf = null;
     this.atlasRectBuf = null;
-    this.ringColorBuf = null;
-    this.avgColorBuf = null;
+    this.flipAndPadBuf = null;
     this.stateBuf = null;
 
     this._bufDirty = {
       center: false,
       sizeInfo: false,
       atlasRect: false,
-      ringColor: false,
-      avgColor: false,
+      flipAndPad: false,
       state: false
     };
 
@@ -354,42 +313,43 @@ export class TokenImpostorLayer {
     this.atlasCanvas = null;
     this.atlasCtx = null;
     this.atlasDirty = false;
-    this.atlasSize = INITIAL_ATLAS_PX;
-    this.slotsBySrc.clear();
+    this.slotsByKey.clear();
     this.nextSlotIdx = 0;
 
     this.capacity = 0;
     this.count = 0;
     this.docIndexById.clear();
     this.docIds = [];
-    this.docSrcById.clear();
-    this.docsBySrc.clear();
+    this.docKeyById.clear();
+    this.docsByKey.clear();
     this.centerArr = null;
     this.cornerArr = null;
     this.sizeInfoArr = null;
     this.atlasRectArr = null;
-    this.ringColorArr = null;
-    this.avgColorArr = null;
+    this.flipAndPadArr = null;
     this.stateArr = null;
     this.indexArr = null;
     this.centerBuf = null;
     this.sizeInfoBuf = null;
     this.atlasRectBuf = null;
-    this.ringColorBuf = null;
-    this.avgColorBuf = null;
+    this.flipAndPadBuf = null;
     this.stateBuf = null;
     this._visibilityDirty = true;
   }
 
   _initAtlas() {
-    this.atlasSize = INITIAL_ATLAS_PX;
+    this.atlasSize = ATLAS_PX;
     if (typeof document !== "undefined" && typeof document.createElement === "function") {
       const c = document.createElement("canvas");
       c.width = this.atlasSize;
       c.height = this.atlasSize;
       this.atlasCanvas = c;
-      this.atlasCtx = c.getContext("2d", { willReadFrequently: true });
-      this.atlasCtx?.clearRect(0, 0, this.atlasSize, this.atlasSize);
+      this.atlasCtx = c.getContext("2d");
+      if (this.atlasCtx) {
+        this.atlasCtx.imageSmoothingEnabled = true;
+        this.atlasCtx.imageSmoothingQuality = "high";
+        this.atlasCtx.clearRect(0, 0, this.atlasSize, this.atlasSize);
+      }
       const base = PIXI.BaseTexture.from(c, {
         scaleMode: PIXI.SCALE_MODES.LINEAR,
         mipmap: PIXI.MIPMAP_MODES.ON,
@@ -401,47 +361,6 @@ export class TokenImpostorLayer {
     } else {
       this.atlasTexture = PIXI.Texture.WHITE;
     }
-  }
-
-  _growAtlasToMax() {
-    if (this.atlasSize >= MAX_ATLAS_PX || !this.atlasCanvas || !this.atlasCtx) return false;
-    const oldSize = this.atlasSize;
-    const oldCanvas = this.atlasCanvas;
-    this.atlasSize = MAX_ATLAS_PX;
-
-    const nextCanvas = document.createElement("canvas");
-    nextCanvas.width = this.atlasSize;
-    nextCanvas.height = this.atlasSize;
-    const nextCtx = nextCanvas.getContext("2d", { willReadFrequently: true });
-    nextCtx.clearRect(0, 0, this.atlasSize, this.atlasSize);
-    nextCtx.drawImage(oldCanvas, 0, 0);
-
-    this.atlasCanvas = nextCanvas;
-    this.atlasCtx = nextCtx;
-
-    const oldTex = this.atlasTexture;
-    const base = PIXI.BaseTexture.from(nextCanvas, {
-      scaleMode: PIXI.SCALE_MODES.LINEAR,
-      mipmap: PIXI.MIPMAP_MODES.ON,
-      wrapMode: PIXI.WRAP_MODES.CLAMP,
-      alphaMode: PIXI.ALPHA_MODES.PMA,
-      resolution: 1
-    });
-    this.atlasTexture = new PIXI.Texture(base);
-    if (this.shader?.uniforms) this.shader.uniforms.uAtlas = this.atlasTexture;
-    try { oldTex?.destroy?.(true); } catch {}
-
-    // Recompute UVs for existing slots since atlas doubled in width & height
-    const inv = 1 / this.atlasSize;
-    const uSpan = CONTENT_PX * inv;
-    for (const [src, slot] of this.slotsBySrc) {
-      slot.u0 = (slot.col * CELL_PX + PAD_PX) * inv;
-      slot.v0 = (slot.row * CELL_PX + PAD_PX) * inv;
-      slot.uSpan = uSpan;
-      if (slot.ready) this._applySlotToDocs(src, slot);
-    }
-    this.atlasDirty = true;
-    return true;
   }
 
   _initShader() {
@@ -502,11 +421,9 @@ export class TokenImpostorLayer {
     const nextCorner = new Float32Array(verts * 2);
     const nextSizeInfo = new Float32Array(verts * 4);
     const nextAtlasRect = new Float32Array(verts * 4);
-    const nextRingColor = new Float32Array(verts * 3);
-    const nextAvgColor = new Float32Array(verts * 3);
+    const nextFlipAndPad = new Float32Array(verts * 4);
     const nextState = new Float32Array(verts * 4);
 
-    // Pre-fill unit quad corners and triangle indices
     for (let i = 0; i < nextCap; i++) {
       const o = i * 8;
       nextCorner[o] = -1; nextCorner[o + 1] = -1;
@@ -533,8 +450,7 @@ export class TokenImpostorLayer {
       nextCenter.set(this.centerArr.subarray(0, copyVerts * 2));
       nextSizeInfo.set(this.sizeInfoArr.subarray(0, copyVerts * 4));
       nextAtlasRect.set(this.atlasRectArr.subarray(0, copyVerts * 4));
-      nextRingColor.set(this.ringColorArr.subarray(0, copyVerts * 3));
-      nextAvgColor.set(this.avgColorArr.subarray(0, copyVerts * 3));
+      nextFlipAndPad.set(this.flipAndPadArr.subarray(0, copyVerts * 4));
       nextState.set(this.stateArr.subarray(0, copyVerts * 4));
     }
 
@@ -543,16 +459,14 @@ export class TokenImpostorLayer {
     this.cornerArr = nextCorner;
     this.sizeInfoArr = nextSizeInfo;
     this.atlasRectArr = nextAtlasRect;
-    this.ringColorArr = nextRingColor;
-    this.avgColorArr = nextAvgColor;
+    this.flipAndPadArr = nextFlipAndPad;
     this.stateArr = nextState;
     this.indexArr = nextIdx;
 
     this.centerBuf = new PIXI.Buffer(nextCenter, false, false);
     this.sizeInfoBuf = new PIXI.Buffer(nextSizeInfo, false, false);
     this.atlasRectBuf = new PIXI.Buffer(nextAtlasRect, false, false);
-    this.ringColorBuf = new PIXI.Buffer(nextRingColor, false, false);
-    this.avgColorBuf = new PIXI.Buffer(nextAvgColor, false, false);
+    this.flipAndPadBuf = new PIXI.Buffer(nextFlipAndPad, false, false);
     this.stateBuf = new PIXI.Buffer(nextState, false, false);
 
     const oldMesh = this.mesh;
@@ -563,8 +477,7 @@ export class TokenImpostorLayer {
       .addAttribute("aCorner", new PIXI.Buffer(nextCorner, true, false), 2)
       .addAttribute("aSizeInfo", this.sizeInfoBuf, 4)
       .addAttribute("aAtlasRect", this.atlasRectBuf, 4)
-      .addAttribute("aRingColor", this.ringColorBuf, 3)
-      .addAttribute("aAvgColor", this.avgColorBuf, 3)
+      .addAttribute("aFlipAndPad", this.flipAndPadBuf, 4)
       .addAttribute("aState", this.stateBuf, 4)
       .addIndex(nextIdx);
 
@@ -604,14 +517,6 @@ export class TokenImpostorLayer {
     arr[o + 6] = a; arr[o + 7] = b;
   }
 
-  _writeQuad3(arr, slotIdx, a, b, c) {
-    const o = slotIdx * 12;
-    arr[o] = a; arr[o + 1] = b; arr[o + 2] = c;
-    arr[o + 3] = a; arr[o + 4] = b; arr[o + 5] = c;
-    arr[o + 6] = a; arr[o + 7] = b; arr[o + 8] = c;
-    arr[o + 9] = a; arr[o + 10] = b; arr[o + 11] = c;
-  }
-
   _writeQuad4(arr, slotIdx, a, b, c, d) {
     const o = slotIdx * 16;
     arr[o] = a; arr[o + 1] = b; arr[o + 2] = c; arr[o + 3] = d;
@@ -620,21 +525,18 @@ export class TokenImpostorLayer {
     arr[o + 12] = a; arr[o + 13] = b; arr[o + 14] = c; arr[o + 15] = d;
   }
 
-  _requestAtlasSlot(src) {
-    if (!src) return null;
-    let slot = this.slotsBySrc.get(src);
+  _requestAtlasSlot(spec) {
+    if (!spec?.artSrc) return null;
+    let slot = this.slotsByKey.get(spec.slotKey);
     if (slot) return slot;
 
     const colsPerRow = Math.floor(this.atlasSize / CELL_PX);
     const maxSlots = colsPerRow * colsPerRow;
-    if (this.nextSlotIdx >= maxSlots) {
-      if (!this._growAtlasToMax()) return null;
-    }
+    if (this.nextSlotIdx >= maxSlots) return null;
 
-    const curCols = Math.floor(this.atlasSize / CELL_PX);
     const idx = this.nextSlotIdx++;
-    const col = idx % curCols;
-    const row = Math.floor(idx / curCols);
+    const col = idx % colsPerRow;
+    const row = Math.floor(idx / colsPerRow);
     const inv = 1 / this.atlasSize;
 
     slot = {
@@ -643,15 +545,15 @@ export class TokenImpostorLayer {
       u0: (col * CELL_PX + PAD_PX) * inv,
       v0: (row * CELL_PX + PAD_PX) * inv,
       uSpan: CONTENT_PX * inv,
-      avgRgb: null,
+      spec,
       ready: false,
       failed: false
     };
-    this.slotsBySrc.set(src, slot);
+    this.slotsByKey.set(spec.slotKey, slot);
 
-    if (!this._decodeQueuedSet.has(src)) {
-      this._decodeQueuedSet.add(src);
-      this._decodeQueue.push(src);
+    if (!this._decodeQueuedSet.has(spec.slotKey)) {
+      this._decodeQueuedSet.add(spec.slotKey);
+      this._decodeQueue.push(spec.slotKey);
       this._pumpAtlasDecodes();
     }
     return slot;
@@ -660,13 +562,13 @@ export class TokenImpostorLayer {
   _pumpAtlasDecodes() {
     if (!this.mounted || !this.atlasCtx) return;
     while (this._activeDecodes < MAX_CONCURRENT_DECODES && this._decodeQueue.length > 0) {
-      const src = this._decodeQueue.shift();
-      this._decodeQueuedSet.delete(src);
-      const slot = this.slotsBySrc.get(src);
+      const slotKey = this._decodeQueue.shift();
+      this._decodeQueuedSet.delete(slotKey);
+      const slot = this.slotsByKey.get(slotKey);
       if (!slot || slot.ready || slot.failed) continue;
       this._activeDecodes++;
       const gen = this._gen;
-      this._decodeAndPack(src, slot, gen).finally(() => {
+      this._decodeAndPack(slotKey, slot, gen).finally(() => {
         this._activeDecodes = Math.max(0, this._activeDecodes - 1);
         if (this.mounted && gen === this._gen && this._decodeQueue.length > 0) {
           this._pumpAtlasDecodes();
@@ -675,35 +577,53 @@ export class TokenImpostorLayer {
     }
   }
 
-  async _decodeAndPack(src, slot, gen) {
+  async _loadDrawable(src) {
+    // 1. Fast path: reuse already loaded PIXI / Foundry cached image source if available
+    try {
+      const cached = globalThis.PIXI?.Assets?.cache?.get?.(src) || globalThis.foundry?.canvas?.getTexture?.(src);
+      const resSrc = cached?.baseTexture?.resource?.source;
+      if (resSrc && (resSrc.naturalWidth > 0 || resSrc.width > 0)) {
+        return { drawable: resSrc, shouldClose: false };
+      }
+    } catch {}
+
+    // 2. Off-main-thread raster decode with high-quality resize
+    const lower = String(src).split("?")[0].toLowerCase();
+    const isSvg = lower.endsWith(".svg");
+    if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
+      try {
+        const res = await fetch(src);
+        if (res.ok) {
+          const blob = await res.blob();
+          const bmp = await createImageBitmap(blob);
+          return { drawable: bmp, shouldClose: true };
+        }
+      } catch {}
+    }
+
+    // 3. Fallback via HTMLImageElement (handles SVG, special URLs, etc.)
+    if (typeof Image !== "undefined") {
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.crossOrigin = "anonymous";
+        el.onload = () => resolve(el);
+        el.onerror = reject;
+        el.src = src;
+      });
+      return { drawable: img, shouldClose: false };
+    }
+    return { drawable: null, shouldClose: false };
+  }
+
+  async _decodeAndPack(slotKey, slot, gen) {
     if (!this.mounted || gen !== this._gen || !this.atlasCtx) return;
     let drawable = null;
     let shouldClose = false;
 
     try {
-      const lower = String(src).split("?")[0].toLowerCase();
-      const isSvg = lower.endsWith(".svg");
-      if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
-        const res = await fetch(src);
-        if (res.ok) {
-          const blob = await res.blob();
-          drawable = await createImageBitmap(blob, {
-            resizeWidth: CONTENT_PX,
-            resizeHeight: CONTENT_PX,
-            resizeQuality: "high"
-          });
-          shouldClose = true;
-        }
-      }
-      if (!drawable && typeof Image !== "undefined") {
-        drawable = await new Promise((resolve, reject) => {
-          const img = new Image();
-          img.crossOrigin = "anonymous";
-          img.onload = () => resolve(img);
-          img.onerror = reject;
-          img.src = src;
-        });
-      }
+      const loaded = await this._loadDrawable(slot.spec.artSrc);
+      drawable = loaded.drawable;
+      shouldClose = loaded.shouldClose;
     } catch {
       slot.failed = true;
       return;
@@ -720,45 +640,76 @@ export class TokenImpostorLayer {
       const cellY = slot.row * CELL_PX;
       const dstX = cellX + PAD_PX;
       const dstY = cellY + PAD_PX;
+      const sw = drawable.naturalWidth || drawable.width || CONTENT_PX;
+      const sh = drawable.naturalHeight || drawable.height || CONTENT_PX;
 
+      ctx.save();
       ctx.clearRect(cellX, cellY, CELL_PX, CELL_PX);
 
-      // Fit preserving aspect ratio centered in 56x56 content area
-      const sw = drawable.width || CONTENT_PX;
-      const sh = drawable.height || CONTENT_PX;
-      const aspect = sw / Math.max(1, sh);
-      let dw = CONTENT_PX;
-      let dh = CONTENT_PX;
-      if (aspect > 1) dh = CONTENT_PX / aspect;
-      else if (aspect < 1) dw = CONTENT_PX * aspect;
-      const ox = dstX + (CONTENT_PX - dw) * 0.5;
-      const oy = dstY + (CONTENT_PX - dh) * 0.5;
+      if (slot.spec.ringEnabled) {
+        // Bake authentic Foundry v14 Dynamic Token Ring (neutral metallic ring + masked subject portrait)
+        const cx = dstX + CONTENT_PX * 0.5;
+        const cy = dstY + CONTENT_PX * 0.5;
+        const outerR = CONTENT_PX * 0.47;
+        const ringThickness = CONTENT_PX * 0.08;
+        const innerR = outerR - ringThickness;
 
-      ctx.drawImage(drawable, ox, oy, dw, dh);
+        // Subtle grounded drop shadow
+        ctx.beginPath();
+        ctx.arc(cx, cy + 2, outerR, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
+        ctx.fill();
 
-      // Compute average RGB from opaque pixels for seamless orbital morph
-      let rSum = 0, gSum = 0, bSum = 0, n = 0;
-      try {
-        const imgData = ctx.getImageData(dstX, dstY, CONTENT_PX, CONTENT_PX).data;
-        for (let py = 4; py < CONTENT_PX - 4; py += 6) {
-          for (let px = 4; px < CONTENT_PX - 4; px += 6) {
-            const o = (py * CONTENT_PX + px) * 4;
-            if (imgData[o + 3] > 40) {
-              rSum += imgData[o];
-              gSum += imgData[o + 1];
-              bSum += imgData[o + 2];
-              n++;
-            }
-          }
-        }
-      } catch {}
+        // Dark circular token background
+        ctx.beginPath();
+        ctx.arc(cx, cy, innerR + 0.5, 0, Math.PI * 2);
+        ctx.fillStyle = slot.spec.bgColor || "#26282e";
+        ctx.fill();
 
-      slot.avgRgb = n > 0
-        ? [rSum / (n * 255), gSum / (n * 255), bSum / (n * 255)]
-        : [0.65, 0.65, 0.65];
+        // Clip inside ring and draw subject portrait preserving aspect ratio + subject.scale
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
+        ctx.clip();
+        const aspect = sw / Math.max(1, sh);
+        const subScale = slot.spec.subjectScale || 1;
+        const fit = innerR * 2 * subScale;
+        let dw = fit, dh = fit;
+        if (aspect > 1) dw = fit * aspect;
+        else if (aspect < 1) dh = fit / aspect;
+        ctx.drawImage(drawable, cx - dw * 0.5, cy - dh * 0.5, dw, dh);
+        ctx.restore();
+
+        // Subtle metallic ring bezel
+        ctx.beginPath();
+        ctx.arc(cx, cy, outerR - ringThickness * 0.5, 0, Math.PI * 2);
+        ctx.lineWidth = ringThickness;
+        ctx.strokeStyle = slot.spec.ringColor || "#b9b4a4";
+        ctx.stroke();
+
+        // Crisp dark hairline outer edge
+        ctx.beginPath();
+        ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+        ctx.stroke();
+      } else {
+        // Draw authentic raw token art (e.g. top-down / Hero in a Box pop-out) preserving full transparency & aspect
+        const aspect = sw / Math.max(1, sh);
+        let dw = CONTENT_PX;
+        let dh = CONTENT_PX;
+        if (aspect > 1) dh = CONTENT_PX / aspect;
+        else if (aspect < 1) dw = CONTENT_PX * aspect;
+        const ox = dstX + (CONTENT_PX - dw) * 0.5;
+        const oy = dstY + (CONTENT_PX - dh) * 0.5;
+        ctx.drawImage(drawable, ox, oy, dw, dh);
+      }
+
+      ctx.restore();
+
       slot.ready = true;
       this.atlasDirty = true;
-      this._applySlotToDocs(src, slot);
+      this._applySlotToDocs(slotKey, slot);
     } catch {
       slot.failed = true;
     } finally {
@@ -766,41 +717,37 @@ export class TokenImpostorLayer {
     }
   }
 
-  _applySlotToDocs(src, slot) {
-    const ids = this.docsBySrc.get(src);
+  _applySlotToDocs(slotKey, slot) {
+    const ids = this.docsByKey.get(slotKey);
     if (!ids?.size || !this.atlasRectArr) return;
     for (const docId of ids) {
       const idx = this.docIndexById.get(docId);
       if (idx === undefined) continue;
       this._writeQuad4(this.atlasRectArr, idx, slot.u0, slot.v0, slot.uSpan, 1.0);
       this._bufDirty.atlasRect = true;
-      if (slot.avgRgb) {
-        this._writeQuad3(this.avgColorArr, idx, slot.avgRgb[0], slot.avgRgb[1], slot.avgRgb[2]);
-        this._bufDirty.avgColor = true;
-      }
     }
   }
 
-  _registerDocSrc(docId, nextSrc) {
-    const prevSrc = this.docSrcById.get(docId);
-    if (prevSrc === nextSrc) return;
-    if (prevSrc) {
-      const oldSet = this.docsBySrc.get(prevSrc);
+  _registerDocKey(docId, nextKey) {
+    const prevKey = this.docKeyById.get(docId);
+    if (prevKey === nextKey) return;
+    if (prevKey) {
+      const oldSet = this.docsByKey.get(prevKey);
       if (oldSet) {
         oldSet.delete(docId);
-        if (oldSet.size === 0) this.docsBySrc.delete(prevSrc);
+        if (oldSet.size === 0) this.docsByKey.delete(prevKey);
       }
     }
-    if (nextSrc) {
-      this.docSrcById.set(docId, nextSrc);
-      let set = this.docsBySrc.get(nextSrc);
+    if (nextKey) {
+      this.docKeyById.set(docId, nextKey);
+      let set = this.docsByKey.get(nextKey);
       if (!set) {
         set = new Set();
-        this.docsBySrc.set(nextSrc, set);
+        this.docsByKey.set(nextKey, set);
       }
       set.add(docId);
     } else {
-      this.docSrcById.delete(docId);
+      this.docKeyById.delete(docId);
     }
   }
 
@@ -814,8 +761,8 @@ export class TokenImpostorLayer {
 
     this.docIndexById.clear();
     this.docIds = [];
-    this.docSrcById.clear();
-    this.docsBySrc.clear();
+    this.docKeyById.clear();
+    this.docsByKey.clear();
     this.count = 0;
 
     this._ensureCapacity(list.length);
@@ -852,32 +799,25 @@ export class TokenImpostorLayer {
     const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
     const cx = x + w * 0.5;
     const cy = y + h * 0.5;
-    const halfSize = Math.min(w, h) * 0.5;
     const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0);
     const lockRot = Boolean(doc._source?.lockRotation ?? doc.lockRotation);
     const rotRad = lockRot ? 0 : ((Number(doc._source?.rotation ?? doc.rotation ?? 0) || 0) * Math.PI / 180);
 
-    const isParty = isPartyTokenDoc(doc);
-    const ringEnabled = Boolean(doc._source?.ring?.enabled);
-    const ringRgb = getDispositionRingColor(doc, isParty);
-    const src = getSafeTokenArtSrc(doc);
-    this._registerDocSrc(doc.id, src);
+    const spec = getTokenRenderSpec(doc);
+    this._registerDocKey(doc.id, spec.artSrc ? spec.slotKey : null);
 
-    const slot = src ? this._requestAtlasSlot(src) : null;
+    const slot = spec.artSrc ? this._requestAtlasSlot(spec) : null;
     const hasSlot = Boolean(slot?.ready);
-    const avgRgb = slot?.avgRgb || [ringRgb[0] * 0.55, ringRgb[1] * 0.55, ringRgb[2] * 0.55];
 
     this._writeQuad2(this.centerArr, idx, cx, cy);
-    this._writeQuad4(this.sizeInfoArr, idx, halfSize, isParty ? PARTY_MIN_SCREEN_RADIUS : 0.0, rotRad, elev);
+    this._writeQuad4(this.sizeInfoArr, idx, w * 0.5, h * 0.5, rotRad, elev);
     this._writeQuad4(this.atlasRectArr, idx, hasSlot ? slot.u0 : 0, hasSlot ? slot.v0 : 0, hasSlot ? slot.uSpan : 0, hasSlot ? 1.0 : 0.0);
-    this._writeQuad3(this.ringColorArr, idx, ringRgb[0], ringRgb[1], ringRgb[2]);
-    this._writeQuad3(this.avgColorArr, idx, avgRgb[0], avgRgb[1], avgRgb[2]);
+    this._writeQuad4(this.flipAndPadArr, idx, spec.flipX, spec.flipY, spec.texScale, 0);
 
     this._bufDirty.center = true;
     this._bufDirty.sizeInfo = true;
     this._bufDirty.atlasRect = true;
-    this._bufDirty.ringColor = true;
-    this._bufDirty.avgColor = true;
+    this._bufDirty.flipAndPad = true;
     return idx;
   }
 
@@ -892,7 +832,7 @@ export class TokenImpostorLayer {
     const idx = this.docIndexById.get(docId);
     if (idx === undefined) return;
 
-    this._registerDocSrc(docId, null);
+    this._registerDocKey(docId, null);
     this.fadeOverrides.delete(docId);
     this.docIndexById.delete(docId);
 
@@ -905,15 +845,13 @@ export class TokenImpostorLayer {
       this.centerArr.copyWithin(idx * 8, lastIdx * 8, lastIdx * 8 + 8);
       this.sizeInfoArr.copyWithin(idx * 16, lastIdx * 16, lastIdx * 16 + 16);
       this.atlasRectArr.copyWithin(idx * 16, lastIdx * 16, lastIdx * 16 + 16);
-      this.ringColorArr.copyWithin(idx * 12, lastIdx * 12, lastIdx * 12 + 12);
-      this.avgColorArr.copyWithin(idx * 12, lastIdx * 12, lastIdx * 12 + 12);
+      this.flipAndPadArr.copyWithin(idx * 16, lastIdx * 16, lastIdx * 16 + 16);
       this.stateArr.copyWithin(idx * 16, lastIdx * 16, lastIdx * 16 + 16);
 
       this._bufDirty.center = true;
       this._bufDirty.sizeInfo = true;
       this._bufDirty.atlasRect = true;
-      this._bufDirty.ringColor = true;
-      this._bufDirty.avgColor = true;
+      this._bufDirty.flipAndPad = true;
       this._bufDirty.state = true;
     }
 
@@ -963,12 +901,11 @@ export class TokenImpostorLayer {
   }
 
   _computeTokenAlpha(doc, visCtx) {
-    if (!doc || !doc.viewed) return { alpha: 0, needsVision: 0, isParty: 0, ringEnabled: 0 };
+    if (!doc || !doc.viewed) return { alpha: 0, needsVision: 0, isParty: 0 };
 
     const isParty = isPartyTokenDoc(doc) ? 1.0 : 0.0;
-    const ringEnabled = doc._source?.ring?.enabled ? 1.0 : 0.0;
     const isHidden = Boolean(doc._source?.hidden ?? doc.hidden);
-    if (isHidden && !visCtx.isGM) return { alpha: 0, needsVision: 1, isParty, ringEnabled };
+    if (isHidden && !visCtx.isGM) return { alpha: 0, needsVision: 1, isParty };
 
     const owned = isOwnedByCurrentUserSafe(doc);
     const needsVision = (visCtx.tokenVision && !visCtx.isGM && !owned) ? 1.0 : 0.0;
@@ -981,7 +918,7 @@ export class TokenImpostorLayer {
       obj.mesh && !obj.mesh.destroyed && obj.mesh.renderable && obj.mesh.visible !== false
     );
     if (nativeVisible && !hasFadeOverride) {
-      return { alpha: 0, needsVision, isParty, ringEnabled };
+      return { alpha: 0, needsVision, isParty };
     }
 
     const grid = canvas.grid?.size || 100;
@@ -996,19 +933,19 @@ export class TokenImpostorLayer {
     // Roof check: suppress impostor if sitting under a baked pyramid roof when native roofMesh isn't mounted
     const lid = doc._source?.level || doc.level || canvas.level?.id;
     if (this.controller?.isPointUnderBakedRoof?.(lid, cx, cy, elev)) {
-      return { alpha: 0, needsVision, isParty, ringEnabled };
+      return { alpha: 0, needsVision, isParty };
     }
 
     // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW!)
     if (visCtx.tokenVision) {
       if (!visCtx.isGM && !owned) {
-        if (!visCtx.hasActiveVision) return { alpha: 0, needsVision, isParty, ringEnabled };
+        if (!visCtx.hasActiveVision) return { alpha: 0, needsVision, isParty };
         if (!this._passesVisionCheck(cx, cy, elev, visCtx.visionBoxes)) {
-          return { alpha: 0, needsVision, isParty, ringEnabled };
+          return { alpha: 0, needsVision, isParty };
         }
       } else if (visCtx.isGM && visCtx.hasActiveVision && !obj?.controlled) {
         if (!this._passesVisionCheck(cx, cy, elev, visCtx.visionBoxes)) {
-          return { alpha: 0, needsVision, isParty, ringEnabled };
+          return { alpha: 0, needsVision, isParty };
         }
       }
     }
@@ -1018,7 +955,7 @@ export class TokenImpostorLayer {
       : Math.min(Number(doc._source?.alpha ?? 1), isHidden ? 0.5 : 1.0);
     const overrideMult = hasFadeOverride ? this.fadeOverrides.get(doc.id) : 1.0;
     const alpha = Math.max(0, Math.min(1, rawAlpha * overrideMult));
-    return { alpha, needsVision, isParty, ringEnabled };
+    return { alpha, needsVision, isParty };
   }
 
   _passesVisionCheck(cx, cy, elev, visionBoxes) {
@@ -1052,10 +989,9 @@ export class TokenImpostorLayer {
     if (
       Math.abs(this.stateArr[o] - st.alpha) > 0.001 ||
       this.stateArr[o + 1] !== st.needsVision ||
-      this.stateArr[o + 2] !== st.isParty ||
-      this.stateArr[o + 3] !== st.ringEnabled
+      this.stateArr[o + 2] !== st.isParty
     ) {
-      this._writeQuad4(this.stateArr, idx, st.alpha, st.needsVision, st.isParty, st.ringEnabled);
+      this._writeQuad4(this.stateArr, idx, st.alpha, st.needsVision, st.isParty, 0);
       this._bufDirty.state = true;
     }
   }
@@ -1084,8 +1020,7 @@ export class TokenImpostorLayer {
     if (this._bufDirty.center && this.centerBuf) { this.centerBuf.update(); this._bufDirty.center = false; }
     if (this._bufDirty.sizeInfo && this.sizeInfoBuf) { this.sizeInfoBuf.update(); this._bufDirty.sizeInfo = false; }
     if (this._bufDirty.atlasRect && this.atlasRectBuf) { this.atlasRectBuf.update(); this._bufDirty.atlasRect = false; }
-    if (this._bufDirty.ringColor && this.ringColorBuf) { this.ringColorBuf.update(); this._bufDirty.ringColor = false; }
-    if (this._bufDirty.avgColor && this.avgColorBuf) { this.avgColorBuf.update(); this._bufDirty.avgColor = false; }
+    if (this._bufDirty.flipAndPad && this.flipAndPadBuf) { this.flipAndPadBuf.update(); this._bufDirty.flipAndPad = false; }
     if (this._bufDirty.state && this.stateBuf) { this.stateBuf.update(); this._bufDirty.state = false; }
   }
 
@@ -1097,12 +1032,12 @@ export class TokenImpostorLayer {
 
   getStats() {
     let readySlots = 0;
-    for (const s of this.slotsBySrc.values()) if (s.ready) readySlots++;
+    for (const s of this.slotsByKey.values()) if (s.ready) readySlots++;
     return {
       mounted: this.mounted,
       trackedTokens: this.count,
       atlasSize: this.atlasSize,
-      atlasSlots: this.slotsBySrc.size,
+      atlasSlots: this.slotsByKey.size,
       atlasReady: readySlots,
       pendingDecodes: this._decodeQueue.length + this._activeDecodes
     };
