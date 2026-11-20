@@ -154,34 +154,79 @@ function parseCssColor(val, fallback) {
   }
 }
 
+function littleEndianToCss(le) {
+  if (le === null || le === undefined || !Number.isFinite(le)) return null;
+  const r = le & 0xff;
+  const g = (le >> 8) & 0xff;
+  const b = (le >> 16) & 0xff;
+  return `rgb(${r},${g},${b})`;
+}
+
+function getFoundryRingAssetInfo(sizeUnits) {
+  try {
+    const RingCls = globalThis.CONFIG?.Token?.ring?.ringClass;
+    if (!RingCls?.getRingDataBySize) return null;
+    const data = RingCls.getRingDataBySize(Math.max(1, sizeUnits || 1));
+    if (!data?.ringName && !data?.bkgName) return null;
+    const ringTex = data.ringName ? globalThis.PIXI?.Assets?.cache?.get?.(data.ringName) : null;
+    const bkgTex = data.bkgName ? globalThis.PIXI?.Assets?.cache?.get?.(data.bkgName) : null;
+    return {
+      ringTex,
+      bkgTex,
+      subjectScaleAdjustment: Number(data.subjectScaleAdjustment) || 1.5,
+      defaultRingCss: littleEndianToCss(data.defaultRingColorLittleEndian),
+      defaultBkgCss: littleEndianToCss(data.defaultBackgroundColorLittleEndian)
+    };
+  } catch {
+    return null;
+  }
+}
+
 function getTokenRenderSpec(doc) {
   const srcObj = doc._source || {};
   const ringEnabled = Boolean(srcObj.ring?.enabled);
+  const hasDistinctSubject = Boolean(ringEnabled && (doc.hasDistinctSubjectTexture || srcObj.ring?.subject?.texture));
   const subjectTex = ringEnabled ? (srcObj.ring?.subject?.texture || doc.ring?.subject?.texture || "") : "";
   const baseTex = srcObj.texture?.src || doc.texture?.src || doc.baseActor?.img || "";
   const artSrc = subjectTex || baseTex;
+
+  const wUnits = Number(srcObj.width ?? doc.width ?? 1) || 1;
+  const hUnits = Number(srcObj.height ?? doc.height ?? 1) || 1;
+  const sizeUnits = Math.min(wUnits, hUnits);
+  const ringInfo = ringEnabled ? getFoundryRingAssetInfo(sizeUnits) : null;
+  const subjectScaleAdj = ringInfo?.subjectScaleAdjustment || 1.5;
 
   const sx = Number(srcObj.texture?.scaleX ?? doc.texture?.scaleX ?? 1) || 1;
   const sy = Number(srcObj.texture?.scaleY ?? doc.texture?.scaleY ?? 1) || 1;
   const flipX = sx < 0 ? -1 : 1;
   const flipY = sy < 0 ? -1 : 1;
-  const texScale = ringEnabled ? 1.0 : Math.min(2.5, Math.max(0.25, Math.max(Math.abs(sx), Math.abs(sy))));
 
-  const ringColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.ring, "#b9b4a4") : "";
-  const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, "#26282e") : "";
-  const subjectScale = ringEnabled ? Math.min(2.2, Math.max(0.5, Number(srcObj.ring?.subject?.scale) || 1)) : 1;
+  // For distinct-subject pop-out tokens (Hero in a Box / D&D 5e), the subject canvas is `subjectScaleAdj * max(1, subScale)`
+  // larger than the 1x ring so heads/weapons extend cleanly beyond the ring at exact native Foundry v14 scale!
+  const subScale = ringEnabled ? Math.min(2.2, Math.max(0.5, Number(srcObj.ring?.subject?.scale) || 1)) : 1;
+  const popoutQuadScale = hasDistinctSubject ? (subjectScaleAdj * Math.max(1.0, subScale)) : 1.0;
+  const texScale = ringEnabled
+    ? popoutQuadScale
+    : Math.min(2.5, Math.max(0.25, Math.max(Math.abs(sx), Math.abs(sy))));
+
+  const ringColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.ring, ringInfo?.defaultRingCss || "") : "";
+  const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, ringInfo?.defaultBkgCss || "") : "";
 
   const slotKey = ringEnabled
-    ? `R|${artSrc}|${ringColor}|${bgColor}|${subjectScale.toFixed(2)}`
+    ? `R${hasDistinctSubject ? "P" : "C"}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
     : `T|${artSrc}`;
 
   return {
     slotKey,
     artSrc,
     ringEnabled,
+    hasDistinctSubject,
+    sizeUnits,
+    subjectScaleAdj,
+    popoutQuadScale,
     ringColor,
     bgColor,
-    subjectScale,
+    subjectScale: subScale,
     flipX,
     flipY,
     texScale
@@ -224,6 +269,8 @@ export class TokenImpostorLayer {
     this.atlasSize = ATLAS_PX;
     this.atlasCanvas = null;
     this.atlasCtx = null;
+    this._tmpCanvas = null;
+    this._tmpCtx = null;
     this.atlasTexture = null;
     this.atlasDirty = false;
     this.slotsByKey = new Map(); // slotKey -> { col, row, u0, v0, uSpan, spec, ready, failed }
@@ -312,6 +359,8 @@ export class TokenImpostorLayer {
     }
     this.atlasCanvas = null;
     this.atlasCtx = null;
+    this._tmpCanvas = null;
+    this._tmpCtx = null;
     this.atlasDirty = false;
     this.slotsByKey.clear();
     this.nextSlotIdx = 0;
@@ -615,6 +664,48 @@ export class TokenImpostorLayer {
     return { drawable: null, shouldClose: false };
   }
 
+  _drawTintedSpritesheetFrame(ctx, pixiTex, tintCss, dx, dy, dw, dh) {
+    const src = pixiTex?.baseTexture?.resource?.source;
+    const f = pixiTex?.frame;
+    if (!src || !f || !f.width || !f.height) return false;
+
+    if (!tintCss) {
+      ctx.drawImage(src, f.x, f.y, f.width, f.height, dx, dy, dw, dh);
+      return true;
+    }
+
+    if (!this._tmpCanvas && typeof document !== "undefined") {
+      this._tmpCanvas = document.createElement("canvas");
+      this._tmpCanvas.width = CELL_PX;
+      this._tmpCanvas.height = CELL_PX;
+      this._tmpCtx = this._tmpCanvas.getContext("2d");
+      if (this._tmpCtx) {
+        this._tmpCtx.imageSmoothingEnabled = true;
+        this._tmpCtx.imageSmoothingQuality = "high";
+      }
+    }
+    const tctx = this._tmpCtx;
+    if (!tctx) {
+      ctx.drawImage(src, f.x, f.y, f.width, f.height, dx, dy, dw, dh);
+      return true;
+    }
+
+    const sz = Math.min(CELL_PX, Math.max(1, Math.round(dw)));
+    tctx.save();
+    tctx.globalCompositeOperation = "source-over";
+    tctx.clearRect(0, 0, CELL_PX, CELL_PX);
+    tctx.drawImage(src, f.x, f.y, f.width, f.height, 0, 0, sz, sz);
+    tctx.globalCompositeOperation = "multiply";
+    tctx.fillStyle = tintCss;
+    tctx.fillRect(0, 0, sz, sz);
+    tctx.globalCompositeOperation = "destination-in";
+    tctx.drawImage(src, f.x, f.y, f.width, f.height, 0, 0, sz, sz);
+    tctx.restore();
+
+    ctx.drawImage(this._tmpCanvas, 0, 0, sz, sz, dx, dy, dw, dh);
+    return true;
+  }
+
   async _decodeAndPack(slotKey, slot, gen) {
     if (!this.mounted || gen !== this._gen || !this.atlasCtx) return;
     let drawable = null;
@@ -642,60 +733,82 @@ export class TokenImpostorLayer {
       const dstY = cellY + PAD_PX;
       const sw = drawable.naturalWidth || drawable.width || CONTENT_PX;
       const sh = drawable.naturalHeight || drawable.height || CONTENT_PX;
+      const aspect = sw / Math.max(1, sh);
 
       ctx.save();
       ctx.clearRect(cellX, cellY, CELL_PX, CELL_PX);
 
       if (slot.spec.ringEnabled) {
-        // Bake authentic Foundry v14 Dynamic Token Ring (neutral metallic ring + masked subject portrait)
+        const ringInfo = getFoundryRingAssetInfo(slot.spec.sizeUnits);
         const cx = dstX + CONTENT_PX * 0.5;
         const cy = dstY + CONTENT_PX * 0.5;
-        const outerR = CONTENT_PX * 0.47;
-        const ringThickness = CONTENT_PX * 0.08;
-        const innerR = outerR - ringThickness;
-
-        // Subtle grounded drop shadow
-        ctx.beginPath();
-        ctx.arc(cx, cy + 2, outerR, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(0, 0, 0, 0.34)";
-        ctx.fill();
-
-        // Dark circular token background
-        ctx.beginPath();
-        ctx.arc(cx, cy, innerR + 0.5, 0, Math.PI * 2);
-        ctx.fillStyle = slot.spec.bgColor || "#26282e";
-        ctx.fill();
-
-        // Clip inside ring and draw subject portrait preserving aspect ratio + subject.scale
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
-        ctx.clip();
-        const aspect = sw / Math.max(1, sh);
         const subScale = slot.spec.subjectScale || 1;
-        const fit = innerR * 2 * subScale;
-        let dw = fit, dh = fit;
-        if (aspect > 1) dw = fit * aspect;
-        else if (aspect < 1) dh = fit / aspect;
-        ctx.drawImage(drawable, cx - dw * 0.5, cy - dh * 0.5, dw, dh);
-        ctx.restore();
 
-        // Subtle metallic ring bezel
-        ctx.beginPath();
-        ctx.arc(cx, cy, outerR - ringThickness * 0.5, 0, Math.PI * 2);
-        ctx.lineWidth = ringThickness;
-        ctx.strokeStyle = slot.spec.ringColor || "#b9b4a4";
-        ctx.stroke();
+        if (slot.spec.hasDistinctSubject) {
+          // Pop-out Dynamic Token Ring (Hero in a Box / D&D 5e 2024):
+          // Ring sits centered at exact 1x grid size (`CONTENT_PX / popoutQuadScale`); pop-out subject draws ON TOP UNCLIPPED!
+          const quadScale = slot.spec.popoutQuadScale || 1.5;
+          const ringBox = CONTENT_PX / quadScale;
+          const rx = cx - ringBox * 0.5;
+          const ry = cy - ringBox * 0.5;
 
-        // Crisp dark hairline outer edge
-        ctx.beginPath();
-        ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-        ctx.stroke();
+          const drewBkg = ringInfo?.bkgTex && this._drawTintedSpritesheetFrame(ctx, ringInfo.bkgTex, slot.spec.bgColor, rx, ry, ringBox, ringBox);
+          if (!drewBkg) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, ringBox * 0.44, 0, Math.PI * 2);
+            ctx.fillStyle = slot.spec.bgColor || "#22242a";
+            ctx.fill();
+          }
+
+          const drewRing = ringInfo?.ringTex && this._drawTintedSpritesheetFrame(ctx, ringInfo.ringTex, slot.spec.ringColor, rx, ry, ringBox, ringBox);
+          if (!drewRing) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, ringBox * 0.45, 0, Math.PI * 2);
+            ctx.lineWidth = Math.max(2, ringBox * 0.06);
+            ctx.strokeStyle = slot.spec.ringColor || "#8a8578";
+            ctx.stroke();
+          }
+
+          // Subject art spans exact native ratio without circular clipping
+          const subjBox = CONTENT_PX * Math.min(1.0, subScale);
+          let dw = subjBox;
+          let dh = subjBox;
+          if (aspect > 1) dh = dw / aspect;
+          else if (aspect < 1) dw = dh * aspect;
+          ctx.drawImage(drawable, cx - dw * 0.5, cy - dh * 0.5, dw, dh);
+        } else {
+          // Classic non-popout portrait inside Dynamic Token Ring: bkg -> clipped subject -> authentic ring sprite on top
+          const ringBox = CONTENT_PX;
+          const drewBkg = ringInfo?.bkgTex && this._drawTintedSpritesheetFrame(ctx, ringInfo.bkgTex, slot.spec.bgColor, dstX, dstY, ringBox, ringBox);
+          if (!drewBkg) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, ringBox * 0.44, 0, Math.PI * 2);
+            ctx.fillStyle = slot.spec.bgColor || "#22242a";
+            ctx.fill();
+          }
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, ringBox * 0.43, 0, Math.PI * 2);
+          ctx.clip();
+          const fit = ringBox * 0.88 * subScale;
+          let dw = fit, dh = fit;
+          if (aspect > 1) dw = fit * aspect;
+          else if (aspect < 1) dh = fit / aspect;
+          ctx.drawImage(drawable, cx - dw * 0.5, cy - dh * 0.5, dw, dh);
+          ctx.restore();
+
+          const drewRing = ringInfo?.ringTex && this._drawTintedSpritesheetFrame(ctx, ringInfo.ringTex, slot.spec.ringColor, dstX, dstY, ringBox, ringBox);
+          if (!drewRing) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, ringBox * 0.45, 0, Math.PI * 2);
+            ctx.lineWidth = Math.max(2, ringBox * 0.06);
+            ctx.strokeStyle = slot.spec.ringColor || "#8a8578";
+            ctx.stroke();
+          }
+        }
       } else {
-        // Draw authentic raw token art (e.g. top-down / Hero in a Box pop-out) preserving full transparency & aspect
-        const aspect = sw / Math.max(1, sh);
+        // Draw authentic raw token art (e.g. top-down / standalone token) preserving full transparency & aspect
         let dw = CONTENT_PX;
         let dh = CONTENT_PX;
         if (aspect > 1) dh = CONTENT_PX / aspect;
