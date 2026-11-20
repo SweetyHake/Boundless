@@ -1,0 +1,75 @@
+.boundless-fieldset {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border-light-tertiary, rgba(255, 255, 255, 0.14));
+  border-radius: 6px;
+}
+
+.boundless-fieldset legend {
+  padding: 0 0.4rem;
+  font-weight: 600;
+}
+
+.boundless-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.boundless-actions button {
+  flex: 1 1 auto;
+}
+
+.boundless-poi-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.5rem 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.boundless-poi-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.boundless-poi-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.boundless-poi-coords {
+  opacity: 0.65;
+  font-size: 0.8em;
+}
+
+.boundless-poi-btns {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.boundless-poi-btns button {
+  width: auto;
+  min-height: unset;
+  padding: 0.15rem 0.45rem;
+  line-height: 1.2;
+}
+
+.boundless-muted {
+  opacity: 0.7;
+  font-style: italic;
+  margin: 0.25rem 0;
+}

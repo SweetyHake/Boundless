@@ -1,0 +1,9 @@
+# Local demo/stress-test map pyramids & textures (~500 MB)
+assets/
+
+# Packaging & OS artifacts
+*.zip
+.DS_Store
+Thumbs.db
+desktop.ini
+node_modules/
