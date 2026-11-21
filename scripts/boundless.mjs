@@ -2343,6 +2343,44 @@ function installBulkSelectionPatch() {
   bulkSelectPatchInstalled = true;
 }
 
+/**
+ * Prevent Foundry v14's `PrimaryCanvasGroup#_onMouseMove` (`#updateHoveredObjects`) from triggering
+ * synchronous `gl.readPixels()` alpha-map extraction (`TextureLoader.getTextureAlphaData`, 10-30ms GPU stalls)
+ * on every Boundless pyramid tile / static prop (which all carry a default `_hoverFadeState` class field even when `hoverFade = false`)
+ * and while the camera is actively zooming/panning.
+ */
+let hoverFadeHitTestPatchInstalled = false;
+let _inHoverFadeHitTest = false;
+function installHoverFadeHitTestPatch() {
+  if (hoverFadeHitTestPatchInstalled) return;
+  const PCG = foundry.canvas?.groups?.PrimaryCanvasGroup;
+  const PSM = foundry.canvas?.primary?.PrimarySpriteMesh;
+  if (!PCG?.prototype?._onMouseMove || !PSM?.prototype?.containsCanvasPoint) return;
+
+  const origOnMouseMove = PCG.prototype._onMouseMove;
+  PCG.prototype._onMouseMove = function (...args) {
+    if (!controller?.active) return origOnMouseMove.apply(this, args);
+    _inHoverFadeHitTest = true;
+    try {
+      return origOnMouseMove.apply(this, args);
+    } finally {
+      _inHoverFadeHitTest = false;
+    }
+  };
+
+  const origContainsCanvasPoint = PSM.prototype.containsCanvasPoint;
+  PSM.prototype.containsCanvasPoint = function (...args) {
+    if (_inHoverFadeHitTest && controller?.active && this._boundlessMesh) {
+      if (!this.hoverFade && !this.occlusionMode) return false;
+      if (this._boundlessTile && !this.hoverFade) return false;
+      if (controller.isActivelyMoving()) return false;
+    }
+    return origContainsCanvasPoint.apply(this, args);
+  };
+
+  hoverFadeHitTestPatchInstalled = true;
+}
+
 class LRUTextureManager {
   promises = new Map();     // src -> Promise<PIXI.Texture>
   lru = new Map();          // src -> PIXI.Texture (insertion order = LRU -> MRU)
@@ -2500,13 +2538,20 @@ class LRUTextureManager {
     }
   }
 
-  prune(inUseSet) {
-    if (this.lru.size <= MAX_VRAM_TEXTURES && this.totalBytes <= MAX_VRAM_BYTES) return;
+  needsPrune() {
+    return this.lru.size > MAX_VRAM_TEXTURES || this.totalBytes > MAX_VRAM_BYTES;
+  }
+
+  prune(inUseSet, maxEvict = Infinity) {
+    if (!this.needsPrune()) return 0;
+    let evicted = 0;
     for (const [src] of this.lru) {
-      if (this.lru.size <= MAX_VRAM_TEXTURES && this.totalBytes <= MAX_VRAM_BYTES) break;
+      if (!this.needsPrune() || evicted >= maxEvict) break;
       if (this.pinned.has(src) || inUseSet.has(src)) continue;
       this._disposeEntry(src);
+      evicted++;
     }
+    return evicted;
   }
 
   clear(includePinned = false) {
@@ -2624,7 +2669,13 @@ class MegaWorld1000 {
   _restoringCamera = false;
   _zoomSyncQueued = false;
   isCameraFlying = false;
+  _lastPanMs = 0;
+  _pruneNeeded = false;
   _prewarmGen = 0;
+
+  isActivelyMoving() {
+    return this.isCameraFlying || (this._lastPanMs > 0 && (performance.now() - this._lastPanMs) < 160);
+  }
 
   _getCameraStorageKey(scene = canvas.scene, levelId = canvas.level?.id) {
     if (!scene?.id) return null;
@@ -2809,7 +2860,7 @@ class MegaWorld1000 {
     if (!layer) return false;
     if (!layer.hasPyramid) return true;
     const effScale = getEffectiveScale(scale);
-    const threshold = layer._roofsMountedMode ? 0.14 : 0.16;
+    const threshold = layer._roofsMountedMode ? 0.21 : 0.24;
     const active = effScale >= threshold;
     layer._roofsMountedMode = active;
     return active;
@@ -3205,6 +3256,7 @@ class MegaWorld1000 {
 
     installLosHorizonPatch();
     installBulkSelectionPatch();
+    installHoverFadeHitTestPatch();
     installLazyTokenLayerPatch();
     this._ensureSocket();
     const mountedLevelId = canvas.level?.id;
@@ -3369,6 +3421,8 @@ class MegaWorld1000 {
       m.textureAlphaThreshold = 0.75;
       m._occludedBySameElevationSurfaces = true;
       m._ssDofBlurPx = 0;
+      m._boundlessMesh = true;
+      m._boundlessTile = false;
       return m;
     }
     const PrimarySpriteMesh = foundry.canvas.primary.PrimarySpriteMesh;
@@ -3376,6 +3430,8 @@ class MegaWorld1000 {
     m.anchor.set(0, 0);
     m.eventMode = "none";
     m.textureAlphaThreshold = 0.75;
+    m._boundlessMesh = true;
+    m._boundlessTile = false;
     return m;
   }
 
@@ -3383,6 +3439,7 @@ class MegaWorld1000 {
     if (!m) return;
     // Clear any Showstopper Depth-of-Field filter & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
+    m._boundlessTile = false;
     m.texture = PIXI.Texture.EMPTY;
     m.debounceSetOcclusion?.cancel?.();
     m.hoverFade = false;
@@ -3703,56 +3760,61 @@ class MegaWorld1000 {
     }
 
     this.lastTargetZ = maxTargetZ;
+    // Synchronously reveal z=0 fallback BEFORE this frame renders whenever zoom-out/pan exposes any edge outside mounted z>0 tiles
+    this._syncBaseLayerVisibility(this.getViewportWorldRect(0.0));
     this._syncIndoorLightVisibility();
     if (anyTilesOrOverlaysChanged) {
       this._roofTokenOccDirty = true;
-    }
-
-    if (anyTilesOrOverlaysChanged) {
-      const inUse = new Set();
-      for (const [, entry] of this.tilesByKey) inUse.add(entry.src);
-      for (const [, ov] of this.activeOverlays) {
-        if (ov.srcWalls) inUse.add(ov.srcWalls);
-        if (ov.srcRoof) inUse.add(ov.srcRoof);
+      if (this.texMgr.needsPrune()) {
+        this._pruneNeeded = true;
       }
-      for (let i = 0; i < this.pendingOverlayMounts.length; i++) {
-        const po = this.pendingOverlayMounts[i];
-        if (po?.ovSpec?.walls) inUse.add(po.ovSpec.walls);
-        if (po?.ovSpec?.roof) inUse.add(po.ovSpec.roof);
-      }
-      for (const fullKey of this.overlayPending) {
-        const cleanKey = fullKey.endsWith(":w") ? fullKey.slice(0, -2) : fullKey;
-        const sep = cleanKey.indexOf("::");
-        if (sep > 0) {
-          const l = this.levelLayers.get(cleanKey.slice(0, sep));
-          const rawOid = cleanKey.slice(sep + 2);
-          const ovSpec = l?.spec?.overlays?.[rawOid];
-          if (ovSpec?.walls) inUse.add(ovSpec.walls);
-          if (ovSpec?.roof) inUse.add(ovSpec.roof);
-        }
-      }
-      for (const [, vt] of this.activeVirtualTiles) {
-        if (vt.src) inUse.add(vt.src);
-      }
-      for (let i = 0; i < this.pendingVirtualTileMounts.length; i++) {
-        const pv = this.pendingVirtualTileMounts[i];
-        if (pv?.tSpec?.src) inUse.add(pv.tSpec.src);
-      }
-      for (const fullId of this.virtualTilePending) {
-        const sep = fullId.indexOf("::");
-        if (sep > 0) {
-          const lid = fullId.slice(0, sep);
-          const tid = Number(fullId.slice(sep + 2));
-          const l = this.levelLayers.get(lid);
-          const tSpec = l ? this.resolveVirtualTile(lid, tid, l.spec?.tiles?.[tid], l.level) : null;
-          if (tSpec?.src) inUse.add(tSpec.src);
-        }
-      }
-      this.texMgr.prune(inUse);
     }
     } finally {
       this._inUpdatePyramid = false;
     }
+  }
+
+  _collectInUseTextures() {
+    const inUse = new Set();
+    for (const [, entry] of this.tilesByKey) inUse.add(entry.src);
+    for (const [, ov] of this.activeOverlays) {
+      if (ov.srcWalls) inUse.add(ov.srcWalls);
+      if (ov.srcRoof) inUse.add(ov.srcRoof);
+    }
+    for (let i = 0; i < this.pendingOverlayMounts.length; i++) {
+      const po = this.pendingOverlayMounts[i];
+      if (po?.ovSpec?.walls) inUse.add(po.ovSpec.walls);
+      if (po?.ovSpec?.roof) inUse.add(po.ovSpec.roof);
+    }
+    for (const fullKey of this.overlayPending) {
+      const cleanKey = fullKey.endsWith(":w") ? fullKey.slice(0, -2) : fullKey;
+      const sep = cleanKey.indexOf("::");
+      if (sep > 0) {
+        const l = this.levelLayers.get(cleanKey.slice(0, sep));
+        const rawOid = cleanKey.slice(sep + 2);
+        const ovSpec = l?.spec?.overlays?.[rawOid];
+        if (ovSpec?.walls) inUse.add(ovSpec.walls);
+        if (ovSpec?.roof) inUse.add(ovSpec.roof);
+      }
+    }
+    for (const [, vt] of this.activeVirtualTiles) {
+      if (vt.src) inUse.add(vt.src);
+    }
+    for (let i = 0; i < this.pendingVirtualTileMounts.length; i++) {
+      const pv = this.pendingVirtualTileMounts[i];
+      if (pv?.tSpec?.src) inUse.add(pv.tSpec.src);
+    }
+    for (const fullId of this.virtualTilePending) {
+      const sep = fullId.indexOf("::");
+      if (sep > 0) {
+        const lid = fullId.slice(0, sep);
+        const tid = Number(fullId.slice(sep + 2));
+        const l = this.levelLayers.get(lid);
+        const tSpec = l ? this.resolveVirtualTile(lid, tid, l.spec?.tiles?.[tid], l.level) : null;
+        if (tSpec?.src) inUse.add(tSpec.src);
+      }
+    }
+    return inUse;
   }
 
   ensureTile(layer, spec, instant = false) {
@@ -3827,6 +3889,7 @@ class MegaWorld1000 {
     const levelElev = getLevelBottomElevation(layer.level);
 
     const m = this.acquireMesh();
+    m._boundlessTile = true;
     m.name = `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
     m.anchor.set(0, 0);
     m.texture = tex;
@@ -3846,10 +3909,13 @@ class MegaWorld1000 {
     m.restrictsLight = e.z > 0;
     m.restrictsWeather = e.z > 0;
 
+    // Only defer visibility (`awaitingSwap`) when zooming IN (`other.z < e.z`, coarser ancestor fully covers this tile).
+    // When zooming OUT (`e.z < other.z`), the new coarser tile sorts BEHIND old finer tiles (`m.sort = 1 + e.z * 10`)
+    // so making it immediately visible fills surrounding space around old tiles with zero black borders!
     let hasOtherZCovering = false;
     if (!instant && e.z > 0 && !e.isReveal) {
       for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z !== e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+        if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
             this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
           hasOtherZCovering = true;
           break;
@@ -3887,32 +3953,60 @@ class MegaWorld1000 {
     const rx1 = Math.min(layer.bounds.x + layer.bounds.w, visVp.x1);
     const ry1 = Math.min(layer.bounds.y + layer.bounds.h, visVp.y1);
     if (rx1 <= rx0 || ry1 <= ry0) return true;
+    const visHigher = [];
+    for (const [, other] of this.tilesByKey) {
+      if (other.levelId === lid && other.ready && !other.awaitingSwap && other.z > 0 && other.mesh?.visible && other.alpha >= 0.98 &&
+          other.x0 < rx1 && other.x0 + other.sizePx > rx0 &&
+          other.y0 < ry1 && other.y0 + other.sizePx > ry0) {
+        visHigher.push(other);
+      }
+    }
+    if (visHigher.length === 0) return false;
     const rw = rx1 - rx0;
     const rh = ry1 - ry0;
-    const samples = [
-      [rx0 + rw * 0.15, ry0 + rh * 0.15],
-      [rx0 + rw * 0.50, ry0 + rh * 0.15],
-      [rx0 + rw * 0.85, ry0 + rh * 0.15],
-      [rx0 + rw * 0.15, ry0 + rh * 0.50],
-      [rx0 + rw * 0.50, ry0 + rh * 0.50],
-      [rx0 + rw * 0.85, ry0 + rh * 0.50],
-      [rx0 + rw * 0.15, ry0 + rh * 0.85],
-      [rx0 + rw * 0.50, ry0 + rh * 0.85],
-      [rx0 + rw * 0.85, ry0 + rh * 0.85]
-    ];
-    for (const [px, py] of samples) {
-      let covered = false;
-      for (const [, other] of this.tilesByKey) {
-        if (other.levelId === lid && other.ready && other.z > 0 && other.mesh?.visible && other.alpha >= 0.98 &&
-            px >= other.x0 && px <= other.x0 + other.sizePx &&
-            py >= other.y0 && py <= other.y0 + other.sizePx) {
-          covered = true;
-          break;
+    const fracs = [0.002, 0.25, 0.5, 0.75, 0.998];
+    for (let yi = 0; yi < 5; yi++) {
+      const py = ry0 + rh * fracs[yi];
+      for (let xi = 0; xi < 5; xi++) {
+        const px = rx0 + rw * fracs[xi];
+        let covered = false;
+        for (let i = 0; i < visHigher.length; i++) {
+          const o = visHigher[i];
+          if (px >= o.x0 && px <= o.x0 + o.sizePx && py >= o.y0 && py <= o.y0 + o.sizePx) {
+            covered = true;
+            break;
+          }
         }
+        if (!covered) return false;
       }
-      if (!covered) return false;
     }
     return true;
+  }
+
+  _syncBaseLayerVisibility(visVp, levelReadyState = null) {
+    let anyChanged = false;
+    for (const layer of this.visibleLevelLayers) {
+      if (!layer.hasPyramid) continue;
+      const lid = layer.level.id;
+      const st = levelReadyState?.get?.(lid);
+      const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
+      const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
+        || this._isViewportCoveredByHigherTiles(layer, visVp);
+      if (z0?.mesh) {
+        const shouldShowBase = !fullyCovered;
+        if (z0.mesh.visible !== shouldShowBase) {
+          z0.mesh.visible = shouldShowBase;
+          anyChanged = true;
+        }
+      }
+      this._setNativeLevelBgVisible(layer.level, !fullyCovered);
+    }
+    if (anyChanged) {
+      canvas.primary.sortDirty = true;
+      this._depthDirty = true;
+      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+    }
+    return anyChanged;
   }
 
   rectsOverlap(ax, ay, asz, bx, by, bsz) {
@@ -3921,7 +4015,7 @@ class MegaWorld1000 {
 
   hasReadyOtherZCovering(e) {
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z !== e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+      if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
           this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
         return true;
       }
@@ -4175,24 +4269,54 @@ class MegaWorld1000 {
       if (!bt || (bt._glTextures && Object.keys(bt._glTextures).length > 0)) return 0;
       return this.texMgr._estimateBytes(tex);
     };
-    const gpuUploadBudget = this.isCameraFlying ? (MAX_GPU_UPLOAD_BYTES_PER_FRAME * 0.5) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
+    const isMoving = this.isActivelyMoving();
+    const gpuUploadBudget = isMoving ? (10 * 1024 * 1024) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
     let frameGpuUploadBytes = 0;
 
-    // Frame-budgeted overlay mounting FIRST so newly mounted roofs sync into depthMask in the exact same frame.
-    // Limit fresh GPU uploads (huge 3000-4000px roof textures) to avoid 100ms+ WebGL mipmap stalls!
+    // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
+    if (this.pendingTileMounts.length > 0) {
+      const maxMounts = isMoving ? 12 : 24;
+      let mounted = 0;
+      while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
+        const peek = this.pendingTileMounts[0];
+        const estBytes = estimateFreshUploadBytes(peek?.tex);
+        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+        const item = this.pendingTileMounts.shift();
+        const e = this.tilesByKey.get(item.key);
+        if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
+        const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
+        if (!isTextureUsable(tex)) {
+          this.tilesByKey.delete(item.key);
+          if (e.layer) e.layer.lastPyramidKey = "";
+          continue;
+        }
+        if (this._mountTileMesh(e, tex, item.instant)) {
+          mounted++;
+          frameGpuUploadBytes += estBytes;
+        }
+      }
+      if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
+    }
+
+    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly, fresh 4K roofs cap at 1/frame and defer while pyramid chunks are still uploading
     if (this.pendingOverlayMounts.length > 0) {
-      const maxCachedOvMounts = this.isCameraFlying ? 8 : 16;
+      const maxCachedOvMounts = isMoving ? 8 : 16;
       let mountedOv = 0;
+      let freshHeavyOv = 0;
       const curVp = this.getViewportWorldRect(0.35);
       while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
         const peek = this.pendingOverlayMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
-        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+        if (estBytes > 0) {
+          if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+          if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (isMoving && this.pendingTileMounts.length > 0))) break;
+        }
         const item = this.pendingOverlayMounts.shift();
         if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
         if (this._mountOverlayMeshes(item, curVp)) {
           mountedOv++;
           frameGpuUploadBytes += estBytes;
+          if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
         }
       }
       if (mountedOv > 0) {
@@ -4200,7 +4324,7 @@ class MegaWorld1000 {
         this._tilesDirty = true;
         this._occlusionDirty = true;
         this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
         this._roofTokenOccDirty = true;
         this.invalidateShowstopperSurfaces();
@@ -4208,16 +4332,17 @@ class MegaWorld1000 {
       if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
     }
 
-    // Frame-budgeted virtual tile mounting (prevents 300+ mesh/texture upload stalls on zoom-out)
+    // 3. Frame-budgeted virtual tile mounting (strict time & upload budget during zoom/pan so hundreds of props never stall frames)
     if (this.pendingVirtualTileMounts.length > 0) {
-      const maxVtMounts = this.isCameraFlying ? 24 : 96;
+      const maxVtMounts = isMoving ? 16 : 48;
+      const vtTimeBudgetMs = isMoving ? 1.5 : 3.5;
       let mountedVt = 0;
       let anyVtLight = false;
       let anyVtOcc = false;
       const curVp = this.getViewportWorldRect(0.28);
       const tStart = performance.now();
       while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
-        if (mountedVt > 0 && (performance.now() - tStart) > 4.5) break;
+        if (mountedVt > 0 && (performance.now() - tStart) > vtTimeBudgetMs) break;
         const peek = this.pendingVirtualTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
         if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
@@ -4249,7 +4374,7 @@ class MegaWorld1000 {
       this.lightBatch.syncDepthElevations(this._hasMultiElevationDepth());
       if (canvas.masks?.depth) canvas.masks.depth._elevationDirty = true;
       this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
 
     if (this._depthDirty || this._depthDeferred) {
@@ -4275,29 +4400,16 @@ class MegaWorld1000 {
       this.syncRoofTokenOcclusion();
     }
 
-    // Frame-budgeted tile mounting (respects shared frameGpuUploadBytes budget for fresh uploads; already-resident GPU tiles mount fast)
-    if (this.pendingTileMounts.length > 0) {
-      const maxMounts = this.isCameraFlying ? 6 : 24;
-      let mounted = 0;
-      while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
-        const peek = this.pendingTileMounts[0];
-        const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
-        const item = this.pendingTileMounts.shift();
-        const e = this.tilesByKey.get(item.key);
-        if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
-        const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
-        if (!isTextureUsable(tex)) {
-          this.tilesByKey.delete(item.key);
-          if (e.layer) e.layer.lastPyramidKey = "";
-          continue;
-        }
-        if (this._mountTileMesh(e, tex, item.instant)) {
-          mounted++;
-          frameGpuUploadBytes += estBytes;
+    // Incremental VRAM pruning strictly while camera is idle (max 4 textures/frame) to prevent D3D11/WebGL texture-delete pipeline stalls during zoom
+    if (this._pruneNeeded && !isMoving && this.pendingTileMounts.length === 0) {
+      if (!this.texMgr.needsPrune()) {
+        this._pruneNeeded = false;
+      } else {
+        const evicted = this.texMgr.prune(this._collectInUseTextures(), 4);
+        if (evicted === 0 || !this.texMgr.needsPrune()) {
+          this._pruneNeeded = false;
         }
       }
-      if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
     }
 
     if (!this._tilesDirty) return;
@@ -4388,22 +4500,9 @@ class MegaWorld1000 {
       }
     }
 
-    // Hide z=0 base mesh & native Foundry background mesh whenever ANY sharper tiles (z > 0, including outgoing LOD) cover the visible screen!
-    for (const layer of this.visibleLevelLayers) {
-      if (!layer.hasPyramid) continue;
-      const lid = layer.level.id;
-      const st = levelReadyState.get(lid);
-      const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
-      const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
-        || this._isViewportCoveredByHigherTiles(layer, visVp);
-      if (z0?.mesh) {
-        const shouldShowBase = !fullyCovered;
-        if (z0.mesh.visible !== shouldShowBase) {
-          z0.mesh.visible = shouldShowBase;
-          anyPyramidSwapped = true;
-        }
-      }
-      this._setNativeLevelBgVisible(layer.level, !fullyCovered);
+    // Hide z=0 base mesh & native Foundry background mesh whenever ANY sharper tiles (z > 0, including outgoing LOD) cover the full visible screen!
+    if (this._syncBaseLayerVisibility(visVp, levelReadyState)) {
+      anyPyramidSwapped = true;
     }
 
     if (anyPyramidSwapped) {
@@ -4760,6 +4859,15 @@ class MegaWorld1000 {
     layer.lastOverlayKey = ovKey;
 
     const neededOv = new Set();
+    if (!shouldMountRoofs && this.pendingOverlayMounts.length > 0) {
+      this.pendingOverlayMounts = this.pendingOverlayMounts.filter(item => {
+        if (item?.lid === lid) {
+          this._pendingOverlayKeys.delete(item.fullId);
+          return false;
+        }
+        return true;
+      });
+    }
     if (shouldMountRoofs) {
       for (let sy = sy0; sy <= sy1; sy++) {
         for (let sx = sx0; sx <= sx1; sx++) {
@@ -7199,6 +7307,8 @@ class MegaWorld1000 {
     this._restoringCamera = false;
     this._zoomSyncQueued = false;
     this.isCameraFlying = false;
+    this._lastPanMs = 0;
+    this._pruneNeeded = false;
 
     this.poiManager.unmount();
     this.charPins.unmount();
@@ -7349,6 +7459,7 @@ registerLayerEditorControls(controller);
 
 Hooks.once("init", () => {
   installLazyTokenLayerPatch();
+  installHoverFadeHitTestPatch();
   installCharacterSwitchPatch(controller);
 });
 
@@ -7379,6 +7490,7 @@ Hooks.on("updateLevel", (level, changes) => {
 
 Hooks.on("canvasPan", () => {
   if (!controller.active || controller._restoringCamera || controller._mounting) return;
+  controller._lastPanMs = performance.now();
   controller.scheduleCameraSave();
   controller.updatePyramid();
 });
