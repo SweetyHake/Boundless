@@ -13,7 +13,9 @@ import { bakeSceneToBoundless } from "./scene-baker.mjs";
 const MODULE_ID = "boundless";
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const MAX_LOS_RADIUS_PX = 4500; // 45 cells (225 ft) horizon prevents 100kpx full-world raycasts
-const MAX_VRAM_TEXTURES = 96;   // ~240 MB VRAM budget for mipmapped 1024x1024 WebP cache
+const MAX_VRAM_TEXTURES = 768;  // High entry cap so small 256px prop textures don't evict pyramid/roof textures
+const MAX_VRAM_BYTES = 1024 * 1024 * 1024; // ~1 GB VRAM budget (mipmapped RGBA estimate) for high-PPI multi-level LRU cache
+const MAX_GPU_UPLOAD_BYTES_PER_FRAME = 16 * 1024 * 1024; // ~16 MB/frame fresh WebGL texture upload cap to avoid mipmap stalls
 const CROSSFADE_MS = 160;       // Smooth invisible LOD blend duration
 const LIGHT_PAD_WORLD_PX = 900; // > max 40ft (800px) light radius so lights never pop on viewport edge
 const FOUNDRY_DEFAULT_ATTENUATION = 0.277992; // Exact Foundry v14 computedAttenuation for data.attenuation = 0.5
@@ -122,6 +124,15 @@ function meshContainsPointPixelSafe(mesh, x, y, alphaThreshold = 0.25) {
 function smoothstep(edge0, edge1, x) {
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
   return t * t * (3 - 2 * t);
+}
+
+function hasSpecOverlays(overlays) {
+  if (!overlays) return false;
+  if (Array.isArray(overlays)) return overlays.length > 0;
+  for (const k in overlays) {
+    if (Object.prototype.hasOwnProperty.call(overlays, k)) return true;
+  }
+  return false;
 }
 
 function isPointUnderRoofSpec(px, py, ov) {
@@ -827,7 +838,7 @@ class MegaLightBatch {
             }
 
             let isIndoor = false;
-            if (elevation < topElev && baseSpec.overlays?.length) {
+            if (elevation < topElev && hasSpecOverlays(baseSpec.overlays)) {
               for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
                 for (let dx = -1; dx <= 1 && !isIndoor; dx++) {
                   const oList = baseSectors[`${bsx + dx}_${bsy + dy}`]?.o;
@@ -1121,7 +1132,7 @@ class MegaLightBatch {
           const lightId = `${levelId}::${sk}_${li}`;
           const topElev = getLevelRoofElevation(level);
           let isIndoor = false;
-          if (elevation < topElev && spec.overlays?.length) {
+          if (elevation < topElev && hasSpecOverlays(spec.overlays)) {
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
               for (let dx = -1; dx <= 1 && !isIndoor; dx++) {
                 const oList = sectors[`${sx + dx}_${sy + dy}`]?.o;
@@ -2328,10 +2339,29 @@ function installBulkSelectionPatch() {
 class LRUTextureManager {
   promises = new Map();     // src -> Promise<PIXI.Texture>
   lru = new Map();          // src -> PIXI.Texture (insertion order = LRU -> MRU)
+  bytesBySrc = new Map();   // src -> estimated VRAM bytes (RGBA + mipmaps)
+  totalBytes = 0;
   pinned = new Set();       // Static icons + z0..z2 low-level pyramid stay resident
   workerOwned = new Map();  // src -> { tex: PIXI.Texture, bitmap: ImageBitmap }
   workerPool = new TileWorkerPool();
   _gen = 0;
+
+  _estimateBytes(tex) {
+    const bt = tex?.baseTexture;
+    const w = bt?.realWidth || tex?.width || 256;
+    const h = bt?.realHeight || tex?.height || 256;
+    const mip = bt?.mipmap ? 1.34 : 1.0;
+    return Math.max(4096, Math.round(w * h * 4 * mip));
+  }
+
+  _trackLru(src, tex) {
+    const prev = this.bytesBySrc.get(src) || 0;
+    const next = this._estimateBytes(tex);
+    this.totalBytes += (next - prev);
+    this.bytesBySrc.set(src, next);
+    this.lru.delete(src);
+    this.lru.set(src, tex);
+  }
 
   pin(src) {
     if (src) this.pinned.add(src);
@@ -2364,8 +2394,7 @@ class LRUTextureManager {
       if (gen !== this._gen) return null;
       if (tex?.baseTexture) {
         this._configureBaseTexture(tex, mipmap);
-        this.lru.delete(src);
-        this.lru.set(src, tex);
+        this._trackLru(src, tex);
       }
       return tex;
     }).catch(() => null);
@@ -2406,8 +2435,7 @@ class LRUTextureManager {
             try { prevOwned.bitmap?.close?.(); } catch {}
           }
           this.workerOwned.set(src, { tex, bitmap });
-          this.lru.delete(src);
-          this.lru.set(src, tex);
+          this._trackLru(src, tex);
           return tex;
         } catch (err) {
           try { bitmap.close(); } catch {}
@@ -2450,6 +2478,11 @@ class LRUTextureManager {
 
   _disposeEntry(src) {
     this.lru.delete(src);
+    const bytes = this.bytesBySrc.get(src);
+    if (bytes !== undefined) {
+      this.totalBytes = Math.max(0, this.totalBytes - bytes);
+      this.bytesBySrc.delete(src);
+    }
     const owned = this.workerOwned.get(src);
     if (owned) {
       this.workerOwned.delete(src);
@@ -2461,9 +2494,9 @@ class LRUTextureManager {
   }
 
   prune(inUseSet) {
-    if (this.lru.size <= MAX_VRAM_TEXTURES) return;
+    if (this.lru.size <= MAX_VRAM_TEXTURES && this.totalBytes <= MAX_VRAM_BYTES) return;
     for (const [src] of this.lru) {
-      if (this.lru.size <= MAX_VRAM_TEXTURES) break;
+      if (this.lru.size <= MAX_VRAM_TEXTURES && this.totalBytes <= MAX_VRAM_BYTES) break;
       if (this.pinned.has(src) || inUseSet.has(src)) continue;
       this._disposeEntry(src);
     }
@@ -2476,12 +2509,17 @@ class LRUTextureManager {
     for (const [src] of Array.from(this.lru.entries())) {
       if (includePinned || !this.pinned.has(src)) this._disposeEntry(src);
     }
+    if (includePinned) {
+      this.bytesBySrc.clear();
+      this.totalBytes = 0;
+    }
     this.promises.clear();
   }
 
   getStats() {
     return {
       lruSize: this.lru.size,
+      vramMB: +(this.totalBytes / (1024 * 1024)).toFixed(1),
       pinnedSize: this.pinned.size,
       workerOwned: this.workerOwned.size,
       pending: this.promises.size,
@@ -2515,6 +2553,8 @@ class MegaWorld1000 {
   pendingTileMounts = []; // Frame-budgeted queue (max 4 tile GPU uploads/frame)
   pendingOverlayMounts = []; // Frame-budgeted queue for building roofs/walls on zoom-in
   _pendingOverlayKeys = new Set();
+  pendingVirtualTileMounts = []; // Frame-budgeted queue for virtual tile GPU uploads
+  _pendingVirtualTileKeys = new Set();
   _mountGen = 0;
   _mountPromise = null;
   _mounting = false;
@@ -2758,8 +2798,17 @@ class MegaWorld1000 {
     return span / (1 << z);
   }
 
-  _computeTargetZ(layer, scale) {
+  _computeTargetZ(layer, scale, { hysteresis = false } = {}) {
     const { worldPx, tilePx, maxZoomZ, superGrid } = layer;
+    const prevZ = hysteresis && Number.isInteger(layer.lastTargetZ) && layer.lastTargetZ >= 0 ? layer.lastTargetZ : -1;
+    const applyHyst = (exact) => {
+      const z = Math.ceil(exact);
+      if (prevZ >= 0 && prevZ <= maxZoomZ) {
+        if (z === prevZ + 1 && exact < prevZ + 0.08) return prevZ;
+        if (z === prevZ - 1 && exact > prevZ - 1 - 0.08) return prevZ;
+      }
+      return z;
+    };
     if (superGrid) {
       const macroMaxZ = superGrid.macroMaxZ ?? 2;
       const regionPx = superGrid.regionPx || 100000;
@@ -2769,10 +2818,10 @@ class MegaWorld1000 {
         return Math.min(maxZoomZ, (macroMaxZ + 1) + localZ);
       }
       const macroExact = Math.log2(Math.max(0.5, (worldPx * scale) / tilePx));
-      return Math.max(0, Math.min(macroMaxZ, Math.ceil(macroExact)));
+      return Math.max(0, Math.min(macroMaxZ, applyHyst(macroExact)));
     }
     const exactZ = Math.log2((worldPx * scale) / tilePx);
-    return Math.max(0, Math.min(maxZoomZ, Math.ceil(exactZ)));
+    return Math.max(0, Math.min(maxZoomZ, applyHyst(exactZ)));
   }
 
   async _expandSuperGridManifest(raw) {
@@ -3349,7 +3398,7 @@ class MegaWorld1000 {
       m._ssSetFilterArea = false;
     }
     m.parent?.removeChild(m);
-    if (this.meshPool.length < 360) {
+    if (this.meshPool.length < 1024) {
       this.meshPool.push(m);
     } else {
       try { m._ssDofBlurFilter?.destroy?.(); } catch {}
@@ -3543,7 +3592,7 @@ class MegaWorld1000 {
 
     for (const layer of this.visibleLevelLayers) {
       const { bounds } = layer;
-      const targetZ = this._computeTargetZ(layer, vp.scale);
+      const targetZ = this._computeTargetZ(layer, vp.scale, { hysteresis: true });
       layer.lastTargetZ = targetZ;
       if (targetZ > maxTargetZ) maxTargetZ = targetZ;
 
@@ -3663,6 +3712,10 @@ class MegaWorld1000 {
       for (const [, vt] of this.activeVirtualTiles) {
         if (vt.src) inUse.add(vt.src);
       }
+      for (let i = 0; i < this.pendingVirtualTileMounts.length; i++) {
+        const pv = this.pendingVirtualTileMounts[i];
+        if (pv?.tSpec?.src) inUse.add(pv.tSpec.src);
+      }
       for (const fullId of this.virtualTilePending) {
         const sep = fullId.indexOf("::");
         if (sep > 0) {
@@ -3710,7 +3763,7 @@ class MegaWorld1000 {
     this.tilesByKey.set(spec.key, entry);
     this._tilesDirty = true;
 
-    const isPinned = spec.z <= 2;
+    const isPinned = spec.z <= 1;
     this.texMgr.load(spec.src, { mipmap: true, isPinned, priority: isPinned ? 0 : 1 }).then(tex => {
       if (!this.active) return;
       const e = this.tilesByKey.get(spec.key);
@@ -3723,7 +3776,7 @@ class MegaWorld1000 {
         if (!e.ready) this.tilesByKey.delete(spec.key);
         return;
       }
-      if (instant || e.z <= 2) {
+      if (instant || e.z <= 1) {
         this._mountTileMesh(e, tex, instant);
       } else {
         this.pendingTileMounts.push({ key: spec.key, entry, tex, instant });
@@ -3874,7 +3927,7 @@ class MegaWorld1000 {
     if ((rm._hoverFadeState?.occlusion ?? 0) > 0.02) return true;
     if (occSurfaces?.size > 0 && rm.canvasBounds) {
       for (const s of occSurfaces) {
-        if (s.elevation <= rm.elevation && s.region?.bounds?.intersects(rm.canvasBounds)) return true;
+        if (s.elevation < rm.elevation && s.region?.bounds?.intersects(rm.canvasBounds)) return true;
       }
     }
     return false;
@@ -3945,7 +3998,7 @@ class MegaWorld1000 {
 
         const layer = this.levelLayers.get(ov.levelId);
         const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
-        if (layer && localZ === 5) {
+        if (layer && localZ === 5 && ov.srcWalls) {
           if (revealed) {
             if (ov.wallsMesh) {
               if (!ov.wallsMesh.visible) ov.wallsMesh.visible = true;
@@ -4021,22 +4074,37 @@ class MegaWorld1000 {
             if (existing.mesh) existing.mesh.unoccludedAlpha = 1.0;
           }
         } else {
-          this.ensureTile(layer, spec, true);
+          this.ensureTile(layer, spec, false);
           const created = this.tilesByKey.get(key);
           if (created) created.isReveal = true;
         }
       }
     }
 
-    // Frame-budgeted overlay mounting FIRST so newly mounted roofs sync into depthMask in the exact same frame
+    const estimateFreshUploadBytes = (tex) => {
+      const bt = tex?.baseTexture;
+      if (!bt || (bt._glTextures && Object.keys(bt._glTextures).length > 0)) return 0;
+      return this.texMgr._estimateBytes(tex);
+    };
+    const gpuUploadBudget = this.isCameraFlying ? (MAX_GPU_UPLOAD_BYTES_PER_FRAME * 0.5) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
+    let frameGpuUploadBytes = 0;
+
+    // Frame-budgeted overlay mounting FIRST so newly mounted roofs sync into depthMask in the exact same frame.
+    // Limit fresh GPU uploads (huge 3000-4000px roof textures) to avoid 100ms+ WebGL mipmap stalls!
     if (this.pendingOverlayMounts.length > 0) {
-      const maxOvMounts = this.isCameraFlying ? 24 : 48;
+      const maxCachedOvMounts = this.isCameraFlying ? 8 : 16;
       let mountedOv = 0;
       const curVp = this.getViewportWorldRect(0.35);
-      while (this.pendingOverlayMounts.length > 0 && mountedOv < maxOvMounts) {
+      while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
+        const peek = this.pendingOverlayMounts[0];
+        const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
+        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
         const item = this.pendingOverlayMounts.shift();
         if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
-        if (this._mountOverlayMeshes(item, curVp)) mountedOv++;
+        if (this._mountOverlayMeshes(item, curVp)) {
+          mountedOv++;
+          frameGpuUploadBytes += estBytes;
+        }
       }
       if (mountedOv > 0) {
         canvas.primary.sortDirty = true;
@@ -4045,7 +4113,44 @@ class MegaWorld1000 {
         this._depthDirty = true;
         this._depthElevSyncNeeded = true;
         this._roofTokenOccDirty = true;
+        this.invalidateShowstopperSurfaces();
       }
+      if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
+    }
+
+    // Frame-budgeted virtual tile mounting (prevents 300+ mesh/texture upload stalls on zoom-out)
+    if (this.pendingVirtualTileMounts.length > 0) {
+      const maxVtMounts = this.isCameraFlying ? 16 : 48;
+      let mountedVt = 0;
+      let anyVtLight = false;
+      let anyVtOcc = false;
+      const curVp = this.getViewportWorldRect(0.28);
+      const tStart = performance.now();
+      while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
+        if (mountedVt > 0 && (performance.now() - tStart) > 4.0) break;
+        const peek = this.pendingVirtualTileMounts[0];
+        const estBytes = estimateFreshUploadBytes(peek?.tex);
+        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+        const item = this.pendingVirtualTileMounts.shift();
+        if (item?.fullId) this._pendingVirtualTileKeys.delete(item.fullId);
+        const m = this._mountVirtualTileMesh(item, curVp);
+        if (m) {
+          mountedVt++;
+          frameGpuUploadBytes += estBytes;
+          if (m.restrictsLight || m.restrictsWeather) anyVtLight = true;
+          if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) anyVtOcc = true;
+        }
+      }
+      if (mountedVt > 0) {
+        canvas.primary.sortDirty = true;
+        this.invalidateShowstopperSurfaces();
+        if (anyVtOcc) this._occlusionDirty = true;
+        if (anyVtLight) {
+          this._depthDirty = true;
+          this._depthElevSyncNeeded = true;
+        }
+      }
+      if (this.pendingVirtualTileMounts.length > 0) this._tilesDirty = true;
     }
 
     if (this._depthElevSyncNeeded) {
@@ -4078,11 +4183,14 @@ class MegaWorld1000 {
       this.syncRoofTokenOcclusion();
     }
 
-    // Frame-budgeted tile mounting (max 1-2 uploads/frame during flight, 4 when idle)
+    // Frame-budgeted tile mounting (respects shared frameGpuUploadBytes budget for fresh uploads)
     if (this.pendingTileMounts.length > 0) {
-      const maxMounts = this.isCameraFlying ? 2 : 4;
+      const maxMounts = this.isCameraFlying ? 2 : 6;
       let mounted = 0;
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
+        const peek = this.pendingTileMounts[0];
+        const estBytes = estimateFreshUploadBytes(peek?.tex);
+        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
         const item = this.pendingTileMounts.shift();
         const e = this.tilesByKey.get(item.key);
         if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
@@ -4092,7 +4200,10 @@ class MegaWorld1000 {
           if (e.layer) e.layer.lastPyramidKey = "";
           continue;
         }
-        if (this._mountTileMesh(e, tex, item.instant)) mounted++;
+        if (this._mountTileMesh(e, tex, item.instant)) {
+          mounted++;
+          frameGpuUploadBytes += estBytes;
+        }
       }
       if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
     }
@@ -4171,13 +4282,26 @@ class MegaWorld1000 {
       this._setNativeLevelBgVisible(layer.level, !fullyCovered);
     }
 
+    const retiringOvKeys = [];
     for (const [ovKey, ov] of this.activeOverlays) {
       const layer = this.levelLayers.get(ov.levelId);
       const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
+      const st = levelReadyState.get(ov.levelId);
+      if (ov.retiring) {
+        const z4Ready = !layer?.hasPyramid || Boolean(st?.allReadyOpaque) || localZ === 0;
+        const spec = ov.ovSpec;
+        const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
+        const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);
+        if (localZ < 5 && (z4Ready || offScreen)) {
+          retiringOvKeys.push(ovKey);
+        } else if (localZ < 5) {
+          stillActive = true;
+        }
+        continue;
+      }
       const isZ6 = localZ >= 6;
       const canReveal = localZ >= 5;
       const revealOnZ5 = Boolean(localZ === 5 && ov.roofMesh && this._isRoofRevealed(ov.roofMesh, occSurfaces));
-      const st = levelReadyState.get(ov.levelId);
       const a = isZ6 ? (st ? st.finestZ6Alpha : 1.0) : (revealOnZ5 ? 1.0 : 0.0);
       if (ov.wallsMesh) {
         ov.wallsMesh.visible = a > 0.02;
@@ -4199,6 +4323,25 @@ class MegaWorld1000 {
         }
         ov.roofMesh.hoverFade = canReveal;
         if (ov.roofMesh.unoccludedAlpha !== 1.0) ov.roofMesh.unoccludedAlpha = 1.0;
+      }
+    }
+
+    if (retiringOvKeys.length > 0) {
+      let retiredRoof = false;
+      for (const ovKey of retiringOvKeys) {
+        const ov = this.activeOverlays.get(ovKey);
+        if (!ov) continue;
+        if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
+        if (ov.roofMesh) {
+          this.retireMesh(ov.roofMesh);
+          retiredRoof = true;
+        }
+        this.activeOverlays.delete(ovKey);
+      }
+      if (retiredRoof) {
+        this._depthDirty = true;
+        this._depthElevSyncNeeded = true;
+        this.invalidateShowstopperSurfaces();
       }
     }
 
@@ -4504,9 +4647,30 @@ class MegaWorld1000 {
       : CONST.OCCLUSION_MODES.NONE;
 
     let changed = false;
+    let retiredAnyRoof = false;
     for (const [fullId, ov] of this.activeOverlays) {
       if (ov.levelId !== lid) continue;
       if (!neededOv.has(fullId)) {
+        // When zooming out from localZ >= 5 to localZ < 5 on a pyramid level, keep visible roofs mounted
+        // (with occlusion disabled) until z<=4 baked-roof pyramid tiles finish covering the viewport so interiors never flash!
+        if (!shouldMountRoofs && !hideRoofsForUpperView && layer.hasPyramid && ov.roofMesh && !ov.roofMesh.destroyed) {
+          if (ov.wallsMesh) {
+            this.retireMesh(ov.wallsMesh);
+            ov.wallsMesh = null;
+          }
+          ov.retiring = true;
+          if (ov.roofMesh.occlusionMode !== CONST.OCCLUSION_MODES.NONE) {
+            ov.roofMesh.occlusionMode = CONST.OCCLUSION_MODES.NONE;
+            ov.roofMesh.debounceSetOcclusion?.cancel?.();
+            ov.roofMesh.occluded = false;
+            this._occlusionDirty = true;
+          }
+          ov.roofMesh.hoverFade = false;
+          ov.roofMesh.unoccludedAlpha = 1.0;
+          this._tilesDirty = true;
+          changed = true;
+          continue;
+        }
         const hadRoof = Boolean(ov.roofMesh);
         if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
         if (ov.roofMesh) this.retireMesh(ov.roofMesh);
@@ -4514,23 +4678,25 @@ class MegaWorld1000 {
         if (hadRoof) {
           this._depthDirty = true;
           this._depthElevSyncNeeded = true;
+          retiredAnyRoof = true;
         }
         changed = true;
       } else {
+        ov.retiring = false;
         if (hideRoofsForUpperView && ov.roofMesh) {
           this.retireMesh(ov.roofMesh);
           ov.roofMesh = null;
           this._depthDirty = true;
           this._depthElevSyncNeeded = true;
-          this.invalidateShowstopperSurfaces();
+          retiredAnyRoof = true;
           changed = true;
         } else if (ov.roofMesh) {
           if (ov.roofMesh.occlusionMode !== wantOccMode) {
             ov.roofMesh.occlusionMode = wantOccMode;
             if (!canReveal) {
-            ov.roofMesh.debounceSetOcclusion?.cancel?.();
-            ov.roofMesh.occluded = false;
-          }
+              ov.roofMesh.debounceSetOcclusion?.cancel?.();
+              ov.roofMesh.occluded = false;
+            }
             this._occlusionDirty = true;
           }
           ov.roofMesh.hoverFade = canReveal;
@@ -4539,6 +4705,7 @@ class MegaWorld1000 {
         if (ov.wallsMesh) ov.wallsMesh.visible = showWalls || revealOnZ5;
       }
     }
+    if (retiredAnyRoof) this.invalidateShowstopperSurfaces();
 
     for (const fullId of neededOv) {
       if (this.activeOverlays.has(fullId)) {
@@ -4571,8 +4738,8 @@ class MegaWorld1000 {
       const gen = this._mountGen;
       this.overlayPending.add(fullId);
       Promise.all([
-        needWalls ? this.texMgr.load(ovSpec.walls, { mipmap: true }) : Promise.resolve(null),
-        needRoof ? this.texMgr.load(ovSpec.roof, { mipmap: true }) : Promise.resolve(null)
+        needWalls ? this.texMgr.load(ovSpec.walls, { mipmap: true, priority: 0 }) : Promise.resolve(null),
+        needRoof ? this.texMgr.load(ovSpec.roof, { mipmap: true, priority: 0 }) : Promise.resolve(null)
       ]).then(([tWalls, tRoof]) => {
         if (this._mountGen === gen && this.levelLayers.get(lid) === layer) {
           this.overlayPending.delete(fullId);
@@ -4665,7 +4832,8 @@ class MegaWorld1000 {
       roofMesh.occlusionMode = canRevealNow
         ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
         : CONST.OCCLUSION_MODES.NONE;
-      roofMesh._occludedBySameElevationSurfaces = true;
+      // Match Foundry v14 foreground tiles: ceiling defineSurface regions at level.elevation.top must NOT occlude this level's own roofs
+      roofMesh._occludedBySameElevationSurfaces = false;
       roofMesh.unoccludedAlpha = 1.0;
       roofMesh.occludedAlpha = 0.05;
       roofMesh.hoverFade = canRevealNow;
@@ -4677,11 +4845,10 @@ class MegaWorld1000 {
       this._syncShowstopperMeshDof(roofMesh);
     }
 
-    this.activeOverlays.set(fullId, { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof });
+    this.activeOverlays.set(fullId, { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof, retiring: false });
     if (localZNow >= 6 && !wallsMesh && ovSpec.walls) {
       this._ensureOverlayWallsMesh(fullId, layer, ovSpec);
     }
-    if (roofMesh) this.invalidateShowstopperSurfaces();
     return true;
   }
 
@@ -4763,119 +4930,150 @@ class MegaWorld1000 {
     }
 
     let changed = false;
+    let removedAny = false;
+    let removedAnyLight = false;
+    let removedAnyOcc = false;
     for (const [fullId, vt] of this.activeVirtualTiles) {
       if (vt.levelId !== lid) continue;
       if (!needed.has(fullId)) {
-        const hadLight = Boolean(vt.mesh?.restrictsLight);
+        if (vt.mesh?.restrictsLight || vt.mesh?.restrictsWeather) removedAnyLight = true;
+        if (vt.mesh && vt.mesh.occlusionMode !== CONST.OCCLUSION_MODES.NONE) removedAnyOcc = true;
         if (vt.mesh) this.retireMesh(vt.mesh);
         this.activeVirtualTiles.delete(fullId);
-        this._occlusionDirty = true;
-        this._depthDirty = true;
-        if (hadLight) this._depthElevSyncNeeded = true;
-        this.invalidateShowstopperSurfaces();
+        removedAny = true;
         changed = true;
       }
     }
+    if (removedAny) {
+      this.invalidateShowstopperSurfaces();
+      if (removedAnyOcc) this._occlusionDirty = true;
+      if (removedAnyLight) {
+        this._depthDirty = true;
+        this._depthElevSyncNeeded = true;
+      }
+    }
 
+    const reqRev = this.tileEditsRev;
+    const gen = this._mountGen;
     for (const fullId of needed) {
-      if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId)) continue;
+      if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId) || this._pendingVirtualTileKeys.has(fullId)) continue;
       const tid = Number(fullId.split("::")[1]);
       const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
       if (!tSpec?.src || tSpec.hidden) continue;
 
-      const reqRev = this.tileEditsRev;
-      const gen = this._mountGen;
+      const syncTex = this.texMgr.getSync(tSpec.src);
+      if (syncTex) {
+        this._pendingVirtualTileKeys.add(fullId);
+        this.pendingVirtualTileMounts.push({ fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex: syncTex });
+        this._tilesDirty = true;
+        changed = true;
+        continue;
+      }
+
       this.virtualTilePending.add(fullId);
       this.texMgr.load(tSpec.src, { mipmap: true }).then(tex => {
         if (this._mountGen === gen && this.levelLayers.get(lid) === layer && this.tileEditsRev === reqRev) {
           this.virtualTilePending.delete(fullId);
         }
         if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer) return;
-        if (this.activeVirtualTiles.has(fullId) || this.tileEditsRev !== reqRev) return;
+        if (this.activeVirtualTiles.has(fullId) || this._pendingVirtualTileKeys.has(fullId) || this.tileEditsRev !== reqRev) return;
         if (!isTextureUsable(tex)) {
           layer.lastTileKey = "";
           return;
         }
-        const zNow = layer.lastTargetZ;
-        if (tSpec.minZ !== undefined && zNow < tSpec.minZ) return;
-        if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return;
-        const curVp = this.getViewportWorldRect(0.28);
-        const ax0 = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
-        const ay0 = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
-        const pivX = tSpec.anchorX === undefined ? (tSpec.x + tSpec.w * 0.5) : tSpec.x;
-        const pivY = tSpec.anchorY === undefined ? (tSpec.y + tSpec.h * 0.5) : tSpec.y;
-        const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
-        const curSx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
-        const curSy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
-        const curSx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
-        const curSy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
-        const secX0 = curSx0 * simSectorPx;
-        const secY0 = curSy0 * simSectorPx;
-        const secX1 = (curSx1 + 1) * simSectorPx;
-        const secY1 = (curSy1 + 1) * simSectorPx;
-        if (pivX + halfDiag < secX0 || pivX - halfDiag > secX1 || pivY + halfDiag < secY0 || pivY - halfDiag > secY1) {
-          layer.lastTileKey = "";
-          return;
-        }
-
-        const m = this.acquireMesh();
-        m.name = `Tile.BoundlessVirtual.${fullId}`;
-        const ax = tSpec.anchorX ?? 0.5;
-        const ay = tSpec.anchorY ?? 0.5;
-        m.anchor.set(ax, ay);
-        m.texture = tex;
-        m.position.set(tSpec.x + (tSpec.anchorX === undefined ? tSpec.w * 0.5 : 0), tSpec.y + (tSpec.anchorY === undefined ? tSpec.h * 0.5 : 0));
-        const sx = Number.isFinite(tSpec.scaleX) ? tSpec.scaleX : 1;
-        const sy = Number.isFinite(tSpec.scaleY) ? tSpec.scaleY : 1;
-        const fit = ["fill", "cover", "contain", "width", "height"].includes(tSpec.fit) ? tSpec.fit : "fill";
-        if (typeof m.resize === "function" && tex.width > 0 && tex.height > 0) {
-          m.resize(Math.max(0, tSpec.w || 0), Math.max(0, tSpec.h || 0), { fit, scaleX: sx, scaleY: sy });
-        } else {
-          m.width = tSpec.w;
-          m.height = tSpec.h;
-          if (sx < 0) m.scale.x = -Math.abs(m.scale.x);
-          if (sy < 0) m.scale.y = -Math.abs(m.scale.y);
-        }
-        m.angle = tSpec.rot || 0;
-        m.elevation = Number.isFinite(tSpec.elevation) ? tSpec.elevation : defaultElev;
-        m.sortLayer = resolveSortLayer(tSpec.sortLayer, PrimaryCanvasGroup.SORT_LAYERS.TILES);
-        m.sort = tSpec.sort ?? 50;
-
-        const defaultOcc = layer.isUpper
-          ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
-          : CONST.OCCLUSION_MODES.NONE;
-        m.occlusionMode = resolveOcclusionMode(tSpec.occlusionMode, defaultOcc);
-        m.unoccludedAlpha = tSpec.alpha ?? 1.0;
-        m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
-        m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && m.occlusionMode !== CONST.OCCLUSION_MODES.SURFACE);
-        m.restrictsLight = Boolean(tSpec.restrictsLight);
-        m.restrictsWeather = Boolean(tSpec.restrictsWeather);
-        m.textureAlphaThreshold = tSpec.alphaThreshold ?? 0.75;
-        if (tSpec.tint !== undefined && tSpec.tint !== null) {
-          m.tint = typeof tSpec.tint === "string" ? foundry.utils.Color.from(tSpec.tint).valueOf() : tSpec.tint;
-        }
-        // Hide raw mesh if TilesLayer editor currently renders the native editable Tile for this exact level & slot
-        const edTile = this.layerEditors?.tileActive ? this.layerEditors.tilesByKey.get(`t:${tid}`) : null;
-        if (edTile && edTile.levelId === lid) {
-          m.visible = false;
-        }
-
-        canvas.primary.addChild(m);
-        m.updateCanvasTransform?.();
-        this._syncShowstopperMeshDof(m);
-        this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src, tSpec });
-        this.invalidateShowstopperSurfaces();
-        canvas.primary.sortDirty = true;
-        this._occlusionDirty = true;
-        this._depthDirty = true;
-        if (m.restrictsLight) {
-          this._depthElevSyncNeeded = true;
-        }
+        this._pendingVirtualTileKeys.add(fullId);
+        this.pendingVirtualTileMounts.push({ fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex });
+        this._tilesDirty = true;
       });
       changed = true;
     }
 
     return changed;
+  }
+
+  _mountVirtualTileMesh(item, curVp) {
+    if (!item) return null;
+    const { fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen } = item;
+    if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer) return null;
+    if (this.activeVirtualTiles.has(fullId) || this.tileEditsRev !== reqRev) return null;
+
+    const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(tSpec.src);
+    if (!isTextureUsable(tex)) {
+      layer.lastTileKey = "";
+      return null;
+    }
+
+    const zNow = layer.lastTargetZ;
+    if (tSpec.minZ !== undefined && zNow < tSpec.minZ) return null;
+    if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return null;
+
+    const { simGrid, simSectorPx } = layer;
+    const ax0 = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+    const ay0 = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+    const pivX = tSpec.anchorX === undefined ? (tSpec.x + tSpec.w * 0.5) : tSpec.x;
+    const pivY = tSpec.anchorY === undefined ? (tSpec.y + tSpec.h * 0.5) : tSpec.y;
+    const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
+    const curSx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
+    const curSy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
+    const curSx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
+    const curSy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const secX0 = curSx0 * simSectorPx;
+    const secY0 = curSy0 * simSectorPx;
+    const secX1 = (curSx1 + 1) * simSectorPx;
+    const secY1 = (curSy1 + 1) * simSectorPx;
+    if (pivX + halfDiag < secX0 || pivX - halfDiag > secX1 || pivY + halfDiag < secY0 || pivY - halfDiag > secY1) {
+      layer.lastTileKey = "";
+      return null;
+    }
+
+    const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
+    const m = this.acquireMesh();
+    m.name = `Tile.BoundlessVirtual.${fullId}`;
+    const ax = tSpec.anchorX ?? 0.5;
+    const ay = tSpec.anchorY ?? 0.5;
+    m.anchor.set(ax, ay);
+    m.texture = tex;
+    m.position.set(tSpec.x + (tSpec.anchorX === undefined ? tSpec.w * 0.5 : 0), tSpec.y + (tSpec.anchorY === undefined ? tSpec.h * 0.5 : 0));
+    const sx = Number.isFinite(tSpec.scaleX) ? tSpec.scaleX : 1;
+    const sy = Number.isFinite(tSpec.scaleY) ? tSpec.scaleY : 1;
+    const fit = ["fill", "cover", "contain", "width", "height"].includes(tSpec.fit) ? tSpec.fit : "fill";
+    if (typeof m.resize === "function" && tex.width > 0 && tex.height > 0) {
+      m.resize(Math.max(0, tSpec.w || 0), Math.max(0, tSpec.h || 0), { fit, scaleX: sx, scaleY: sy });
+    } else {
+      m.width = tSpec.w;
+      m.height = tSpec.h;
+      if (sx < 0) m.scale.x = -Math.abs(m.scale.x);
+      if (sy < 0) m.scale.y = -Math.abs(m.scale.y);
+    }
+    m.angle = tSpec.rot || 0;
+    m.elevation = Number.isFinite(tSpec.elevation) ? tSpec.elevation : defaultElev;
+    m.sortLayer = resolveSortLayer(tSpec.sortLayer, PrimaryCanvasGroup.SORT_LAYERS.TILES);
+    m.sort = tSpec.sort ?? 50;
+
+    const defaultOcc = layer.isUpper
+      ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
+      : CONST.OCCLUSION_MODES.NONE;
+    m.occlusionMode = resolveOcclusionMode(tSpec.occlusionMode, defaultOcc);
+    m.unoccludedAlpha = tSpec.alpha ?? 1.0;
+    m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
+    m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && m.occlusionMode !== CONST.OCCLUSION_MODES.SURFACE);
+    m.restrictsLight = Boolean(tSpec.restrictsLight);
+    m.restrictsWeather = Boolean(tSpec.restrictsWeather);
+    m.textureAlphaThreshold = tSpec.alphaThreshold ?? 0.75;
+    if (tSpec.tint !== undefined && tSpec.tint !== null) {
+      m.tint = typeof tSpec.tint === "string" ? foundry.utils.Color.from(tSpec.tint).valueOf() : tSpec.tint;
+    }
+    // Hide raw mesh if TilesLayer editor currently renders the native editable Tile for this exact level & slot
+    const edTile = this.layerEditors?.tileActive ? this.layerEditors.tilesByKey.get(`t:${tid}`) : null;
+    if (edTile && edTile.levelId === lid) {
+      m.visible = false;
+    }
+
+    canvas.primary.addChild(m);
+    m.updateCanvasTransform?.();
+    this._syncShowstopperMeshDof(m);
+    this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src, tSpec });
+    return m;
   }
 
   onLightingRefresh(effects) {
@@ -5724,6 +5922,8 @@ class MegaWorld1000 {
     }
     this.activeVirtualTiles.clear();
     this.virtualTilePending.clear();
+    this.pendingVirtualTileMounts = [];
+    this._pendingVirtualTileKeys.clear();
     for (const layer of this.visibleLevelLayers) layer.lastTileKey = "";
     this.updatePyramid();
     this.layerEditors.syncTiles(true);
@@ -6899,6 +7099,8 @@ class MegaWorld1000 {
     this.pendingTileMounts = [];
     this.pendingOverlayMounts = [];
     this._pendingOverlayKeys.clear();
+    this.pendingVirtualTileMounts = [];
+    this._pendingVirtualTileKeys.clear();
     this._roofTokenOccDirty = false;
     this._waitingForRoofsBeforeIndoor = false;
     this._roofMaskBaking = false;
