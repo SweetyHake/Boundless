@@ -3600,7 +3600,9 @@ class MegaWorld1000 {
       m._boundlessMesh = true;
       m._boundlessTile = false;
       if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
-      m.pluginName = m.constructor?.classPluginName || "batchOcclusion";
+      // Must reset to null (NOT "batchOcclusion") so PrimarySpriteMesh#pluginName getter falls back to this._shader.pluginName
+      // and switches to "batchDepth" during CanvasDepthMask#renderDepthData!
+      m.pluginName = null;
       return m;
     }
     const PrimarySpriteMesh = foundry.canvas.primary.PrimarySpriteMesh;
@@ -3620,7 +3622,7 @@ class MegaWorld1000 {
     m.alpha = 1.0;
     m._boundlessTile = false;
     if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
-    m.pluginName = m.constructor?.classPluginName || "batchOcclusion";
+    m.pluginName = null;
     m.texture = PIXI.Texture.EMPTY;
     m.debounceSetOcclusion?.cancel?.();
     m.hoverFade = false;
@@ -4132,9 +4134,10 @@ class MegaWorld1000 {
     e.ready = true;
     canvas.primary.addChild(m);
     m.updateCanvasTransform?.();
-    // Static ground/lower pyramid tiles never fade on occlusion or move, so use fast PIXI batch shader & skip per-frame quadtree churn
+    // Static ground/lower pyramid tiles never move so skip per-frame quadtree churn;
+    // ONLY use plain PIXI "batch" when the tile does NOT write to CanvasDepthMask (restrictsLight/restrictsWeather require "batchOcclusion" / DepthSamplerShader!)
     if (!layer.isUpper) {
-      m.pluginName = "batch";
+      if (!m.restrictsLight && !m.restrictsWeather) m.pluginName = "batch";
       m.updateCanvasTransform = NOOP_TRANSFORM;
       if (e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
     }
