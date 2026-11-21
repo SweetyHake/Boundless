@@ -4064,7 +4064,7 @@ class MegaWorld1000 {
     for (const [px, py] of pts) {
       let covered = false;
       for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && other.desired && other.ready && other.z > 0 && other.alpha >= 0.98 &&
+        if (other.levelId === e.levelId && other.desired && other.ready && !other.awaitingSwap && other.mesh?.visible && other.z > 0 && other.alpha >= 0.98 &&
             px >= other.x0 && px <= other.x0 + other.sizePx &&
             py >= other.y0 && py <= other.y0 + other.sizePx) {
           covered = true;
@@ -4074,6 +4074,36 @@ class MegaWorld1000 {
       if (!covered) return false;
     }
     return true;
+  }
+
+  _hasPendingVisibleRoofs(layer, visVp) {
+    if (!layer?.hasPyramid || !visVp) return false;
+    const localZ = layer.lastTargetZ - layer.zOffset;
+    if (localZ < 5 || !this._shouldMountRoofs(layer, visVp.scale)) return false;
+    const overlays = layer.spec?.overlays;
+    if (!hasSpecOverlays(overlays)) return false;
+    const topElev = getLevelRoofElevation(layer.level);
+    const viewedBottom = getLevelBottomElevation(canvas.level);
+    if (!layer.level.isView && viewedBottom >= topElev) return false;
+
+    const lid = layer.level.id;
+    const overlapsVis = (ovSpec) => {
+      if (!ovSpec?.roof) return false;
+      const halfDiag = Math.hypot(ovSpec.w || 0, ovSpec.h || 0) * 0.5;
+      return ovSpec.cx + halfDiag >= visVp.x0 && ovSpec.cx - halfDiag <= visVp.x1 &&
+             ovSpec.cy + halfDiag >= visVp.y0 && ovSpec.cy - halfDiag <= visVp.y1;
+    };
+    for (let i = 0; i < this.pendingOverlayMounts.length; i++) {
+      const po = this.pendingOverlayMounts[i];
+      if (po?.lid === lid && overlapsVis(po.ovSpec)) return true;
+    }
+    const prefix = `${lid}::`;
+    for (const fullKey of this.overlayPending) {
+      if (!fullKey.startsWith(prefix) || fullKey.endsWith(":w")) continue;
+      const rawOid = fullKey.slice(prefix.length);
+      if (overlapsVis(overlays[rawOid])) return true;
+    }
+    return false;
   }
 
   hasAnyReadyDesiredUnderneath(e) {
@@ -4298,18 +4328,21 @@ class MegaWorld1000 {
       if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
     }
 
-    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly, fresh 4K roofs cap at 1/frame and defer while pyramid chunks are still uploading
+    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly; fresh 4K roofs cap at 1/frame
+    //    (allow mounting even while pyramid tiles queue if visible z>=5 tiles are waiting on these roofs so interiors never flash!)
     if (this.pendingOverlayMounts.length > 0) {
       const maxCachedOvMounts = isMoving ? 8 : 16;
       let mountedOv = 0;
       let freshHeavyOv = 0;
       const curVp = this.getViewportWorldRect(0.35);
+      const visNow = this.getViewportWorldRect(0.0);
+      const roofsBlockingZ5 = this.visibleLevelLayers.some(l => this._hasPendingVisibleRoofs(l, visNow));
       while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
         const peek = this.pendingOverlayMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
         if (estBytes > 0) {
           if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
-          if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (isMoving && this.pendingTileMounts.length > 0))) break;
+          if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
         }
         const item = this.pendingOverlayMounts.shift();
         if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
@@ -4449,6 +4482,15 @@ class MegaWorld1000 {
       }
     }
 
+    // Hold z>=5 interior-cutout swap until all visible roofs for that level are mounted so bare interiors never flash on zoom-in!
+    for (const layer of this.visibleLevelLayers) {
+      const st = levelReadyState.get(layer.level.id);
+      if (st && st.visDesiredReady && this._hasPendingVisibleRoofs(layer, visVp)) {
+        st.visDesiredReady = false;
+        stillActive = true;
+      }
+    }
+
     // Pass 2: atomic 1-frame LOD swap once all visible desired tiles are ready (zero double-alpha blending & zero depth flicker!)
     for (const [k, e] of this.tilesByKey) {
       const st = levelReadyState.get(e.levelId);
@@ -4520,7 +4562,7 @@ class MegaWorld1000 {
       const roofsMounted = this._shouldMountRoofs(layer, vp.scale);
       const st = levelReadyState.get(ov.levelId);
       if (ov.retiring) {
-        const z4Ready = !layer?.hasPyramid || Boolean(st?.allReadyOpaque) || localZ === 0;
+        const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || localZ === 0;
         const spec = ov.ovSpec;
         const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
         const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);
@@ -4908,6 +4950,12 @@ class MegaWorld1000 {
             ov.roofMesh.occluded = false;
             this._occlusionDirty = true;
           }
+          // Avoid 1-frame double light-cut (CanvasDepthMask + bakedRoofMask) while retiring roof waits for z<=4
+          if (this.lightBatch?.bakedRoofMask && !this.lightBatch.bakedRoofMask.destroyed && ov.roofMesh.restrictsLight) {
+            ov.roofMesh.restrictsLight = false;
+            this._depthDirty = true;
+            if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+          }
           ov.roofMesh.hoverFade = false;
           ov.roofMesh.unoccludedAlpha = 1.0;
           this._tilesDirty = true;
@@ -4936,6 +4984,11 @@ class MegaWorld1000 {
           retiredAnyRoof = true;
           changed = true;
         } else if (ov.roofMesh) {
+          if (!ov.roofMesh.restrictsLight) {
+            ov.roofMesh.restrictsLight = true;
+            this._depthDirty = true;
+            if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+          }
           if (ov.roofMesh.occlusionMode !== wantOccMode) {
             ov.roofMesh.occlusionMode = wantOccMode;
             if (!canReveal) {
@@ -5379,88 +5432,91 @@ class MegaWorld1000 {
       const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
       const darkness = canvas.environment?.darknessLevel ?? 0;
 
-      // 1. Collect Dynamic PointLightSources FIRST so we guarantee their full light radius has wall edges in `level.edges`
-      //    When macro bakedRoofMask is active (localZ < 5, roofs unloaded from CanvasDepthMask), keep lights in MegaLightBatch
-      //    so native PointLightSources never bleed through baked roofs near tokens.
+      // 1. Collect Dynamic PointLightSources FIRST so we guarantee their full light radius has wall edges in `level.edges`.
+      //    Outdoor lights (`!meta.isIndoor`) ALWAYS stay eligible at all zoom levels so controlled/viewed tokens with sightRange=0
+      //    never lose vision on zoom-out! When macro bakedRoofMask is active (roofs unloaded from CanvasDepthMask), only suppress
+      //    indoor lights that are NOT directly inside an active visionSource's LOS polygon so they don't bleed through baked roofs.
       const neededDynLights = new Set();
-      const suppressAllDynForMacroRoof = Boolean(this.lightBatch.useBakedRoofMask);
+      const suppressUnseenIndoorForMacroRoof = Boolean(this.lightBatch.useBakedRoofMask);
       const suppressIndoorDyn = Boolean(this.lightBatch.hideIndoorLights);
 
-      const isMetaEligibleDyn = (meta) => {
+      const isMetaEligibleDyn = (meta, visionSource = null) => {
         if (!meta) return false;
         if (suppressIndoorDyn && meta.isIndoor) return false;
+        if (suppressUnseenIndoorForMacroRoof && meta.isIndoor) {
+          const canSeeIndoor = Boolean(visionSource?.los?.contains?.(meta.lx, meta.ly));
+          if (!canSeeIndoor) return false;
+        }
         if (darkness < (meta.darkMin ?? 0) || darkness > (meta.darkMax ?? 1)) return false;
         return true;
       };
 
-      if (!suppressAllDynForMacroRoof) {
-        // 1a. Open-door lights (always included, never starved by vision light cap)
-        for (const door of this.openDoors.values()) {
-          const layer = this.levelLayers.get(door.levelId);
+      // 1a. Open-door lights (always included, never starved by vision light cap)
+      for (const door of this.openDoors.values()) {
+        const layer = this.levelLayers.get(door.levelId);
+        if (!layer?.spec?.sectors) continue;
+        const { simGrid, simSectorPx, spec } = layer;
+        const sx0 = Math.max(0, Math.floor((door.x - LIGHT_PAD_WORLD_PX) / simSectorPx));
+        const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
+        const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
+        const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
+        for (let sy = sy0; sy <= sy1; sy++) {
+          for (let sx = sx0; sx <= sx1; sx++) {
+            const sk = `${sx}_${sy}`;
+            const sec = spec.sectors[sk];
+            if (!sec?.l?.length) continue;
+            for (let li = 0; li < sec.l.length; li++) {
+              const lid = `${door.levelId}::${sk}_${li}`;
+              const meta = this.lightBatch.lightMetaById.get(lid);
+              if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
+                neededDynLights.add(lid);
+              }
+            }
+          }
+        }
+      }
+
+      // 1b. Nearest lights to active visionSources (skip when box-selecting a crowd > 6 visionSources)
+      const MAX_VISION_DYN_LIGHTS = 24;
+      if (canvas.effects?.visionSources?.size && canvas.effects.visionSources.size <= 6) {
+        const visionCandidates = new Map(); // lid -> minDistSq
+        for (const vs of canvas.effects.visionSources) {
+          if (!vs?.active) continue;
+          const vsLevelId = vs.data?.level || canvas.level?.id;
+          const layer = this.levelLayers.get(vsLevelId);
           if (!layer?.spec?.sectors) continue;
           const { simGrid, simSectorPx, spec } = layer;
-          const sx0 = Math.max(0, Math.floor((door.x - LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
-          const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const vRad = Math.min(MAX_LOS_RADIUS_PX, Math.max(vs.radius || 0, 60 * pxPerFt));
+          const sx0 = Math.max(0, Math.floor((vs.x - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sy0 = Math.max(0, Math.floor((vs.y - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sx1 = Math.min(simGrid - 1, Math.floor((vs.x + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const sy1 = Math.min(simGrid - 1, Math.floor((vs.y + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
           for (let sy = sy0; sy <= sy1; sy++) {
             for (let sx = sx0; sx <= sx1; sx++) {
               const sk = `${sx}_${sy}`;
               const sec = spec.sectors[sk];
               if (!sec?.l?.length) continue;
               for (let li = 0; li < sec.l.length; li++) {
-                const lid = `${door.levelId}::${sk}_${li}`;
+                const lid = `${vsLevelId}::${sk}_${li}`;
+                if (neededDynLights.has(lid)) continue;
                 const meta = this.lightBatch.lightMetaById.get(lid);
-                if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
-                  neededDynLights.add(lid);
+                if (!isMetaEligibleDyn(meta, vs)) continue;
+                const dx = meta.lx - vs.x;
+                const dy = meta.ly - vs.y;
+                const maxD = vRad + meta.dimPx;
+                const distSq = dx * dx + dy * dy;
+                if (distSq <= maxD * maxD) {
+                  const prev = visionCandidates.get(lid);
+                  if (prev === undefined || distSq < prev) visionCandidates.set(lid, distSq);
                 }
               }
             }
           }
         }
-
-        // 1b. Nearest lights to active visionSources (skip when box-selecting a crowd > 6 visionSources)
-        const MAX_VISION_DYN_LIGHTS = 24;
-        if (canvas.effects?.visionSources?.size && canvas.effects.visionSources.size <= 6) {
-          const visionCandidates = new Map(); // lid -> minDistSq
-          for (const vs of canvas.effects.visionSources) {
-            if (!vs?.active) continue;
-            const vsLevelId = vs.data?.level || canvas.level?.id;
-            const layer = this.levelLayers.get(vsLevelId);
-            if (!layer?.spec?.sectors) continue;
-            const { simGrid, simSectorPx, spec } = layer;
-            const vRad = Math.min(MAX_LOS_RADIUS_PX, Math.max(vs.radius || 0, 60 * pxPerFt));
-            const sx0 = Math.max(0, Math.floor((vs.x - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sy0 = Math.max(0, Math.floor((vs.y - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sx1 = Math.min(simGrid - 1, Math.floor((vs.x + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sy1 = Math.min(simGrid - 1, Math.floor((vs.y + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
-            for (let sy = sy0; sy <= sy1; sy++) {
-              for (let sx = sx0; sx <= sx1; sx++) {
-                const sk = `${sx}_${sy}`;
-                const sec = spec.sectors[sk];
-                if (!sec?.l?.length) continue;
-                for (let li = 0; li < sec.l.length; li++) {
-                  const lid = `${vsLevelId}::${sk}_${li}`;
-                  if (neededDynLights.has(lid)) continue;
-                  const meta = this.lightBatch.lightMetaById.get(lid);
-                  if (!isMetaEligibleDyn(meta)) continue;
-                  const dx = meta.lx - vs.x;
-                  const dy = meta.ly - vs.y;
-                  const maxD = vRad + meta.dimPx;
-                  const distSq = dx * dx + dy * dy;
-                  if (distSq <= maxD * maxD) {
-                    const prev = visionCandidates.get(lid);
-                    if (prev === undefined || distSq < prev) visionCandidates.set(lid, distSq);
-                  }
-                }
-              }
-            }
-          }
-          if (visionCandidates.size > 0) {
-            const sorted = Array.from(visionCandidates.entries()).sort((a, b) => a[1] - b[1]);
-            const take = Math.min(MAX_VISION_DYN_LIGHTS, sorted.length);
-            for (let i = 0; i < take; i++) neededDynLights.add(sorted[i][0]);
-          }
+        if (visionCandidates.size > 0) {
+          const sorted = Array.from(visionCandidates.entries()).sort((a, b) => a[1] - b[1]);
+          const take = Math.min(MAX_VISION_DYN_LIGHTS, sorted.length);
+          for (let i = 0; i < take; i++) neededDynLights.add(sorted[i][0]);
         }
       }
 
