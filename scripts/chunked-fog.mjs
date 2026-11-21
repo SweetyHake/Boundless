@@ -60,8 +60,14 @@ export class ChunkedFogManager {
   _dirtyShared = new Set();
   _dirtyPrivate = new Set();
   _lastPolySigs = new Map();
-  _applyingRemoteFlag = false;
+  _savingSharedDepth = 0;
   _savingServer = false;
+  _fogGen = 0;
+  _chunkLoadSeq = new Map();
+  _pendingChunkLoads = new Map();
+  _remoteRevealQueues = new Map();
+  _lastHandledResetAt = 0;
+  _seenBrushIds = new Set();
 
   // Saved native hooks/methods for clean unmount restoration
   _patches = null;
@@ -103,9 +109,16 @@ export class ChunkedFogManager {
     }
 
     this.enabled = true;
+    this._fogGen++;
+    this._chunkLoadSeq.clear();
+    this._pendingChunkLoads.clear();
     this.mode = getSceneFogMode(scene);
     this.sceneId = scene.id;
     this.levelId = canvas.level?.id || "default";
+    this._lastHandledResetAt = Number(scene?.flags?.[MODULE_ID]?.fogResetAt?.[this.levelId]) || 0;
+    this._seenBrushIds.clear();
+    const initBrushId = scene?.flags?.[MODULE_ID]?.fogBrush?.id;
+    if (initBrushId) this._markBrushSeen(initBrushId);
     this._storageKey = this._buildStorageKey(
       this.sceneId,
       this.levelId,
@@ -302,29 +315,46 @@ export class ChunkedFogManager {
     ctx.restore();
   }
 
-  _applyPolygons(polygons, { target = "shared", markDirty = true } = {}) {
-    if (!this.enabled || !this.container || !polygons?.length) return false;
+  _applyPolygons(polygons, { target = "shared", markDirty = true, maxChunks = Infinity } = {}) {
+    if (!this.enabled || !this.container || !Array.isArray(polygons) || !polygons.length) return false;
     const touched = new Set();
+    const scene = game.scenes?.get?.(this.sceneId) ?? (canvas?.scene?.id === this.sceneId ? canvas.scene : null);
+    const pad = Math.max(0, Number(scene?.padding) || 0);
+    const totalW = Number(canvas?.dimensions?.width) || Number(scene?.dimensions?.width) || ((scene?.width || 100000) * (1 + pad * 2));
+    const totalH = Number(canvas?.dimensions?.height) || Number(scene?.dimensions?.height) || ((scene?.height || 100000) * (1 + pad * 2));
+    const maxCx = Math.max(0, Math.ceil(totalW / CHUNK_WORLD_PX));
+    const maxCy = Math.max(0, Math.ceil(totalH / CHUNK_WORLD_PX));
 
     for (const pts of polygons) {
-      if (!pts || pts.length < 6) continue;
+      if (!Array.isArray(pts) || pts.length < 6) continue;
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let valid = true;
       for (let i = 0; i < pts.length; i += 2) {
         const px = pts[i], py = pts[i + 1];
+        if (!Number.isFinite(px) || !Number.isFinite(py)) { valid = false; break; }
         if (px < minX) minX = px;
         if (px > maxX) maxX = px;
         if (py < minY) minY = py;
         if (py > maxY) maxY = py;
       }
+      if (!valid || !Number.isFinite(minX)) continue;
 
-      const cx0 = Math.max(0, Math.floor(minX / CHUNK_WORLD_PX));
-      const cy0 = Math.max(0, Math.floor(minY / CHUNK_WORLD_PX));
-      const cx1 = Math.floor(maxX / CHUNK_WORLD_PX);
-      const cy1 = Math.floor(maxY / CHUNK_WORLD_PX);
+      const rawCx0 = Math.floor(minX / CHUNK_WORLD_PX);
+      const rawCy0 = Math.floor(minY / CHUNK_WORLD_PX);
+      const rawCx1 = Math.floor(maxX / CHUNK_WORLD_PX);
+      const rawCy1 = Math.floor(maxY / CHUNK_WORLD_PX);
+      if (rawCx1 < 0 || rawCy1 < 0 || rawCx0 > maxCx || rawCy0 > maxCy) continue;
+      const cx0 = Math.max(0, Math.min(maxCx, rawCx0));
+      const cy0 = Math.max(0, Math.min(maxCy, rawCy0));
+      const cx1 = Math.max(0, Math.min(maxCx, rawCx1));
+      const cy1 = Math.max(0, Math.min(maxCy, rawCy1));
 
       for (let cy = cy0; cy <= cy1; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
-          const chunk = this._getOrCreateChunk(cx, cy);
+          const ck = `${cx}_${cy}`;
+          const existingChunk = this.chunks.get(ck);
+          if ((!existingChunk || !touched.has(existingChunk)) && touched.size >= maxChunks) continue;
+          const chunk = existingChunk || this._getOrCreateChunk(cx, cy);
           const ox = cx * CHUNK_WORLD_PX;
           const oy = cy * CHUNK_WORLD_PX;
 
@@ -507,7 +537,24 @@ export class ChunkedFogManager {
   // ===== Socket & Scene Flag Sync =====
 
   handleSocketMessage(payload) {
-    if (!this.enabled || !payload) return false;
+    if (!payload) return false;
+
+    // On activeGM, persist SHARED-mode exploration sent from players on a different scene/level
+    // even while the GM is currently viewing another level or scene.
+    if (
+      payload.type === "fogReveal" &&
+      Array.isArray(payload.polygons) &&
+      payload.sceneId &&
+      (payload.sceneId !== this.sceneId || (payload.levelId && payload.levelId !== this.levelId))
+    ) {
+      if (game.users?.activeGM?.id === game.user?.id) {
+        this._persistRemoteSharedReveal(payload).catch(() => {});
+        return true;
+      }
+      return false;
+    }
+
+    if (!this.enabled) return false;
     if (payload.sceneId !== this.sceneId) return false;
     if (payload.levelId && payload.levelId !== this.levelId) return false;
 
@@ -515,7 +562,7 @@ export class ChunkedFogManager {
       if (!this.isSharedMode || !Array.isArray(payload.polygons)) return true;
       // Only activeGM needs to mark shared chunks dirty for DB persistence; other clients cache locally
       const isAuthoritativeGM = game.users?.activeGM?.id === game.user?.id;
-      this._applyPolygons(payload.polygons, { target: "shared", markDirty: isAuthoritativeGM });
+      this._applyPolygons(payload.polygons, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
       if (!isAuthoritativeGM) {
         // Keep local cache fresh on non-GM clients without triggering server writes
         this._saveLocalCacheOnly();
@@ -523,29 +570,246 @@ export class ChunkedFogManager {
       return true;
     }
 
-    if (payload.type === "fogBrush") {
-      if (!Array.isArray(payload.strokes)) return true;
-      // In INDIVIDUAL mode each player persists GM brush reveal to their own user flags;
-      // in SHARED mode the GM already persists to scene.flags
-      const shouldPersist = !this.isSharedMode;
-      this._applyBrushStrokes(payload.strokes, { markDirty: shouldPersist });
-      if (!shouldPersist) this._saveLocalCacheOnly();
-      return true;
-    }
-
-    if (payload.type === "fogReset") {
-      this.reset({ broadcast: false, persist: false });
+    // Never trust client-spoofable socket messages for GM-only fogBrush or fogReset;
+    // those propagate strictly via server-authorized Scene document flags (`onSceneFogBrushChanged` / `onSceneFogResetChanged`).
+    if (payload.type === "fogBrush" || payload.type === "fogReset") {
       return true;
     }
 
     return false;
   }
 
+  _persistRemoteSharedReveal(payload) {
+    const sceneId = payload?.sceneId;
+    if (!sceneId || !Array.isArray(payload.polygons) || !payload.polygons.length) return Promise.resolve();
+    const targetScene = game.scenes?.get?.(sceneId);
+    if (
+      !targetScene ||
+      !targetScene.tokenVision ||
+      targetScene.flags?.[MODULE_ID]?.chunkedFog === false ||
+      getSceneFogMode(targetScene) !== getFogModes().SHARED
+    ) return Promise.resolve();
+    let targetLevelId;
+    if (payload.levelId != null) {
+      if (
+        typeof payload.levelId !== "string" ||
+        !payload.levelId ||
+        payload.levelId.startsWith("-=") ||
+        !/^[A-Za-z0-9_-]+$/.test(payload.levelId)
+      ) return Promise.resolve();
+      if (targetScene.levels?.size) {
+        if (!targetScene.levels.has(payload.levelId)) return Promise.resolve();
+      } else if (payload.levelId !== "default") {
+        return Promise.resolve();
+      }
+      targetLevelId = payload.levelId;
+    } else {
+      targetLevelId = targetScene.initialLevel?.id || "default";
+    }
+    const queueKey = `${sceneId}::${targetLevelId}`;
+
+    let q = this._remoteRevealQueues.get(queueKey);
+    if (!q) {
+      q = { polygons: [], running: null };
+      this._remoteRevealQueues.set(queueKey, q);
+    }
+    for (const pts of payload.polygons) {
+      if (Array.isArray(pts) && pts.length >= 6) q.polygons.push(pts);
+    }
+    if (!q.running) {
+      const run = async () => {
+        try {
+          await this._drainRemoteSharedRevealQueue(queueKey, sceneId, targetLevelId);
+        } catch (err) {
+          console.warn(`${MODULE_ID} | Failed to persist remote shared fog reveal:`, err);
+        } finally {
+          const cur = this._remoteRevealQueues.get(queueKey);
+          if (cur) {
+            cur.running = null;
+            if (!cur.polygons.length) {
+              this._remoteRevealQueues.delete(queueKey);
+            } else {
+              cur.running = run();
+            }
+          }
+        }
+      };
+      q.running = run();
+    }
+    return q.running;
+  }
+
+  async _drainRemoteSharedRevealQueue(queueKey, sceneId, targetLevelId) {
+    const MAX_REMOTE_CHUNKS_PER_BATCH = 64;
+    while (true) {
+      const q = this._remoteRevealQueues.get(queueKey);
+      if (!q || !q.polygons.length) break;
+      const batchPolys = q.polygons.splice(0);
+
+      const targetScene = game.scenes?.get?.(sceneId);
+      if (
+        !targetScene ||
+        !targetScene.tokenVision ||
+        targetScene.flags?.[MODULE_ID]?.chunkedFog === false ||
+        getSceneFogMode(targetScene) !== getFogModes().SHARED
+      ) break;
+      const existingMap = targetScene.flags?.[MODULE_ID]?.sharedFog?.[targetLevelId] || {};
+      const pad = Math.max(0, Number(targetScene.padding) || 0);
+      const totalW = Number(targetScene.dimensions?.width) || ((targetScene.width || 100000) * (1 + pad * 2));
+      const totalH = Number(targetScene.dimensions?.height) || ((targetScene.height || 100000) * (1 + pad * 2));
+      const maxCx = Math.max(0, Math.ceil(totalW / CHUNK_WORLD_PX));
+      const maxCy = Math.max(0, Math.ceil(totalH / CHUNK_WORLD_PX));
+
+      const polysByChunk = new Map();
+      for (const pts of batchPolys) {
+        if (!Array.isArray(pts) || pts.length < 6) continue;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        let valid = true;
+        for (let i = 0; i < pts.length; i += 2) {
+          const px = pts[i], py = pts[i + 1];
+          if (!Number.isFinite(px) || !Number.isFinite(py)) { valid = false; break; }
+          if (px < minX) minX = px;
+          if (px > maxX) maxX = px;
+          if (py < minY) minY = py;
+          if (py > maxY) maxY = py;
+        }
+        if (!valid || !Number.isFinite(minX)) continue;
+        const rawCx0 = Math.floor(minX / CHUNK_WORLD_PX);
+        const rawCy0 = Math.floor(minY / CHUNK_WORLD_PX);
+        const rawCx1 = Math.floor(maxX / CHUNK_WORLD_PX);
+        const rawCy1 = Math.floor(maxY / CHUNK_WORLD_PX);
+        if (rawCx1 < 0 || rawCy1 < 0 || rawCx0 > maxCx || rawCy0 > maxCy) continue;
+        const cx0 = Math.max(0, Math.min(maxCx, rawCx0));
+        const cy0 = Math.max(0, Math.min(maxCy, rawCy0));
+        const cx1 = Math.max(0, Math.min(maxCx, rawCx1));
+        const cy1 = Math.max(0, Math.min(maxCy, rawCy1));
+        for (let cy = cy0; cy <= cy1; cy++) {
+          for (let cx = cx0; cx <= cx1; cx++) {
+            const ck = `${cx}_${cy}`;
+            if (!polysByChunk.has(ck) && polysByChunk.size >= MAX_REMOTE_CHUNKS_PER_BATCH) continue;
+            let arr = polysByChunk.get(ck);
+            if (!arr) { arr = []; polysByChunk.set(ck, arr); }
+            arr.push(pts);
+          }
+        }
+      }
+      if (!polysByChunk.size) continue;
+
+      const scale = CHUNK_TEX_PX / CHUNK_WORLD_PX;
+      const update = {};
+      for (const [ck, polys] of polysByChunk) {
+        const [cx, cy] = ck.split("_").map(Number);
+        const c = document.createElement("canvas");
+        c.width = CHUNK_TEX_PX;
+        c.height = CHUNK_TEX_PX;
+        const ctx = c.getContext("2d", { alpha: true });
+        const prevUrl = existingMap[ck];
+        if (typeof prevUrl === "string" && prevUrl.startsWith("data:image/")) {
+          await new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => { try { ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX); } catch {} resolve(); };
+            img.onerror = resolve;
+            img.src = prevUrl;
+          });
+        }
+        const ox = cx * CHUNK_WORLD_PX;
+        const oy = cy * CHUNK_WORLD_PX;
+        ctx.save();
+        ctx.fillStyle = "#ffffff";
+        ctx.globalCompositeOperation = "source-over";
+        for (const pts of polys) {
+          ctx.beginPath();
+          ctx.moveTo((pts[0] - ox) * scale, (pts[1] - oy) * scale);
+          for (let i = 2; i < pts.length; i += 2) {
+            ctx.lineTo((pts[i] - ox) * scale, (pts[i + 1] - oy) * scale);
+          }
+          ctx.closePath();
+          ctx.fill();
+        }
+        ctx.restore();
+        update[`flags.${MODULE_ID}.sharedFog.${targetLevelId}.${ck}`] = encodeCanvas(c);
+      }
+      if (Object.keys(update).length) {
+        try {
+          await targetScene.update(update);
+        } catch (err) {
+          console.warn(`${MODULE_ID} | Failed to update remote shared fog:`, err);
+        }
+      }
+    }
+  }
+
   onSceneFogFlagsChanged(scene, sharedFogChanges) {
-    if (!this.enabled || !this.isSharedMode || !sharedFogChanges || this._applyingRemoteFlag) return;
+    if (!this.enabled || !this.isSharedMode || this._savingSharedDepth > 0) return;
+    if (sharedFogChanges === null) {
+      this._clearAllSharedChunksLocal();
+      return;
+    }
+    if (!sharedFogChanges || typeof sharedFogChanges !== "object") return;
+    if (`-=${this.levelId}` in sharedFogChanges || sharedFogChanges[this.levelId] === null) {
+      this._clearAllSharedChunksLocal();
+      return;
+    }
     const levelPatch = sharedFogChanges[this.levelId];
     if (!levelPatch || typeof levelPatch !== "object") return;
-    this._mergeChunkMap(levelPatch, { intoShared: true });
+    this._mergeChunkMap(levelPatch, { intoShared: true, replace: true });
+  }
+
+  onSceneFogResetChanged(scene, fogResetAtChanges) {
+    if (!this.enabled || !fogResetAtChanges || typeof fogResetAtChanges !== "object") return;
+    const nextResetAt = Number(fogResetAtChanges[this.levelId]) || 0;
+    if (nextResetAt > this._lastHandledResetAt) {
+      this._lastHandledResetAt = nextResetAt;
+      this.reset({ broadcast: false, persist: false });
+    }
+  }
+
+  _markBrushSeen(id) {
+    if (!id) return;
+    this._seenBrushIds.add(id);
+    while (this._seenBrushIds.size > 64) {
+      const oldest = this._seenBrushIds.values().next().value;
+      this._seenBrushIds.delete(oldest);
+    }
+  }
+
+  onSceneFogBrushChanged(scene, brushPayload) {
+    if (!this.enabled || !brushPayload || typeof brushPayload !== "object") return;
+    if (!brushPayload.id || this._seenBrushIds.has(brushPayload.id)) return;
+    this._markBrushSeen(brushPayload.id);
+    const fullBrush = scene?.flags?.[MODULE_ID]?.fogBrush;
+    const levelId = brushPayload.levelId ?? fullBrush?.levelId;
+    const strokes = Array.isArray(brushPayload.strokes) ? brushPayload.strokes : fullBrush?.strokes;
+    if (levelId && levelId !== this.levelId) return;
+    if (!Array.isArray(strokes) || !strokes.length) return;
+    const shouldPersist = !this.isSharedMode;
+    this._applyBrushStrokes(strokes, { markDirty: shouldPersist });
+    if (!shouldPersist) this._saveLocalCacheOnly();
+  }
+
+  _clearAllSharedChunksLocal() {
+    this._fogGen++;
+    this._chunkLoadSeq.clear();
+    this._pendingChunkLoads.clear();
+    for (const [key, chunk] of Array.from(this.chunks.entries())) {
+      if (chunk.hasPrivate && chunk.sharedCtx) {
+        chunk.sharedCtx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+      } else {
+        this._destroyChunkEntry(chunk);
+        this.chunks.delete(key);
+      }
+    }
+  }
+
+  _destroyChunkEntry(chunk) {
+    if (!chunk) return;
+    try { chunk.sprite?.parent?.removeChild(chunk.sprite); } catch {}
+    if (chunk.sprite && !chunk.sprite.destroyed) {
+      try { chunk.sprite.destroy(); } catch {}
+    }
+    if (chunk.texture && !chunk.texture.destroyed) {
+      try { chunk.texture.destroy(true); } catch {}
+    }
   }
 
   // ===== Persistence (Server Flags + Fast Local Cache) =====
@@ -559,31 +823,45 @@ export class ChunkedFogManager {
   }
 
   _saveLocalCacheOnly() {
-    if (!this._storageKey) return;
+    if (!this._storageKey || this._pendingChunkLoads.size > 0) return;
     try {
-      const data = {};
+      const chunks = {};
       for (const [key, chunk] of this.chunks) {
-        data[key] = encodeCanvas(chunk.canvas);
+        chunks[key] = encodeCanvas(chunk.canvas);
       }
-      localStorage.setItem(this._storageKey, JSON.stringify(data));
+      localStorage.setItem(this._storageKey, JSON.stringify({ savedAt: Date.now(), chunks }));
     } catch {}
   }
 
   async saveNow() {
     if (!this.enabled || (!this._dirtyShared.size && !this._dirtyPrivate.size)) return;
-    const scene = canvas?.scene;
-    if (!scene || scene.id !== this.sceneId) return;
+    // Capture scene/level/chunks synchronously BEFORE any await so unmount()/mount() cannot race or corrupt another level!
+    const sceneId = this.sceneId;
+    const levelId = this.levelId;
+    const isSharedMode = this.isSharedMode;
+    const scene = game.scenes?.get?.(sceneId) ?? (canvas?.scene?.id === sceneId ? canvas.scene : null);
+    if (!scene || !sceneId || !levelId) return;
 
-    const sharedKeys = Array.from(this._dirtyShared);
-    const privateKeys = Array.from(this._dirtyPrivate);
-    this._dirtyShared.clear();
-    this._dirtyPrivate.clear();
+    const sharedKeys = [];
+    for (const key of Array.from(this._dirtyShared)) {
+      if ((this._pendingChunkLoads.get(key) || 0) > 0) continue;
+      sharedKeys.push(key);
+      this._dirtyShared.delete(key);
+    }
+    const privateKeys = [];
+    for (const key of Array.from(this._dirtyPrivate)) {
+      if ((this._pendingChunkLoads.get(key) || 0) > 0) continue;
+      privateKeys.push(key);
+      this._dirtyPrivate.delete(key);
+    }
+    if (!sharedKeys.length && !privateKeys.length) return;
 
     // 1. Fast local cache update
     this._saveLocalCacheOnly();
 
-    // 2. Server persistence in SHARED mode (GM writes to Scene flags; remote socket reveals are only marked dirty on activeGM)
-    if (this.isSharedMode && sharedKeys.length && game.user?.isGM) {
+    // 2. Pre-encode both server payloads synchronously while chunks are still live
+    let sharedUpdate = null;
+    if (isSharedMode && sharedKeys.length && game.user?.isGM) {
       const update = {};
       for (const key of sharedKeys) {
         const chunk = this.chunks.get(key);
@@ -591,72 +869,143 @@ export class ChunkedFogManager {
         const srcCanvas = chunk.sharedCanvas || chunk.canvas;
         const srcCtx = chunk.sharedCtx || chunk.ctx;
         if (isCanvasEmpty(srcCtx)) {
-          update[`flags.${MODULE_ID}.sharedFog.${this.levelId}.-=${key}`] = null;
+          update[`flags.${MODULE_ID}.sharedFog.${levelId}.-=${key}`] = null;
         } else {
-          update[`flags.${MODULE_ID}.sharedFog.${this.levelId}.${key}`] = encodeCanvas(srcCanvas);
+          update[`flags.${MODULE_ID}.sharedFog.${levelId}.${key}`] = encodeCanvas(srcCanvas);
         }
       }
-      if (Object.keys(update).length) {
-        this._applyingRemoteFlag = true;
-        try {
-          await scene.update(update);
-        } catch (err) {
-          console.warn(`${MODULE_ID} | Failed to persist shared chunked fog:`, err);
-        } finally {
-          this._applyingRemoteFlag = false;
-        }
-      }
+      if (Object.keys(update).length) sharedUpdate = update;
     }
 
-    // 3. Server persistence for INDIVIDUAL mode (or GM private layer in SHARED mode) via User flags
+    let privateUpdate = null;
     if (privateKeys.length && game.user) {
       const update = {};
       for (const key of privateKeys) {
         const chunk = this.chunks.get(key);
         if (!chunk) continue;
         if (isCanvasEmpty(chunk.ctx)) {
-          update[`flags.${MODULE_ID}.fog.${this.sceneId}.${this.levelId}.-=${key}`] = null;
+          update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.-=${key}`] = null;
         } else {
-          update[`flags.${MODULE_ID}.fog.${this.sceneId}.${this.levelId}.${key}`] = encodeCanvas(chunk.canvas);
+          update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.${key}`] = encodeCanvas(chunk.canvas);
         }
       }
-      if (Object.keys(update).length) {
-        try {
-          await game.user.update(update);
-        } catch (err) {
-          console.warn(`${MODULE_ID} | Failed to persist personal chunked fog:`, err);
-        }
+      if (Object.keys(update).length) privateUpdate = update;
+    }
+
+    // 3. Persist to server asynchronously with depth-counted re-entrancy guard
+    if (sharedUpdate) {
+      this._savingSharedDepth++;
+      try {
+        await scene.update(sharedUpdate);
+      } catch (err) {
+        console.warn(`${MODULE_ID} | Failed to persist shared chunked fog:`, err);
+      } finally {
+        this._savingSharedDepth = Math.max(0, this._savingSharedDepth - 1);
+      }
+    }
+
+    if (privateUpdate && game.user) {
+      try {
+        await game.user.update(privateUpdate);
+      } catch (err) {
+        console.warn(`${MODULE_ID} | Failed to persist personal chunked fog:`, err);
       }
     }
   }
 
-  _mergeChunkMap(mapObj, { intoShared = false, intoPrivate = false } = {}) {
+  _mergeChunkMap(mapObj, { intoShared = false, intoPrivate = false, replace = false } = {}) {
     if (!mapObj || typeof mapObj !== "object") return;
     const mountSceneId = this.sceneId;
     const mountLevelId = this.levelId;
+    const gen = this._fogGen;
 
-    for (const [key, dataUrl] of Object.entries(mapObj)) {
-      if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) continue;
+    for (const [rawKey, dataUrl] of Object.entries(mapObj)) {
+      const isDeletion = rawKey.startsWith("-=") || dataUrl === null;
+      const key = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
       const [cxStr, cyStr] = key.split("_");
       const cx = Number(cxStr), cy = Number(cyStr);
       if (!Number.isInteger(cx) || !Number.isInteger(cy)) continue;
 
+      const seqKey = `${intoPrivate ? "priv" : "shared"}:${key}`;
+      const seq = (this._chunkLoadSeq.get(seqKey) || 0) + 1;
+      this._chunkLoadSeq.set(seqKey, seq);
+
+      if (isDeletion) {
+        const existing = this.chunks.get(key);
+        if (!existing) continue;
+        if (intoShared && existing.hasPrivate && existing.sharedCtx) {
+          existing.sharedCtx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+        } else {
+          this._destroyChunkEntry(existing);
+          this.chunks.delete(key);
+        }
+        continue;
+      }
+
+      if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) continue;
+
+      this._pendingChunkLoads.set(key, (this._pendingChunkLoads.get(key) || 0) + 1);
+      let settled = false;
+      const finishPending = () => {
+        if (settled) return;
+        settled = true;
+        if (gen !== this._fogGen) return;
+        const rem = (this._pendingChunkLoads.get(key) || 1) - 1;
+        if (rem <= 0) {
+          this._pendingChunkLoads.delete(key);
+          if (this.enabled && (this._dirtyShared.has(key) || this._dirtyPrivate.has(key))) {
+            this._scheduleSave();
+          }
+        } else {
+          this._pendingChunkLoads.set(key, rem);
+        }
+      };
+
       const img = new Image();
       img.onload = () => {
-        if (!this.enabled || !this.container || this.sceneId !== mountSceneId || this.levelId !== mountLevelId) return;
+        if (
+          !this.enabled ||
+          !this.container ||
+          gen !== this._fogGen ||
+          this._chunkLoadSeq.get(seqKey) !== seq ||
+          this.sceneId !== mountSceneId ||
+          this.levelId !== mountLevelId
+        ) {
+          finishPending();
+          return;
+        }
         const chunk = this._getOrCreateChunk(cx, cy);
         if (intoPrivate && this.isSharedMode && game.user?.isGM) {
           this._ensureSharedCopy(chunk);
+          if (replace) chunk.ctx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
           chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
         } else {
-          chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
-          if (intoShared && chunk.sharedCtx) {
-            chunk.sharedCtx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+          if (replace) {
+            if (intoShared && chunk.sharedCtx) {
+              chunk.sharedCtx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+              chunk.sharedCtx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+              if (!chunk.hasPrivate) {
+                chunk.ctx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+                chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+              } else {
+                chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+              }
+            } else {
+              chunk.ctx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+              chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+            }
+          } else {
+            chunk.ctx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+            if (intoShared && chunk.sharedCtx) {
+              chunk.sharedCtx.drawImage(img, 0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+            }
           }
         }
         chunk.texture.baseTexture.update();
         this.updateViewportCulling();
+        finishPending();
       };
+      img.onerror = finishPending;
       img.src = dataUrl;
     }
   }
@@ -676,11 +1025,22 @@ export class ChunkedFogManager {
       if (personalFromUser) {
         this._mergeChunkMap(personalFromUser, { intoPrivate: true });
       }
-      // Fallback to localStorage cache if user flags were not saved yet
+      // Fallback to localStorage cache if user flags were not saved yet (respecting GM fogResetAt timestamp)
       if (!personalFromUser && this._storageKey) {
         try {
           const raw = localStorage.getItem(this._storageKey);
-          if (raw) this._mergeChunkMap(JSON.parse(raw), { intoPrivate: true });
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            const resetAt = Number(scene?.flags?.[MODULE_ID]?.fogResetAt?.[this.levelId]) || 0;
+            const isWrapped = parsed && typeof parsed === "object" && "chunks" in parsed && typeof parsed.chunks === "object";
+            const savedAt = isWrapped ? (Number(parsed.savedAt) || 0) : 0;
+            const chunkMap = isWrapped ? parsed.chunks : parsed;
+            if (resetAt > 0 && savedAt < resetAt) {
+              localStorage.removeItem(this._storageKey);
+            } else if (chunkMap) {
+              this._mergeChunkMap(chunkMap, { intoPrivate: true });
+            }
+          }
         } catch {}
       }
     }
@@ -691,14 +1051,20 @@ export class ChunkedFogManager {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
     }
+    if (this._brushFlushTimer !== null) {
+      clearTimeout(this._brushFlushTimer);
+      this._brushFlushTimer = null;
+    }
+    this._brushPendingStrokes = [];
+    this._fogGen++;
+    this._chunkLoadSeq.clear();
+    this._pendingChunkLoads.clear();
     this._dirtyShared.clear();
     this._dirtyPrivate.clear();
     this._lastPolySigs.clear();
 
     for (const chunk of this.chunks.values()) {
-      chunk.sprite.parent?.removeChild(chunk.sprite);
-      chunk.sprite.destroy();
-      chunk.texture.destroy(true);
+      this._destroyChunkEntry(chunk);
     }
     this.chunks.clear();
 
@@ -706,38 +1072,60 @@ export class ChunkedFogManager {
       try { localStorage.removeItem(this._storageKey); } catch {}
     }
 
-    if (persist && this.sceneId && this.levelId) {
-      const scene = canvas?.scene;
-      if (game.user?.isGM && scene?.id === this.sceneId && scene.flags?.[MODULE_ID]?.sharedFog?.[this.levelId]) {
-        this._applyingRemoteFlag = true;
+    const sceneId = this.sceneId;
+    const levelId = this.levelId;
+    if (persist && sceneId && levelId) {
+      const scene = game.scenes?.get?.(sceneId) ?? (canvas?.scene?.id === sceneId ? canvas.scene : null);
+      if (game.user?.isGM && scene) {
+        const resetAt = Date.now();
+        this._lastHandledResetAt = resetAt;
+        const scenePatch = { [`flags.${MODULE_ID}.fogResetAt.${levelId}`]: resetAt };
+        if (scene.flags?.[MODULE_ID]?.sharedFog?.[levelId]) {
+          scenePatch[`flags.${MODULE_ID}.sharedFog.-=${levelId}`] = null;
+        }
+        this._savingSharedDepth++;
         try {
-          await scene.update({ [`flags.${MODULE_ID}.sharedFog.-=${this.levelId}`]: null });
+          await scene.update(scenePatch);
         } catch (err) {
           console.warn(`${MODULE_ID} | Failed to clear shared fog flags:`, err);
         } finally {
-          this._applyingRemoteFlag = false;
+          this._savingSharedDepth = Math.max(0, this._savingSharedDepth - 1);
         }
       }
-      if (game.user?.flags?.[MODULE_ID]?.fog?.[this.sceneId]?.[this.levelId]) {
+      if (game.user?.isGM && game.users) {
+        // Clear per-user INDIVIDUAL / GM-private fog flags across all users (online & offline) so F5 never revives reset fog
+        const updates = [];
+        for (const u of game.users) {
+          if (u?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
+            updates.push({ _id: u.id, [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
+          }
+        }
+        if (updates.length) {
+          try {
+            if (typeof User?.updateDocuments === "function") {
+              await User.updateDocuments(updates);
+            } else {
+              for (const u of game.users) {
+                if (u?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
+                  await u.update({ [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`${MODULE_ID} | Failed to clear user fog flags:`, err);
+          }
+        }
+      } else if (game.user?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
         try {
-          await game.user.update({ [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null });
+          await game.user.update({ [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
         } catch (err) {
           console.warn(`${MODULE_ID} | Failed to clear user fog flags:`, err);
         }
       }
     }
 
-    if (broadcast && this.sceneId) {
-      game.socket?.emit(SOCKET_NAME, {
-        type: "fogReset",
-        sceneId: this.sceneId,
-        levelId: this.levelId,
-        senderId: game.user?.id
-      });
-    }
-
-    if (this.enabled) {
-      this.revealFromActiveVision({ broadcast: false });
+    if (this.enabled && this.sceneId === sceneId && this.levelId === levelId) {
+      this.revealFromActiveVision({ broadcast: this.isSharedMode && !game.user?.isGM });
     }
   }
 
@@ -766,14 +1154,23 @@ export class ChunkedFogManager {
       clearTimeout(this._brushFlushTimer);
       this._brushFlushTimer = null;
     }
-    if (!this._brushPendingStrokes.length || !this.sceneId) return;
+    if (!this._brushPendingStrokes.length || !this.sceneId || !game.user?.isGM) return;
+    const scene = game.scenes?.get?.(this.sceneId) ?? (canvas?.scene?.id === this.sceneId ? canvas.scene : null);
+    if (!scene) {
+      this._brushPendingStrokes = [];
+      return;
+    }
     const strokes = this._brushPendingStrokes.splice(0);
-    game.socket?.emit(SOCKET_NAME, {
-      type: "fogBrush",
-      sceneId: this.sceneId,
-      levelId: this.levelId,
-      senderId: game.user?.id,
-      strokes
+    const id = foundry.utils.randomID();
+    this._markBrushSeen(id);
+    scene.update({
+      [`flags.${MODULE_ID}.fogBrush`]: {
+        id,
+        levelId: this.levelId,
+        strokes
+      }
+    }).catch(err => {
+      console.warn(`${MODULE_ID} | Failed to broadcast GM fog brush via scene flags:`, err);
     });
   }
 
@@ -893,6 +1290,8 @@ export class ChunkedFogManager {
     view.addEventListener("pointerdown", onPointerDown, true);
     window.addEventListener("pointermove", onPointerMove, true);
     window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerUp, true);
+    window.addEventListener("blur", onPointerUp);
     view.addEventListener("wheel", onWheel, { capture: true, passive: false });
     window.addEventListener("keydown", onKeyDown, true);
 
@@ -910,13 +1309,17 @@ export class ChunkedFogManager {
       view.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("pointermove", onPointerMove, true);
       window.removeEventListener("pointerup", onPointerUp, true);
+      window.removeEventListener("pointercancel", onPointerUp, true);
+      window.removeEventListener("blur", onPointerUp);
       view.removeEventListener("wheel", onWheel, true);
       window.removeEventListener("keydown", onKeyDown, true);
       this._brushListeners = null;
     }
     if (this._brushPreview) {
-      this._brushPreview.parent?.removeChild(this._brushPreview);
-      this._brushPreview.destroy();
+      try { this._brushPreview.parent?.removeChild(this._brushPreview); } catch {}
+      if (!this._brushPreview.destroyed) {
+        try { this._brushPreview.destroy(); } catch {}
+      }
       this._brushPreview = null;
     }
   }
@@ -944,6 +1347,10 @@ export class ChunkedFogManager {
 
     this._removeNativePatches();
 
+    this._fogGen++;
+    this._chunkLoadSeq.clear();
+    this._pendingChunkLoads.clear();
+    this._seenBrushIds.clear();
     this.enabled = false;
     this.mode = 0;
     this._dirtyShared.clear();
@@ -951,15 +1358,15 @@ export class ChunkedFogManager {
     this._lastPolySigs.clear();
 
     for (const chunk of this.chunks.values()) {
-      chunk.sprite.parent?.removeChild(chunk.sprite);
-      chunk.sprite.destroy();
-      chunk.texture.destroy(true);
+      this._destroyChunkEntry(chunk);
     }
     this.chunks.clear();
 
     if (this.container) {
-      this.container.parent?.removeChild(this.container);
-      this.container.destroy({ children: true });
+      try { this.container.parent?.removeChild(this.container); } catch {}
+      if (!this.container.destroyed) {
+        try { this.container.destroy({ children: true }); } catch {}
+      }
       this.container = null;
     }
 

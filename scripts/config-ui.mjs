@@ -42,14 +42,22 @@ async function promptBakeLevel(controller, level) {
   });
   if (!result) return;
 
-  const stats = await controller.bakeNativeToLevel(level.id, { removeOriginals: result.removeOriginals });
-  ui.notifications.info(game.i18n.format("BOUNDLESS.Config.BakeDone", {
-    level: level.name || level.id,
-    tiles: stats.tiles,
-    walls: stats.walls,
-    lights: stats.lights,
-    sounds: stats.sounds
-  }));
+  try {
+    const stats = await controller.bakeNativeToLevel(level.id, {
+      removeOriginals: result.removeOriginals,
+      scene: level.parent || canvas.scene
+    });
+    ui.notifications.info(game.i18n.format("BOUNDLESS.Config.BakeDone", {
+      level: level.name || level.id,
+      tiles: stats.tiles,
+      walls: stats.walls,
+      lights: stats.lights,
+      sounds: stats.sounds
+    }));
+  } catch (err) {
+    console.error(`${MODULE_ID} | Level bake failed:`, err);
+    ui.notifications.error(game.i18n.format("BOUNDLESS.Baker.Failed", { error: err?.message || String(err) }));
+  }
 }
 
 async function openBakePyramidDialog(controller, scene, { singleLevelId = null } = {}) {
@@ -149,9 +157,10 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
   if (!opts) return;
 
   const abortCtrl = new AbortController();
+  const fallbackLevelId = scene.initialLevel?.id || scene.firstLevel?.id || Array.from(scene.levels || [])[0]?.id || null;
   const levelIds = singleLevelId
     ? [singleLevelId]
-    : (opts.allLevels ? null : (canvas.scene?.id === scene.id && canvas.level?.id ? [canvas.level.id] : null));
+    : (opts.allLevels ? null : (canvas.scene?.id === scene.id && canvas.level?.id ? [canvas.level.id] : (fallbackLevelId ? [fallbackLevelId] : null)));
 
   const progressDialog = new DialogV2({
     window: { title: loc("BOUNDLESS.Baker.ProgressTitle"), icon: "fa-solid fa-spinner fa-spin" },
@@ -170,6 +179,10 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
       callback: () => { abortCtrl.abort(); }
     }]
   });
+  let finished = false;
+  progressDialog.addEventListener?.("close", () => {
+    if (!finished) abortCtrl.abort();
+  }, { once: true });
   await progressDialog.render(true);
 
   try {
@@ -193,6 +206,7 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
         if (stEl && text) stEl.textContent = text;
       }
     });
+    finished = true;
     await progressDialog.close().catch(() => {});
     ui.notifications.info(game.i18n.format("BOUNDLESS.Baker.Done", {
       scene: stats.scene.name,
@@ -203,6 +217,7 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
       sounds: stats.sounds
     }));
   } catch (err) {
+    finished = true;
     await progressDialog.close().catch(() => {});
     if (err?.name === "AbortError") {
       ui.notifications.warn(loc("BOUNDLESS.Baker.Cancelled"));
@@ -248,34 +263,40 @@ export function registerConfigUI(controller) {
   Hooks.on("renderSceneConfig", (app, html) => {
     const root = html instanceof HTMLElement ? html : html?.[0];
     const scene = app.document;
-    if (!root || !scene || root.querySelector('.tab[data-tab="boundless"]')) return;
+    if (!root || !scene) return;
 
     const nav = root.querySelector('nav.sheet-tabs, nav.tabs');
     const lastTab = root.querySelector('.tab[data-tab="misc"][data-group="sheet"]')
       || Array.from(root.querySelectorAll('.tab[data-group="sheet"]')).at(-1);
     if (!nav || !lastTab) return;
 
+    const isActiveTab = app.tabGroups?.sheet === "boundless";
+    let tabBtn = nav.querySelector('a[data-tab="boundless"]');
+    if (!tabBtn) {
+      tabBtn = document.createElement("a");
+      tabBtn.dataset.action = "tab";
+      tabBtn.dataset.group = "sheet";
+      tabBtn.dataset.tab = "boundless";
+      tabBtn.innerHTML = `<i class="fa-solid fa-map"></i><span>${escapeHtml(loc("BOUNDLESS.TabLabel"))}</span>`;
+      nav.appendChild(tabBtn);
+    }
+    tabBtn.classList.toggle("active", isActiveTab);
+
+    // Replace existing injected tab on re-renders so updated/baked scene flags are never clobbered by stale DOM inputs
+    const existingTab = root.querySelector('.tab[data-tab="boundless"]');
+    if (existingTab) existingTab.remove();
+
     const cfg = scene.flags?.[MODULE_ID] || {};
     const enabled = Boolean(cfg.enabled);
     const manifestUrl = cfg.manifestUrl || "";
     const maxLosPx = cfg.maxLosPx ?? 4500;
     const chunkedFog = cfg.chunkedFog !== false;
-    const macroAtmosphere = cfg.macroAtmosphere !== false;
     const showPois = cfg.showPois !== false;
     const showCharacterPins = cfg.showCharacterPins !== false;
     const virtualizeTokens = cfg.virtualizeTokens !== false;
     const effectivePois = controller.getEffectivePOIs(scene);
     const hasCustomPois = Array.isArray(cfg.pois);
-    const isActiveTab = app.tabGroups?.sheet === "boundless";
-
-    // Add nav button matching native v14 SceneConfig markup
-    const tabBtn = document.createElement("a");
-    if (isActiveTab) tabBtn.className = "active";
-    tabBtn.dataset.action = "tab";
-    tabBtn.dataset.group = "sheet";
-    tabBtn.dataset.tab = "boundless";
-    tabBtn.innerHTML = `<i class="fa-solid fa-map"></i><span>${escapeHtml(loc("BOUNDLESS.TabLabel"))}</span>`;
-    nav.appendChild(tabBtn);
+    const isCurrentScene = canvas.scene?.id === scene.id;
 
     // Add tab content div matching native v14 SceneConfig markup
     const section = document.createElement("div");
@@ -317,14 +338,6 @@ export function registerConfigUI(controller) {
             <input type="checkbox" name="flags.${MODULE_ID}.chunkedFog" ${chunkedFog ? "checked" : ""}>
           </div>
           <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.ChunkedFogHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.MacroAtmosphere"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.macroAtmosphere" ${macroAtmosphere ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.MacroAtmosphereHint"))}</p>
         </div>
 
         <div class="form-group">
@@ -414,6 +427,7 @@ export function registerConfigUI(controller) {
         await controller.resetPOIs(scene);
         refreshPoiDom();
       } else if (action === "flyPoi") {
+        if (canvas.scene?.id !== scene.id) return;
         const current = controller.getEffectivePOIs(scene);
         const target = current.find(p => p.id === btn.dataset.poiId);
         if (target) controller.poiManager.flyTo(target);
@@ -421,14 +435,39 @@ export function registerConfigUI(controller) {
         if (canvas.scene?.id === scene.id && canvas.fog) {
           await canvas.fog.reset();
         } else {
-          await controller.fogManager.reset({ broadcast: true, persist: true });
+          // Inactive scene: clear persisted fog flags directly on `scene` and users without touching the currently viewed scene!
+          const nowTs = Date.now();
+          const fogResetPatch = {};
+          if (scene.flags?.[MODULE_ID]?.sharedFog) {
+            fogResetPatch[`flags.${MODULE_ID}.-=sharedFog`] = null;
+          }
+          for (const lvl of (scene.levels || [])) {
+            fogResetPatch[`flags.${MODULE_ID}.fogResetAt.${lvl.id}`] = nowTs;
+          }
+          if (Object.keys(fogResetPatch).length) {
+            await scene.update(fogResetPatch);
+          }
+          if (game.user?.isGM && game.users) {
+            const updates = [];
+            for (const u of game.users) {
+              if (u?.flags?.[MODULE_ID]?.fog?.[scene.id]) {
+                updates.push({ _id: u.id, [`flags.${MODULE_ID}.fog.-=${scene.id}`]: null });
+              }
+            }
+            if (updates.length) {
+              if (typeof User?.updateDocuments === "function") await User.updateDocuments(updates);
+              else for (const u of game.users) if (u?.flags?.[MODULE_ID]?.fog?.[scene.id]) await u.update({ [`flags.${MODULE_ID}.fog.-=${scene.id}`]: null });
+            }
+          }
           ui.notifications.info(loc("BOUNDLESS.Config.ResetFogDone"));
         }
       } else if (action === "bakePyramid") {
         await openBakePyramidDialog(controller, scene);
       } else if (action === "bakeLevel") {
-        if (canvas.scene?.id !== scene.id) return;
-        await promptBakeLevel(controller, canvas.level);
+        const targetLvl = canvas.scene?.id === scene.id
+          ? canvas.level
+          : (scene.initialLevel || scene.firstLevel || Array.from(scene.levels || [])[0]);
+        if (targetLvl) await promptBakeLevel(controller, targetLvl);
       }
     });
   });
@@ -436,14 +475,19 @@ export function registerConfigUI(controller) {
   Hooks.on("renderLevelConfig", (app, html) => {
     const root = html instanceof HTMLElement ? html : html?.[0];
     const level = app.document;
-    if (!root || !level || root.querySelector(".boundless-level-fieldset")) return;
+    if (!root || !level) return;
 
-    const body = root.querySelector(".standard-form, .window-content form > div, form");
-    const footer = root.querySelector("footer.form-footer");
-    if (!body) return;
+    const existingFieldset = root.querySelector(".boundless-level-fieldset");
+    if (existingFieldset) existingFieldset.remove();
+
+    const scrollBody = root.querySelector("section.scrollable")
+      || root.querySelector(".standard-form, .window-content form > div, form");
+    if (!scrollBody) return;
 
     const cfg = level.flags?.[MODULE_ID] || {};
-    const enabled = Boolean(cfg.enabled);
+    const hasExplicitEnabled = cfg.enabled !== undefined;
+    const sceneEnabled = Boolean(level.parent?.flags?.[MODULE_ID]?.enabled);
+    const enabled = hasExplicitEnabled ? Boolean(cfg.enabled) : sceneEnabled;
     const manifestUrl = cfg.manifestUrl || "";
     const pyramidBaseUrl = cfg.pyramidBaseUrl || "";
 
@@ -455,7 +499,7 @@ export function registerConfigUI(controller) {
       <div class="form-group">
         <label>${escapeHtml(loc("BOUNDLESS.Config.LevelEnabled"))}</label>
         <div class="form-fields">
-          <input type="checkbox" name="flags.${MODULE_ID}.enabled" ${enabled ? "checked" : ""}>
+          <input type="checkbox" data-bl-level-enabled ${hasExplicitEnabled ? `name="flags.${MODULE_ID}.enabled"` : ""} ${enabled ? "checked" : ""}>
         </div>
         <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.LevelEnabledHint"))}</p>
       </div>
@@ -485,11 +529,16 @@ export function registerConfigUI(controller) {
       </div>
     `;
 
-    if (footer && footer.parentElement) {
-      footer.before(fieldset);
-    } else {
-      body.appendChild(fieldset);
+    // Only submit `flags.boundless.enabled` if already explicitly set OR the GM intentionally toggles it;
+    // saving LevelConfig on a non-Boundless scene will never accidentally persist `enabled: false`!
+    const enabledInput = fieldset.querySelector("input[data-bl-level-enabled]");
+    if (enabledInput && !hasExplicitEnabled) {
+      enabledInput.addEventListener("change", () => {
+        enabledInput.setAttribute("name", `flags.${MODULE_ID}.enabled`);
+      }, { once: true });
     }
+
+    scrollBody.appendChild(fieldset);
 
     fieldset.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button[data-bl-action]");

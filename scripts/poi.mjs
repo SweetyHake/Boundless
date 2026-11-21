@@ -171,7 +171,9 @@ function drawPoiGlyph(g, iconKey, r, color) {
       g.lineTo(0, r * 0.68);
       g.moveTo(-r * 0.46, -r * 0.16);
       g.lineTo(r * 0.46, -r * 0.16);
-      g.arc(0, r * 0.12, r * 0.62, 0.18 * Math.PI, 0.82 * Math.PI);
+      const a0 = 0.18 * Math.PI;
+      g.moveTo(r * 0.62 * Math.cos(a0), r * 0.12 + r * 0.62 * Math.sin(a0));
+      g.arc(0, r * 0.12, r * 0.62, a0, 0.82 * Math.PI);
       return;
     }
     case "nature": {
@@ -340,6 +342,124 @@ function buildFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScal
   };
 }
 
+/**
+ * GTA 5-style 3-phase character switch trajectory:
+ *   1. Smooth vertical pull-up from current position (skipped automatically if already zoomed out)
+ *   2. Sky-level horizontal cruise over the world toward the destination character
+ *   3. Gradual, unhurried vertical descent onto the target character with silky landing cushion
+ * Overlapping C1-smooth phase windows keep transitions completely seamless with zero corner stops.
+ */
+function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScale, maxScale }) {
+  const V = Math.max(256, viewportSize || 1200);
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const dist = Math.hypot(dx, dy);
+  const logRatio = Math.abs(Math.log(scale1 / Math.max(scale0, 1e-4)));
+
+  if (dist < 2 && logRatio < 0.01) {
+    return { trivial: true, S: 0, durationMs: 0, rawTime: true, sample: () => ({ x: x1, y: y1, scale: scale1 }) };
+  }
+
+  const safeMin = Math.max(1e-4, minScale);
+  const lowScale = Math.min(scale0, scale1);
+  const w0 = V / Math.max(scale0, 1e-4);
+
+  // Pick flight altitude proportional to travel distance so the camera rises meaningfully
+  // above rooftops / districts / provinces before cruising across, without needlessly pulling
+  // even higher when already zoomed out and clicking a character visible on screen.
+  let apexScale;
+  if (dist < 480 && scale0 >= 0.42 && scale1 >= 0.42) {
+    // Short room-scale hop: subtle lift -> glide -> settle (responsive in combat)
+    apexScale = Math.max(safeMin, lowScale * 0.62);
+  } else {
+    const distAltitude = (V * 0.40) / Math.max(dist, 1);
+    const alreadyElevatedAndVisible = scale0 <= 0.22 && dist <= w0 * 0.75;
+    let desiredApex;
+    if (alreadyElevatedAndVisible) {
+      // Already looking from macro overview with character in view: glide over and descend smoothly
+      desiredApex = lowScale;
+    } else if (dist > 60) {
+      const pullUpCap = scale0 > 0.22 ? Math.min(0.24, lowScale / 2.5) : lowScale;
+      desiredApex = Math.min(distAltitude, pullUpCap);
+    } else {
+      desiredApex = lowScale;
+    }
+    const floorApex = Math.max(safeMin * 1.12, 0.012);
+    apexScale = Math.max(floorApex, Math.min(lowScale, desiredApex));
+  }
+
+  const logS0 = Math.log(Math.max(scale0, 1e-4));
+  const logS1 = Math.log(Math.max(scale1, 1e-4));
+  const logApex = Math.log(Math.max(apexScale, 1e-4));
+
+  const upSpan = Math.max(0, logS0 - logApex);
+  const downSpan = Math.max(0, logS1 - logApex);
+  const needUp = upSpan > 0.06;
+  const needCruise = dist > 14;
+  const needDown = downSpan > 0.06;
+
+  const wApex = V / Math.max(apexScale, 1e-4);
+  const cruiseScreens = dist / Math.max(wApex, 1);
+
+  const wUp = needUp ? (0.58 + upSpan * 0.42) : 0;
+  const wCruise = needCruise ? (0.44 + Math.min(1.4, Math.log1p(cruiseScreens) * 0.46)) : 0;
+  // Unhurried, gradual descent so the camera eases smoothly down onto the character
+  const wDown = needDown ? (0.82 + downSpan * 0.56) : 0;
+  const wSum = Math.max(0.001, wUp + wCruise + wDown);
+
+  const fUp = wUp / wSum;
+  const fDown = wDown / wSum;
+
+  // Gentle phase overlaps for silky C1-smooth flow between pull-up, sky cruise, and gradual descent
+  const upEnd = needUp ? Math.min(0.64, fUp * 1.18) : 0;
+  const downStart = needDown ? Math.max(upEnd * 0.76, 1.0 - fDown * 1.18) : 1.0;
+
+  const cruiseStart = needUp ? (fUp * 0.68) : 0.0;
+  const cruiseEnd = needDown ? Math.max(cruiseStart + 0.14, 1.0 - fDown * 0.72) : 1.0;
+  const cruiseLen = Math.max(0.05, cruiseEnd - cruiseStart);
+  const downLen = Math.max(0.05, 1.0 - downStart);
+
+  // Adaptive cinematic duration (~2.5-5.4s) with generous time for smooth zoom-out and zoom-in
+  const isShortHop = dist < 480 && scale0 >= 0.42 && scale1 >= 0.42;
+  const rawDuration = isShortHop
+    ? Math.round(920 + dist * 0.55)
+    : Math.round(1450 + upSpan * 720 + Math.log1p(cruiseScreens) * 700 + downSpan * 860);
+  const durationMs = isShortHop
+    ? Math.max(900, Math.min(1300, rawDuration))
+    : Math.max(2400, Math.min(5400, rawDuration));
+
+  // Velvet S-curves with gentle mid-phase slope (no sudden drop or snap)
+  const easePullUp = (u) => cubicBezier(0.42, 0.0, 0.36, 1.0, u);
+  const easeCruise = (u) => cubicBezier(0.45, 0.0, 0.32, 1.0, u);
+  const easeDescent = (u) => cubicBezier(0.38, 0.0, 0.28, 1.0, u);
+
+  return {
+    trivial: false,
+    rawTime: true,
+    S: upSpan + downSpan + Math.log1p(cruiseScreens),
+    durationMs,
+    sample(t) {
+      if (t <= 0) return { x: x0, y: y0, scale: scale0 };
+      if (t >= 1) return { x: x1, y: y1, scale: scale1 };
+
+      const uUp = needUp ? easePullUp(Math.max(0, Math.min(1, t / Math.max(0.05, upEnd)))) : 1.0;
+      const uDown = needDown ? easeDescent(Math.max(0, Math.min(1, (t - downStart) / downLen))) : 0.0;
+      const uMove = needCruise
+        ? easeCruise(Math.max(0, Math.min(1, (t - cruiseStart) / cruiseLen)))
+        : 1.0;
+
+      const logScale = logApex + (logS0 - logApex) * (1.0 - uUp) + (logS1 - logApex) * uDown;
+      const scale = Math.max(minScale, Math.min(maxScale, Math.exp(logScale)));
+
+      return {
+        x: x0 + dx * uMove,
+        y: y0 + dy * uMove,
+        scale
+      };
+    }
+  };
+}
+
 function getProvinceSubPoiTemplates() {
   return [
     { suffix: "citadel", name: loc("BOUNDLESS.DefaultPOI.Citadel", "Цитадель"), x: 17600, y: 40100, targetScale: 0.45, color: "#f0a85a", kind: "minor", icon: "castle" },
@@ -365,8 +485,16 @@ export function getDefault1000Pois() {
     { id: "def_village", name: loc("BOUNDLESS.DefaultPOI.Village", "Деревня у озера"), x: 74500, y: 50500, targetScale: 0.11, color: "#f5c96b", kind: "major", icon: "village" },
     ...subs
       .filter(s => s.suffix !== "village")
-      .map(s => ({ id: `def_${s.suffix}`, ...s }))
+      .map(({ suffix, ...rest }) => ({ id: `def_${suffix}`, ...rest }))
   ];
+}
+
+function getLiveStageTransform(stageScale, px, py, sw, sh) {
+  const a = stageScale;
+  const d = canvas.stage?.scale?.y || stageScale;
+  const posX = Number.isFinite(canvas.stage?.position?.x) ? canvas.stage.position.x : sw * 0.5;
+  const posY = Number.isFinite(canvas.stage?.position?.y) ? canvas.stage.position.y : sh * 0.5;
+  return { a, d, tx: posX - px * a, ty: posY - py * d };
 }
 
 function rectsOverlap(a, b, pad = 0) {
@@ -382,6 +510,7 @@ function rectsOverlap(a, b, pad = 0) {
  * Shared DialogV2 modal for creating or editing a POI pin (used both from map right-click/tool and SceneConfig).
  */
 export async function openPoiEditorDialog(controller, scene, initial = {}) {
+  if (!scene) return null;
   const DialogV2 = foundry.applications.api.DialogV2;
   const isEdit = Boolean(initial.id);
   const currentScale = canvas.ready && canvas.scene?.id === scene?.id
@@ -438,7 +567,7 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
         <label>${escapeHtml(loc("BOUNDLESS.Config.PoiColorScale", "Цвет и масштаб прилёта"))}</label>
         <div class="form-fields">
           <input type="color" name="color" value="${escapeHtml(defaultColor)}">
-          <input type="number" name="targetScale" value="${escapeHtml(defaultScale)}" min="0.02" max="2.5" step="0.01">
+          <input type="number" name="targetScale" value="${escapeHtml(defaultScale)}" min="0.02" max="2.5" step="0.001">
           <button type="button" class="boundless-use-cur-scale" title="${escapeHtml(loc("BOUNDLESS.Config.PoiUseCurrentScale", "Взять текущий масштаб камеры"))}">
             <i class="fa-solid fa-magnifying-glass"></i>
           </button>
@@ -539,10 +668,12 @@ export class PoiManager {
   lastPivotY = NaN;
   _layoutDirty = true;
   _flight = null;
+  _flightSeq = 0;
   _dragState = null;
   _contextMenuEl = null;
   _placementHintEl = null;
   _placementListeners = null;
+  _pendingLevelSwitch = null;
   _superGridInfo = null;        // { cols, rows, regionPx } when using superGrid manifest defaults
   _superGridSubProvinces = new Map(); // "col_row" -> { lastUsedMs, entries: [] }
 
@@ -551,10 +682,23 @@ export class PoiManager {
   }
 
   mount(scene, manifest) {
-    this.unmount();
+    // Preserve an in-progress cross-level flight that targeted this exact scene & level
+    const keepFlight = Boolean(
+      this._flight &&
+      this._flight.sceneId === scene?.id &&
+      (!this._flight.levelId || this._flight.levelId === canvas.level?.id)
+    );
+    const prevEnabled = this.enabled;
+    const wasPlacementActive = this.placementActive;
+    this.unmount({ keepFlight, skipControlsRefresh: true });
     const cfg = scene?.flags?.[MODULE_ID] || {};
-    this.enabled = cfg.showPois !== false;
-    if (!this.enabled || !canvas?.controls) return;
+    this.enabled = Boolean(cfg.showPois !== false && canvas?.controls);
+    if (!this.enabled) {
+      if ((prevEnabled !== this.enabled || wasPlacementActive) && ui?.controls?.rendered) {
+        ui.controls.render({ reset: true });
+      }
+      return;
+    }
 
     this.container = new PIXI.Container();
     this.container.zIndex = 650;
@@ -565,6 +709,9 @@ export class PoiManager {
 
     this.rebuild(scene, manifest);
     this.updateViewport();
+    if ((prevEnabled !== this.enabled || wasPlacementActive) && ui?.controls?.rendered) {
+      ui.controls.render({ reset: true });
+    }
   }
 
   resolvePois(scene, manifest) {
@@ -584,7 +731,10 @@ export class PoiManager {
       return manifest.pois;
     }
     // Built-in 1000x1000 map defaults when no custom POIs are set
-    if (manifest?.worldCells === 1000 || (canvas.dimensions?.width === 100000 && canvas.dimensions?.height === 100000)) {
+    const isActiveScene = Boolean(scene?.id && scene.id === canvas.scene?.id);
+    const w = isActiveScene ? canvas.dimensions?.width : scene?.width;
+    const h = isActiveScene ? canvas.dimensions?.height : scene?.height;
+    if (manifest?.worldCells === 1000 || (w === 100000 && h === 100000)) {
       return getDefault1000Pois();
     }
     return [];
@@ -612,10 +762,19 @@ export class PoiManager {
     this.pins = [];
 
     const cfg = scene?.flags?.[MODULE_ID] || {};
+    const prevEnabled = this.enabled;
+    const wasPlacementActive = this.placementActive;
     this.enabled = cfg.showPois !== false;
     if (!this.enabled) {
+      this.setPlacementActive(false, { skipUpdate: true });
       this.container.visible = false;
+      if ((prevEnabled !== this.enabled || wasPlacementActive) && ui?.controls?.rendered) {
+        ui.controls.render({ reset: true });
+      }
       return;
+    }
+    if (prevEnabled !== this.enabled && ui?.controls?.rendered) {
+      ui.controls.render({ reset: true });
     }
 
     const activeManifest = manifest ?? this.controller?.manifest;
@@ -658,8 +817,10 @@ export class PoiManager {
     const r0 = Math.max(0, Math.floor(yMinWorld / regionPx));
     const r1 = Math.min(rows - 1, Math.floor(yMaxWorld / regionPx));
 
+    if (c1 < c0 || r1 < r0) return;
+    const visibleCount = (c1 - c0 + 1) * (r1 - r0 + 1);
     // Avoid spawning across all 36 provinces if somehow zoomed out with placementActive
-    if ((c1 - c0 + 1) * (r1 - r0 + 1) > 9) return;
+    if (visibleCount > 9) return;
 
     const now = performance.now();
     const templates = getProvinceSubPoiTemplates();
@@ -694,10 +855,11 @@ export class PoiManager {
       }
     }
 
-    // LRU evict distant province sub-pins (keep up to 6 recent provinces in VRAM)
-    if (this._superGridSubProvinces.size > 6) {
+    // LRU evict distant province sub-pins (never evict provinces currently visible on screen)
+    const maxKeep = Math.max(6, visibleCount);
+    if (this._superGridSubProvinces.size > maxKeep) {
       const sorted = Array.from(this._superGridSubProvinces.entries()).sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
-      while (sorted.length > 6) {
+      while (sorted.length > maxKeep) {
         const [evictKey, bucket] = sorted.shift();
         for (const p of bucket.entries) {
           p.root.parent?.removeChild(p.root);
@@ -923,6 +1085,7 @@ export class PoiManager {
 
     root.on("pointerout", () => {
       entry.hovered = false;
+      if (entry.dragging) return;
       drawMedal(false);
       drawPill(false);
       if (entry.mode === "compact") {
@@ -930,8 +1093,10 @@ export class PoiManager {
         root.hitArea = hitCompact;
       }
       root.zIndex = isMajor ? 30 : (isDetail ? 10 : 20);
-      this.container.sortDirty = true;
+      if (this.container) this.container.sortDirty = true;
       this._applyPinTransform(entry, canvas.stage?.scale?.x || 1);
+      this._layoutDirty = true;
+      this.updateViewport();
     });
 
     root.on("pointerdown", (ev) => {
@@ -991,27 +1156,38 @@ export class PoiManager {
 
   _startPinDrag(entry, ev) {
     this._cancelDrag();
+    const startPointerId = ev.pointerId ?? ev.data?.pointerId;
     const startClientX = ev.clientX ?? ev.global?.x ?? 0;
     const startClientY = ev.clientY ?? ev.global?.y ?? 0;
+    const origX = entry.poi.x;
+    const origY = entry.poi.y;
+    const getRestoredZIndex = () => (entry.hovered ? 500 : (entry.isMajor ? 30 : (entry.isDetail ? 10 : 20)));
     let moved = false;
 
     const toWorld = (clientX, clientY) => {
       const view = canvas.app?.view || canvas.app?.canvas;
-      if (!view) return null;
+      if (!view || !canvas?.stage) return null;
       const rect = view.getBoundingClientRect();
       const sx = clientX - rect.left;
       const sy = clientY - rect.top;
-      return canvas.stage.toLocal(new PIXI.Point(sx, sy));
+      const pt = canvas.stage.toLocal(new PIXI.Point(sx, sy));
+      if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return null;
+      return pt;
     };
 
     const onMove = (moveEv) => {
+      if (startPointerId !== undefined && moveEv.pointerId !== undefined && moveEv.pointerId !== startPointerId) return;
+      if (moveEv.buttons !== undefined && (moveEv.buttons & 1) === 0) {
+        onCancel();
+        return;
+      }
       const dist = Math.hypot(moveEv.clientX - startClientX, moveEv.clientY - startClientY);
       if (!moved && dist < 5) return;
       if (!moved) {
         moved = true;
         entry.dragging = true;
         entry.root.zIndex = 600;
-        this.container.sortDirty = true;
+        if (this.container) this.container.sortDirty = true;
       }
       const pt = toWorld(moveEv.clientX, moveEv.clientY);
       if (pt) {
@@ -1020,38 +1196,79 @@ export class PoiManager {
     };
 
     const onUp = async (upEv) => {
-      cleanup();
+      if (startPointerId !== undefined && upEv.pointerId !== undefined && upEv.pointerId !== startPointerId) return;
+      if (upEv.button !== 0) return;
       if (!moved) {
+        cleanup(false, false);
         if (!this.placementActive) this.flyTo(entry.poi);
         return;
       }
       const pt = toWorld(upEv.clientX, upEv.clientY);
-      const nx = Math.round(pt ? pt.x : entry.root.position.x);
-      const ny = Math.round(pt ? pt.y : entry.root.position.y);
-      entry.poi.x = nx;
-      entry.poi.y = ny;
-      await this.controller?.updatePOI?.(entry.poi.id, { x: nx, y: ny });
+      const rawX = pt ? pt.x : (Number.isFinite(entry.root.position?.x) ? entry.root.position.x : origX);
+      const rawY = pt ? pt.y : (Number.isFinite(entry.root.position?.y) ? entry.root.position.y : origY);
+      const nx = Math.round(rawX);
+      const ny = Math.round(rawY);
+      if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+        cleanup(false, true);
+        return;
+      }
+      entry.root.position.set(nx, ny);
+      cleanup(false, false);
+      try {
+        const updated = await this.controller?.updatePOI?.(entry.poi.id, { x: nx, y: ny });
+        if (!updated && !entry.root.destroyed) {
+          entry.root.position.set(origX, origY);
+          this._layoutDirty = true;
+          this.updateViewport();
+        }
+      } catch {
+        if (!entry.root.destroyed) {
+          entry.root.position.set(origX, origY);
+          this._layoutDirty = true;
+          this.updateViewport();
+        }
+      }
     };
 
-    const cleanup = () => {
+    const onCancel = (cancelEv) => {
+      if (cancelEv?.pointerId !== undefined && startPointerId !== undefined && cancelEv.pointerId !== startPointerId) return;
+      cleanup(false, true);
+    };
+
+    const cleanup = (skipUpdate = false, revert = false) => {
       entry.dragging = false;
+      if (!entry.root.destroyed) {
+        if (revert) entry.root.position.set(origX, origY);
+        if (!entry.hovered) {
+          entry.drawMedal?.(false);
+          entry.drawPill?.(false);
+          if (entry.mode === "compact") {
+            if (entry.pillGroup) entry.pillGroup.visible = false;
+            entry.root.hitArea = entry.hitCompact;
+          }
+        }
+        entry.root.zIndex = getRestoredZIndex();
+        if (this.container) this.container.sortDirty = true;
+      }
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
-      window.removeEventListener("pointercancel", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
+      window.removeEventListener("blur", onCancel);
       if (this._dragState?.cleanup === cleanup) this._dragState = null;
       this._layoutDirty = true;
-      this.updateViewport();
+      if (!skipUpdate) this.updateViewport();
     };
 
     this._dragState = { entry, cleanup };
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
-    window.addEventListener("pointercancel", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+    window.addEventListener("blur", onCancel);
   }
 
-  _cancelDrag() {
+  _cancelDrag(skipUpdate = false) {
     if (this._dragState) {
-      this._dragState.cleanup();
+      this._dragState.cleanup(skipUpdate, true);
       this._dragState = null;
     }
   }
@@ -1154,7 +1371,11 @@ export class PoiManager {
       this._closeContextMenu();
     };
     this._contextMenuKey = (keyEv) => {
-      if (keyEv.code === "Escape") this._closeContextMenu();
+      if (keyEv.code === "Escape") {
+        keyEv.preventDefault();
+        keyEv.stopPropagation();
+        this._closeContextMenu();
+      }
     };
     setTimeout(() => {
       if (this._contextMenuEl !== menu) return;
@@ -1164,7 +1385,7 @@ export class PoiManager {
     }, 0);
   }
 
-  setPlacementActive(active) {
+  setPlacementActive(active, { skipUpdate = false } = {}) {
     const next = Boolean(active && game.user?.isGM && this.controller?.active);
     if (next === this.placementActive) return;
     this.placementActive = next;
@@ -1176,19 +1397,35 @@ export class PoiManager {
 
       const onPointerDown = (ev) => {
         if (!this.placementActive || ev.button !== 0) return;
+        if (!canvas?.ready || !canvas.stage) return;
         if (ev.target !== view) return;
-        // Ignore clicks on existing pins (handled by PIXI pin pointerdown for dragging)
+        if (this._contextMenuEl) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._closeContextMenu();
+          return;
+        }
+        // Ignore clicks on existing pins (including superGrid sub-pins; handled by PIXI pointerdown for dragging)
         const rect = view.getBoundingClientRect();
         const sx = ev.clientX - rect.left;
         const sy = ev.clientY - rect.top;
         const worldPt = canvas.stage.toLocal(new PIXI.Point(sx, sy));
-        for (const p of this.pins) {
-          if (!p.root.visible) continue;
-          const wt = canvas.stage.worldTransform;
-          const px = wt.a * p.poi.x + wt.tx;
-          const py = wt.d * p.poi.y + wt.ty;
+        const stageScale = canvas.stage.scale?.x || 1;
+        const pivot = canvas.stage.pivot;
+        const [sw = window.innerWidth, sh = window.innerHeight] = canvas.screenDimensions || [];
+        const wt = getLiveStageTransform(stageScale, pivot?.x || 0, pivot?.y || 0, sw, sh);
+        const allPins = this._superGridSubProvinces.size > 0
+          ? [...this.pins, ...Array.from(this._superGridSubProvinces.values()).flatMap(b => b.entries)]
+          : this.pins;
+        for (const p of allPins) {
+          if (!p.root?.visible) continue;
+          const pinX = Number.isFinite(p.root.position?.x) ? p.root.position.x : p.poi.x;
+          const pinY = Number.isFinite(p.root.position?.y) ? p.root.position.y : p.poi.y;
+          const px = wt.a * pinX + wt.tx;
+          const py = wt.d * pinY + wt.ty;
           const hb = p.root.hitArea;
-          if (hb && sx >= px + hb.x && sx <= px + hb.x + hb.width && sy >= py + hb.y && sy <= py + hb.y + hb.height) {
+          const boost = p.dragging ? 1.12 : (p.hovered ? 1.07 : 1.0);
+          if (hb && sx >= px + hb.x * boost && sx <= px + (hb.x + hb.width) * boost && sy >= py + hb.y * boost && sy <= py + (hb.y + hb.height) * boost) {
             return;
           }
         }
@@ -1203,17 +1440,33 @@ export class PoiManager {
 
       const onKeyDown = (ev) => {
         if (ev.code === "Escape" && this.placementActive) {
+          if (this._contextMenuEl) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this._closeContextMenu();
+            return;
+          }
+          const target = ev.target;
+          const tag = target?.tagName;
+          if (
+            tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable ||
+            target?.closest?.("dialog") || document.querySelector("dialog[open]")
+          ) {
+            return;
+          }
+          ev.preventDefault();
+          ev.stopPropagation();
           this.setPlacementActive(false);
-          ui.controls?.render?.();
+          if (ui?.controls?.rendered) ui.controls.render({ reset: true });
         }
       };
 
-      view?.addEventListener("pointerdown", onPointerDown, true);
+      window.addEventListener("pointerdown", onPointerDown, true);
       window.addEventListener("keydown", onKeyDown, true);
       this._placementListeners = { onPointerDown, onKeyDown, view };
     } else {
       if (this._placementListeners) {
-        this._placementListeners.view?.removeEventListener("pointerdown", this._placementListeners.onPointerDown, true);
+        window.removeEventListener("pointerdown", this._placementListeners.onPointerDown, true);
         window.removeEventListener("keydown", this._placementListeners.onKeyDown, true);
         if (this._placementListeners.view && this._placementListeners.view.style.cursor === "crosshair") {
           this._placementListeners.view.style.cursor = "";
@@ -1224,7 +1477,7 @@ export class PoiManager {
     }
 
     this._layoutDirty = true;
-    this.updateViewport();
+    if (!skipUpdate) this.updateViewport();
   }
 
   _showPlacementHint(show) {
@@ -1277,8 +1530,8 @@ export class PoiManager {
     this.lastPivotY = py;
     this._layoutDirty = false;
 
-    const wt = canvas.stage.worldTransform;
     const [sw = window.innerWidth, sh = window.innerHeight] = canvas.screenDimensions || [];
+    const wt = getLiveStageTransform(stageScale, px, py, sw, sh);
 
     // Lazily populate sub-location pins for visible superGrid provinces when descending
     if (this._superGridInfo) {
@@ -1294,8 +1547,10 @@ export class PoiManager {
     const onScreen = [];
     for (const entry of allEntries) {
       const poi = entry.poi;
-      const sx = wt.a * poi.x + wt.tx;
-      const sy = wt.d * poi.y + wt.ty;
+      const pinX = Number.isFinite(entry.root?.position?.x) ? entry.root.position.x : poi.x;
+      const pinY = Number.isFinite(entry.root?.position?.y) ? entry.root.position.y : poi.y;
+      const sx = wt.a * pinX + wt.tx;
+      const sy = wt.d * pinY + wt.ty;
       if (!entry.dragging && (sx < -240 || sx > sw + 240 || sy < -180 || sy > sh + 180)) {
         entry.root.visible = false;
         continue;
@@ -1398,7 +1653,8 @@ export class PoiManager {
     }
   }
 
-  cancelFlight() {
+  cancelFlight(bumpSeq = true) {
+    if (bumpSeq) this._flightSeq++;
     const f = this._flight;
     if (!f) return;
     this._flight = null;
@@ -1406,17 +1662,86 @@ export class PoiManager {
     f.resolve(false);
   }
 
+  _canViewLevelLazy(scene, targetLevel) {
+    if (!scene || !targetLevel) return false;
+    // Fast path: if Foundry already computed _availableLevels, use Scene#availableLevels (applies SceneManager#_getAvailableLevels)
+    if (scene._availableLevels && scene.availableLevels?.has) {
+      return Boolean(scene.availableLevels.has(targetLevel));
+    }
+    const isGM = Boolean(game.user?.isGM);
+    if (isGM || !scene.tokenVision) {
+      if (scene.availableLevels?.has) {
+        return Boolean(scene.availableLevels.has(targetLevel));
+      }
+      const allLevels = new Set(scene.levels?.sorted || scene.levels?.values?.() || []);
+      const allowed = canvas?.manager?._getAvailableLevels?.(allLevels) ?? allLevels;
+      return allowed.has(targetLevel);
+    }
+
+    // Non-GM with tokenVision and uncached _availableLevels: resolve OBSERVER token levels WITHOUT waking lazy ActorDelta!
+    const obsLvl = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.OBSERVER ?? 2;
+    const inheritLvl = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.INHERIT ?? -1;
+    const user = game.user;
+    const baseSet = new Set();
+    for (const tok of scene.tokens || []) {
+      if (!tok?.level) continue;
+      let hasObs = false;
+      if (!tok.isLazyDelta) {
+        try { hasObs = Boolean(tok.testUserPermission?.(user, "OBSERVER")); } catch {}
+      } else {
+        const deltaOwn = tok._source?.delta?.ownership;
+        const baseOwn = tok.baseActor?.ownership;
+        const uid = user?.id;
+        if (uid && typeof deltaOwn?.[uid] === "number" && deltaOwn[uid] !== inheritLvl) {
+          hasObs = deltaOwn[uid] >= obsLvl;
+        } else if (uid && typeof baseOwn?.[uid] === "number" && baseOwn[uid] !== inheritLvl) {
+          hasObs = baseOwn[uid] >= obsLvl;
+        } else if (typeof deltaOwn?.default === "number" && deltaOwn.default !== inheritLvl) {
+          hasObs = deltaOwn.default >= obsLvl;
+        } else if (typeof baseOwn?.default === "number" && baseOwn.default !== inheritLvl) {
+          hasObs = baseOwn.default >= obsLvl;
+        } else if (!baseOwn && typeof tok.baseActor?.testUserPermission === "function") {
+          try { hasObs = Boolean(tok.baseActor.testUserPermission(user, "OBSERVER")); } catch {}
+        }
+      }
+      if (hasObs) {
+        const lvl = scene.levels?.get?.(tok.level);
+        if (lvl) baseSet.add(lvl);
+      }
+    }
+    const allowed = canvas?.manager?._getAvailableLevels?.(baseSet) ?? baseSet;
+    return allowed.has(targetLevel);
+  }
+
   async flyTo(poi, options = {}) {
     if (!poi || !canvas?.ready || !canvas.stage) return false;
+    if (!Number.isFinite(poi.x) || !Number.isFinite(poi.y)) return false;
+
+    const seq = ++this._flightSeq;
+    const originSceneId = canvas.scene?.id;
 
     // Cancel any previous Boundless flight or native Foundry animatePan seamlessly
-    this.cancelFlight();
+    this.cancelFlight(false);
     const AnimCls = foundry.canvas?.animation?.CanvasAnimation || globalThis.CanvasAnimation;
     try { AnimCls?.terminateAnimation?.("canvas.animatePan"); } catch {}
 
     if (poi.levelId && canvas.level?.id !== poi.levelId && canvas.scene?.levels?.has(poi.levelId)) {
-      await canvas.scene.view({ level: poi.levelId });
-      if (!canvas?.ready || !canvas.stage) return false;
+      const targetLevel = canvas.scene.levels.get(poi.levelId);
+      if (!this._canViewLevelLazy(canvas.scene, targetLevel)) return false;
+
+      // Mark pending level switch so canvasTearDown / controller.mount -> poiManager.unmount() won't bump _flightSeq
+      this._pendingLevelSwitch = { seq, sceneId: originSceneId, levelId: poi.levelId };
+      try {
+        await canvas.scene.view({ level: poi.levelId });
+        // Wait for async Boundless controller.mount() triggered by canvasReady so PoiManager.mount() finishes before animation starts
+        if (this.controller?._mountPromise) {
+          try { await this.controller._mountPromise; } catch {}
+        }
+      } finally {
+        if (this._pendingLevelSwitch?.seq === seq) this._pendingLevelSwitch = null;
+      }
+      if (seq !== this._flightSeq || !canvas?.ready || !canvas.stage) return false;
+      if (canvas.scene?.id !== originSceneId || canvas.level?.id !== poi.levelId) return false;
     }
 
     const worldMinScale = this.controller?._worldMinScale ?? canvas.dimensions?.scale?.min ?? 0.008;
@@ -1429,7 +1754,8 @@ export class PoiManager {
 
     const tierKey = normalizePoiKind(poi.kind);
     const tierDefaultScale = POI_TIER_DEFAULTS[tierKey].defaultTargetScale;
-    let rawTargetScale = options.scale ?? poi.targetScale ?? poi.scale ?? tierDefaultScale;
+    const parsedTargetScale = Number(options.scale ?? poi.targetScale ?? poi.scale);
+    let rawTargetScale = (Number.isFinite(parsedTargetScale) && parsedTargetScale > 0) ? parsedTargetScale : tierDefaultScale;
 
     // Multi-step drill-down: if clicking a major/minor overview pin we are already hovering near at its landing scale,
     // glide one step deeper into the location!
@@ -1449,7 +1775,12 @@ export class PoiManager {
     const y1 = constrained.y;
     const scale1 = constrained.scale;
 
-    if (!Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1)) {
+    if (
+      !Number.isFinite(x0) || !Number.isFinite(y0) ||
+      !Number.isFinite(x1) || !Number.isFinite(y1) ||
+      !Number.isFinite(scale0) || scale0 <= 0 ||
+      !Number.isFinite(scale1) || scale1 <= 0
+    ) {
       return false;
     }
 
@@ -1461,24 +1792,40 @@ export class PoiManager {
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
     const viewportSize = Math.hypot(sw, sh) * 0.65;
     const flightMinScale = Math.min(activeMinScale, worldMinScale);
+    const rho = (Number.isFinite(options.rho) && options.rho > 0.1) ? options.rho : FLY_DEFAULT_RHO;
 
-    const path = buildFlightPath({
-      x0, y0, scale0,
-      x1, y1, scale1,
-      viewportSize,
-      minScale: flightMinScale,
-      maxScale,
-      rho: options.rho ?? FLY_DEFAULT_RHO
-    });
+    const useGtaStyle = options.style === "gta5";
+    const path = useGtaStyle
+      ? buildGtaFlightPath({
+        x0, y0, scale0,
+        x1, y1, scale1,
+        viewportSize: Math.min(sw, sh),
+        minScale: flightMinScale,
+        maxScale
+      })
+      : buildFlightPath({
+        x0, y0, scale0,
+        x1, y1, scale1,
+        viewportSize,
+        minScale: flightMinScale,
+        maxScale,
+        rho
+      });
 
-    if (path.trivial) {
+    if (path.trivial || !Number.isFinite(path.S)) {
       canvas.pan({ x: x1, y: y1, scale: scale1 });
       return true;
     }
 
     const duration = Number.isFinite(options.duration) && options.duration > 0
       ? options.duration
-      : Math.max(FLY_MIN_DURATION_MS, Math.min(FLY_MAX_DURATION_MS, Math.round(920 + path.S * 580)));
+      : (useGtaStyle && path.durationMs > 0
+        ? path.durationMs
+        : Math.max(FLY_MIN_DURATION_MS, Math.min(FLY_MAX_DURATION_MS, Math.round(920 + path.S * 580))));
+
+    // Guard against any concurrent flight that could have started while awaiting
+    if (seq !== this._flightSeq) return false;
+    this.cancelFlight(false);
 
     // Prewarm destination & approach pyramid tiles in VRAM while camera is still gliding in
     this.controller?.prewarmArea?.(x1, y1, scale1);
@@ -1518,8 +1865,8 @@ export class PoiManager {
         if (startTime === null) startTime = now;
         const elapsed = now - startTime;
         const t = Math.max(0, Math.min(1, elapsed / duration));
-        const eased = easeCameraFlight(t);
-        const pose = path.sample(eased);
+        const progress = path.rawTime ? t : easeCameraFlight(t);
+        const pose = path.sample(progress);
         canvas.pan(pose);
 
         if (t >= 1) {
@@ -1549,7 +1896,7 @@ export class PoiManager {
         resolve(completed);
       };
 
-      this._flight = { cleanup, resolve };
+      this._flight = { cleanup, resolve, sceneId: originSceneId, levelId: poi.levelId || canvas.level?.id || null };
 
       view?.addEventListener("wheel", onUserWheel, { capture: true, passive: true });
       view?.addEventListener("pointerdown", onUserPointerDown, { capture: true, passive: true });
@@ -1563,16 +1910,20 @@ export class PoiManager {
     });
   }
 
-  unmount() {
-    this.setPlacementActive(false);
-    this._closeContextMenu();
-    this._cancelDrag();
-    this.cancelFlight();
-    this._clearSuperGridSubPins();
+  unmount({ keepFlight = false, skipControlsRefresh = false } = {}) {
+    const shouldRefreshControls = !skipControlsRefresh && (this.enabled || this.placementActive);
+    this.enabled = false;
     this._superGridInfo = null;
+    this.setPlacementActive(false, { skipUpdate: true });
+    this._closeContextMenu();
+    this._cancelDrag(true);
+    if (!keepFlight) this.cancelFlight(!this._pendingLevelSwitch);
+    this._clearSuperGridSubPins();
     if (this.container) {
-      this.container.parent?.removeChild(this.container);
-      this.container.destroy({ children: true });
+      try { this.container.parent?.removeChild(this.container); } catch {}
+      if (!this.container.destroyed) {
+        try { this.container.destroy({ children: true }); } catch {}
+      }
       this.container = null;
     }
     this.pins = [];
@@ -1580,6 +1931,9 @@ export class PoiManager {
     this.lastPivotX = NaN;
     this.lastPivotY = NaN;
     this._layoutDirty = true;
+    if (shouldRefreshControls && ui?.controls?.rendered) {
+      ui.controls.render({ reset: true });
+    }
   }
 }
 

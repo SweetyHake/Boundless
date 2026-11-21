@@ -1,29 +1,50 @@
 const SOUND_PAD_WORLD_PX = 1600;
+const SOUND_VP_MIN_SCALE = 0.25;
 
 export class MegaAudioStreamer {
   activeSources = new Map(); // "${levelId}::${sk}_${si}" -> PointSoundSource
   lastKey = "";
 
   update(visibleLevelLayers, vp, resolveSoundFn = null) {
-    if (!canvas?.ready || !canvas.sounds || !visibleLevelLayers?.length) return;
+    if (!canvas?.ready || !canvas.sounds) return;
+    if (!visibleLevelLayers?.length) {
+      if (this.activeSources.size > 0) this.unmount();
+      return;
+    }
     const SoundSourceCls = foundry.canvas?.sources?.PointSoundSource;
     if (!SoundSourceCls) return;
 
-    const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+    const pxPerFt = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
     const darkness = canvas.environment?.darknessLevel ?? 0;
 
-    // Collect listener anchor points (viewport center + all controlled/player tokens)
+    // Collect listener anchor points (viewport only on tactical zoom or livePreview + all controlled/player tokens)
     const anchors = [];
     if (vp) {
-      anchors.push({
-        x0: vp.x0 - SOUND_PAD_WORLD_PX,
-        y0: vp.y0 - SOUND_PAD_WORLD_PX,
-        x1: vp.x1 + SOUND_PAD_WORLD_PX,
-        y1: vp.y1 + SOUND_PAD_WORLD_PX,
-        levelId: null
-      });
+      const vpScale = Number(vp.scale ?? canvas.stage?.scale?.x ?? 1);
+      if (vpScale >= SOUND_VP_MIN_SCALE) {
+        anchors.push({
+          x0: vp.x0 - SOUND_PAD_WORLD_PX,
+          y0: vp.y0 - SOUND_PAD_WORLD_PX,
+          x1: vp.x1 + SOUND_PAD_WORLD_PX,
+          y1: vp.y1 + SOUND_PAD_WORLD_PX,
+          levelId: null
+        });
+      } else if (canvas.sounds.livePreview && canvas.mousePosition) {
+        const mx = Number(canvas.mousePosition.x);
+        const my = Number(canvas.mousePosition.y);
+        if (Number.isFinite(mx) && Number.isFinite(my)) {
+          anchors.push({
+            x0: mx - SOUND_PAD_WORLD_PX,
+            y0: my - SOUND_PAD_WORLD_PX,
+            x1: mx + SOUND_PAD_WORLD_PX,
+            y1: my + SOUND_PAD_WORLD_PX,
+            levelId: canvas.level?.id || null
+          });
+        }
+      }
     }
     for (const tok of canvas.tokens?.placeables || []) {
+      if (!tok || tok.destroyed || !tok.center) continue;
       const isActiveListener = tok.controlled || (!game.user?.isGM && tok.isOwner) || Boolean(tok.document?.hasPlayerOwner);
       if (!isActiveListener) continue;
       anchors.push({
@@ -62,9 +83,10 @@ export class MegaAudioStreamer {
                     x: raw[0], y: raw[1], radius: raw[2] || 20, path: raw[3],
                     volume: raw[4] ?? 0.6, walls: raw[5] !== false, easing: raw[6] !== false,
                     darkMin: raw[7] ?? 0, darkMax: raw[8] ?? 1,
-                    elevation: Number.isFinite(raw[9]) ? raw[9] : ((level.elevation?.base ?? 0) + 5)
+                    elevation: Number.isFinite(raw[9]) ? raw[9] : ((level.elevation?.base ?? 0) + 5),
+                    hidden: Boolean(raw[10]?.hidden)
                   };
-              if (!item || !item.path) continue;
+              if (!item || !item.path || item.hidden) continue;
               if (darkness < item.darkMin || darkness > item.darkMax) continue;
               needed.set(`${lid}::${sk}_${si}`, { layer, item });
             }
@@ -74,7 +96,7 @@ export class MegaAudioStreamer {
     }
 
     const key = Array.from(needed.entries())
-      .map(([k, { item }]) => `${k}:${item.x},${item.y},${item.radius},${item.volume},${item.path}`)
+      .map(([k, { item }]) => `${k}:${item.x},${item.y},${item.radius},${item.volume},${item.path},${item.walls ? 1 : 0},${item.easing ? 1 : 0},${item.elevation}`)
       .sort()
       .join("|");
     if (key === this.lastKey) return;
@@ -94,17 +116,25 @@ export class MegaAudioStreamer {
       const existing = this.activeSources.get(k);
       const radiusPx = (item.radius || 20) * pxPerFt;
       if (existing) {
-        existing.initialize({
-          x: item.x, y: item.y,
-          level: layer.level.id,
-          elevation: item.elevation,
-          radius: radiusPx,
-          walls: Boolean(item.walls),
-          path: item.path,
-          volume: item.volume,
-          easing: Boolean(item.easing)
-        });
-        changed = true;
+        try {
+          existing.initialize({
+            x: item.x, y: item.y,
+            level: layer.level.id,
+            elevation: item.elevation,
+            radius: radiusPx,
+            walls: Boolean(item.walls),
+            path: item.path,
+            volume: item.volume,
+            easing: Boolean(item.easing)
+          });
+          if (existing.shape && !existing.attached) existing.add();
+          changed = true;
+        } catch (err) {
+          console.warn("boundless | Failed to update streamed sound:", item.path, err);
+          try { existing.destroy(); } catch {}
+          this.activeSources.delete(k);
+          changed = true;
+        }
         continue;
       }
       try {
@@ -119,9 +149,13 @@ export class MegaAudioStreamer {
           volume: item.volume,
           easing: Boolean(item.easing)
         });
-        src.add();
-        this.activeSources.set(k, src);
-        changed = true;
+        if (src.shape) {
+          src.add();
+          this.activeSources.set(k, src);
+          changed = true;
+        } else {
+          try { src.destroy(); } catch {}
+        }
       } catch (err) {
         console.warn("boundless | Failed to mount streamed sound:", item.path, err);
       }

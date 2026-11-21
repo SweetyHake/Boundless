@@ -145,7 +145,7 @@ export class TileWorkerPool {
   }
 
   /**
-   * Raise priority of a queued job (e.g. if a prewarm tile suddenly enters the viewport).
+   * Raise priority of a queued or in-flight job (e.g. if a prewarm tile suddenly enters the viewport).
    */
   boost(src, newPriority = 0) {
     const ids = this._jobsBySrc.get(src);
@@ -157,9 +157,44 @@ export class TileWorkerPool {
         moved = true;
       }
     }
+    for (const id of ids) {
+      const act = this._active.get(id);
+      if (act && newPriority < act.priority) {
+        act.priority = newPriority;
+      }
+    }
     if (moved) {
       this._queue.sort((a, b) => a.priority - b.priority);
     }
+  }
+
+  _cancelById(id) {
+    const qIdx = this._queue.findIndex(j => j.id === id);
+    if (qIdx !== -1) {
+      const [job] = this._queue.splice(qIdx, 1);
+      this._untrackSrc(job.src, id);
+      this.stats.aborted++;
+      const err = new Error("aborted");
+      err.aborted = true;
+      job.reject(err);
+      return job.src;
+    }
+
+    const act = this._active.get(id);
+    if (act) {
+      this._active.delete(id);
+      this._untrackSrc(act.src, id);
+      this._workerLoad[act.workerIdx] = Math.max(0, (this._workerLoad[act.workerIdx] || 1) - 1);
+      try {
+        this._workers[act.workerIdx]?.postMessage({ type: "cancel", id });
+      } catch {}
+      this.stats.aborted++;
+      const err = new Error("aborted");
+      err.aborted = true;
+      act.reject(err);
+      return act.src;
+    }
+    return null;
   }
 
   /**
@@ -171,34 +206,7 @@ export class TileWorkerPool {
     let cancelled = 0;
 
     for (const id of Array.from(ids)) {
-      // Check queued jobs first
-      const qIdx = this._queue.findIndex(j => j.id === id);
-      if (qIdx !== -1) {
-        const [job] = this._queue.splice(qIdx, 1);
-        this._untrackSrc(src, id);
-        this.stats.aborted++;
-        cancelled++;
-        const err = new Error("aborted");
-        err.aborted = true;
-        job.reject(err);
-        continue;
-      }
-
-      // Check active in-flight worker jobs
-      const act = this._active.get(id);
-      if (act) {
-        this._active.delete(id);
-        this._untrackSrc(src, id);
-        this._workerLoad[act.workerIdx] = Math.max(0, (this._workerLoad[act.workerIdx] || 1) - 1);
-        try {
-          this._workers[act.workerIdx]?.postMessage({ type: "cancel", id });
-        } catch {}
-        this.stats.aborted++;
-        cancelled++;
-        const err = new Error("aborted");
-        err.aborted = true;
-        act.reject(err);
-      }
+      if (this._cancelById(id) !== null) cancelled++;
     }
 
     if (cancelled > 0) this._dispatch();
@@ -207,38 +215,70 @@ export class TileWorkerPool {
 
   /**
    * Cancel queued/in-flight jobs whose priority >= minPriority (e.g. drop stale prewarm jobs with priority 2).
+   * Returns a Set of cancelled `src` URLs (excluding any URLs in `excludeSrcSet`).
    */
-  cancelAtOrBelowPriority(minPriority = 2) {
-    const toCancel = new Set();
+  cancelAtOrBelowPriority(minPriority = 2, excludeSrcSet = null) {
+    const idsToCancel = [];
     for (const job of this._queue) {
-      if (job.priority >= minPriority) toCancel.add(job.src);
+      if (job.priority >= minPriority && !excludeSrcSet?.has?.(job.src)) {
+        idsToCancel.push(job.id);
+      }
     }
-    for (const act of this._active.values()) {
-      if (act.priority >= minPriority) toCancel.add(act.src);
+    for (const [id, act] of this._active.entries()) {
+      if (act.priority >= minPriority && !excludeSrcSet?.has?.(act.src)) {
+        idsToCancel.push(id);
+      }
     }
-    let total = 0;
-    for (const src of toCancel) total += this.cancel(src);
-    return total;
+    const cancelledSrcs = new Set();
+    for (let i = 0; i < idsToCancel.length; i++) {
+      const src = this._cancelById(idsToCancel[i]);
+      if (src !== null) cancelledSrcs.add(src);
+    }
+    if (cancelledSrcs.size > 0) this._dispatch();
+    return cancelledSrcs;
   }
 
   cancelAll() {
     let total = 0;
-    for (const src of Array.from(this._jobsBySrc.keys())) {
-      total += this.cancel(src);
+    // Drain queued jobs directly WITHOUT calling _dispatch() so queued items are never sent to workers just to be aborted
+    while (this._queue.length > 0) {
+      const job = this._queue.shift();
+      this._untrackSrc(job.src, job.id);
+      this.stats.aborted++;
+      total++;
+      const err = new Error("aborted");
+      err.aborted = true;
+      job.reject(err);
+    }
+    for (const id of Array.from(this._active.keys())) {
+      if (this._cancelById(id) !== null) total++;
     }
     return total;
   }
 
   _dispatch() {
     while (this._queue.length > 0 && this._workers.length > 0) {
-      // Pick least-loaded worker under MAX_INFLIGHT_PER_WORKER
+      // Pick least-loaded alive worker under MAX_INFLIGHT_PER_WORKER
       let bestIdx = -1;
       let bestLoad = MAX_INFLIGHT_PER_WORKER;
+      let anyAlive = false;
       for (let i = 0; i < this._workers.length; i++) {
+        if (!this._workers[i]) continue;
+        anyAlive = true;
         if (this._workerLoad[i] < bestLoad) {
           bestLoad = this._workerLoad[i];
           bestIdx = i;
         }
+      }
+      if (!anyAlive) {
+        this._supported = false;
+        while (this._queue.length > 0) {
+          const job = this._queue.shift();
+          this._untrackSrc(job.src, job.id);
+          this.stats.errors++;
+          job.reject(new Error("no_alive_workers"));
+        }
+        break;
       }
       if (bestIdx === -1) break;
 
@@ -304,6 +344,11 @@ export class TileWorkerPool {
 
   _onWorkerError(workerIdx, err) {
     console.warn(`boundless | Tile decoder worker #${workerIdx} error:`, err?.message || err);
+    const dead = this._workers[workerIdx];
+    this._workers[workerIdx] = null;
+    if (dead) {
+      try { dead.terminate(); } catch {}
+    }
     // Reject all jobs assigned to this worker so callers fall back cleanly
     for (const [id, act] of Array.from(this._active.entries())) {
       if (act.workerIdx !== workerIdx) continue;
@@ -313,6 +358,9 @@ export class TileWorkerPool {
       act.reject(new Error("worker_error"));
     }
     this._workerLoad[workerIdx] = 0;
+    if (!this._workers.some(Boolean)) {
+      this._supported = false;
+    }
     this._dispatch();
   }
 

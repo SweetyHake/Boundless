@@ -5,6 +5,20 @@ const CONTENT_PX = CELL_PX - PAD_PX * 2; // 120x120 crisp art inside 128x128 cel
 const ATLAS_PX = 2048;                   // 16x16 = 256 unique crisp 128x128 token portraits (~16 MB VRAM)
 const MAX_CONCURRENT_DECODES = 6;
 
+function getFiniteLevelBaseElevation(level) {
+  const base = Number(level?.elevation?.base);
+  if (Number.isFinite(base)) return base;
+  const bottom = Number(level?.elevation?.bottom);
+  if (Number.isFinite(bottom)) return bottom;
+  return 0;
+}
+
+function getFiniteLevelRoofElevation(level) {
+  const top = Number(level?.elevation?.top);
+  if (Number.isFinite(top)) return top;
+  return getFiniteLevelBaseElevation(level) + 20;
+}
+
 const IMPOSTOR_VERT = `
 precision highp float;
 
@@ -258,6 +272,36 @@ function isOwnedByCurrentUserSafe(doc) {
   return false;
 }
 
+function isTokenInvisibleSafe(doc) {
+  if (!doc) return false;
+  const invStatus = globalThis.CONFIG?.specialStatusEffects?.INVISIBLE || "invisible";
+  const burrowStatus = globalThis.CONFIG?.specialStatusEffects?.BURROW || "burrow";
+  if (!doc.isLazyDelta) {
+    try {
+      if (
+        doc.hasStatusEffect?.(invStatus) ||
+        doc.hasStatusEffect?.(burrowStatus) ||
+        doc.actor?.statuses?.has?.(invStatus) ||
+        doc.actor?.statuses?.has?.(burrowStatus)
+      ) return true;
+    } catch {}
+  } else {
+    const baseStatuses = doc.baseActor?.statuses;
+    if (baseStatuses?.has?.(invStatus) || baseStatuses?.has?.(burrowStatus)) return true;
+    const deltaEffects = doc._source?.delta?.effects;
+    if (Array.isArray(deltaEffects)) {
+      for (let i = 0; i < deltaEffects.length; i++) {
+        const ef = deltaEffects[i];
+        if (!ef || ef.disabled) continue;
+        if (Array.isArray(ef.statuses) && (ef.statuses.includes(invStatus) || ef.statuses.includes(burrowStatus))) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Single-draw-call Dynamic Texture Atlas Token Impostor Layer mounted inside `canvas.primary`.
  * - Renders authentic 128x128 baked token art (including Foundry v14 Dynamic Token Rings) 1:1 with native Tokens.
@@ -361,10 +405,10 @@ export class TokenImpostorLayer {
     }
     this.shader = null;
 
-    if (this.atlasTexture) {
+    if (this.atlasTexture && this.atlasTexture !== PIXI.Texture.WHITE) {
       try { this.atlasTexture.destroy(true); } catch {}
-      this.atlasTexture = null;
     }
+    this.atlasTexture = null;
     this.atlasCanvas = null;
     this.atlasCtx = null;
     this._tmpCanvas = null;
@@ -437,7 +481,7 @@ export class TokenImpostorLayer {
       uBakedRoofOrigin: new Float32Array([0, 0]),
       uBakedRoofRegion: new Float32Array([100000, 100000]),
       uBakedRoofRepeat: false,
-      uRoofElev: (canvas.level?.elevation?.top ?? 20)
+      uRoofElev: getFiniteLevelRoofElevation(canvas.level)
     });
     this.shader.update = () => this._updateUniforms();
   }
@@ -451,12 +495,18 @@ export class TokenImpostorLayer {
     u.uAtlas = this.atlasTexture || PIXI.Texture.WHITE;
 
     const visionTex = canvas.masks?.vision?.renderTexture;
-    const useVision = Boolean(canvas.visibility?.tokenVision && !game.user?.isGM && visionTex);
+    const useVision = Boolean(
+      canvas.visibility?.tokenVision && !game.user?.isGM &&
+      visionTex && !visionTex.destroyed && visionTex.baseTexture && !visionTex.baseTexture.destroyed
+    );
     u.uUseVisionMask = useVision;
-    if (useVision) u.uVisionTex = visionTex;
+    u.uVisionTex = useVision ? visionTex : PIXI.Texture.WHITE;
 
     const lb = this.controller?.lightBatch;
-    const hasRoof = Boolean(lb?.useBakedRoofMask && lb.bakedRoofMask && !lb.bakedRoofMask.destroyed);
+    const hasRoof = Boolean(
+      lb?.useBakedRoofMask && lb.bakedRoofMask &&
+      !lb.bakedRoofMask.destroyed && lb.bakedRoofMask.baseTexture && !lb.bakedRoofMask.baseTexture.destroyed
+    );
     u.uUseBakedRoofMask = hasRoof;
     if (hasRoof) {
       u.uBakedRoofMask = lb.bakedRoofMask;
@@ -465,8 +515,10 @@ export class TokenImpostorLayer {
       u.uBakedRoofRegion[0] = lb.bakedRoofRegion[0];
       u.uBakedRoofRegion[1] = lb.bakedRoofRegion[1];
       u.uBakedRoofRepeat = Boolean(lb.bakedRoofRepeat);
+    } else {
+      u.uBakedRoofMask = PIXI.Texture.EMPTY;
     }
-    u.uRoofElev = canvas.level?.elevation?.top ?? 20;
+    u.uRoofElev = getFiniteLevelRoofElevation(canvas.level);
   }
 
   _ensureCapacity(minCount) {
@@ -545,7 +597,7 @@ export class TokenImpostorLayer {
     mesh.blendMode = PIXI.BLEND_MODES.NORMAL;
     mesh.eventMode = "none";
     mesh.cullable = false;
-    mesh.elevation = canvas.level?.elevation?.bottom ?? 0;
+    mesh.elevation = getFiniteLevelBaseElevation(canvas.level);
     mesh.sortLayer = PrimaryCanvasGroup?.SORT_LAYERS?.TOKENS ?? 700;
     mesh.sort = -1000;
     mesh.zIndex = -1000;
@@ -590,11 +642,28 @@ export class TokenImpostorLayer {
 
     const colsPerRow = Math.floor(this.atlasSize / CELL_PX);
     const maxSlots = colsPerRow * colsPerRow;
-    if (this.nextSlotIdx >= maxSlots) return null;
-
-    const idx = this.nextSlotIdx++;
-    const col = idx % colsPerRow;
-    const row = Math.floor(idx / colsPerRow);
+    let col, row;
+    if (this.nextSlotIdx < maxSlots) {
+      const idx = this.nextSlotIdx++;
+      col = idx % colsPerRow;
+      row = Math.floor(idx / colsPerRow);
+    } else {
+      // Recycle an unused atlas slot (zero refcount in docsByKey)
+      let victimKey = null;
+      let victimSlot = null;
+      for (const [k, s] of this.slotsByKey) {
+        if (!this.docsByKey.get(k)?.size) {
+          victimKey = k;
+          victimSlot = s;
+          break;
+        }
+      }
+      if (!victimSlot) return null;
+      this.slotsByKey.delete(victimKey);
+      this._decodeQueuedSet.delete(victimKey);
+      col = victimSlot.col;
+      row = victimSlot.row;
+    }
     const inv = 1 / this.atlasSize;
 
     slot = {
@@ -627,8 +696,9 @@ export class TokenImpostorLayer {
       this._activeDecodes++;
       const gen = this._gen;
       this._decodeAndPack(slotKey, slot, gen).finally(() => {
+        if (gen !== this._gen) return;
         this._activeDecodes = Math.max(0, this._activeDecodes - 1);
-        if (this.mounted && gen === this._gen && this._decodeQueue.length > 0) {
+        if (this.mounted && this._decodeQueue.length > 0) {
           this._pumpAtlasDecodes();
         }
       });
@@ -640,7 +710,7 @@ export class TokenImpostorLayer {
     try {
       const cached = globalThis.PIXI?.Assets?.cache?.get?.(src) || globalThis.foundry?.canvas?.getTexture?.(src);
       const resSrc = cached?.baseTexture?.resource?.source;
-      if (resSrc && (resSrc.naturalWidth > 0 || resSrc.width > 0)) {
+      if (resSrc && (resSrc.videoWidth > 0 || resSrc.naturalWidth > 0 || resSrc.width > 0)) {
         return { drawable: resSrc, shouldClose: false };
       }
     } catch {}
@@ -725,11 +795,11 @@ export class TokenImpostorLayer {
       drawable = loaded.drawable;
       shouldClose = loaded.shouldClose;
     } catch {
-      slot.failed = true;
+      if (this.slotsByKey.get(slotKey) === slot) slot.failed = true;
       return;
     }
 
-    if (!drawable || !this.mounted || gen !== this._gen || !this.atlasCtx) {
+    if (!drawable || !this.mounted || gen !== this._gen || !this.atlasCtx || this.slotsByKey.get(slotKey) !== slot) {
       if (shouldClose) try { drawable?.close?.(); } catch {}
       return;
     }
@@ -740,8 +810,8 @@ export class TokenImpostorLayer {
       const cellY = slot.row * CELL_PX;
       const dstX = cellX + PAD_PX;
       const dstY = cellY + PAD_PX;
-      const sw = drawable.naturalWidth || drawable.width || CONTENT_PX;
-      const sh = drawable.naturalHeight || drawable.height || CONTENT_PX;
+      const sw = drawable.videoWidth || drawable.naturalWidth || drawable.width || CONTENT_PX;
+      const sh = drawable.videoHeight || drawable.naturalHeight || drawable.height || CONTENT_PX;
       const aspect = sw / Math.max(1, sh);
 
       ctx.save();
@@ -892,7 +962,7 @@ export class TokenImpostorLayer {
       this._upsertDocInternal(list[i]);
     }
     if (this.mesh) {
-      this.mesh.elevation = canvas.level?.elevation?.bottom ?? 0;
+      this.mesh.elevation = getFiniteLevelBaseElevation(canvas.level);
       this.mesh.size = this.count * 6;
       this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
     }
@@ -909,9 +979,12 @@ export class TokenImpostorLayer {
       idx = this.count++;
       this.docIndexById.set(doc.id, idx);
       this.docIds[idx] = doc.id;
+      // Clear stale state slot (e.g. reused after removeToken) so activeVisibleCount stays exact
+      this._writeQuad4(this.stateArr, idx, 0, 0, 0, 0);
+      this._bufDirty.state = true;
       if (this.mesh) {
         this.mesh.size = this.count * 6;
-        this.mesh.visible = this.count > 0;
+        this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
       }
     }
 
@@ -981,10 +1054,12 @@ export class TokenImpostorLayer {
       this._bufDirty.state = true;
     }
 
+    this._writeQuad4(this.stateArr, lastIdx, 0, 0, 0, 0);
+    this._bufDirty.state = true;
     this.docIds.length = lastIdx;
     this.count = lastIdx;
     if (this.mesh) {
-      this.mesh.elevation = canvas.level?.elevation?.bottom ?? 0;
+      this.mesh.elevation = getFiniteLevelBaseElevation(canvas.level);
       this.mesh.size = this.count * 6;
       this.mesh.visible = this.count > 0 && this.activeVisibleCount > 0;
     }
@@ -1088,7 +1163,7 @@ export class TokenImpostorLayer {
       Number.isFinite(Number(obj._ssOcclusionAlpha)) &&
       Number(obj._ssOcclusionAlpha) <= 0.05
     );
-    if (isMountedOnLayer) {
+    if (isMountedOnLayer && !this.streamer?.isTokenDrawing?.(obj)) {
       if (obj.visible === false || hiddenByShowstopper) {
         return { alpha: 0, needsVision, isParty };
       }
@@ -1096,6 +1171,8 @@ export class TokenImpostorLayer {
       if (nativeActive && !hasFadeOverride) {
         return { alpha: 0, needsVision, isParty };
       }
+    } else if (hiddenByShowstopper) {
+      return { alpha: 0, needsVision, isParty };
     }
 
     const grid = canvas.grid?.size || 100;
@@ -1113,29 +1190,29 @@ export class TokenImpostorLayer {
       return { alpha: 0, needsVision, isParty };
     }
 
-    // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW!)
+    // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW or Invisible enemies!)
     if (visCtx.tokenVision && !isVisionSource) {
       if (!visCtx.isGM && !owned) {
         if (!visCtx.hasActiveVision) return { alpha: 0, needsVision, isParty };
-        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes)) {
+        if (isTokenInvisibleSafe(doc)) return { alpha: 0, needsVision, isParty };
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) {
           return { alpha: 0, needsVision, isParty };
         }
       } else if (visCtx.isGM && visCtx.hasActiveVision && !obj?.controlled) {
-        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes)) {
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) {
           return { alpha: 0, needsVision, isParty };
         }
       }
     }
 
-    const rawAlpha = Number.isFinite(doc.alpha)
-      ? doc.alpha
-      : Math.min(Number(doc._source?.alpha ?? 1), isHidden ? 0.5 : 1.0);
+    const baseAlpha = Number.isFinite(doc.alpha) ? doc.alpha : Number(doc._source?.alpha ?? 1);
+    const rawAlpha = isHidden ? Math.min(baseAlpha, 0.5) : baseAlpha;
     const overrideMult = hasFadeOverride ? this.fadeOverrides.get(doc.id) : 1.0;
     const alpha = Math.max(0, Math.min(1, rawAlpha * overrideMult));
     return { alpha, needsVision, isParty };
   }
 
-  _passesVisionCheck(cx, cy, elev, w, h, visionBoxes) {
+  _passesVisionCheck(cx, cy, elev, w, h, visionBoxes, obj = null) {
     const pad = Math.max(w || 100, h || 100, 100);
     let inAnyBox = false;
     for (let i = 0; i < visionBoxes.length; i++) {
@@ -1167,7 +1244,8 @@ export class TokenImpostorLayer {
     if (typeof tv !== "function") return true;
     try {
       const tolerance = Math.max(2, Math.min(w || 100, h || 100) * 0.35);
-      return Boolean(tv.call(canvas.visibility, { x: cx, y: cy, elevation: elev }, { tolerance }));
+      const opts = (obj && !obj.destroyed) ? { tolerance, object: obj } : { tolerance };
+      return Boolean(tv.call(canvas.visibility, { x: cx, y: cy, elevation: elev }, opts));
     } catch {
       return false;
     }

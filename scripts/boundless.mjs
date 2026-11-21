@@ -1,7 +1,6 @@
 import { PoiManager, registerPoiControls } from "./poi.mjs";
-import { CharacterPinManager } from "./character-pins.mjs";
+import { CharacterPinManager, installCharacterSwitchPatch } from "./character-pins.mjs";
 import { ChunkedFogManager, registerFogControls } from "./chunked-fog.mjs";
-import { MacroAtmosphereLayer } from "./macro-atmosphere.mjs";
 import { MegaAudioStreamer } from "./audio-streamer.mjs";
 import { VirtualWallEditor, registerWallEditorControls } from "./wall-editor.mjs";
 import { VirtualLayerEditors, registerLayerEditorControls } from "./layer-editors.mjs";
@@ -47,8 +46,61 @@ function isTextureUsable(tex) {
   return Boolean(tex && !tex.destroyed && tex.baseTexture && !tex.baseTexture.destroyed);
 }
 
+/**
+ * In Foundry v14, unset `level.elevation.bottom` resolves to `-Infinity` and `top` to `Infinity` (ExtendedNumberField).
+ * Always fall back to finite `base` -> finite `bottom` -> `0` when a finite default elevation is required (lights/sounds/tiles/Showstopper).
+ */
+function getLevelBaseElevation(level) {
+  const base = Number(level?.elevation?.base);
+  if (Number.isFinite(base)) return base;
+  const bottom = Number(level?.elevation?.bottom);
+  if (Number.isFinite(bottom)) return bottom;
+  return 0;
+}
+
+/**
+ * Preserve Foundry v14's exact `level.elevation.bottom` (including `-Infinity` for basements/undercrofts)
+ * for level ordering, `isUpper` checks, pyramid ground mesh elevation, and depth comparisons.
+ */
+function getLevelBottomElevation(level) {
+  const bottom = level?.elevation?.bottom;
+  if (typeof bottom === "number" && !Number.isNaN(bottom)) return bottom;
+  return getLevelBaseElevation(level);
+}
+
+/**
+ * In Foundry v14, unset `level.elevation.top` resolves to `Infinity` at runtime (ExtendedNumberField).
+ * Always fall back to `base/bottom + 20` when `top` is non-finite so roof occlusion, indoor lights, and Showstopper stay consistent.
+ */
+function getLevelRoofElevation(level) {
+  const top = Number(level?.elevation?.top);
+  if (Number.isFinite(top)) return top;
+  return getLevelBaseElevation(level) + 20;
+}
+
+/** Convert Foundry v14 wall threshold (in scene distance units) into pixel-scaled Edge threshold (including darkness). */
+function buildEdgeThresholdPx(threshold, pxPerFt) {
+  if (!threshold || typeof threshold !== "object") return undefined;
+  const light = Number.isFinite(Number(threshold.light)) ? Number(threshold.light) * pxPerFt : null;
+  const sight = Number.isFinite(Number(threshold.sight)) ? Number(threshold.sight) * pxPerFt : null;
+  const sound = Number.isFinite(Number(threshold.sound)) ? Number(threshold.sound) * pxPerFt : null;
+  if (light === null && sight === null && sound === null) return undefined;
+  return {
+    light,
+    darkness: light,
+    sight,
+    sound,
+    attenuation: Boolean(threshold.attenuation)
+  };
+}
+
 function meshContainsPointPixelSafe(mesh, x, y, alphaThreshold = 0.25) {
   if (!mesh || mesh.destroyed) return false;
+  if (typeof mesh.containsCanvasPoint === "function") {
+    try {
+      return Boolean(mesh.containsCanvasPoint({ x, y }, alphaThreshold));
+    } catch {}
+  }
   if (typeof mesh.containsPixel === "function") {
     try {
       return Boolean(mesh.containsPixel(x, y, alphaThreshold));
@@ -152,6 +204,7 @@ void main() {
     vRatio = 0.5;
     vDepthElev = 1.0;
     vDimPx = 0.0;
+    vIsMacro = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
@@ -234,7 +287,7 @@ void main() {
   if (dist >= 1.0) discard;
 
   float depthMask = 1.0;
-  if (uUseDepthTexture) {
+  if (uUseDepthTexture && vIsMacro < 0.5) {
     vec4 depthColor = texture2D(uDepthTexture, vSamplerUvs);
     depthMask = step(depthColor.g - (0.5 / 255.0), vDepthElev)
               * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
@@ -268,11 +321,11 @@ void main() {
   vec3 outCol;
   if (vIsMacro > 0.5) {
     // Soft Gaussian orbital settlement glow (never a harsh spotlight disc over forests/lakes)
-    float macroFalloff = exp(-3.6 * dist * dist) * smoothstep(1.0, 0.72, dist);
+    float macroFalloff = exp(-3.6 * dist * dist) * (1.0 - smoothstep(0.72, 1.0, dist));
     outCol = mix(bg, dimCol, macroFalloff * 0.65 * vWeight);
   } else {
     vec3 finalCol = switchColor(brightCol, dimCol, dist, vRatio, uAttenuation);
-    float edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
+    float edgeFade = (1.0 - smoothstep(1.0 - max(uAttenuation, 0.0001), 1.0, dist)) * depthMask;
     outCol = mix(bg, finalCol, edgeFade);
   }
 
@@ -315,7 +368,7 @@ void main() {
   if (dist >= 1.0) discard;
 
   float depthMask = 1.0;
-  if (uUseDepthTexture) {
+  if (uUseDepthTexture && vIsMacro < 0.5) {
     vec4 depthColor = texture2D(uDepthTexture, vSamplerUvs);
     depthMask = step(depthColor.g - (0.5 / 255.0), vDepthElev)
               * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
@@ -339,9 +392,9 @@ void main() {
 
   float edgeFade;
   if (vIsMacro > 0.5) {
-    edgeFade = exp(-3.6 * dist * dist) * smoothstep(1.0, 0.72, dist) * 0.55;
+    edgeFade = exp(-3.6 * dist * dist) * (1.0 - smoothstep(0.72, 1.0, dist)) * 0.55;
   } else {
-    edgeFade = smoothstep(1.0, 1.0 - uAttenuation, dist) * depthMask;
+    edgeFade = (1.0 - smoothstep(1.0 - max(uAttenuation, 0.0001), 1.0, dist)) * depthMask;
   }
   vec3 outCol = vColor * vColorAlpha * reflection * edgeFade;
 
@@ -529,7 +582,7 @@ class MegaLightBatch {
     };
   }
 
-  _collectNativeWallEdges(levelId, EdgeCls) {
+  _collectNativeWallEdges(levelId, EdgeCls, pxPerFt = this._buildPxPerFt || 20) {
     const nativeEdges = [];
     if (canvas.scene?.walls) {
       for (const w of canvas.scene.walls) {
@@ -537,9 +590,11 @@ class MegaLightBatch {
         if (w.door && w.ds === 1) continue;
         if (w.levels?.size && !w.levels.has(levelId)) continue;
         const [x1, y1, x2, y2] = w.c;
+        const threshold = buildEdgeThresholdPx(w.threshold, pxPerFt);
         nativeEdges.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
           id: `nw_${levelId}_${w.id}`, type: "wall",
-          move: w.move, sight: w.sight, light: w.light, sound: w.sound, direction: w.dir || 0
+          move: w.move, sight: w.sight, light: w.light, darkness: w.darkness ?? w.light, sound: w.sound, direction: w.dir || 0,
+          ...(threshold ? { threshold } : {})
         }));
       }
     }
@@ -571,6 +626,7 @@ class MegaLightBatch {
     this._isSuppressedFn = opts.isSuppressedFn || null;
     this._hasLevelEditsFn = opts.hasLevelEditsFn || null;
     this._onBatchChanged = opts.onBatchChanged || null;
+    this._onChunkBaked = opts.onChunkBaked || null;
     this._currentDarkness = canvas.environment?.darknessLevel ?? 0;
 
     const EdgeCls = foundry.canvas.geometry.edges.Edge;
@@ -609,7 +665,7 @@ class MegaLightBatch {
       if (!sectors) continue;
 
       const levelId = level.id;
-      const defaultLightElev = (level.elevation?.base ?? level.elevation?.bottom ?? 0) + 6;
+      const defaultLightElev = getLevelBaseElevation(level) + 6;
       const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
       const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
 
@@ -630,9 +686,12 @@ class MegaLightBatch {
             for (let wi = 0; wi < bsec.w.length; wi++) {
               const w = bsec.w[wi];
               if (w[6] === 0) continue;
+              const wEx = w[9] && typeof w[9] === "object" ? w[9] : null;
+              const threshold = buildEdgeThresholdPx(wEx?.threshold, pxPerFt);
               arr.push(new EdgeCls({ x: w[0], y: w[1] }, { x: w[2], y: w[3] }, {
                 id: `sgw_${levelId}_${bsk}_${wi}`, type: "wall",
-                move: w[4], sight: w[5], light: w[6], sound: w[7], direction: w[8] || 0
+                move: w[4], sight: w[5], light: w[6], darkness: w[6], sound: w[7], direction: w[8] || 0,
+                ...(threshold ? { threshold } : {})
               }));
             }
           }
@@ -640,9 +699,14 @@ class MegaLightBatch {
             for (let di = 0; di < bsec.d.length; di++) {
               const d = bsec.d[di];
               if (d[5] === 1) continue;
+              const dEx = d[6] && typeof d[6] === "object" ? d[6] : null;
+              const dLight = dEx?.light ?? 20;
+              if (dLight === 0) continue;
+              const threshold = buildEdgeThresholdPx(dEx?.threshold, pxPerFt);
               arr.push(new EdgeCls({ x: d[0], y: d[1] }, { x: d[2], y: d[3] }, {
                 id: `sgd_${levelId}_${bsk}_${di}`, type: "wall",
-                move: 20, sight: 20, light: 20, sound: 20, direction: 0
+                move: dEx?.move ?? 20, sight: dEx?.sight ?? 20, light: dLight, darkness: dLight, sound: dEx?.sound ?? 20, direction: dEx?.dir ?? 0,
+                ...(threshold ? { threshold } : {})
               }));
             }
           }
@@ -680,7 +744,7 @@ class MegaLightBatch {
 
         // Bake shadow polygons ONCE for the base province (e.g. 635 lights)
         const bakedBaseSectors = [];
-        const topElev = level.elevation?.top ?? 20;
+        const topElev = getLevelRoofElevation(level);
         for (const [bsk, bsec] of Object.entries(baseSectors)) {
           if (!bsec?.l?.length) continue;
           const [bsx, bsy] = bsk.split("_").map(Number);
@@ -696,12 +760,20 @@ class MegaLightBatch {
           const bakedLights = [];
           for (let li = 0; li < bsec.l.length; li++) {
             const raw = bsec.l[li];
+            const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
+            if (extra?.hidden) continue;
             const lx = raw[0], ly = raw[1];
             const dimFt = raw[2], brightFt = raw[3];
             const colorHex = raw[4], alpha = raw[5] ?? 0.5, anim = raw[6] || "";
             const elevation = Number.isFinite(raw[7]) ? raw[7] : defaultLightElev;
+            const useWalls = extra?.walls !== false;
+            const angle = extra?.angle ?? 360;
+            const rotation = extra?.rotation ?? 0;
+            const darkMin = extra?.darkMin ?? 0;
+            const darkMax = extra?.darkMax ?? 1;
             const dimPx = Math.max(dimFt || 0, brightFt || 0) * pxPerFt;
-            if (dimPx <= 0) continue;
+            if (dimPx <= 0 || angle <= 0) continue;
+            if (darkMin > 0 || darkMax < 1) this._hasDarknessRangedLights = true;
             const ratio = Math.min(1, ((brightFt || 0) * pxPerFt) / dimPx);
             let r = 0, g = 0, b = 0;
             if (colorHex) {
@@ -713,22 +785,26 @@ class MegaLightBatch {
               : -1.0;
 
             let hasNearbyWall = false;
-            for (const e of localEdges) {
-              if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
-                  Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
-                hasNearbyWall = true;
-                break;
+            if (useWalls) {
+              for (const e of localEdges) {
+                if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+                    Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+                  hasNearbyWall = true;
+                  break;
+                }
               }
             }
 
             let offsets = null;
-            if (hasNearbyWall) {
+            if (hasNearbyWall || angle < 360) {
               const poly = new CSP();
               poly.initialize({ x: lx, y: ly }, {
                 type: "light",
                 level: fakeBaseLevel,
-                edgeTypes: { wall: true },
+                edgeTypes: { wall: useWalls },
                 radius: dimPx,
+                angle,
+                rotation,
                 density: 32,
                 hasLimitedRadius: true,
                 useThreshold: true
@@ -768,7 +844,8 @@ class MegaLightBatch {
 
             bakedLights.push({
               li, lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation,
-              dimPx, ratio, r, g, b, phase, offsets, isIndoor
+              dimPx, ratio, r, g, b, phase, offsets, isIndoor,
+              walls: useWalls, angle, rotation, darkMin, darkMax, extra
             });
           }
           if (bakedLights.length) {
@@ -818,11 +895,13 @@ class MegaLightBatch {
                 const vCount = vertCursor - vStart;
                 const lightId = `${levelId}::${sk}_${bl.li}`;
                 const suppressed = Boolean(this._isSuppressedFn?.(lightId));
+                const rawEntry = [lx, ly, bl.dimFt, bl.brightFt, bl.colorHex, bl.alpha, bl.anim, bl.elevation];
+                if (bl.extra) rawEntry.push(bl.extra);
                 this.lightMetaById.set(lightId, {
                   id: lightId, levelId, elevation: bl.elevation, sk, lx, ly, dimPx: bl.dimPx, vStart, vCount,
                   weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor: bl.isIndoor,
-                  walls: true, angle: 360, rotation: 0, darkMin: 0, darkMax: 1,
-                  raw: [lx, ly, bl.dimFt, bl.brightFt, bl.colorHex, bl.alpha, bl.anim, bl.elevation]
+                  walls: bl.walls, angle: bl.angle, rotation: bl.rotation, darkMin: bl.darkMin, darkMax: bl.darkMax,
+                  raw: rawEntry
                 });
                 if (lx - bl.dimPx < minX) minX = lx - bl.dimPx;
                 if (ly - bl.dimPx < minY) minY = ly - bl.dimPx;
@@ -856,9 +935,11 @@ class MegaLightBatch {
                 };
             if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
             const [x1, y1, x2, y2] = seg.c;
+            const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
             arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
               id: `bw_${levelId}_${sk}_${wi}`, type: "wall",
-              move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
+              move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+              ...(threshold ? { threshold } : {})
             }));
           }
         }
@@ -873,9 +954,11 @@ class MegaLightBatch {
                 };
             if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
             const [x1, y1, x2, y2] = seg.c;
+            const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
             arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
               id: `bd_${levelId}_${sk}_${di}`, type: "wall",
-              move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
+              move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+              ...(threshold ? { threshold } : {})
             }));
           }
         }
@@ -1036,7 +1119,7 @@ class MegaLightBatch {
 
           const vCount = vertCursor - vStart;
           const lightId = `${levelId}::${sk}_${li}`;
-          const topElev = level.elevation?.top ?? 20;
+          const topElev = getLevelRoofElevation(level);
           let isIndoor = false;
           if (elevation < topElev && spec.overlays?.length) {
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
@@ -1158,7 +1241,8 @@ class MegaLightBatch {
 
     const depthMask = canvas.masks?.depth;
     if (!depthMask) return;
-    // Ensure Foundry's depth mask elevation table is up to date before mapping
+    // Ensure Foundry's primary children are sorted and depth mask elevation table is up to date before mapping
+    if (canvas.primary?.sortDirty) canvas.primary.sortChildren();
     depthMask._elevationDirty = true;
     depthMask._update?.();
 
@@ -1264,7 +1348,7 @@ class MegaLightBatch {
     const EdgeCls = foundry.canvas.geometry.edges.Edge;
     const sectors = chunkData.sectors;
     const allLevelSectors = layer.spec?.sectors || sectors;
-    const overlays = chunkData.overlays || layer.spec?.overlays || {};
+    const overlays = layer.spec?.overlays || chunkData.overlays || {};
     const sectorEntries = Object.entries(sectors).filter(([, s]) => s?.l?.length);
     if (sectorEntries.length === 0) return;
 
@@ -1283,6 +1367,7 @@ class MegaLightBatch {
       }
     }
 
+    const pxPerFt = this._buildPxPerFt || 20;
     const sectorEdges = new Map();
     for (const sk of neededWallSectors) {
       const sec = sectors[sk] || allLevelSectors[sk];
@@ -1295,9 +1380,11 @@ class MegaLightBatch {
             : { c: sec.w[wi].slice(0, 4), move: sec.w[wi][4], sight: sec.w[wi][5], light: sec.w[wi][6], sound: sec.w[wi][7], dir: sec.w[wi][8] || 0, door: 0, ds: 0 };
           if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
           const [x1, y1, x2, y2] = seg.c;
+          const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
           arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
             id: `cw_${levelId}_${sk}_${wi}`, type: "wall",
-            move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
+            move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+            ...(threshold ? { threshold } : {})
           }));
         }
       }
@@ -1308,9 +1395,11 @@ class MegaLightBatch {
             : { c: sec.d[di].slice(0, 4), move: 20, sight: 20, light: 20, sound: 20, dir: 0, door: sec.d[di][4] || 1, ds: sec.d[di][5] || 0 };
           if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
           const [x1, y1, x2, y2] = seg.c;
+          const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
           arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
             id: `cd_${levelId}_${sk}_${di}`, type: "wall",
-            move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
+            move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+            ...(threshold ? { threshold } : {})
           }));
         }
       }
@@ -1351,6 +1440,7 @@ class MegaLightBatch {
     this._chunkBakeQueue.push({
       gen: this._chunkBakeGen,
       fullKey,
+      chunkKey,
       levelId,
       level,
       sectors,
@@ -1378,11 +1468,12 @@ class MegaLightBatch {
 
   _scheduleChunkBakePump() {
     if (this._chunkBakeRaf !== null || this._chunkBakeQueue.length === 0) return;
-    const sched = typeof requestAnimationFrame === "function"
-      ? requestAnimationFrame
-      : (fn) => setTimeout(fn, 0);
+    const useRaf = typeof requestAnimationFrame === "function";
+    this._chunkBakeIsTimer = !useRaf;
+    const sched = useRaf ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
     this._chunkBakeRaf = sched(() => {
       this._chunkBakeRaf = null;
+      this._chunkBakeIsTimer = false;
       this._pumpChunkBakeQueue();
     });
   }
@@ -1400,8 +1491,8 @@ class MegaLightBatch {
         continue;
       }
 
-      const defaultLightElev = (job.level.elevation?.base ?? job.level.elevation?.bottom ?? 0) + 6;
-      const topElev = job.level.elevation?.top ?? 20;
+      const defaultLightElev = getLevelBaseElevation(job.level) + 6;
+      const topElev = getLevelRoofElevation(job.level);
 
       while (job.secIdx < job.sectorEntries.length && (performance.now() - startMs) < budgetMs) {
         const [sk, sec] = job.sectorEntries[job.secIdx++];
@@ -1587,11 +1678,18 @@ class MegaLightBatch {
     weights.fill(1.0);
     const depthElevs = new Float32Array(job.vertCursor);
     const depthMask = this.useDepthTexture ? canvas.masks?.depth : null;
+    let otherBatchesStale = false;
     if (depthMask) {
+      if (canvas.primary?.sortDirty) canvas.primary.sortChildren();
       depthMask._elevationDirty = true;
       depthMask._update?.();
+      const hadOtherBatches = this.chunkBatches.size > 0 || Boolean(this.depthElevArray && this.depthElevBuffer);
       for (const meta of job.metas) {
         const mapped = depthMask.mapElevation(meta.elevation);
+        const prev = this._depthElevCheckMap.get(meta.elevation);
+        if (hadOtherBatches && prev !== undefined && Math.abs(prev - mapped) > 0.0001) {
+          otherBatchesStale = true;
+        }
         this._depthElevCheckMap.set(meta.elevation, mapped);
         depthElevs.fill(mapped, meta.vStart, meta.vStart + meta.vCount);
       }
@@ -1652,6 +1750,7 @@ class MegaLightBatch {
 
     for (const meta of job.metas) {
       meta.batch = batch;
+      meta.baseWeight = this._isSuppressedFn?.(meta.id) ? 0.0 : 1.0;
       batch.lightIds.push(meta.id);
       this.lightMetaById.set(meta.id, meta);
       const eff = this._computeEffectiveWeight(meta);
@@ -1670,6 +1769,7 @@ class MegaLightBatch {
     }
 
     this.chunkBatches.set(job.fullKey, batch);
+    if (otherBatchesStale) this.syncDepthElevations(true);
     this.totalLights += job.metas.length;
     this.activeLightsCount += batch.activeCount;
     this.totalVertices += job.vertCursor;
@@ -1678,11 +1778,12 @@ class MegaLightBatch {
     if (effects) this._attachSingleBatch(batch, effects);
     if (this._lastVp) {
       const vp = this._lastVp;
-      const showDetail = !this.macroBatch || vp.scale >= 0.035;
+      const showDetail = !this.macroBatch || vp.scale >= 0.020;
       this._cullBatch(batch, vp.x0 - LIGHT_PAD_WORLD_PX, vp.y0 - LIGHT_PAD_WORLD_PX, vp.x1 + LIGHT_PAD_WORLD_PX, vp.y1 + LIGHT_PAD_WORLD_PX, showDetail);
       this._updateMacroCrossfade(vp.scale);
     }
     this._onBatchChanged?.();
+    this._onChunkBaked?.(job.levelId, job.chunkKey);
   }
 
   detachChunk(levelId, chunkKey) {
@@ -1839,18 +1940,18 @@ class MegaLightBatch {
     u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
 
     const illum = canvas.effects?.illumination;
-    const isDynamic = Boolean(illum?.hasDynamicDarknessLevel && illum?.renderTexture);
+    const isDynamic = Boolean(illum?.hasDynamicDarknessLevel && isTextureUsable(illum?.renderTexture));
     u.uHasDarknessTexture = isDynamic;
-    if (isDynamic) u.uDarknessLevelTexture = illum.renderTexture;
+    u.uDarknessLevelTexture = isDynamic ? illum.renderTexture : PIXI.Texture.EMPTY;
 
     const depthTex = canvas.masks?.depth?.renderTexture;
-    u.uUseDepthTexture = Boolean(this.useDepthTexture && depthTex);
-    if (u.uUseDepthTexture) u.uDepthTexture = depthTex;
+    u.uUseDepthTexture = Boolean(this.useDepthTexture && isTextureUsable(depthTex));
+    u.uDepthTexture = u.uUseDepthTexture ? depthTex : PIXI.Texture.EMPTY;
 
-    const hasRoofMask = Boolean(this.useBakedRoofMask && this.bakedRoofMask && !this.bakedRoofMask.destroyed);
+    const hasRoofMask = Boolean(this.useBakedRoofMask && isTextureUsable(this.bakedRoofMask));
     u.uUseBakedRoofMask = hasRoofMask;
+    u.uBakedRoofMask = hasRoofMask ? this.bakedRoofMask : PIXI.Texture.EMPTY;
     if (hasRoofMask) {
-      u.uBakedRoofMask = this.bakedRoofMask;
       u.uBakedRoofRepeat = this.bakedRoofRepeat;
     }
 
@@ -1899,17 +2000,18 @@ class MegaLightBatch {
     u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
 
     const primTex = canvas.primary?.renderTexture;
-    u.uHasPrimaryTexture = Boolean(primTex);
-    u.uPrimaryTexture = primTex || PIXI.Texture.WHITE;
+    const hasPrim = isTextureUsable(primTex);
+    u.uHasPrimaryTexture = hasPrim;
+    u.uPrimaryTexture = hasPrim ? primTex : PIXI.Texture.WHITE;
 
     const depthTex = canvas.masks?.depth?.renderTexture;
-    u.uUseDepthTexture = Boolean(this.useDepthTexture && depthTex);
-    if (u.uUseDepthTexture) u.uDepthTexture = depthTex;
+    u.uUseDepthTexture = Boolean(this.useDepthTexture && isTextureUsable(depthTex));
+    u.uDepthTexture = u.uUseDepthTexture ? depthTex : PIXI.Texture.EMPTY;
 
-    const hasRoofMask = Boolean(this.useBakedRoofMask && this.bakedRoofMask && !this.bakedRoofMask.destroyed);
+    const hasRoofMask = Boolean(this.useBakedRoofMask && isTextureUsable(this.bakedRoofMask));
     u.uUseBakedRoofMask = hasRoofMask;
+    u.uBakedRoofMask = hasRoofMask ? this.bakedRoofMask : PIXI.Texture.EMPTY;
     if (hasRoofMask) {
-      u.uBakedRoofMask = this.bakedRoofMask;
       u.uBakedRoofRepeat = this.bakedRoofRepeat;
     }
 
@@ -1971,7 +2073,7 @@ class MegaLightBatch {
   }
 
   setUseBakedRoofMask(enabled) {
-    this.useBakedRoofMask = Boolean(enabled && this.bakedRoofMask && !this.bakedRoofMask.destroyed);
+    this.useBakedRoofMask = Boolean(enabled && isTextureUsable(this.bakedRoofMask));
   }
 
   disposeBakedRoofMask() {
@@ -1994,12 +2096,19 @@ class MegaLightBatch {
   }
 
   flushWeights() {
+    let visChanged = false;
     if (this.weightsDirty && this.weightBuffer) {
       this.weightBuffer.update();
       this.weightsDirty = false;
       const hasVisible = this.visibleIndexCount > 0 && this.activeLightsCount > 0;
-      if (this.illumMesh) this.illumMesh.visible = hasVisible;
-      if (this.colorMesh) this.colorMesh.visible = hasVisible;
+      if (this.illumMesh && this.illumMesh.visible !== hasVisible) {
+        this.illumMesh.visible = hasVisible;
+        visChanged = true;
+      }
+      if (this.colorMesh && this.colorMesh.visible !== hasVisible) {
+        this.colorMesh.visible = hasVisible;
+        visChanged = true;
+      }
     }
     const showDetail = !this.macroBatch || !this._lastVp || this._lastVp.scale >= 0.020;
     for (const batch of this.chunkBatches.values()) {
@@ -2007,9 +2116,16 @@ class MegaLightBatch {
       batch.weightBuffer.update();
       batch.weightsDirty = false;
       const hasVisible = showDetail && batch.visibleIndexCount > 0 && batch.activeCount > 0;
-      batch.illumMesh.visible = hasVisible;
-      batch.colorMesh.visible = hasVisible;
+      if (batch.illumMesh.visible !== hasVisible) {
+        batch.illumMesh.visible = hasVisible;
+        visChanged = true;
+      }
+      if (batch.colorMesh.visible !== hasVisible) {
+        batch.colorMesh.visible = hasVisible;
+        visChanged = true;
+      }
     }
+    if (visChanged) this._onBatchChanged?.();
   }
 
   _attachSingleBatch(batch, effects) {
@@ -2061,10 +2177,14 @@ class MegaLightBatch {
   destroy() {
     this._chunkBakeGen++;
     this._chunkBakeQueue = [];
-    if (this._chunkBakeRaf !== null && typeof cancelAnimationFrame === "function") {
-      try { cancelAnimationFrame(this._chunkBakeRaf); } catch {}
+    if (this._chunkBakeRaf !== null) {
+      try {
+        if (this._chunkBakeIsTimer) clearTimeout(this._chunkBakeRaf);
+        else if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(this._chunkBakeRaf);
+      } catch {}
     }
     this._chunkBakeRaf = null;
+    this._chunkBakeIsTimer = false;
     this._effects = null;
     this._lastVp = null;
     this._depthElevCheckMap.clear();
@@ -2072,6 +2192,7 @@ class MegaLightBatch {
     this._isSuppressedFn = null;
     this._hasLevelEditsFn = null;
     this._onBatchChanged = null;
+    this._onChunkBaked = null;
 
     if (this.macroBatch) {
       this.macroBatch.illumMesh?.parent?.removeChild(this.macroBatch.illumMesh);
@@ -2210,6 +2331,7 @@ class LRUTextureManager {
   pinned = new Set();       // Static icons + z0..z2 low-level pyramid stay resident
   workerOwned = new Map();  // src -> { tex: PIXI.Texture, bitmap: ImageBitmap }
   workerPool = new TileWorkerPool();
+  _gen = 0;
 
   pin(src) {
     if (src) this.pinned.add(src);
@@ -2219,8 +2341,7 @@ class LRUTextureManager {
     const tex = this.lru.get(src);
     if (tex) {
       if (!isTextureUsable(tex)) {
-        this.lru.delete(src);
-        this.workerOwned.delete(src);
+        this._disposeEntry(src);
         return null;
       }
       this.lru.delete(src);
@@ -2237,9 +2358,10 @@ class LRUTextureManager {
     tex.baseTexture.update();
   }
 
-  _loadFallback(src, mipmap) {
+  _loadFallback(src, mipmap, gen = this._gen) {
     this.workerPool.stats.fallbackDecoded++;
     return foundry.canvas.loadTexture(src).then(tex => {
+      if (gen !== this._gen) return null;
       if (tex?.baseTexture) {
         this._configureBaseTexture(tex, mipmap);
         this.lru.delete(src);
@@ -2259,11 +2381,16 @@ class LRUTextureManager {
       return this.promises.get(src);
     }
 
+    const gen = this._gen;
     const useWorker = isWorkerDecodableUrl(src) && this.workerPool.isSupported();
     let p;
     if (useWorker) {
       p = this.workerPool.decode(src, { priority }).then(bitmap => {
         if (!bitmap) return null;
+        if (gen !== this._gen) {
+          try { bitmap.close(); } catch {}
+          return null;
+        }
         try {
           const base = new PIXI.BaseTexture(bitmap, {
             mipmap: mipmap ? PIXI.MIPMAP_MODES.ON : PIXI.MIPMAP_MODES.OFF,
@@ -2273,23 +2400,29 @@ class LRUTextureManager {
             resolution: 1
           });
           const tex = new PIXI.Texture(base);
+          const prevOwned = this.workerOwned.get(src);
+          if (prevOwned) {
+            try { prevOwned.tex?.destroy?.(true); } catch {}
+            try { prevOwned.bitmap?.close?.(); } catch {}
+          }
           this.workerOwned.set(src, { tex, bitmap });
           this.lru.delete(src);
           this.lru.set(src, tex);
           return tex;
         } catch (err) {
           try { bitmap.close(); } catch {}
-          return this._loadFallback(src, mipmap);
+          if (gen !== this._gen) return null;
+          return this._loadFallback(src, mipmap, gen);
         }
       }).catch(err => {
-        if (err?.aborted) return null;
-        return this._loadFallback(src, mipmap);
+        if (err?.aborted || gen !== this._gen) return null;
+        return this._loadFallback(src, mipmap, gen);
       }).finally(() => {
-        this.promises.delete(src);
+        if (this.promises.get(src) === p) this.promises.delete(src);
       });
     } else {
-      p = this._loadFallback(src, mipmap).finally(() => {
-        this.promises.delete(src);
+      p = this._loadFallback(src, mipmap, gen).finally(() => {
+        if (this.promises.get(src) === p) this.promises.delete(src);
       });
     }
 
@@ -2305,7 +2438,14 @@ class LRUTextureManager {
   }
 
   cancelPrewarm() {
-    return this.workerPool.cancelAtOrBelowPriority(2);
+    const cancelledSrcs = this.workerPool.cancelAtOrBelowPriority(2, this.pinned);
+    if (cancelledSrcs && typeof cancelledSrcs[Symbol.iterator] === "function") {
+      for (const src of cancelledSrcs) {
+        this.promises.delete(src);
+      }
+      return cancelledSrcs.size;
+    }
+    return cancelledSrcs || 0;
   }
 
   _disposeEntry(src) {
@@ -2330,6 +2470,7 @@ class LRUTextureManager {
   }
 
   clear(includePinned = false) {
+    this._gen++;
     this.workerPool.cancelAll();
     if (includePinned) this.pinned.clear();
     for (const [src] of Array.from(this.lru.entries())) {
@@ -2373,6 +2514,11 @@ class MegaWorld1000 {
   _origDepthAutoRender = null;
   pendingTileMounts = []; // Frame-budgeted queue (max 4 tile GPU uploads/frame)
   pendingOverlayMounts = []; // Frame-budgeted queue for building roofs/walls on zoom-in
+  _pendingOverlayKeys = new Set();
+  _mountGen = 0;
+  _mountPromise = null;
+  _mounting = false;
+  _inUpdatePyramid = false;
   _roofTokenOccDirty = false;
   _waitingForRoofsBeforeIndoor = false;
   _roofMaskBaking = false;
@@ -2409,7 +2555,6 @@ class MegaWorld1000 {
   poiManager = new PoiManager(this);
   charPins = new CharacterPinManager(this);
   fogManager = new ChunkedFogManager();
-  atmosphere = new MacroAtmosphereLayer();
   audioStreamer = new MegaAudioStreamer();
   wallEditor = new VirtualWallEditor(this);
   layerEditors = new VirtualLayerEditors(this);
@@ -2491,7 +2636,7 @@ class MegaWorld1000 {
     const maxBudget = 12;
 
     for (const layer of this.visibleLevelLayers) {
-      if (!layer.hasPyramid || urls.length >= maxBudget) continue;
+      if (!layer.hasPyramid || layer.maxZoomZ < 1 || urls.length >= maxBudget) continue;
       const { bounds } = layer;
       const destZ = Math.max(1, this._computeTargetZ(layer, safeScale));
       // Warm intermediate levels first (closest in time during descent), then destination level
@@ -2502,7 +2647,7 @@ class MegaWorld1000 {
 
       for (const z of levelsToWarm) {
         if (urls.length >= maxBudget) break;
-        const nTiles = this._getPyramidGridSize(layer, z);
+        const { nx, ny } = this._getPyramidGridDims(layer, z);
         const tileWorldSize = this._getPyramidTileSize(layer, z);
         const padFactor = z === destZ ? 0.9 : 0.4;
         const bx0 = Math.max(bounds.x, worldX - halfW * padFactor);
@@ -2513,8 +2658,8 @@ class MegaWorld1000 {
 
         const tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
         const ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-        const tx1 = Math.min(nTiles - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
-        const ty1 = Math.min(nTiles - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
+        const tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+        const ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
 
         for (let ty = ty0; ty <= ty1 && urls.length < maxBudget; ty++) {
           for (let tx = tx0; tx <= tx1 && urls.length < maxBudget; tx++) {
@@ -2580,19 +2725,37 @@ class MegaWorld1000 {
     this.syncZoomLimits();
   }
 
-  _getPyramidGridSize(layer, z) {
+  _getPyramidGridDims(layer, z) {
     const sg = layer.superGrid;
     if (sg) {
       const macroMaxZ = sg.macroMaxZ ?? 2;
-      if (z <= macroMaxZ) return 1 << z;
-      return (sg.cols || 6) * (1 << (z - (macroMaxZ + 1)));
+      if (z <= macroMaxZ) {
+        const n = 1 << z;
+        return { nx: n, ny: n };
+      }
+      const localN = 1 << (z - (macroMaxZ + 1));
+      return { nx: (sg.cols || 6) * localN, ny: (sg.rows || 6) * localN };
     }
-    return 1 << z;
+    const n = 1 << z;
+    return { nx: n, ny: n };
+  }
+
+  _getPyramidGridSize(layer, z) {
+    const { nx, ny } = this._getPyramidGridDims(layer, z);
+    return Math.max(nx, ny);
   }
 
   _getPyramidTileSize(layer, z) {
+    const sg = layer.superGrid;
+    if (sg) {
+      const macroMaxZ = sg.macroMaxZ ?? 2;
+      if (z > macroMaxZ) {
+        const localN = 1 << (z - (macroMaxZ + 1));
+        return (sg.regionPx || 100000) / localN;
+      }
+    }
     const span = Math.max(layer.bounds?.w || layer.worldPx || 100000, layer.bounds?.h || layer.worldPx || 100000);
-    return span / this._getPyramidGridSize(layer, z);
+    return span / (1 << z);
   }
 
   _computeTargetZ(layer, scale) {
@@ -2659,21 +2822,27 @@ class MegaWorld1000 {
           if (bsec.w?.length) {
             for (let i = 0; i < bsec.w.length; i++) {
               const w = bsec.w[i];
-              sec.w.push([w[0] + offX, w[1] + offY, w[2] + offX, w[3] + offY, w[4], w[5], w[6], w[7], w[8]]);
+              const row = [w[0] + offX, w[1] + offY, w[2] + offX, w[3] + offY, w[4], w[5], w[6], w[7], w[8]];
+              if (w[9] !== undefined) row.push(w[9]);
+              sec.w.push(row);
             }
             totalWalls += sec.w.length;
           }
           if (bsec.d?.length) {
             for (let i = 0; i < bsec.d.length; i++) {
               const d = bsec.d[i];
-              sec.d.push([d[0] + offX, d[1] + offY, d[2] + offX, d[3] + offY, d[4], d[5]]);
+              const row = [d[0] + offX, d[1] + offY, d[2] + offX, d[3] + offY, d[4], d[5]];
+              if (d[6] !== undefined) row.push(d[6]);
+              sec.d.push(row);
             }
             totalDoors += sec.d.length;
           }
           if (bsec.l?.length) {
             for (let i = 0; i < bsec.l.length; i++) {
               const l = bsec.l[i];
-              sec.l.push([l[0] + offX, l[1] + offY, l[2], l[3], l[4], l[5], l[6], l[7]]);
+              const row = [l[0] + offX, l[1] + offY, l[2], l[3], l[4], l[5], l[6], l[7]];
+              if (l[8] !== undefined) row.push(l[8]);
+              sec.l.push(row);
             }
             totalLights += sec.l.length;
           }
@@ -2712,8 +2881,17 @@ class MegaWorld1000 {
   async _fetchManifest(url) {
     if (!url) return null;
     url = String(url).replaceAll("modules/sh-megamap/", `modules/${MODULE_ID}/`);
-    if (this.manifestCache.has(url)) return this.manifestCache.get(url);
-    let data = await fetch(`${url}?v=${Date.now()}`).then(r => r.json());
+    if (this.manifestCache.has(url)) {
+      const cached = this.manifestCache.get(url);
+      if (cached?.chunks?.baseUrl) {
+        return { ...cached, sectors: {}, overlays: {} };
+      }
+      return cached;
+    }
+    const sep = url.includes("?") ? "&" : "?";
+    const resp = await fetch(`${url}${sep}v=${Date.now()}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} loading manifest ${url}`);
+    let data = await resp.json();
     // Chunked world manifests (`boundless-chunked-v1`) stream sectors/overlays lazily per-chunk; never expand all 36 provinces into RAM upfront!
     if (data?.chunks?.baseUrl) {
       if (Array.isArray(data.superGrid?.tints) && !data.superGrid.parsedTints) {
@@ -2723,6 +2901,8 @@ class MegaWorld1000 {
       }
       if (!data.sectors) data.sectors = {};
       if (!data.overlays) data.overlays = {};
+      this.manifestCache.set(url, data);
+      return { ...data, sectors: {}, overlays: {} };
     } else if (data?.superGrid?.baseManifestUrl) {
       data = await this._expandSuperGridManifest(data);
     }
@@ -2732,21 +2912,28 @@ class MegaWorld1000 {
 
   _normalizeLevelSpec(rawSpec, level, levelCfg = {}) {
     if (!rawSpec) return null;
-    const worldPx = rawSpec.worldPx || Math.max(canvas.dimensions?.width || 100000, canvas.dimensions?.height || 100000);
+    const superGrid = rawSpec.superGrid || null;
+    const sgRegionPx = superGrid?.regionPx || 100000;
+    const sgW = superGrid ? (superGrid.cols || 6) * sgRegionPx : 0;
+    const sgH = superGrid ? (superGrid.rows || 6) * sgRegionPx : 0;
+    const worldPx = rawSpec.worldPx || Math.max(sgW, sgH, canvas.dimensions?.width || 100000, canvas.dimensions?.height || 100000);
     const tilePx = rawSpec.tilePx || 1024;
     const simGrid = rawSpec.simGrid || 40;
     const simSectorPx = rawSpec.simSectorPx || Math.ceil(worldPx / simGrid);
-    const superGrid = rawSpec.superGrid || null;
     const zOffset = superGrid ? ((superGrid.macroMaxZ ?? 2) + 1) : 0;
-    const pyramidBaseUrl = levelCfg.pyramidBaseUrl !== undefined
-      ? levelCfg.pyramidBaseUrl
+    const cfgBaseUrl = typeof levelCfg.pyramidBaseUrl === "string" ? levelCfg.pyramidBaseUrl.trim() : levelCfg.pyramidBaseUrl;
+    const pyramidBaseUrl = cfgBaseUrl
+      ? cfgBaseUrl
       : (rawSpec.pyramidBaseUrl !== undefined
           ? rawSpec.pyramidBaseUrl
           : (rawSpec.blockFlags || rawSpec.maxZoomZ !== undefined ? `modules/${MODULE_ID}/assets/pyramid` : null));
 
     const hasPyramid = Boolean(pyramidBaseUrl);
     const maxZoomZ = rawSpec.maxZoomZ ?? (hasPyramid ? (7 + zOffset) : 0);
-    const bounds = levelCfg.bounds || rawSpec.bounds || { x: 0, y: 0, w: worldPx, h: worldPx };
+    const defaultBounds = superGrid
+      ? { x: 0, y: 0, w: sgW || worldPx, h: sgH || worldPx }
+      : { x: 0, y: 0, w: worldPx, h: worldPx };
+    const bounds = levelCfg.bounds || rawSpec.bounds || defaultBounds;
 
     return {
       level,
@@ -2761,7 +2948,7 @@ class MegaWorld1000 {
       simGrid,
       simSectorPx,
       bounds,
-      isUpper: !level.isView && ((level.elevation?.bottom ?? 0) > (canvas.level?.elevation?.bottom ?? 0)),
+      isUpper: !level.isView && (getLevelBottomElevation(level) > getLevelBottomElevation(canvas.level)),
       lastPyramidKey: "",
       lastOverlayKey: "",
       lastTileKey: "",
@@ -2794,7 +2981,6 @@ class MegaWorld1000 {
         console.warn(`${MODULE_ID} | Could not load scene manifest ${mUrl}:`, err);
       }
     }
-    this.manifest = sceneManifest;
 
     const layers = [];
     for (const level of visibleLevels) {
@@ -2822,8 +3008,12 @@ class MegaWorld1000 {
       }
     }
 
-    layers.sort((a, b) => (a.level.elevation?.bottom ?? 0) - (b.level.elevation?.bottom ?? 0));
-    return layers;
+    layers.sort((a, b) => {
+      const ea = getLevelBottomElevation(a.level);
+      const eb = getLevelBottomElevation(b.level);
+      return ea < eb ? -1 : (ea > eb ? 1 : (a.level.index ?? 0) - (b.level.index ?? 0));
+    });
+    return { layers, sceneManifest };
   }
 
   _capFilterResolution(filter, maxRes = 1.0) {
@@ -2856,7 +3046,7 @@ class MegaWorld1000 {
   _hasMultiElevationDepth() {
     const visibleLevels = (canvas.scene?.levels?.sorted || []).filter(l => l.isVisible);
     if (visibleLevels.length > 1) return true;
-    const baseElev = canvas.level?.elevation?.bottom ?? 0;
+    const baseElev = getLevelBottomElevation(canvas.level);
 
     // Check native TileDocuments that restrict light above base elevation
     if (canvas.tiles?.placeables) {
@@ -2923,12 +3113,26 @@ class MegaWorld1000 {
         Boolean(this.wallEdits.get(levelId)?.size) || Boolean(this.lightEdits.get(levelId)?.size),
       onBatchChanged: () => {
         if (this.active && canvas?.effects) this._optimizeEffectsLayers(canvas.effects);
+      },
+      onChunkBaked: () => {
+        if (this.active) this.updateSimAndLightBubbles(false);
       }
     };
   }
 
-  async mount(scene) {
+  mount(scene) {
     this.unmount();
+    const mountGen = ++this._mountGen;
+    this._mounting = true;
+    const p = this._mountImpl(scene, mountGen).finally(() => {
+      if (this._mountGen === mountGen) this._mounting = false;
+      if (this._mountPromise === p) this._mountPromise = null;
+    });
+    this._mountPromise = p;
+    return p;
+  }
+
+  async _mountImpl(scene, mountGen) {
     const cfg = scene?.flags?.[MODULE_ID];
     const anyLevelFlag = scene?.levels?.some?.(l => l.flags?.[MODULE_ID]?.enabled);
     if (!cfg?.enabled && !anyLevelFlag) return;
@@ -2937,8 +3141,27 @@ class MegaWorld1000 {
     installBulkSelectionPatch();
     installLazyTokenLayerPatch();
     this._ensureSocket();
-    this.active = true;
     const mountedLevelId = canvas.level?.id;
+
+    const { layers, sceneManifest } = await this._resolveVisibleLevelLayers(scene, cfg || {});
+    if (this._mountGen !== mountGen) return;
+    if (canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+      this.unmount();
+      return;
+    }
+
+    // If the currently viewed level (and its visible sub-levels) have NO Boundless layers, leave Foundry 100% native!
+    if (layers.length === 0) {
+      this.unmount();
+      console.log(`${MODULE_ID} | Active level "${canvas.level?.name}" has no Boundless layers; running native Foundry rendering.`);
+      return;
+    }
+
+    this.manifest = sceneManifest;
+    this.active = true;
+    this.visibleLevelLayers = layers;
+    this.levelLayers.clear();
+    for (const l of layers) this.levelLayers.set(l.level.id, l);
 
     // Allow full seamless zoom-out across giant worlds (including 6000x6000 continents) and deep 2.5x combat zoom-in
     if (canvas.dimensions?.scale) {
@@ -2975,24 +3198,12 @@ class MegaWorld1000 {
       this._depthDirty = true;
     }
 
-    const layers = await this._resolveVisibleLevelLayers(scene, cfg || {});
-    if (!this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) return;
-
-    this.visibleLevelLayers = layers;
-    this.levelLayers.clear();
-    for (const l of layers) this.levelLayers.set(l.level.id, l);
-
-    // If the currently viewed level (and its visible sub-levels) have NO Boundless layers, leave Foundry 100% native!
-    if (layers.length === 0) {
-      console.log(`${MODULE_ID} | Active level "${canvas.level?.name}" has no Boundless layers; running native Foundry rendering.`);
-      return;
-    }
-
-    // Load virtual wall/light/sound/tile edits before building GPU light batch
+    // Load virtual wall/light/sound/tile edits and persisted doorStates before mounting chunkStreamer & GPU light batch
     this._loadWallEdits(scene);
     this._loadLightEdits(scene);
     this._loadSoundEdits(scene);
     this._loadTileEdits(scene);
+    this._restoreDoorStates(scene);
 
     // Mount chunked world streamer BEFORE lightBatch & first updateAll so active token/viewport chunks stream smoothly
     this.chunkStreamer.mount(layers);
@@ -3018,28 +3229,40 @@ class MegaWorld1000 {
     const preloadTasks = [];
     for (const layer of layers) {
       if (layer.hasPyramid) {
-        preloadTasks.push(this.texMgr.load(`${layer.pyramidBaseUrl}/0/0_0.webp`, { mipmap: true, isPinned: true }));
+        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+        preloadTasks.push(this.texMgr.load(`${mBase}/0/0_0.webp`, { mipmap: true, isPinned: true }));
       }
     }
     await Promise.all(preloadTasks);
-    if (!this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) return;
+    if (this._mountGen !== mountGen) return;
+    if (!this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+      this.unmount();
+      return;
+    }
 
-    // Warm z=1 tiles silently in background for every visible pyramid layer
+    // Warm z=1 tiles silently in background for every visible pyramid layer (clipped to actual bounds for non-square maps)
     for (const layer of layers) {
       if (!layer.hasPyramid || layer.maxZoomZ < 1) continue;
-      for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
-        this.texMgr.load(`${layer.pyramidBaseUrl}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+      const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+      const z1TileSz = this._getPyramidTileSize(layer, 1);
+      const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
+      const maxY1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.h || layer.worldPx) - 0.001) / z1TileSz));
+      for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
+        this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
       }
     }
 
     // Mount permanent z=0 base layer for every visible pyramid level
     for (const layer of layers) {
       if (layer.hasPyramid) {
+        const baseKey = `${layer.level.id}::0_0_0`;
+        if (this.tilesByKey.has(baseKey)) continue;
+        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
         this.ensureTile(layer, {
-          key: `${layer.level.id}::0_0_0`,
+          key: baseKey,
           levelId: layer.level.id,
           z: 0, x: 0, y: 0,
-          src: `${layer.pyramidBaseUrl}/0/0_0.webp`
+          src: `${mBase}/0/0_0.webp`
         }, true);
       }
     }
@@ -3048,14 +3271,10 @@ class MegaWorld1000 {
     this.tickerFn = () => this.stepCrossfades(canvas.app.ticker.deltaMS || 16.6);
     canvas.app.ticker.add(this.tickerFn);
 
-    // Restore persisted door states from scene flags before mounting bubbles & door icons
-    this._restoreDoorStates(scene);
-
-    // Mount POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, macro atmosphere, native wall/door/layer editors, token virtualization streamer, and spatial ambient audio
+    // Mount POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, native wall/door/layer editors, token virtualization streamer, and spatial ambient audio
     this.poiManager.mount(scene, this.manifest);
     this.charPins.mount(scene);
     this.fogManager.mount(scene);
-    this.atmosphere.mount(scene);
     this.wallEditor.mount();
     this.layerEditors.mount();
     this.tokenStreamer.mount(scene);
@@ -3076,7 +3295,9 @@ class MegaWorld1000 {
       const m = this.meshPool.pop();
       m.name = null;
       m.visible = true;
+      m.occluded = false;
       m.angle = 0;
+      m.scale.set(1, 1);
       m.tint = 0xffffff;
       m.textureAlphaThreshold = 0.75;
       m._occludedBySameElevationSurfaces = true;
@@ -3093,10 +3314,31 @@ class MegaWorld1000 {
 
   retireMesh(m) {
     if (!m) return;
-    // Clear any Showstopper Depth-of-Field filter state before pooling so reused meshes never inherit stale blur
+    // Clear any Showstopper Depth-of-Field filter & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
+    m.texture = PIXI.Texture.EMPTY;
+    m.debounceSetOcclusion?.cancel?.();
+    m.hoverFade = false;
+    m.occlusionMode = CONST.OCCLUSION_MODES.NONE;
+    m.occluded = false;
+    if (m._occlusionState) {
+      m._occlusionState.fade = 0;
+      m._occlusionState.radial = 0;
+      m._occlusionState.vision = 0;
+      m._occlusionState.surface = 0;
+    }
+    if (m._hoverFadeState) {
+      m._hoverFadeState.hovered = false;
+      m._hoverFadeState.faded = false;
+      m._hoverFadeState.fading = false;
+      m._hoverFadeState.hoveredTime = 0;
+      m._hoverFadeState._hoveredTime = 0;
+      m._hoverFadeState.fadingTime = 0;
+      m._hoverFadeState.occlusion = 0;
+    }
     m._ssDofBlurPx = 0;
     if (m._ssDofBlurFilter) {
+      try { m._ssDofBlurFilter.blur = 0; } catch {}
       if (Array.isArray(m.filters)) {
         const next = m.filters.filter(f => f !== m._ssDofBlurFilter);
         m.filters = next.length > 0 ? next : null;
@@ -3110,6 +3352,8 @@ class MegaWorld1000 {
     if (this.meshPool.length < 360) {
       this.meshPool.push(m);
     } else {
+      try { m._ssDofBlurFilter?.destroy?.(); } catch {}
+      m._ssDofBlurFilter = null;
       m.destroy();
     }
   }
@@ -3124,11 +3368,9 @@ class MegaWorld1000 {
     if (!ssApi) return;
     try {
       if (!ssApi.getTokenMovementSetting?.("vertical") || !ssApi.getTokenMovementSetting?.("verticalBlur")) return;
-      const baseElev = Number.isFinite(Number(canvas?.level?.elevation?.base))
-        ? Number(canvas.level.elevation.base)
-        : (Number(canvas?.level?.elevation?.bottom) || 0);
+      const baseElev = getLevelBaseElevation(canvas?.level);
       const obsElev = Number(ssApi.getObserverElevation?.());
-      if (!Number.isFinite(obsElev) || Math.abs(obsElev - baseElev) <= 0.05) return;
+      if (!Number.isFinite(obsElev) || obsElev <= baseElev + 0.05) return;
       if (typeof ssApi.computeElevationPerspective === "function") {
         const grid = canvas?.grid?.size ?? 100;
         const sceneDist = Number(canvas?.scene?.grid?.distance ?? canvas?.grid?.distance) || 5;
@@ -3139,7 +3381,8 @@ class MegaWorld1000 {
         const mPersp = ssApi.computeElevationPerspective(mElev, obsElev, {
           gridSize: grid, gridDistance: sceneDist, tokenSize: grid, hoverBlend: 0, baseElevation: baseElev
         });
-        const blurPx = (Number(mPersp?.dofBlurPx) || 0) * (Number(obsPersp?.cameraOcclusionAlpha) ?? 1);
+        const occAlpha = Number.isFinite(Number(obsPersp?.cameraOcclusionAlpha)) ? Number(obsPersp.cameraOcclusionAlpha) : 1;
+        const blurPx = (Number(mPersp?.dofBlurPx) || 0) * occAlpha;
         m._ssDofBlurPx = blurPx > 0.22 ? blurPx : 0;
       }
       this._scheduleShowstopperDofSync();
@@ -3270,16 +3513,17 @@ class MegaWorld1000 {
   }
 
   updatePyramid() {
-    if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready) return;
+    if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready || this._inUpdatePyramid) return;
+    this._inUpdatePyramid = true;
+    try {
     const vp = this.getViewportWorldRect(0.28);
 
-    // Update GPU light frustum culling, spatial chunk streaming, POI pin scale, macro atmosphere, chunked fog culling, spatial audio, and native streamed walls/doors
+    // Update GPU light frustum culling, spatial chunk streaming, POI pin scale, chunked fog culling, spatial audio, and native streamed walls/doors
     this.chunkStreamer.update(vp);
     this.lightBatch.updateViewport(vp);
     this._optimizeEffectsLayers(canvas.effects);
     this.poiManager.updateViewport(vp);
     this.charPins.updateViewport();
-    this.atmosphere.updateScale(vp.scale);
     this.fogManager.updateViewportCulling(vp);
     // Keep token frustum culling & GPU Impostor Atlas synced even during camera flight (<0.05ms)
     this.tokenStreamer.scheduleSync(vp);
@@ -3313,12 +3557,12 @@ class MegaWorld1000 {
 
         let tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;
         if (targetZ > 0 && overlapsBounds) {
-          const nTiles = this._getPyramidGridSize(layer, targetZ);
+          const { nx, ny } = this._getPyramidGridDims(layer, targetZ);
           const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
           tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
           ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-          tx1 = Math.min(nTiles - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
-          ty1 = Math.min(nTiles - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
+          tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+          ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
         }
 
         const pyrKey = `${overlapsBounds ? 1 : 0}_${targetZ}_${tx0}_${ty0}_${tx1}_${ty1}`;
@@ -3328,9 +3572,10 @@ class MegaWorld1000 {
 
           const lid = layer.level.id;
           const baseKey = `${lid}::0_0_0`;
+          const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
           const desiredMap = new Map();
           if (overlapsBounds) {
-            desiredMap.set(baseKey, { levelId: lid, z: 0, x: 0, y: 0, key: baseKey, src: `${layer.pyramidBaseUrl}/0/0_0.webp` });
+            desiredMap.set(baseKey, { levelId: lid, z: 0, x: 0, y: 0, key: baseKey, src: `${mBase}/0/0_0.webp` });
             if (targetZ > 0) {
               for (let ty = ty0; ty <= ty1; ty++) {
                 for (let tx = tx0; tx <= tx1; tx++) {
@@ -3348,13 +3593,17 @@ class MegaWorld1000 {
           const revealTileZ = layer.zOffset + 6;
           for (const [k, entry] of this.tilesByKey) {
             if (entry.levelId !== lid) continue;
+            const inDesired = desiredMap.has(k);
             const keepReveal = Boolean(entry.isReveal && targetZ === revealTargetZ && entry.z === revealTileZ);
-            entry.desired = desiredMap.has(k) || keepReveal;
+            if (!keepReveal && entry.isReveal) {
+              entry.isReveal = false;
+              this._revealTileKeys.delete(k);
+            }
+            entry.desired = inDesired || keepReveal;
             if (entry.desired) {
               entry.fadingOut = false;
               desiredSrcs.add(entry.src);
             } else {
-              entry.isReveal = false;
               if (!entry.ready && entry.z > 2) {
                 this.tilesByKey.delete(k);
                 if (!desiredSrcs.has(entry.src)) this.texMgr.cancel(entry.src);
@@ -3405,7 +3654,8 @@ class MegaWorld1000 {
         const sep = cleanKey.indexOf("::");
         if (sep > 0) {
           const l = this.levelLayers.get(cleanKey.slice(0, sep));
-          const ovSpec = l?.spec?.overlays?.[Number(cleanKey.slice(sep + 2))];
+          const rawOid = cleanKey.slice(sep + 2);
+          const ovSpec = l?.spec?.overlays?.[rawOid];
           if (ovSpec?.walls) inUse.add(ovSpec.walls);
           if (ovSpec?.roof) inUse.add(ovSpec.roof);
         }
@@ -3413,7 +3663,20 @@ class MegaWorld1000 {
       for (const [, vt] of this.activeVirtualTiles) {
         if (vt.src) inUse.add(vt.src);
       }
+      for (const fullId of this.virtualTilePending) {
+        const sep = fullId.indexOf("::");
+        if (sep > 0) {
+          const lid = fullId.slice(0, sep);
+          const tid = Number(fullId.slice(sep + 2));
+          const l = this.levelLayers.get(lid);
+          const tSpec = l ? this.resolveVirtualTile(lid, tid, l.spec?.tiles?.[tid], l.level) : null;
+          if (tSpec?.src) inUse.add(tSpec.src);
+        }
+      }
       this.texMgr.prune(inUse);
+    }
+    } finally {
+      this._inUpdatePyramid = false;
     }
   }
 
@@ -3422,6 +3685,9 @@ class MegaWorld1000 {
     const sizePx = this._getPyramidTileSize(layer, spec.z);
     const x0 = bounds.x + spec.x * sizePx;
     const y0 = bounds.y + spec.y * sizePx;
+
+    const prevEntry = this.tilesByKey.get(spec.key);
+    if (prevEntry?.mesh) this.retireMesh(prevEntry.mesh);
 
     const entry = {
       key: spec.key,
@@ -3446,23 +3712,38 @@ class MegaWorld1000 {
 
     const isPinned = spec.z <= 2;
     this.texMgr.load(spec.src, { mipmap: true, isPinned, priority: isPinned ? 0 : 1 }).then(tex => {
-      if (!this.active || !tex || !this.tilesByKey.has(spec.key)) return;
+      if (!this.active) return;
       const e = this.tilesByKey.get(spec.key);
-      if (!e || e.fadingOut || (!e.desired && e.z > 0)) return;
+      if (e !== entry) return;
+      if (!tex || !isTextureUsable(tex)) {
+        if (!e.ready) this.tilesByKey.delete(spec.key);
+        return;
+      }
+      if (e.fadingOut || (!e.desired && e.z > 0)) {
+        if (!e.ready) this.tilesByKey.delete(spec.key);
+        return;
+      }
       if (instant || e.z <= 2) {
         this._mountTileMesh(e, tex, instant);
       } else {
-        this.pendingTileMounts.push({ key: spec.key, tex, instant });
+        this.pendingTileMounts.push({ key: spec.key, entry, tex, instant });
         this._tilesDirty = true;
       }
     });
   }
 
   _mountTileMesh(e, tex, instant) {
-    if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0) || !isTextureUsable(tex)) return;
+    if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0)) return false;
+    if (!isTextureUsable(tex)) {
+      if (this.tilesByKey.get(e.key) === e) {
+        this.tilesByKey.delete(e.key);
+        if (e.layer) e.layer.lastPyramidKey = "";
+      }
+      return false;
+    }
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const layer = e.layer;
-    const levelElev = layer.level.elevation?.bottom ?? 0;
+    const levelElev = getLevelBottomElevation(layer.level);
 
     const m = this.acquireMesh();
     m.name = `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
@@ -3502,6 +3783,7 @@ class MegaWorld1000 {
     this._tilesDirty = true;
     this._depthDirty = true;
     if (canvas.masks?.depth) canvas.masks.depth._elevationDirty = true;
+    return true;
   }
 
   rectsOverlap(ax, ay, asz, bx, by, bsz) {
@@ -3518,13 +3800,33 @@ class MegaWorld1000 {
     return false;
   }
 
-  isTileFullyReplacedByDesired(e) {
+  isTileFullyReplacedByDesired(e, vp = null) {
     const s = e.sizePx;
+    let rx0 = e.x0;
+    let ry0 = e.y0;
+    let rx1 = e.x0 + s;
+    let ry1 = e.y0 + s;
+    const b = e.layer?.bounds;
+    if (b) {
+      rx0 = Math.max(rx0, b.x);
+      ry0 = Math.max(ry0, b.y);
+      rx1 = Math.min(rx1, b.x + b.w);
+      ry1 = Math.min(ry1, b.y + b.h);
+    }
+    if (vp) {
+      rx0 = Math.max(rx0, vp.x0);
+      ry0 = Math.max(ry0, vp.y0);
+      rx1 = Math.min(rx1, vp.x1);
+      ry1 = Math.min(ry1, vp.y1);
+    }
+    if (rx1 <= rx0 || ry1 <= ry0) return true;
+    const rw = rx1 - rx0;
+    const rh = ry1 - ry0;
     const pts = [
-      [e.x0 + s * 0.25, e.y0 + s * 0.25],
-      [e.x0 + s * 0.75, e.y0 + s * 0.25],
-      [e.x0 + s * 0.25, e.y0 + s * 0.75],
-      [e.x0 + s * 0.75, e.y0 + s * 0.75],
+      [rx0 + rw * 0.25, ry0 + rh * 0.25],
+      [rx0 + rw * 0.75, ry0 + rh * 0.25],
+      [rx0 + rw * 0.25, ry0 + rh * 0.75],
+      [rx0 + rw * 0.75, ry0 + rh * 0.75],
     ];
     for (const [px, py] of pts) {
       let covered = false;
@@ -3582,12 +3884,16 @@ class MegaWorld1000 {
     const existing = this.activeOverlays.get(fullId);
     if (!existing || existing.wallsMesh || !existing.srcWalls || this.overlayPending.has(`${fullId}:w`)) return;
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
-    const topElev = layer.level.elevation?.top ?? 20;
+    const topElev = getLevelRoofElevation(layer.level);
+    const lid = layer.level.id;
+    const gen = this._mountGen;
     this.overlayPending.add(`${fullId}:w`);
     this.texMgr.load(existing.srcWalls, { mipmap: true }).then((tWalls) => {
-      this.overlayPending.delete(`${fullId}:w`);
+      if (this._mountGen === gen && this.levelLayers.get(lid) === layer) {
+        this.overlayPending.delete(`${fullId}:w`);
+      }
       const cur = this.activeOverlays.get(fullId);
-      if (!this.active || !cur || cur.wallsMesh || !isTextureUsable(tWalls)) return;
+      if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || !cur || cur.wallsMesh || !isTextureUsable(tWalls)) return;
       const wallsMesh = this.acquireMesh();
       wallsMesh.name = `Tile.BoundlessWalls.${fullId}`;
       wallsMesh.anchor.set(0.5, 0.5);
@@ -3621,7 +3927,6 @@ class MegaWorld1000 {
   stepCrossfades(dtMs) {
     if (!this.active || !canvas?.ready) return;
 
-    this.atmosphere.tick(dtMs);
     this.tokenStreamer.step(dtMs);
 
     // Keep CanvasDepthMask synced whenever any mounted roof fades in/out (hoverFade, ALT, token inside, or v14 Region Surface)
@@ -3651,14 +3956,24 @@ class MegaWorld1000 {
             const revealZ = layer.zOffset + 6;
             if (layer.hasPyramid && layer.maxZoomZ >= revealZ && ov.ovSpec) {
               const { bounds } = layer;
-              const nTiles = this._getPyramidGridSize(layer, revealZ);
+              const { nx, ny } = this._getPyramidGridDims(layer, revealZ);
               const tileWorldSize = this._getPyramidTileSize(layer, revealZ);
-              const halfW = (ov.ovSpec.w || 0) * 0.55;
-              const halfH = (ov.ovSpec.h || 0) * 0.55;
+              const w = ov.ovSpec.w || 0;
+              const h = ov.ovSpec.h || 0;
+              const rot = ov.ovSpec.rot || 0;
+              let halfW = w * 0.55;
+              let halfH = h * 0.55;
+              if (rot) {
+                const rad = (rot * Math.PI) / 180;
+                const c = Math.abs(Math.cos(rad));
+                const s = Math.abs(Math.sin(rad));
+                halfW = (w * c + h * s) * 0.55;
+                halfH = (w * s + h * c) * 0.55;
+              }
               const tx0 = Math.max(0, Math.floor((ov.ovSpec.cx - halfW - bounds.x) / tileWorldSize));
               const ty0 = Math.max(0, Math.floor((ov.ovSpec.cy - halfH - bounds.y) / tileWorldSize));
-              const tx1 = Math.min(nTiles - 1, Math.floor((ov.ovSpec.cx + halfW - bounds.x) / tileWorldSize));
-              const ty1 = Math.min(nTiles - 1, Math.floor((ov.ovSpec.cy + halfH - bounds.y) / tileWorldSize));
+              const tx1 = Math.min(nx - 1, Math.floor((ov.ovSpec.cx + halfW - bounds.x) / tileWorldSize));
+              const ty1 = Math.min(ny - 1, Math.floor((ov.ovSpec.cy + halfH - bounds.y) / tileWorldSize));
               for (let ty = ty0; ty <= ty1; ty++) {
                 for (let tx = tx0; tx <= tx1; tx++) {
                   const spec = this.resolvePyramidTile(layer, revealZ, tx, ty);
@@ -3720,6 +4035,7 @@ class MegaWorld1000 {
       const curVp = this.getViewportWorldRect(0.35);
       while (this.pendingOverlayMounts.length > 0 && mountedOv < maxOvMounts) {
         const item = this.pendingOverlayMounts.shift();
+        if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
         if (this._mountOverlayMeshes(item, curVp)) mountedOv++;
       }
       if (mountedOv > 0) {
@@ -3769,10 +4085,14 @@ class MegaWorld1000 {
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
         const item = this.pendingTileMounts.shift();
         const e = this.tilesByKey.get(item.key);
-        if (e && !e.ready && !e.fadingOut && (e.desired || e.z === 0)) {
-          this._mountTileMesh(e, item.tex, item.instant);
-          mounted++;
+        if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
+        const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
+        if (!isTextureUsable(tex)) {
+          this.tilesByKey.delete(item.key);
+          if (e.layer) e.layer.lastPyramidKey = "";
+          continue;
         }
+        if (this._mountTileMesh(e, tex, item.instant)) mounted++;
       }
       if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
     }
@@ -3780,7 +4100,7 @@ class MegaWorld1000 {
     if (!this._tilesDirty) return;
 
     const step = dtMs / CROSSFADE_MS;
-    const vp = this.getViewportWorldRect(0.35);
+    const vp = this.getViewportWorldRect(0.28);
     const toDelete = [];
     let stillActive = false;
 
@@ -3805,7 +4125,7 @@ class MegaWorld1000 {
           continue;
         }
         if (e.z < e.layer.lastTargetZ) {
-          if (this.isTileFullyReplacedByDesired(e)) {
+          if (this.isTileFullyReplacedByDesired(e, vp)) {
             toDelete.push(k);
           }
         } else {
@@ -3871,7 +4191,10 @@ class MegaWorld1000 {
           : CONST.OCCLUSION_MODES.NONE;
         if (ov.roofMesh.occlusionMode !== wantOcc) {
           ov.roofMesh.occlusionMode = wantOcc;
-          if (!canReveal) ov.roofMesh.occluded = false;
+          if (!canReveal) {
+            ov.roofMesh.debounceSetOcclusion?.cancel?.();
+            ov.roofMesh.occluded = false;
+          }
           this._occlusionDirty = true;
         }
         ov.roofMesh.hoverFade = canReveal;
@@ -3892,10 +4215,16 @@ class MegaWorld1000 {
     const renderer = canvas?.app?.renderer;
     if (!renderer || !layers?.length) return;
 
-    // Pick the primary layer carrying baked building roofs (supports monolithic 1000x1000, superGrid, and chunked worlds)
+    // Pick the primary layer carrying baked building roofs (supports monolithic 1000x1000, superGrid, chunked worlds, or explicit roofMaskUrl)
     let targetLayer = null;
     let ovList = null;
     for (const l of layers) {
+      if (l.spec?.roofMaskUrl) {
+        targetLayer = l;
+        const rawOvs = l.spec?._superGridBase?.overlays || l.spec?.overlays;
+        ovList = rawOvs ? (Array.isArray(rawOvs) ? rawOvs : Object.values(rawOvs)) : [];
+        break;
+      }
       const rawOvs = l.spec?._superGridBase?.overlays || l.spec?.overlays;
       if (!rawOvs) continue;
       const list = Array.isArray(rawOvs) ? rawOvs : Object.values(rawOvs);
@@ -3905,7 +4234,7 @@ class MegaWorld1000 {
         break;
       }
     }
-    if (!targetLayer || !ovList?.length) return;
+    if (!targetLayer) return;
 
     const isSuperGrid = Boolean(targetLayer.spec?.superGrid);
     const originX = isSuperGrid ? 0 : (targetLayer.bounds?.x || 0);
@@ -3938,56 +4267,56 @@ class MegaWorld1000 {
 
     const gen = ++this._roofMaskGen;
     this._roofMaskBaking = true;
+    let rt = null;
+    let container = null;
     try {
       const maxTex = renderer.gl?.getParameter?.(renderer.gl.MAX_TEXTURE_SIZE) || 2048;
       const maskSize = maxTex >= 2048 ? 2048 : 1024;
-      const rt = PIXI.RenderTexture.create({
+
+      let maskTex = null;
+      let texByUrl = null;
+
+      if (roofMaskUrl) {
+        // Prebaked single-file roof alpha mask supplied by exporter (0 per-house texture loads!)
+        maskTex = await this.texMgr.load(roofMaskUrl, { mipmap: false, isPinned: false });
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+          return;
+        }
+        if (!isTextureUsable(maskTex)) return;
+      } else if (roofUrls.size <= MAX_SPRITE_MASK_URLS) {
+        // Small reusable template roof set (e.g. <= 24 shared textures): load & pin for instant pixel-exact mask + z>=5 roofs
+        const urlList = Array.from(roofUrls);
+        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+          return;
+        }
+        texByUrl = new Map();
+        for (let i = 0; i < urlList.length; i++) {
+          if (isTextureUsable(loaded[i])) texByUrl.set(urlList[i], loaded[i]);
+        }
+        if (!texByUrl.size) return;
+      }
+
+      rt = PIXI.RenderTexture.create({
         width: maskSize,
         height: maskSize,
         scaleMode: PIXI.SCALE_MODES.LINEAR,
         mipmap: PIXI.MIPMAP_MODES.OFF,
         wrapMode: PIXI.WRAP_MODES.CLAMP
       });
+      container = new PIXI.Container();
 
-      const container = new PIXI.Container();
-
-      if (roofMaskUrl) {
-        // Prebaked single-file roof alpha mask supplied by exporter (0 per-house texture loads!)
-        const maskTex = await this.texMgr.load(roofMaskUrl, { mipmap: false, isPinned: false });
-        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
-          rt.destroy(true);
-          container.destroy({ children: true });
-          return;
-        }
-        if (maskTex) {
-          const sp = new PIXI.Sprite(maskTex);
-          sp.width = maskSize;
-          sp.height = maskSize;
-          container.addChild(sp);
-        }
-      } else if (roofUrls.size <= MAX_SPRITE_MASK_URLS) {
-        // Small reusable template roof set (e.g. <= 24 shared textures): load & pin for instant pixel-exact mask + z>=5 roofs
-        const urlList = Array.from(roofUrls);
-        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
-        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
-          rt.destroy(true);
-          container.destroy({ children: true });
-          return;
-        }
-        const texByUrl = new Map();
-        for (let i = 0; i < urlList.length; i++) {
-          if (loaded[i]) texByUrl.set(urlList[i], loaded[i]);
-        }
-        if (!texByUrl.size) {
-          rt.destroy(true);
-          container.destroy({ children: true });
-          return;
-        }
+      if (maskTex) {
+        const sp = new PIXI.Sprite(maskTex);
+        sp.width = maskSize;
+        sp.height = maskSize;
+        container.addChild(sp);
+      } else if (texByUrl) {
         container.scale.set(maskSize / Math.max(1, regionW), maskSize / Math.max(1, regionH));
         for (const ov of ovList) {
           if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
           const tex = texByUrl.get(ov.roof);
-          if (!tex) continue;
+          if (!isTextureUsable(tex)) continue;
           const sp = new PIXI.Sprite(tex);
           sp.anchor.set(0.5, 0.5);
           sp.position.set(ov.cx - originX, ov.cy - originY);
@@ -4042,6 +4371,7 @@ class MegaWorld1000 {
 
       renderer.render(container, { renderTexture: rt, clear: true });
       container.destroy({ children: true, texture: false, baseTexture: false });
+      container = null;
 
       this.lightBatch.setBakedRoofMask(rt, {
         originX,
@@ -4050,7 +4380,16 @@ class MegaWorld1000 {
         regionH,
         repeat
       });
+      rt = null;
       this._syncIndoorLightVisibility();
+    } catch (err) {
+      if (container && !container.destroyed) {
+        try { container.destroy({ children: true, texture: false, baseTexture: false }); } catch {}
+      }
+      if (rt && !rt.destroyed) {
+        try { rt.destroy(true); } catch {}
+      }
+      console.warn(`${MODULE_ID} | Failed baking roof mask:`, err);
     } finally {
       if (this._roofMaskGen === gen) this._roofMaskBaking = false;
     }
@@ -4058,11 +4397,11 @@ class MegaWorld1000 {
 
   _syncIndoorLightVisibility() {
     if (!this.active || !this.lightBatch) return;
-    const viewedBottom = canvas.level?.elevation?.bottom ?? 0;
+    const viewedBottom = getLevelBottomElevation(canvas.level);
     let wantMacroRoofMask = false;
     for (const layer of this.visibleLevelLayers) {
       if (!layer.spec?.overlays) continue;
-      const topElev = layer.level.elevation?.top ?? 20;
+      const topElev = getLevelRoofElevation(layer.level);
       const hideRoofsForUpperView = !layer.level.isView && viewedBottom >= topElev;
       if (hideRoofsForUpperView) continue;
       const localZ = layer.lastTargetZ - layer.zOffset;
@@ -4121,8 +4460,8 @@ class MegaWorld1000 {
     const { simGrid, simSectorPx, spec, level } = layer;
     const sectors = spec.sectors;
     const lid = level.id;
-    const topElev = level.elevation?.top ?? 20;
-    const viewedBottom = canvas.level?.elevation?.bottom ?? 0;
+    const topElev = getLevelRoofElevation(level);
+    const viewedBottom = getLevelBottomElevation(canvas.level);
     // If viewing an upper level above this level's top, hide lower-level roofs so upper floor tiles aren't covered
     const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
     const localZ = targetZ - layer.zOffset;
@@ -4178,10 +4517,20 @@ class MegaWorld1000 {
         }
         changed = true;
       } else {
-        if (ov.roofMesh) {
+        if (hideRoofsForUpperView && ov.roofMesh) {
+          this.retireMesh(ov.roofMesh);
+          ov.roofMesh = null;
+          this._depthDirty = true;
+          this._depthElevSyncNeeded = true;
+          this.invalidateShowstopperSurfaces();
+          changed = true;
+        } else if (ov.roofMesh) {
           if (ov.roofMesh.occlusionMode !== wantOccMode) {
             ov.roofMesh.occlusionMode = wantOccMode;
-            if (!canReveal) ov.roofMesh.occluded = false;
+            if (!canReveal) {
+            ov.roofMesh.debounceSetOcclusion?.cancel?.();
+            ov.roofMesh.occluded = false;
+          }
             this._occlusionDirty = true;
           }
           ov.roofMesh.hoverFade = canReveal;
@@ -4200,9 +4549,9 @@ class MegaWorld1000 {
         }
         continue;
       }
-      if (this.overlayPending.has(fullId)) continue;
-      const oid = Number(fullId.split("::")[1]);
-      const ovSpec = overlays[oid];
+      if (this.overlayPending.has(fullId) || this._pendingOverlayKeys.has(fullId)) continue;
+      const rawOid = fullId.slice(fullId.indexOf("::") + 2);
+      const ovSpec = overlays[rawOid];
       if (!ovSpec) continue;
 
       const needWalls = Boolean(showWalls && ovSpec.walls);
@@ -4212,21 +4561,26 @@ class MegaWorld1000 {
 
       if ((!needWalls || syncWalls) && (!needRoof || syncRoof)) {
         if (syncWalls || syncRoof) {
-          this.pendingOverlayMounts.push({ fullId, lid, oid, layer, ovSpec, topElev, tWalls: syncWalls, tRoof: syncRoof });
+          this._pendingOverlayKeys.add(fullId);
+          this.pendingOverlayMounts.push({ fullId, lid, oid: rawOid, layer, ovSpec, topElev, tWalls: syncWalls, tRoof: syncRoof });
           changed = true;
         }
         continue;
       }
 
+      const gen = this._mountGen;
       this.overlayPending.add(fullId);
       Promise.all([
         needWalls ? this.texMgr.load(ovSpec.walls, { mipmap: true }) : Promise.resolve(null),
         needRoof ? this.texMgr.load(ovSpec.roof, { mipmap: true }) : Promise.resolve(null)
       ]).then(([tWalls, tRoof]) => {
-        this.overlayPending.delete(fullId);
-        if (!this.active || !this.levelLayers.has(lid) || this.activeOverlays.has(fullId)) return;
+        if (this._mountGen === gen && this.levelLayers.get(lid) === layer) {
+          this.overlayPending.delete(fullId);
+        }
+        if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || this.activeOverlays.has(fullId) || this._pendingOverlayKeys.has(fullId)) return;
         if (!tWalls && !tRoof) return;
-        this.pendingOverlayMounts.push({ fullId, lid, oid, layer, ovSpec, topElev, tWalls, tRoof });
+        this._pendingOverlayKeys.add(fullId);
+        this.pendingOverlayMounts.push({ fullId, lid, oid: rawOid, layer, ovSpec, topElev, tWalls, tRoof });
       });
       changed = true;
     }
@@ -4236,9 +4590,22 @@ class MegaWorld1000 {
 
   _mountOverlayMeshes(item, curVp) {
     const { fullId, lid, oid, layer, ovSpec, topElev } = item;
-    if (!this.active || !this.levelLayers.has(lid) || this.activeOverlays.has(fullId)) return false;
-    if (ovSpec.cx + ovSpec.w < curVp.x0 || ovSpec.cx - ovSpec.w > curVp.x1 ||
-        ovSpec.cy + ovSpec.h < curVp.y0 || ovSpec.cy - ovSpec.h > curVp.y1) return false;
+    if (!this.active || this.levelLayers.get(lid) !== layer || this.activeOverlays.has(fullId)) return false;
+    const halfDiag = Math.hypot(ovSpec.w || 0, ovSpec.h || 0) * 0.5;
+    const { simGrid, simSectorPx } = layer;
+    const curSx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
+    const curSy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
+    const curSx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
+    const curSy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const secX0 = curSx0 * simSectorPx;
+    const secY0 = curSy0 * simSectorPx;
+    const secX1 = (curSx1 + 1) * simSectorPx;
+    const secY1 = (curSy1 + 1) * simSectorPx;
+    if (ovSpec.cx + halfDiag < secX0 || ovSpec.cx - halfDiag > secX1 ||
+        ovSpec.cy + halfDiag < secY0 || ovSpec.cy - halfDiag > secY1) {
+      layer.lastOverlayKey = "";
+      return false;
+    }
 
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const localZNow = layer.lastTargetZ - layer.zOffset;
@@ -4311,6 +4678,9 @@ class MegaWorld1000 {
     }
 
     this.activeOverlays.set(fullId, { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof });
+    if (localZNow >= 6 && !wallsMesh && ovSpec.walls) {
+      this._ensureOverlayWallsMesh(fullId, layer, ovSpec);
+    }
     if (roofMesh) this.invalidateShowstopperSurfaces();
     return true;
   }
@@ -4327,7 +4697,7 @@ class MegaWorld1000 {
     const { simGrid, simSectorPx, spec, level } = layer;
     const sectors = spec.sectors;
     const lid = level.id;
-    const defaultElev = level.elevation?.bottom ?? 0;
+    const defaultElev = getLevelBaseElevation(level);
 
     const sx0 = Math.max(0, Math.floor(vp.x0 / simSectorPx));
     const sy0 = Math.max(0, Math.floor(vp.y0 / simSectorPx));
@@ -4338,31 +4708,55 @@ class MegaWorld1000 {
     if (tileKey === layer.lastTileKey) return false;
     layer.lastTileKey = tileKey;
 
+    const secX0 = sx0 * simSectorPx;
+    const secY0 = sy0 * simSectorPx;
+    const secX1 = (sx1 + 1) * simSectorPx;
+    const secY1 = (sy1 + 1) * simSectorPx;
+    const tileIntersectsSectors = (t) => {
+      const ax0 = t.anchorX !== undefined ? t.anchorX : 0.5;
+      const ay0 = t.anchorY !== undefined ? t.anchorY : 0.5;
+      const pivX = t.anchorX === undefined ? (t.x + t.w * 0.5) : t.x;
+      const pivY = t.anchorY === undefined ? (t.y + t.h * 0.5) : t.y;
+      const halfDiag = Math.hypot(t.w || 0, t.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
+      return pivX + halfDiag >= secX0 && pivX - halfDiag <= secX1 && pivY + halfDiag >= secY0 && pivY - halfDiag <= secY1;
+    };
+
     const needed = new Set();
     if (sectors) {
+      const candidateTids = new Set();
       for (let sy = sy0; sy <= sy1; sy++) {
         for (let sx = sx0; sx <= sx1; sx++) {
           const sec = sectors[`${sx}_${sy}`];
           if (!sec?.t?.length) continue;
-          for (const tid of sec.t) {
-            const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
-            if (!tSpec) continue;
-            if (tSpec.minZ !== undefined && targetZ < tSpec.minZ) continue;
-            if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
-            needed.add(`${lid}::${tid}`);
-          }
+          for (const tid of sec.t) candidateTids.add(tid);
+        }
+      }
+      // Include tiles edited & dragged outside their original home sector
+      const lvlTileEdits = this.tileEdits.get(lid);
+      if (lvlTileEdits?.size) {
+        for (const [tKey, ov] of lvlTileEdits) {
+          if (!ov || !tKey.startsWith("t:")) continue;
+          const tid = Number(tKey.slice(2));
+          if (Number.isInteger(tid) && tiles[tid]) candidateTids.add(tid);
+        }
+      }
+      for (const tid of candidateTids) {
+        const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
+        if (!tSpec || tSpec.hidden) continue;
+        if (tSpec.minZ !== undefined && targetZ < tSpec.minZ) continue;
+        if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
+        if (tileIntersectsSectors(tSpec)) {
+          needed.add(`${lid}::${tid}`);
         }
       }
     } else {
-      // Fallback for small inline tile lists without spatial sector index
+      // Fallback for small inline tile lists without spatial sector index (matched to active sector bounds so tileKey stays exact)
       for (let tid = 0; tid < tiles.length; tid++) {
         const t = this.resolveVirtualTile(lid, tid, tiles[tid], level);
-        if (!t) continue;
+        if (!t || t.hidden) continue;
         if (t.minZ !== undefined && targetZ < t.minZ) continue;
         if (t.maxZ !== undefined && targetZ > t.maxZ) continue;
-        const x0 = t.x - (t.anchorX ?? 0) * t.w;
-        const y0 = t.y - (t.anchorY ?? 0) * t.h;
-        if (x0 + t.w >= vp.x0 && x0 <= vp.x1 && y0 + t.h >= vp.y0 && y0 <= vp.y1) {
+        if (tileIntersectsSectors(t)) {
           needed.add(`${lid}::${tid}`);
         }
       }
@@ -4372,8 +4766,13 @@ class MegaWorld1000 {
     for (const [fullId, vt] of this.activeVirtualTiles) {
       if (vt.levelId !== lid) continue;
       if (!needed.has(fullId)) {
+        const hadLight = Boolean(vt.mesh?.restrictsLight);
         if (vt.mesh) this.retireMesh(vt.mesh);
         this.activeVirtualTiles.delete(fullId);
+        this._occlusionDirty = true;
+        this._depthDirty = true;
+        if (hadLight) this._depthElevSyncNeeded = true;
+        this.invalidateShowstopperSurfaces();
         changed = true;
       }
     }
@@ -4382,12 +4781,42 @@ class MegaWorld1000 {
       if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId)) continue;
       const tid = Number(fullId.split("::")[1]);
       const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
-      if (!tSpec?.src) continue;
+      if (!tSpec?.src || tSpec.hidden) continue;
 
+      const reqRev = this.tileEditsRev;
+      const gen = this._mountGen;
       this.virtualTilePending.add(fullId);
       this.texMgr.load(tSpec.src, { mipmap: true }).then(tex => {
-        this.virtualTilePending.delete(fullId);
-        if (!this.active || !isTextureUsable(tex) || !this.levelLayers.has(lid)) return;
+        if (this._mountGen === gen && this.levelLayers.get(lid) === layer && this.tileEditsRev === reqRev) {
+          this.virtualTilePending.delete(fullId);
+        }
+        if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer) return;
+        if (this.activeVirtualTiles.has(fullId) || this.tileEditsRev !== reqRev) return;
+        if (!isTextureUsable(tex)) {
+          layer.lastTileKey = "";
+          return;
+        }
+        const zNow = layer.lastTargetZ;
+        if (tSpec.minZ !== undefined && zNow < tSpec.minZ) return;
+        if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return;
+        const curVp = this.getViewportWorldRect(0.28);
+        const ax0 = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+        const ay0 = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+        const pivX = tSpec.anchorX === undefined ? (tSpec.x + tSpec.w * 0.5) : tSpec.x;
+        const pivY = tSpec.anchorY === undefined ? (tSpec.y + tSpec.h * 0.5) : tSpec.y;
+        const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
+        const curSx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
+        const curSy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
+        const curSx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
+        const curSy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+        const secX0 = curSx0 * simSectorPx;
+        const secY0 = curSy0 * simSectorPx;
+        const secX1 = (curSx1 + 1) * simSectorPx;
+        const secY1 = (curSy1 + 1) * simSectorPx;
+        if (pivX + halfDiag < secX0 || pivX - halfDiag > secX1 || pivY + halfDiag < secY0 || pivY - halfDiag > secY1) {
+          layer.lastTileKey = "";
+          return;
+        }
 
         const m = this.acquireMesh();
         m.name = `Tile.BoundlessVirtual.${fullId}`;
@@ -4396,8 +4825,17 @@ class MegaWorld1000 {
         m.anchor.set(ax, ay);
         m.texture = tex;
         m.position.set(tSpec.x + (tSpec.anchorX === undefined ? tSpec.w * 0.5 : 0), tSpec.y + (tSpec.anchorY === undefined ? tSpec.h * 0.5 : 0));
-        m.width = tSpec.w;
-        m.height = tSpec.h;
+        const sx = Number.isFinite(tSpec.scaleX) ? tSpec.scaleX : 1;
+        const sy = Number.isFinite(tSpec.scaleY) ? tSpec.scaleY : 1;
+        const fit = ["fill", "cover", "contain", "width", "height"].includes(tSpec.fit) ? tSpec.fit : "fill";
+        if (typeof m.resize === "function" && tex.width > 0 && tex.height > 0) {
+          m.resize(Math.max(0, tSpec.w || 0), Math.max(0, tSpec.h || 0), { fit, scaleX: sx, scaleY: sy });
+        } else {
+          m.width = tSpec.w;
+          m.height = tSpec.h;
+          if (sx < 0) m.scale.x = -Math.abs(m.scale.x);
+          if (sy < 0) m.scale.y = -Math.abs(m.scale.y);
+        }
         m.angle = tSpec.rot || 0;
         m.elevation = Number.isFinite(tSpec.elevation) ? tSpec.elevation : defaultElev;
         m.sortLayer = resolveSortLayer(tSpec.sortLayer, PrimaryCanvasGroup.SORT_LAYERS.TILES);
@@ -4416,8 +4854,9 @@ class MegaWorld1000 {
         if (tSpec.tint !== undefined && tSpec.tint !== null) {
           m.tint = typeof tSpec.tint === "string" ? foundry.utils.Color.from(tSpec.tint).valueOf() : tSpec.tint;
         }
-        // Hide raw mesh if TilesLayer editor currently renders the native editable Tile for this slot
-        if (this.layerEditors?.tileActive && this.layerEditors.tilesByKey.has(`t:${tid}`)) {
+        // Hide raw mesh if TilesLayer editor currently renders the native editable Tile for this exact level & slot
+        const edTile = this.layerEditors?.tileActive ? this.layerEditors.tilesByKey.get(`t:${tid}`) : null;
+        if (edTile && edTile.levelId === lid) {
           m.visible = false;
         }
 
@@ -4585,6 +5024,7 @@ class MegaWorld1000 {
       let bulkControlledAdded = 0;
 
       for (const tok of canvas.tokens.placeables) {
+        if (!tok || tok.destroyed || tok.isPreview || !tok.center) continue;
         const doc = tok.document;
         const lightRadPx = Math.max(doc?.light?.dim || 0, doc?.light?.bright || 0) * pxPerFt;
         const isCoreActor = Boolean(doc?.hasPlayerOwner)
@@ -4650,14 +5090,17 @@ class MegaWorld1000 {
               if (!seg) continue;
               const dKey = seg.door ? `${lid}::${sk}_w${wi}` : null;
               const isOpen = dKey ? (this.getCurrentDoorState(dKey, seg.ds) === 1) : false;
-              if (isOpen) continue;
-              const [x1, y1, x2, y2] = seg.c;
               const eid = `mw_${lid}_${sk}_${wi}`;
-              const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-                id: eid, type: "wall",
-                move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
-              });
-              level.edges.set(eid, edge);
+              if (!isOpen) {
+                const [x1, y1, x2, y2] = seg.c;
+                const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
+                const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+                  id: eid, type: "wall",
+                  move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+                  ...(threshold ? { threshold } : {})
+                });
+                level.edges.set(eid, edge);
+              }
               edgeIds.push(eid);
             }
           }
@@ -4671,9 +5114,11 @@ class MegaWorld1000 {
               const eid = `md_${dKey}`;
               const isOpen = seg.door ? (this.getCurrentDoorState(dKey, seg.ds) === 1) : false;
               if (!isOpen) {
+                const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
                 const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
                   id: eid, type: "wall",
-                  move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound, direction: seg.dir || 0
+                  move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+                  ...(threshold ? { threshold } : {})
                 });
                 level.edges.set(eid, edge);
               }
@@ -4735,6 +5180,7 @@ class MegaWorld1000 {
         canvas.perception.update({
           initializeVision: edgesChanged,
           initializeLighting: lightsChanged || edgesChanged,
+          initializeSounds: edgesChanged,
           refreshLighting: true,
           refreshVision: true
         });
@@ -4781,11 +5227,13 @@ class MegaWorld1000 {
       move: seg.move ?? 20,
       sight: seg.sight ?? 20,
       light: seg.light ?? 20,
+      darkness: seg.darkness ?? seg.light ?? 20,
       sound: seg.sound ?? 20,
       dir: seg.dir || 0,
       doorType: seg.door,
       defaultDs: seg.ds,
-      doorSound: seg.doorSound || ""
+      doorSound: seg.doorSound || "",
+      threshold: seg.threshold || null
     };
   }
 
@@ -4806,14 +5254,35 @@ class MegaWorld1000 {
     const savedStates = scene?.flags?.[MODULE_ID]?.doorStates;
     if (!savedStates || typeof savedStates !== "object") return;
     for (const [dKey, rawVal] of Object.entries(savedStates)) {
+      if (rawVal === null || rawVal === undefined) continue;
       const info = this._resolveDoorByKey(dKey);
-      if (!info) continue;
-      const ds = this._normalizeDoorState(rawVal, info.defaultDs);
+      const ds = this._normalizeDoorState(rawVal, info?.defaultDs ?? 0);
       this.doorStates.set(dKey, ds);
-      if (ds === 1) {
+      if (info && ((ds === 1) !== (info.defaultDs === 1))) {
         const dx = (info.ptA.x + info.ptB.x) * 0.5;
         const dy = (info.ptA.y + info.ptB.y) * 0.5;
         this.openDoors.set(dKey, { levelId: info.levelId, x: dx, y: dy, sx: info.sx, sy: info.sy, eid: info.eid });
+      }
+    }
+  }
+
+  _reconcileChunkDoorStates(layer, chunkData) {
+    if (!layer || !chunkData?.sectors || !this.doorStates.size) return;
+    const lid = layer.level.id;
+    const prefix = `${lid}::`;
+    for (const [dKey, ds] of this.doorStates) {
+      if (!dKey.startsWith(prefix)) continue;
+      const info = this._resolveDoorByKey(dKey);
+      if (!info) continue;
+      const sk = `${info.sx}_${info.sy}`;
+      if (!chunkData.sectors[sk]) continue;
+      const differsFromBaked = (ds === 1) !== (info.defaultDs === 1);
+      if (differsFromBaked) {
+        const dx = (info.ptA.x + info.ptB.x) * 0.5;
+        const dy = (info.ptA.y + info.ptB.y) * 0.5;
+        this.openDoors.set(dKey, { levelId: info.levelId, x: dx, y: dy, sx: info.sx, sy: info.sy, eid: info.eid });
+      } else {
+        this.openDoors.delete(dKey);
       }
     }
   }
@@ -4832,21 +5301,28 @@ class MegaWorld1000 {
     this.doorStates.set(dKey, ds);
     const isOpen = ds === 1;
     const wasOpen = curDs === 1;
+    const differsFromBaked = isOpen !== (defaultDs === 1);
 
     if (isOpen) {
       level?.edges?.delete(eid);
+    } else if (this.simSectors.has(`${levelId}::${sx}_${sy}`)) {
+      const pxPerFt = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
+      const threshold = buildEdgeThresholdPx(info.threshold, pxPerFt);
+      level?.edges?.set(eid, new EdgeCls(ptA, ptB, {
+        id: eid, type: "wall",
+        move: info.move ?? 20,
+        sight: info.sight ?? 20,
+        light: info.light ?? 20,
+        darkness: info.darkness ?? info.light ?? 20,
+        sound: info.sound ?? 20,
+        direction: info.dir || 0,
+        ...(threshold ? { threshold } : {})
+      }));
+    }
+
+    if (differsFromBaked) {
       this.openDoors.set(dKey, { levelId, x: dx, y: dy, sx, sy, eid });
     } else {
-      if (this.simSectors.has(`${levelId}::${sx}_${sy}`)) {
-        level?.edges?.set(eid, new EdgeCls(ptA, ptB, {
-          id: eid, type: "wall",
-          move: info.move ?? 20,
-          sight: info.sight ?? 20,
-          light: info.light ?? 20,
-          sound: info.sound ?? 20,
-          direction: info.dir || 0
-        }));
-      }
       this.openDoors.delete(dKey);
     }
 
@@ -4863,6 +5339,7 @@ class MegaWorld1000 {
       canvas.perception.update({
         initializeVision: true,
         initializeLighting: true,
+        initializeSounds: true,
         refreshLighting: true,
         refreshVision: true
       });
@@ -4877,13 +5354,23 @@ class MegaWorld1000 {
     if (this.fogManager.handleSocketMessage(payload)) return;
 
     const info = this._resolveDoorByKey(payload.dKey);
-    if (!info) return;
+    if (!info) {
+      if (payload.type === "doorState" && payload.dKey) {
+        if (!game.users?.get?.(payload.senderId)?.isGM) return;
+        const targetDs = payload.ds !== undefined
+          ? this._normalizeDoorState(payload.ds, 0)
+          : (payload.isOpen ? 1 : 0);
+        this.doorStates.set(payload.dKey, targetDs);
+      }
+      return;
+    }
 
     const targetDs = payload.ds !== undefined
       ? this._normalizeDoorState(payload.ds, info.defaultDs)
       : (payload.isOpen ? 1 : 0);
 
     if (payload.type === "doorState") {
+      if (!game.users?.get?.(payload.senderId)?.isGM) return;
       this._applyDoorStateLocal(info, targetDs, { playSound: payload.playSound !== false });
     } else if (payload.type === "doorRequest") {
       // Only the single active GM persists player door requests and broadcasts authoritative state
@@ -4909,7 +5396,10 @@ class MegaWorld1000 {
     const ds = this._normalizeDoorState(targetDs, info.defaultDs);
     const curDs = this.getCurrentDoorState(dKey, info.defaultDs);
 
-    if (!game.user.isGM && (curDs === 2 || ds === 2)) return;
+    if (!game.user.isGM) {
+      if (info.doorType === 2 || curDs === 2 || ds === 2) return;
+      if (!game.users?.activeGM) return;
+    }
 
     this._applyDoorStateLocal(info, ds, { playSound });
 
@@ -4978,7 +5468,7 @@ class MegaWorld1000 {
         ds: ov.ds || 0,
         doorSound: ov.doorSound || "",
         threshold: ov.threshold || null,
-        animation: ov.animation?.texture ? ov.animation : null
+        animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null
       };
     }
     if (kind === "d") {
@@ -4990,19 +5480,19 @@ class MegaWorld1000 {
         idx,
         wKey,
         c: [x1, y1, x2, y2],
-        move: 20,
-        sight: 20,
-        light: 20,
-        sound: 20,
-        dir: 0,
+        move: extra?.move ?? 20,
+        sight: extra?.sight ?? 20,
+        light: extra?.light ?? 20,
+        sound: extra?.sound ?? 20,
+        dir: extra?.dir || 0,
         door: doorType || 1,
         ds: defaultDs || 0,
         doorSound: extra?.doorSound || "",
         threshold: extra?.threshold || null,
-        animation: extra?.animation?.texture ? extra.animation : null
+        animation: (extra?.animation?.type && extra?.animation?.texture) ? extra.animation : null
       };
     }
-    const [x1, y1, x2, y2, move, sight, light, sound, dir] = raw;
+    const [x1, y1, x2, y2, move, sight, light, sound, dir, extra] = raw;
     return {
       kind: "w",
       levelId,
@@ -5018,7 +5508,7 @@ class MegaWorld1000 {
       door: 0,
       ds: 0,
       doorSound: "",
-      threshold: null,
+      threshold: extra?.threshold || null,
       animation: null
     };
   }
@@ -5041,6 +5531,23 @@ class MegaWorld1000 {
     }
     this.simSectors.clear();
     this.lastSimKey = "";
+
+    // Revalidate tracked doors in openDoors after wall/door edits (removals, wall conversions, coordinate moves)
+    for (const dKey of Array.from(this.openDoors.keys())) {
+      const info = this._resolveDoorByKey(dKey);
+      if (!info) {
+        this.openDoors.delete(dKey);
+        continue;
+      }
+      const curDs = this.getCurrentDoorState(dKey, info.defaultDs);
+      if ((curDs === 1) !== (info.defaultDs === 1)) {
+        const dx = (info.ptA.x + info.ptB.x) * 0.5;
+        const dy = (info.ptA.y + info.ptB.y) * 0.5;
+        this.openDoors.set(dKey, { levelId: info.levelId, x: dx, y: dy, sx: info.sx, sy: info.sy, eid: info.eid });
+      } else {
+        this.openDoors.delete(dKey);
+      }
+    }
 
     this.updateSimAndLightBubbles(true);
     this.wallEditor.syncViewport(true);
@@ -5080,7 +5587,7 @@ class MegaWorld1000 {
 
   resolveVirtualLight(levelId, sk, idx, raw, level = null) {
     const lKey = `${sk}:l:${idx}`;
-    const defaultElev = ((level?.elevation?.base ?? level?.elevation?.bottom ?? 0) + 6);
+    const defaultElev = getLevelBaseElevation(level) + 6;
     const levelMap = this.lightEdits.get(levelId);
     if (levelMap && levelMap.has(lKey)) {
       const ov = levelMap.get(lKey);
@@ -5134,7 +5641,7 @@ class MegaWorld1000 {
 
   resolveVirtualSound(levelId, sk, idx, raw, level = null) {
     const sKey = `${sk}:s:${idx}`;
-    const defaultElev = ((level?.elevation?.base ?? level?.elevation?.bottom ?? 0) + 5);
+    const defaultElev = getLevelBaseElevation(level) + 5;
     const levelMap = this.soundEdits.get(levelId);
     if (levelMap && levelMap.has(sKey)) {
       const ov = levelMap.get(sKey);
@@ -5144,16 +5651,19 @@ class MegaWorld1000 {
         x: ov.x, y: ov.y, radius: ov.radius ?? 20, path: ov.path || "",
         volume: ov.volume ?? 0.6, walls: ov.walls !== false, easing: ov.easing !== false,
         darkMin: ov.darkMin ?? 0, darkMax: ov.darkMax ?? 1,
-        elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev
+        elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev,
+        hidden: Boolean(ov.hidden)
       };
     }
-    const [x, y, radius, path, volume, walls, easing, darkMin, darkMax, customElev] = raw;
+    const [x, y, radius, path, volume, walls, easing, darkMin, darkMax, customElev, extra] = raw;
+    const ex = extra && typeof extra === "object" ? extra : null;
     return {
       levelId, sk, idx, sKey,
       x, y, radius: radius || 20, path: path || "",
       volume: volume ?? 0.6, walls: walls !== false, easing: easing !== false,
       darkMin: darkMin ?? 0, darkMax: darkMax ?? 1,
-      elevation: Number.isFinite(customElev) ? customElev : defaultElev
+      elevation: Number.isFinite(customElev) ? customElev : defaultElev,
+      hidden: Boolean(ex?.hidden)
     };
   }
 
@@ -5176,12 +5686,19 @@ class MegaWorld1000 {
 
   resolveVirtualTile(levelId, tid, raw, level = null) {
     const tKey = `t:${tid}`;
-    const defaultElev = level?.elevation?.bottom ?? 0;
+    const defaultElev = getLevelBaseElevation(level);
     const levelMap = this.tileEdits.get(levelId);
     if (levelMap && levelMap.has(tKey)) {
       const ov = levelMap.get(tKey);
       if (ov === null) return null;
-      return { levelId, tid, tKey, ...ov, elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev };
+      // Preserve non-editable Boundless tile metadata from raw spec (without re-injecting raw.anchorX/anchorY)
+      const preserved = {};
+      if (raw && typeof raw === "object") {
+        for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable"]) {
+          if (raw[k] !== undefined) preserved[k] = raw[k];
+        }
+      }
+      return { levelId, tid, tKey, ...preserved, ...ov, elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev };
     }
     if (!raw) return null;
     return { levelId, tid, tKey, ...raw, elevation: Number.isFinite(raw.elevation) ? raw.elevation : defaultElev };
@@ -5242,7 +5759,18 @@ class MegaWorld1000 {
   }
 
   onSceneUpdate(scene, changes) {
-    if (!this.active || scene?.id !== canvas.scene?.id) return;
+    if (scene?.id !== canvas.scene?.id) return;
+
+    const flagChanges = changes?.flags?.[MODULE_ID];
+    const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
+
+    // Handle enabling/disabling or manifest changes even when controller is currently inactive
+    if (flagDeleted || (flagChanges && ("enabled" in flagChanges || "manifestUrl" in flagChanges || "-=manifestUrl" in flagChanges || "levelId" in flagChanges || "-=levelId" in flagChanges))) {
+      this.mount(scene);
+      return;
+    }
+
+    if (!this.active) return;
 
     // React to native Foundry v14 Scene fog mode (DISABLED / INDIVIDUAL / SHARED) & tokenVision changes
     if (changes?.fog || "tokenVision" in (changes || {})) {
@@ -5250,33 +5778,56 @@ class MegaWorld1000 {
       this.tokenStreamer.onVisibilityChanged();
     }
 
-    const flagChanges = changes?.flags?.[MODULE_ID];
-    if (!flagChanges) return;
+    if (!flagChanges || typeof flagChanges !== "object") return;
 
-    if (flagChanges.wallEdits && typeof flagChanges.wallEdits === "object") {
+    if ("wallEdits" in flagChanges || "-=wallEdits" in flagChanges) {
       this._loadWallEdits(scene);
       this.applyVirtualWallChangesLocal();
     }
 
-    if (flagChanges.lightEdits && typeof flagChanges.lightEdits === "object") {
+    if ("lightEdits" in flagChanges || "-=lightEdits" in flagChanges) {
       this._loadLightEdits(scene);
       this.applyVirtualLightChangesLocal();
     }
 
-    if (flagChanges.soundEdits && typeof flagChanges.soundEdits === "object") {
+    if ("soundEdits" in flagChanges || "-=soundEdits" in flagChanges) {
       this._loadSoundEdits(scene);
       this.applyVirtualSoundChangesLocal();
     }
 
-    if (flagChanges.tileEdits && typeof flagChanges.tileEdits === "object") {
+    if ("tileEdits" in flagChanges || "-=tileEdits" in flagChanges) {
       this._loadTileEdits(scene);
       this.applyVirtualTileChangesLocal();
     }
 
-    if (flagChanges.doorStates && typeof flagChanges.doorStates === "object") {
-      for (const [dKey, rawVal] of Object.entries(flagChanges.doorStates)) {
+    if ("-=doorStates" in flagChanges || flagChanges.doorStates === null) {
+      const prevKeys = Array.from(this.doorStates.keys());
+      // Keep this.doorStates intact while reverting so _applyDoorStateLocal sees curDs !== defaultDs
+      for (const dKey of prevKeys) {
         const info = this._resolveDoorByKey(dKey);
-        if (info) this._applyDoorStateLocal(info, rawVal, { playSound: false });
+        if (info) this._applyDoorStateLocal(info, info.defaultDs, { playSound: false });
+      }
+      this.doorStates.clear();
+      this.openDoors.clear();
+      this._restoreDoorStates(scene);
+    } else if (flagChanges.doorStates && typeof flagChanges.doorStates === "object") {
+      for (const [rawKey, rawVal] of Object.entries(flagChanges.doorStates)) {
+        if (rawKey.startsWith("-=") || rawVal === null) {
+          const dKey = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
+          const info = this._resolveDoorByKey(dKey);
+          if (info) {
+            this._applyDoorStateLocal(info, info.defaultDs, { playSound: false });
+          }
+          this.doorStates.delete(dKey);
+          this.openDoors.delete(dKey);
+        } else {
+          const info = this._resolveDoorByKey(rawKey);
+          if (info) {
+            this._applyDoorStateLocal(info, rawVal, { playSound: false });
+          } else {
+            this.doorStates.set(rawKey, this._normalizeDoorState(rawVal, 0));
+          }
+        }
       }
     }
 
@@ -5298,21 +5849,21 @@ class MegaWorld1000 {
 
     if ("chunkedFog" in flagChanges) {
       this.fogManager.mount(scene);
-    } else if (flagChanges.sharedFog && typeof flagChanges.sharedFog === "object") {
-      this.fogManager.onSceneFogFlagsChanged(scene, flagChanges.sharedFog);
+    } else {
+      if ("sharedFog" in flagChanges || "-=sharedFog" in flagChanges) {
+        this.fogManager.onSceneFogFlagsChanged(scene, flagChanges.sharedFog ?? null);
+      }
+      if (flagChanges.fogResetAt && typeof flagChanges.fogResetAt === "object") {
+        this.fogManager.onSceneFogResetChanged(scene, flagChanges.fogResetAt);
+      }
+      if (flagChanges.fogBrush && typeof flagChanges.fogBrush === "object") {
+        this.fogManager.onSceneFogBrushChanged(scene, flagChanges.fogBrush);
+      }
     }
 
     if ("virtualizeTokens" in flagChanges) {
       this.tokenStreamer.mount(scene);
       this.tokenStreamer.scheduleSync(this.getViewportWorldRect(0.28), true);
-    }
-
-    if ("macroAtmosphere" in flagChanges) {
-      this.atmosphere.mount(scene);
-    }
-
-    if ("enabled" in flagChanges || "manifestUrl" in flagChanges) {
-      this.mount(scene);
     }
   }
 
@@ -5324,14 +5875,18 @@ class MegaWorld1000 {
     return foundry.utils.deepClone(resolved || []);
   }
 
-  async addPOI(poiSpec, scene = canvas.scene) {
-    if (!scene) return null;
-    const existing = this.getEffectivePOIs(scene).map(p => {
+  _sanitizePoisForSave(pois) {
+    return (pois || []).map(p => {
       const clean = { ...p };
       delete clean._isSecondaryProvince;
       delete clean._virtualSub;
       return clean;
     });
+  }
+
+  async addPOI(poiSpec, scene = canvas.scene) {
+    if (!scene) return null;
+    const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const kind = poiSpec.kind === "detail" ? "detail" : (poiSpec.kind === "minor" ? "minor" : "major");
     const entry = {
       id: poiSpec.id || foundry.utils.randomID(),
@@ -5354,10 +5909,12 @@ class MegaWorld1000 {
 
   async updatePOI(poiId, patch, scene = canvas.scene) {
     if (!scene || !poiId || !patch) return null;
-    const existing = this.getEffectivePOIs(scene);
+    const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const idx = existing.findIndex(p => p.id === poiId);
     if (idx < 0) return null;
     const updated = { ...existing[idx], ...patch, id: poiId };
+    delete updated._isSecondaryProvince;
+    delete updated._virtualSub;
     if ("x" in patch) updated.x = Math.round(patch.x);
     if ("y" in patch) updated.y = Math.round(patch.y);
     if ("targetScale" in patch) {
@@ -5371,7 +5928,7 @@ class MegaWorld1000 {
 
   async removePOI(poiId, scene = canvas.scene) {
     if (!scene || !poiId) return false;
-    const existing = this.getEffectivePOIs(scene).filter(p => p.id !== poiId);
+    const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene)).filter(p => p.id !== poiId);
     await scene.update({ [`flags.${MODULE_ID}.pois`]: existing });
     return true;
   }
@@ -5443,13 +6000,19 @@ class MegaWorld1000 {
       if (!t.texture?.src) continue;
       const tid = tiles.length;
       const occModes = Array.from(t.occlusion?.modes || []);
+      const rot = t.rotation || 0;
+      const ax = Number.isFinite(t.texture.anchorX) ? t.texture.anchorX : 0.5;
+      const ay = Number.isFinite(t.texture.anchorY) ? t.texture.anchorY : 0.5;
       const tileSpec = {
         src: t.texture.src,
         x: t.x, y: t.y, w: t.width, h: t.height,
-        rot: t.rotation || 0,
+        anchorX: ax,
+        anchorY: ay,
+        rot,
         elevation: t.elevation,
         sort: t.sort || 0,
         alpha: t.alpha ?? 1,
+        hidden: Boolean(t.hidden),
         tint: t.texture.tint ? foundry.utils.Color.from(t.texture.tint).css : null,
         alphaThreshold: t.texture.alphaThreshold ?? 0.75,
         occlusionMode: occModes.length ? occModes : CONST.OCCLUSION_MODES.NONE,
@@ -5457,13 +6020,27 @@ class MegaWorld1000 {
         restrictsLight: Boolean(t.restrictions?.light),
         restrictsWeather: Boolean(t.restrictions?.weather)
       };
+      if (Number.isFinite(t.texture.scaleX) && t.texture.scaleX !== 1) tileSpec.scaleX = t.texture.scaleX;
+      if (Number.isFinite(t.texture.scaleY) && t.texture.scaleY !== 1) tileSpec.scaleY = t.texture.scaleY;
+      if (t.texture.fit && t.texture.fit !== "fill") tileSpec.fit = t.texture.fit;
       tiles.push(tileSpec);
       tileIdsToDelete.push(t.id);
 
-      const sx0 = Math.floor(t.x / simSectorPx);
-      const sy0 = Math.floor(t.y / simSectorPx);
-      const sx1 = Math.floor((t.x + t.width) / simSectorPx);
-      const sy1 = Math.floor((t.y + t.height) / simSectorPx);
+      // Compute rotated AABB around Foundry v14 Tile pivot (t.x, t.y) with anchor (ax, ay)
+      const rad = (rot * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const dx = (0.5 - ax) * t.width;
+      const dy = (0.5 - ay) * t.height;
+      const cx = t.x + (cos * dx - sin * dy);
+      const cy = t.y + (sin * dx + cos * dy);
+      const rx = (t.width * Math.abs(cos) + t.height * Math.abs(sin)) * 0.5;
+      const ry = (t.width * Math.abs(sin) + t.height * Math.abs(cos)) * 0.5;
+      const minX = cx - rx, maxX = cx + rx, minY = cy - ry, maxY = cy + ry;
+      const sx0 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(minX / simSectorPx)));
+      const sy0 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(minY / simSectorPx)));
+      const sx1 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(maxX / simSectorPx)));
+      const sy1 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(maxY / simSectorPx)));
       for (let sy = sy0; sy <= sy1; sy++) {
         for (let sx = sx0; sx <= sx1; sx++) {
           ensureSec(sx, sy).t.push(tid);
@@ -5479,10 +6056,15 @@ class MegaWorld1000 {
       const sec = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
       if (w.door) {
         const extra = {};
+        if (w.move !== undefined && w.move !== 20) extra.move = w.move;
+        if (w.sight !== undefined && w.sight !== 20) extra.sight = w.sight;
+        if (w.light !== undefined && w.light !== 20) extra.light = w.light;
+        if (w.sound !== undefined && w.sound !== 20) extra.sound = w.sound;
+        if (w.dir) extra.dir = w.dir;
         if (w.doorSound) extra.doorSound = w.doorSound;
-        if (w.animation?.texture) {
+        if (w.animation?.type && w.animation?.texture) {
           extra.animation = {
-            type: w.animation.type || "swing",
+            type: w.animation.type,
             texture: w.animation.texture,
             flip: Boolean(w.animation.flip),
             double: Boolean(w.animation.double),
@@ -5503,7 +6085,18 @@ class MegaWorld1000 {
           ? [x1, y1, x2, y2, w.door, w.ds || 0, extra]
           : [x1, y1, x2, y2, w.door, w.ds || 0]);
       } else {
-        sec.w.push([x1, y1, x2, y2, w.move, w.sight, w.light, w.sound, w.dir || 0]);
+        const row = [x1, y1, x2, y2, w.move, w.sight, w.light, w.sound, w.dir || 0];
+        if (w.threshold && (w.threshold.light || w.threshold.sight || w.threshold.sound)) {
+          row.push({
+            threshold: {
+              light: w.threshold.light ?? null,
+              sight: w.threshold.sight ?? null,
+              sound: w.threshold.sound ?? null,
+              attenuation: Boolean(w.threshold.attenuation)
+            }
+          });
+        }
+        sec.w.push(row);
       }
       wallIdsToDelete.push(w.id);
     }
@@ -5511,8 +6104,8 @@ class MegaWorld1000 {
     const lightIdsToDelete = [];
     for (const l of scene.lights) {
       if (l.levels?.size && !l.levels.has(levelId)) continue;
-      // Keep negative (darkness) sources as native AmbientLightDocuments since MegaLightBatch renders additive light
-      if (l.config?.negative) continue;
+      // Keep negative (darkness) and vision-providing sources as native AmbientLightDocuments
+      if (l.config?.negative || l.vision) continue;
       const sec = ensureSec(Math.floor(l.x / simSectorPx), Math.floor(l.y / simSectorPx));
       const colorCss = l.config?.color ? foundry.utils.Color.from(l.config.color).css : null;
       const extra = {};
@@ -5543,7 +6136,7 @@ class MegaWorld1000 {
       if (snd.levels?.size && !snd.levels.has(levelId)) continue;
       if (!snd.path) continue;
       const sec = ensureSec(Math.floor(snd.x / simSectorPx), Math.floor(snd.y / simSectorPx));
-      sec.s.push([
+      const row = [
         snd.x, snd.y,
         snd.radius || 20,
         snd.path,
@@ -5553,7 +6146,9 @@ class MegaWorld1000 {
         snd.darkness?.min ?? 0,
         snd.darkness?.max ?? 1,
         snd.elevation
-      ]);
+      ];
+      if (snd.hidden) row.push({ hidden: true });
+      sec.s.push(row);
       soundIdsToDelete.push(snd.id);
     }
 
@@ -5582,28 +6177,78 @@ class MegaWorld1000 {
    * Bake native Foundry TileDocuments, WallDocuments, and AmbientLightDocuments on a Level
    * into an inline Boundless spatial sector manifest on `level.flags["boundless"]`.
    */
-  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null } = {}) {
-    const scene = canvas.scene;
-    const level = scene?.levels?.get(levelId);
-    if (!scene || !level) throw new Error(`Level "${levelId}" not found.`);
+  async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null, scene = canvas.scene } = {}) {
+    const targetScene = scene || canvas.scene;
+    const level = targetScene?.levels?.get(levelId);
+    if (!targetScene || !level) throw new Error(`Level "${levelId}" not found.`);
 
     const {
       worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors,
       tileIdsToDelete, wallIdsToDelete, lightIdsToDelete, soundIdsToDelete
-    } = this.collectLevelSpatialData(scene, level, { simGrid });
+    } = this.collectLevelSpatialData(targetScene, level, { simGrid });
 
     const inlineManifest = { worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors };
     const existingCfg = foundry.utils.deepClone(level.flags?.[MODULE_ID] || {});
     await level.update({ [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true, inlineManifest } });
 
-    if (removeOriginals) {
-      if (tileIdsToDelete.length) await scene.deleteEmbeddedDocuments("Tile", tileIdsToDelete);
-      if (wallIdsToDelete.length) await scene.deleteEmbeddedDocuments("Wall", wallIdsToDelete);
-      if (lightIdsToDelete.length) await scene.deleteEmbeddedDocuments("AmbientLight", lightIdsToDelete);
-      if (soundIdsToDelete.length) await scene.deleteEmbeddedDocuments("AmbientSound", soundIdsToDelete);
+    // Clear stale index-keyed edits & doorStates for this re-baked level on targetScene
+    const prevSceneFlags = targetScene.flags?.[MODULE_ID] || {};
+    const stalePatch = {};
+    for (const mapKey of ["wallEdits", "lightEdits", "soundEdits", "tileEdits"]) {
+      if (prevSceneFlags[mapKey] && typeof prevSceneFlags[mapKey] === "object" && (levelId in prevSceneFlags[mapKey])) {
+        stalePatch[`flags.${MODULE_ID}.${mapKey}.-=${levelId}`] = null;
+      }
+    }
+    if (prevSceneFlags.doorStates && typeof prevSceneFlags.doorStates === "object") {
+      const prefix = `${levelId}:`;
+      for (const dKey of Object.keys(prevSceneFlags.doorStates)) {
+        if (dKey.startsWith(prefix)) stalePatch[`flags.${MODULE_ID}.doorStates.-=${dKey}`] = null;
+      }
+    }
+    if (Object.keys(stalePatch).length) {
+      await targetScene.update(stalePatch);
     }
 
-    await this.mount(scene);
+    if (removeOriginals) {
+      const hasMultipleLevels = (targetScene.levels?.size || 0) > 1;
+      const otherLevelIds = hasMultipleLevels
+        ? Array.from(targetScene.levels || []).map(l => l.id).filter(lid => lid !== levelId)
+        : [];
+      const pruneOrDelete = async (docName, rawIds) => {
+        const ids = Array.from(new Set(rawIds));
+        if (!ids.length) return;
+        if (!hasMultipleLevels) {
+          await targetScene.deleteEmbeddedDocuments(docName, ids);
+          return;
+        }
+        const collection = targetScene.getEmbeddedCollection?.(docName);
+        const toDelete = [];
+        const toUpdate = [];
+        for (const id of ids) {
+          const doc = collection?.get?.(id);
+          if (!doc) continue;
+          const docLevels = doc.levels ? Array.from(doc.levels) : [];
+          if (!docLevels.length) {
+            if (otherLevelIds.length === 0) toDelete.push(id);
+            else toUpdate.push({ _id: id, levels: otherLevelIds });
+            continue;
+          }
+          const remaining = docLevels.filter(lid => lid !== levelId);
+          if (remaining.length === 0) toDelete.push(id);
+          else if (remaining.length < docLevels.length) toUpdate.push({ _id: id, levels: remaining });
+        }
+        if (toUpdate.length) await targetScene.updateEmbeddedDocuments(docName, toUpdate);
+        if (toDelete.length) await targetScene.deleteEmbeddedDocuments(docName, toDelete);
+      };
+      await pruneOrDelete("Tile", tileIdsToDelete);
+      await pruneOrDelete("Wall", wallIdsToDelete);
+      await pruneOrDelete("AmbientLight", lightIdsToDelete);
+      await pruneOrDelete("AmbientSound", soundIdsToDelete);
+    }
+
+    if (canvas.scene?.id === targetScene.id) {
+      await this.mount(targetScene);
+    }
     return {
       levelId,
       tiles: tiles.length,
@@ -5611,6 +6256,34 @@ class MegaWorld1000 {
       lights: lightIdsToDelete.length,
       sounds: soundIdsToDelete.length
     };
+  }
+
+  _isPointInsideVirtualTile(px, py, tSpec, pad = 0) {
+    const w = tSpec?.w || 0;
+    const h = tSpec?.h || 0;
+    if (w <= 0 || h <= 0) return false;
+    // Anchor pivot matches syncVirtualTiles(): if anchorX is omitted, x/y is top-left and pivot is (x + w/2, y + h/2)
+    const ax = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+    const ay = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+    const pivX = tSpec.anchorX === undefined ? (tSpec.x + w * 0.5) : tSpec.x;
+    const pivY = tSpec.anchorY === undefined ? (tSpec.y + h * 0.5) : tSpec.y;
+    const dx = px - pivX;
+    const dy = py - pivY;
+    const rot = tSpec.rot || 0;
+    let lx = dx;
+    let ly = dy;
+    if (rot) {
+      const rad = (-rot * Math.PI) / 180;
+      const c = Math.cos(rad);
+      const s = Math.sin(rad);
+      lx = dx * c - dy * s;
+      ly = dx * s + dy * c;
+    }
+    const minLx = -ax * w - pad;
+    const maxLx = (1 - ax) * w + pad;
+    const minLy = -ay * h - pad;
+    const maxLy = (1 - ay) * h + pad;
+    return lx >= minLx && lx <= maxLx && ly >= minLy && ly <= maxLy;
   }
 
   /**
@@ -5621,13 +6294,13 @@ class MegaWorld1000 {
     const layer = this.levelLayers.get(lid);
     if (!layer?.spec) return false;
     const { simGrid, simSectorPx, spec, level } = layer;
-    const topElev = level.elevation?.top ?? 20;
+    const topElev = getLevelRoofElevation(level);
     const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
     const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
 
     // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
     if (tokElev < topElev && spec.overlays && spec.sectors) {
-      const viewedBottom = canvas.level?.elevation?.bottom ?? 0;
+      const viewedBottom = getLevelBottomElevation(canvas.level);
       const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
       if (!hideRoofsForUpperView) {
         for (let dy = -1; dy <= 1; dy++) {
@@ -5647,14 +6320,32 @@ class MegaWorld1000 {
       }
     }
 
-    // 2. Check zoomed-out virtual tiles with minZ > current targetZ that sit above this point
-    const sec = spec.sectors?.[`${sx}_${sy}`];
-    if (sec?.t?.length && spec.tiles?.length) {
-      for (const tid of sec.t) {
+    // 2. Check zoomed-out virtual tiles with minZ > current targetZ that sit above this point (including sectorless inline lists & dragged tileEdits)
+    if (spec.tiles?.length) {
+      const candidateTids = new Set();
+      if (spec.sectors) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const tList = spec.sectors[`${sx + dx}_${sy + dy}`]?.t;
+            if (tList?.length) for (const tid of tList) candidateTids.add(tid);
+          }
+        }
+        const lvlEdits = this.tileEdits.get(lid);
+        if (lvlEdits?.size) {
+          for (const [tKey, ov] of lvlEdits) {
+            if (!ov || !tKey.startsWith("t:")) continue;
+            const tid = Number(tKey.slice(2));
+            if (Number.isInteger(tid) && spec.tiles[tid]) candidateTids.add(tid);
+          }
+        }
+      } else {
+        for (let tid = 0; tid < spec.tiles.length; tid++) candidateTids.add(tid);
+      }
+      for (const tid of candidateTids) {
         const tSpec = this.resolveVirtualTile(lid, tid, spec.tiles[tid], level);
-        if (!tSpec || (tSpec.elevation ?? 0) <= tokElev) continue;
+        if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
         if (tSpec.minZ !== undefined && layer.lastTargetZ < tSpec.minZ) {
-          if (tx >= tSpec.x && tx <= tSpec.x + tSpec.w && ty >= tSpec.y && ty <= tSpec.y + tSpec.h) {
+          if (this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
             return true;
           }
         }
@@ -5686,7 +6377,7 @@ class MegaWorld1000 {
       if (!layer?.spec) continue;
       const curLid = layer.level?.id;
       const { simGrid, simSectorPx, spec, level } = layer;
-      const topElev = Number.isFinite(Number(level?.elevation?.top)) ? Number(level.elevation.top) : 20;
+      const topElev = getLevelRoofElevation(level);
       const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(x / simSectorPx)));
       const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(y / simSectorPx)));
 
@@ -5737,60 +6428,66 @@ class MegaWorld1000 {
         }
       }
 
-      // 2) Virtual tiles (`spec.tiles` indexed per sector `sectors[sk].t`)
-      if (spec.tiles?.length && spec.sectors) {
-        const seenTiles = new Set();
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const tList = spec.sectors[`${sx + dx}_${sy + dy}`]?.t;
-            if (!tList?.length) continue;
-            for (const tid of tList) {
-              if (seenTiles.has(tid)) continue;
-              seenTiles.add(tid);
-              const tSpec = this.resolveVirtualTile(curLid, tid, spec.tiles[tid], level);
-              if (!tSpec || tSpec.hidden) continue;
-              if (tSpec.surfaceMode === "ignore" || tSpec.walkable === false) continue;
-              const alpha = Number(tSpec.alpha ?? 1);
-              if (tSpec.surfaceMode !== "solid" && alpha < 0.35) continue;
+      // 2) Virtual tiles (`spec.tiles` indexed per sector `sectors[sk].t`, sectorless lists, and dragged `tileEdits`)
+      if (spec.tiles?.length) {
+        const candidateTids = new Set();
+        if (spec.sectors) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const tList = spec.sectors[`${sx + dx}_${sy + dy}`]?.t;
+              if (tList?.length) for (const tid of tList) candidateTids.add(tid);
+            }
+          }
+          const lvlEdits = this.tileEdits.get(curLid);
+          if (lvlEdits?.size) {
+            for (const [tKey, ov] of lvlEdits) {
+              if (!ov || !tKey.startsWith("t:")) continue;
+              const tid = Number(tKey.slice(2));
+              if (Number.isInteger(tid) && spec.tiles[tid]) candidateTids.add(tid);
+            }
+          }
+        } else {
+          for (let tid = 0; tid < spec.tiles.length; tid++) candidateTids.add(tid);
+        }
+        for (const tid of candidateTids) {
+          const tSpec = this.resolveVirtualTile(curLid, tid, spec.tiles[tid], level);
+          if (!tSpec || tSpec.hidden) continue;
+          if (tSpec.surfaceMode === "ignore" || tSpec.walkable === false) continue;
+          const alpha = Number(tSpec.alpha ?? 1);
+          if (tSpec.surfaceMode !== "solid" && alpha < 0.35) continue;
 
-              const tElev = Number.isFinite(Number(tSpec.elevation)) ? Number(tSpec.elevation) : (Number(level?.elevation?.bottom) || 0);
-              if (tElev > elev + 0.05 || tElev <= bestElev + 0.001) continue;
+          const tElev = Number.isFinite(Number(tSpec.elevation)) ? Number(tSpec.elevation) : getLevelBaseElevation(level);
+          if (tElev > elev + 0.05 || tElev <= bestElev + 0.001) continue;
 
-              const minX = tSpec.x - radius;
-              const maxX = tSpec.x + (tSpec.w || 0) + radius;
-              const minY = tSpec.y - radius;
-              const maxY = tSpec.y + (tSpec.h || 0) + radius;
-              if (x < minX || x > maxX || y < minY || y > maxY) continue;
+          if (!this._isPointInsideVirtualTile(x, y, tSpec, radius)) continue;
 
-              const fullId = `${curLid}::${tid}`;
-              const mountedMesh = this.activeVirtualTiles.get(fullId)?.mesh;
-              let supported = false;
-              if (mountedMesh && !mountedMesh.destroyed && mountedMesh.visible !== false) {
-                const alphaThr = tSpec.surfaceMode === "solid" ? 0.05 : Math.min(0.85, 0.25 / Math.max(0.35, alpha));
-                let hitWeight = 0;
-                for (let k = 0; k < SUPPORT_SOLE_KERNEL.length; k++) {
-                  const [kx, ky, w] = SUPPORT_SOLE_KERNEL[k];
-                  if (meshContainsPointPixelSafe(mountedMesh, x + kx * radius, y + ky * radius, alphaThr)) {
-                    hitWeight += w;
-                    if (hitWeight >= 5) break;
-                  }
-                }
-                supported = hitWeight >= 5;
-              } else {
-                supported = (x >= tSpec.x && x <= tSpec.x + (tSpec.w || 0) && y >= tSpec.y && y <= tSpec.y + (tSpec.h || 0));
-              }
-
-              if (supported) {
-                bestElev = tElev;
-                best = {
-                  elevation: tElev,
-                  level: level || null,
-                  sourceType: "tile",
-                  sourceId: fullId,
-                  isLargePlatform: true
-                };
+          const fullId = `${curLid}::${tid}`;
+          const mountedMesh = this.activeVirtualTiles.get(fullId)?.mesh;
+          let supported = false;
+          if (mountedMesh && !mountedMesh.destroyed && mountedMesh.visible !== false) {
+            const alphaThr = tSpec.surfaceMode === "solid" ? 0.05 : Math.min(0.85, 0.25 / Math.max(0.35, alpha));
+            let hitWeight = 0;
+            for (let k = 0; k < SUPPORT_SOLE_KERNEL.length; k++) {
+              const [kx, ky, w] = SUPPORT_SOLE_KERNEL[k];
+              if (meshContainsPointPixelSafe(mountedMesh, x + kx * radius, y + ky * radius, alphaThr)) {
+                hitWeight += w;
+                if (hitWeight >= 5) break;
               }
             }
+            supported = hitWeight >= 5;
+          } else {
+            supported = this._isPointInsideVirtualTile(x, y, tSpec, 0);
+          }
+
+          if (supported) {
+            bestElev = tElev;
+            best = {
+              elevation: tElev,
+              level: level || null,
+              sourceType: "tile",
+              sourceId: fullId,
+              isLargePlatform: true
+            };
           }
         }
       }
@@ -5865,18 +6562,23 @@ class MegaWorld1000 {
     // Queue non-blocking time-sliced GPU light baking for this chunk (<= 6ms/frame)
     this.lightBatch.queueChunkBake(layer, chunkKey, chunkData);
 
-    // Bake pixel-accurate roof mask for chunked worlds (once with repeat=true for superGrid, or over active chunk overlays)
-    if (chunkData?.overlays) {
+    // Reconcile persisted door states that belong to sectors in this newly loaded chunk
+    this._reconcileChunkDoorStates(layer, chunkData);
+
+    // Bake pixel-accurate roof mask for chunked worlds (repeat=true only when chunk spans full superGrid region)
+    if (chunkData?.overlays && !layer.spec?.roofMaskUrl) {
       const isSuperGrid = Boolean(layer.spec?.superGrid);
-      if (isSuperGrid) {
+      const regionPx = layer.spec?.superGrid?.regionPx || 100000;
+      const b = chunkData.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
+      const isFullSuperGridProvince = isSuperGrid && (b.w === regionPx && b.h === regionPx);
+      if (isFullSuperGridProvince) {
         if (!this.lightBatch.bakedRoofMask && !this._roofMaskBaking) {
           const ovList = Array.isArray(chunkData.overlays) ? chunkData.overlays : Object.values(chunkData.overlays);
-          const b = chunkData.bounds || { x: 0, y: 0, w: layer.spec.superGrid.regionPx || 100000, h: layer.spec.superGrid.regionPx || 100000 };
           this._bakeRoofMaskFromList(ovList, {
             originX: b.x || 0,
             originY: b.y || 0,
-            regionW: b.w || 100000,
-            regionH: b.h || 100000,
+            regionW: b.w || regionPx,
+            regionH: b.h || regionPx,
             repeat: true
           });
         }
@@ -5885,7 +6587,7 @@ class MegaWorld1000 {
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (const ov of allOvs) {
           if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
-          const r = Math.max(ov.w || 0, ov.h || 0) * 0.6;
+          const r = Math.hypot(ov.w || 0, ov.h || 0) * 0.5;
           if (ov.cx - r < minX) minX = ov.cx - r;
           if (ov.cy - r < minY) minY = ov.cy - r;
           if (ov.cx + r > maxX) maxX = ov.cx + r;
@@ -5903,26 +6605,43 @@ class MegaWorld1000 {
       }
     }
 
-    // Invalidate spatial caches so roofs, walls, doors, audio, and sim-bubbles pick up newly loaded sectors immediately
+    // Invalidate spatial caches so roofs, walls, doors, audio, editors, and sim-bubbles pick up newly loaded sectors immediately
     layer.lastOverlayKey = "";
     layer.lastTileKey = "";
-    this.lastSimKey = "";
-    this.lastDynLightKey = "";
+    this.lastSimKey = null;
+    this.lastDynLightKey = null;
+    this.audioStreamer.lastKey = "";
     this._roofTokenOccDirty = true;
     this.updatePyramid();
-    this.updateSimAndLightBubbles(false);
+    this.updateSimAndLightBubbles(true);
     this.wallEditor.syncViewport(true);
+    this.layerEditors.syncViewport(true);
   }
 
-  onChunkUnloaded(layer, chunkKey) {
+  onChunkUnloaded(layer, chunkKey, { deferRefresh = false } = {}) {
     if (!layer) return;
     this.lightBatch.detachChunk(layer.level.id, chunkKey);
+    // Drop openDoors entries whose sectors were unloaded with this chunk
+    const lid = layer.level.id;
+    const sectors = layer.spec?.sectors;
+    for (const [dKey, door] of this.openDoors) {
+      if (door.levelId === lid && !sectors?.[`${door.sx}_${door.sy}`]) {
+        this.openDoors.delete(dKey);
+      }
+    }
     layer.lastOverlayKey = "";
     layer.lastTileKey = "";
-    this.lastSimKey = "";
-    this.lastDynLightKey = "";
+    this.lastSimKey = null;
+    this.lastDynLightKey = null;
+    this.audioStreamer.lastKey = "";
+    this._roofTokenOccDirty = true;
     if (this.active) {
-      this.updatePyramid();
+      this.updateSimAndLightBubbles(true);
+      this.wallEditor.syncViewport(true);
+      this.layerEditors.syncViewport(true);
+      if (!deferRefresh && !this._inUpdatePyramid) {
+        this.updatePyramid();
+      }
     }
   }
 
@@ -5973,7 +6692,6 @@ class MegaWorld1000 {
             manifestUrl,
             showPois: true,
             chunkedFog: true,
-            macroAtmosphere: true,
             virtualizeTokens: true
           }
         }
@@ -6104,6 +6822,10 @@ class MegaWorld1000 {
   unmount() {
     if (this.active) this._saveCameraNow();
     this.active = false;
+    this._mounting = false;
+    this._mountGen++;
+    this._prewarmGen++;
+    this.manifest = null;
     if (this._camSaveTimer !== null) {
       clearTimeout(this._camSaveTimer);
       this._camSaveTimer = null;
@@ -6119,7 +6841,6 @@ class MegaWorld1000 {
     this.poiManager.unmount();
     this.charPins.unmount();
     this.fogManager.unmount();
-    this.atmosphere.unmount();
     // Unmount in reverse patch order so scene.updateEmbeddedDocuments / deleteEmbeddedDocuments restore cleanly
     this.layerEditors.unmount();
     this.wallEditor.unmount();
@@ -6158,9 +6879,15 @@ class MegaWorld1000 {
       this._origIfVoidEnabled = null;
     }
 
-    if (this._origDepthAutoRender !== null && canvas?.masks?.depth) {
-      canvas.masks.depth.autoRender = this._origDepthAutoRender;
-      canvas.masks.depth.renderDirty = true;
+    if (canvas?.effects?.darkness) canvas.effects.darkness.visible = true;
+    if (canvas?.effects?.background?.lighting) canvas.effects.background.lighting.visible = true;
+    if (canvas?.effects?.coloration) canvas.effects.coloration.visible = true;
+
+    if (this._origDepthAutoRender !== null) {
+      if (canvas?.masks?.depth) {
+        canvas.masks.depth.autoRender = this._origDepthAutoRender;
+        canvas.masks.depth.renderDirty = true;
+      }
       this._origDepthAutoRender = null;
     }
 
@@ -6171,6 +6898,7 @@ class MegaWorld1000 {
 
     this.pendingTileMounts = [];
     this.pendingOverlayMounts = [];
+    this._pendingOverlayKeys.clear();
     this._roofTokenOccDirty = false;
     this._waitingForRoofsBeforeIndoor = false;
     this._roofMaskBaking = false;
@@ -6195,11 +6923,17 @@ class MegaWorld1000 {
     this.lightBatch.hideIndoorLights = false;
     this._updatingBubbles = false;
 
+    const destroyMeshSafe = (m) => {
+      if (!m) return;
+      m.debounceSetOcclusion?.cancel?.();
+      try { m._ssDofBlurFilter?.destroy?.(); } catch {}
+      m._ssDofBlurFilter = null;
+      m.parent?.removeChild(m);
+      if (!m.destroyed) m.destroy();
+    };
+
     for (const [, e] of this.tilesByKey) {
-      if (e.mesh) {
-        e.mesh.parent?.removeChild(e.mesh);
-        e.mesh.destroy();
-      }
+      destroyMeshSafe(e.mesh);
     }
     this.tilesByKey.clear();
 
@@ -6207,6 +6941,7 @@ class MegaWorld1000 {
       if (tok && !tok.destroyed) {
         tok.renderable = true;
         if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = true;
+        if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
       }
     }
     this._roofHiddenTokens.clear();
@@ -6214,19 +6949,19 @@ class MegaWorld1000 {
     this._revealTileKeys.clear();
 
     for (const [, ov] of this.activeOverlays) {
-      if (ov.wallsMesh) { ov.wallsMesh.parent?.removeChild(ov.wallsMesh); ov.wallsMesh.destroy(); }
-      if (ov.roofMesh) { ov.roofMesh.parent?.removeChild(ov.roofMesh); ov.roofMesh.destroy(); }
+      destroyMeshSafe(ov.wallsMesh);
+      destroyMeshSafe(ov.roofMesh);
     }
     this.activeOverlays.clear();
     this.overlayPending.clear();
 
     for (const [, vt] of this.activeVirtualTiles) {
-      if (vt.mesh) { vt.mesh.parent?.removeChild(vt.mesh); vt.mesh.destroy(); }
+      destroyMeshSafe(vt.mesh);
     }
     this.activeVirtualTiles.clear();
     this.virtualTilePending.clear();
 
-    for (const m of this.meshPool) m.destroy();
+    for (const m of this.meshPool) destroyMeshSafe(m);
     this.meshPool = [];
 
     this.levelLayers.clear();
@@ -6250,6 +6985,7 @@ registerLayerEditorControls(controller);
 
 Hooks.once("init", () => {
   installLazyTokenLayerPatch();
+  installCharacterSwitchPatch(controller);
 });
 
 Hooks.once("ready", async () => {
@@ -6267,8 +7003,18 @@ Hooks.on("updateScene", (scene, changes) => {
   controller.onSceneUpdate(scene, changes);
 });
 
+Hooks.on("updateLevel", (level, changes) => {
+  const parentScene = level?.parent;
+  if (!parentScene || parentScene.id !== canvas.scene?.id) return;
+  const flagChanges = changes?.flags?.[MODULE_ID];
+  const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
+  if (flagChanges || flagDeleted) {
+    controller.mount(parentScene);
+  }
+});
+
 Hooks.on("canvasPan", () => {
-  if (!controller.active) return;
+  if (!controller.active || controller._restoringCamera || controller._mounting) return;
   controller.scheduleCameraSave();
   controller.updatePyramid();
 });
@@ -6309,7 +7055,7 @@ Hooks.on("sightRefresh", () => {
 });
 
 Hooks.on("updateToken", (doc, changes) => {
-  if (!controller.active) return;
+  if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenUpdated(doc, changes);
   controller.charPins.onTokenUpdated(doc, changes);
   const posChanged = "x" in changes || "y" in changes || "level" in changes;
@@ -6326,12 +7072,19 @@ Hooks.on("updateToken", (doc, changes) => {
 });
 
 Hooks.on("drawToken", (tok) => {
-  if (!controller.active) return;
+  if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenDrawn(tok);
 });
 
+Hooks.on("refreshToken", (tok, flags) => {
+  if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
+  if (flags?.refreshPosition || flags?.refreshElevation) {
+    controller._roofTokenOccDirty = true;
+  }
+});
+
 Hooks.on("createToken", (doc) => {
-  if (!controller.active) return;
+  if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenCreated(doc);
   controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
@@ -6341,7 +7094,7 @@ Hooks.on("createToken", (doc) => {
 });
 
 Hooks.on("deleteToken", (doc) => {
-  if (!controller.active) return;
+  if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenDeleted(doc);
   controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
@@ -6366,7 +7119,9 @@ Hooks.on("updateActor", (_actor, changes) => {
 Hooks.on("collapseSidebar", () => {
   if (!controller.active) return;
   controller.charPins._lastSidebarCheckMs = 0;
-  setTimeout(() => controller.charPins.updateViewport(), 120);
+  setTimeout(() => {
+    if (controller.active) controller.charPins.updateViewport();
+  }, 120);
 });
 
 window.addEventListener("resize", () => {
@@ -6379,8 +7134,8 @@ window.addEventListener("resize", () => {
 
 // React seamlessly to native TileDocuments added/edited/removed on any level (floors blocking lower-level lights, roofs, etc.)
 for (const hookName of ["createTile", "updateTile", "deleteTile"]) {
-  Hooks.on(hookName, () => {
-    if (!controller.active) return;
+  Hooks.on(hookName, (doc) => {
+    if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
     controller._depthDirty = true;
     controller._depthElevSyncNeeded = true;
     controller._occlusionDirty = true;
@@ -6389,8 +7144,8 @@ for (const hookName of ["createTile", "updateTile", "deleteTile"]) {
 
 // React to native WallDocuments added/edited/removed on any level so GPU light shadows stay in sync
 for (const hookName of ["createWall", "updateWall", "deleteWall"]) {
-  Hooks.on(hookName, () => {
-    if (!controller.active || !controller.visibleLevelLayers.length) return;
+  Hooks.on(hookName, (doc) => {
+    if (!controller.active || !controller.visibleLevelLayers.length || doc?.parent?.id !== canvas.scene?.id) return;
     controller.scheduleLightBatchRebuild();
   });
 }
@@ -6402,12 +7157,21 @@ Hooks.on("highlightObjects", () => {
 });
 
 for (const hookName of ["createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior"]) {
-  Hooks.on(hookName, () => {
+  Hooks.on(hookName, (doc) => {
     if (!controller.active) return;
+    const sc = doc?.parent?.documentName === "Scene" ? doc.parent : doc?.parent?.parent;
+    if (sc && sc.id !== canvas.scene?.id) return;
     controller._depthDirty = true;
     controller._occlusionDirty = true;
   });
 }
+
+Hooks.on("initializeEdges", (scene) => {
+  if (!controller.active || (scene && scene.id !== canvas.scene?.id)) return;
+  controller.simSectors.clear();
+  controller.lastSimKey = "";
+  controller.updateSimAndLightBubbles(true);
+});
 
 Hooks.on("canvasTearDown", () => {
   controller.unmount();

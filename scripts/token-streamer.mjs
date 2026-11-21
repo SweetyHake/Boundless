@@ -52,14 +52,15 @@ function isAlwaysMountedTokenDoc(doc) {
   if (doc.actorLink) return true;
   const base = doc.baseActor;
   if (base?.hasPlayerOwner || base?.type === "character") return true;
+  if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && base?.testUserPermission?.(game.user, "OBSERVER")) return true;
   if (doc.flags?.[MODULE_ID]?.pinned) return true;
   if (doc.combatant) return true;
   if (game.combat?.combatants?.some?.(c => c.tokenId === doc.id && c.sceneId === doc.parent?.id)) return true;
-  const light = doc._source?.light ?? doc.light;
+  const light = doc.light ?? doc._source?.light;
   if ((Number(light?.dim) || 0) > 0 || (Number(light?.bright) || 0) > 0) return true;
   const obj = doc._object;
   if (obj && !obj.destroyed) {
-    if (obj.controlled || obj._animation || obj.movementAnimationPromise) return true;
+    if (obj.controlled || obj.hasPreview || obj.hasActiveHUD || obj.movementAnimationPromise || (obj.animationContexts?.size > 0)) return true;
     if (obj.targeted?.size > 0) return true;
   }
   return false;
@@ -69,10 +70,22 @@ function isLazyTokenLayerActiveForScene(scene) {
   if (!scene) return false;
   const cfg = scene.flags?.[MODULE_ID] || {};
   if (cfg.virtualizeTokens === false) return false;
+  const visibleLevels = (scene.levels?.sorted || []).filter(l => l?.isVisible);
+  if (!visibleLevels.length && canvas?.level && canvas.scene?.id === scene.id) {
+    visibleLevels.push(canvas.level);
+  }
+  if (visibleLevels.length > 0) {
+    const anyLevelEnabled = visibleLevels.some(l => l.flags?.[MODULE_ID]?.enabled === true);
+    const sceneEnabledForVisible = Boolean(cfg.enabled) && visibleLevels.some(l => l.flags?.[MODULE_ID]?.enabled !== false);
+    return anyLevelEnabled || sceneEnabledForVisible;
+  }
   return Boolean(cfg.enabled || scene.levels?.some?.(l => l.flags?.[MODULE_ID]?.enabled));
 }
 
 let lazyPatchInstalled = false;
+let lazyFilteredViewKey = null;
+const coreDrawingCounts = new WeakMap();
+const coreDrawPromises = new WeakMap();
 
 /**
  * Patch `TokenLayer.prototype.viewedDocuments` ONCE at init so initial `TokenLayer#_draw()`
@@ -92,12 +105,33 @@ export function installLazyTokenLayerPatch() {
       yield* origViewed.call(this);
       return;
     }
+    const viewKey = `${scene.id}::${scene._view ?? canvas?.level?.id ?? ""}`;
     for (const doc of origViewed.call(this)) {
       if (isAlwaysMountedTokenDoc(doc)) {
         yield doc;
+      } else {
+        lazyFilteredViewKey = viewKey;
       }
     }
   };
+  const TokenCls = foundry.canvas?.placeables?.Token ?? CONFIG.Token?.objectClass;
+  if (TokenCls?.prototype?.draw) {
+    const origDraw = TokenCls.prototype.draw;
+    TokenCls.prototype.draw = function (...args) {
+      coreDrawingCounts.set(this, (coreDrawingCounts.get(this) || 0) + 1);
+      const p = Promise.resolve(origDraw.apply(this, args)).finally(() => {
+        const rem = (coreDrawingCounts.get(this) || 1) - 1;
+        if (rem <= 0) {
+          coreDrawingCounts.delete(this);
+          if (coreDrawPromises.get(this) === p) coreDrawPromises.delete(this);
+        } else {
+          coreDrawingCounts.set(this, rem);
+        }
+      });
+      coreDrawPromises.set(this, p);
+      return p;
+    };
+  }
   lazyPatchInstalled = true;
 }
 
@@ -138,6 +172,7 @@ export class TokenStreamer {
     this._activeFades = new Map();
 
     this._rafId = null;
+    this._materializeRafId = null;
     this._pumping = false;
     this._evictTimer = null;
     this._gen = 0;
@@ -146,6 +181,13 @@ export class TokenStreamer {
     this._lastStreamKey = "";
     this._nativeTokensActive = false;
     this._flightPrewarmTarget = null;
+  }
+
+  isTokenDrawing(tok) {
+    if (!tok) return false;
+    if ((coreDrawingCounts.get(tok) || 0) > 0) return true;
+    const docId = tok.document?.id;
+    return Boolean(docId && this._drawingIds.has(docId));
   }
 
   _indexDoc(doc) {
@@ -201,6 +243,7 @@ export class TokenStreamer {
     this.enabled = true;
     this.sceneId = scene.id;
     this._gen++;
+    lazyFilteredViewKey = null;
     const curScale = canvas?.stage?.scale?.x ?? 1;
     this._nativeTokensActive = curScale >= MOUNT_ENTER_SCALE;
 
@@ -213,10 +256,101 @@ export class TokenStreamer {
     this.impostors.mount(scene);
   }
 
+  _cancelMaterialize() {
+    if (this._materializeRafId !== null) {
+      if (typeof cancelAnimationFrame === "function") {
+        try { cancelAnimationFrame(this._materializeRafId); } catch {}
+      } else {
+        clearTimeout(this._materializeRafId);
+      }
+      this._materializeRafId = null;
+    }
+  }
+
+  _materializeMissingPlaceables(scene, gen, { allowWhenFlagsEnabled = false } = {}) {
+    this._cancelMaterialize();
+    if (!scene?.tokens || !canvas?.tokens?.objects) return;
+    const queue = [];
+    for (const doc of scene.tokens) {
+      if (!doc || !doc.viewed) continue;
+      const existing = doc._object;
+      if (existing && !existing.destroyed && existing.parent === canvas.tokens.objects) continue;
+      queue.push(doc);
+    }
+    if (!queue.length) {
+      lazyFilteredViewKey = null;
+      return;
+    }
+
+    const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn => setTimeout(fn, 16));
+    const step = async () => {
+      this._materializeRafId = null;
+      if (gen !== this._gen || this.enabled || !canvas?.ready || canvas.scene?.id !== scene.id || !canvas.tokens?.objects) return;
+      if (this.controller?._mounting) {
+        this._materializeRafId = sched(() => { step(); });
+        return;
+      }
+      if (allowWhenFlagsEnabled) {
+        if (this.controller?.active) return;
+      } else if (isLazyTokenLayerActiveForScene(canvas.scene)) {
+        return;
+      }
+      const layer = canvas.tokens;
+      const startMs = performance.now();
+      let drawn = 0;
+      let anyPerception = false;
+
+      while (queue.length > 0 && drawn < MAX_DRAWS_PER_FRAME && (performance.now() - startMs) < DRAW_FRAME_BUDGET_MS) {
+        const doc = queue.shift();
+        if (!doc || doc.parent?.id !== scene.id || !scene.tokens?.has?.(doc.id) || !doc.viewed) continue;
+        const existing = doc._object;
+        if (existing && !existing.destroyed && existing.parent === layer.objects) continue;
+        try {
+          doc._destroyed = false;
+          const obj = (doc._object && !doc._object.destroyed) ? doc._object : layer.createObject(doc);
+          doc._object = obj;
+          if (obj.parent !== layer.objects) layer.objects.addChild(obj);
+          await obj.draw();
+          if (gen !== this._gen || this.enabled || !canvas?.ready || canvas.scene?.id !== scene.id) return;
+          if (!scene.tokens?.has?.(doc.id) || obj.destroyed) {
+            if (!obj.destroyed) {
+              try {
+                layer.objects.removeChild(obj);
+                obj.destroy({ children: true });
+              } catch {}
+            }
+            continue;
+          }
+          drawn++;
+          if (doc._source?.sight?.enabled || Number(doc._source?.light?.dim || 0) > 0 || Number(doc._source?.light?.bright || 0) > 0) {
+            anyPerception = true;
+          }
+        } catch (err) {
+          console.warn(`${MODULE_ID} | Failed to restore virtualized token "${doc.name}":`, err);
+        }
+      }
+
+      if (anyPerception && canvas?.ready && canvas.scene?.id === scene.id) {
+        canvas.perception?.update?.({ initializeVision: true, initializeLighting: true, refreshVision: true, refreshLighting: true });
+      }
+
+      if (queue.length > 0 && gen === this._gen && !this.enabled && canvas?.ready && canvas.scene?.id === scene.id) {
+        this._materializeRafId = sched(() => { step(); });
+      } else if (queue.length === 0 && gen === this._gen) {
+        lazyFilteredViewKey = null;
+      }
+    };
+
+    this._materializeRafId = sched(() => { step(); });
+  }
+
   unmount() {
+    const wasEnabled = this.enabled;
+    const prevSceneId = this.sceneId;
     this.enabled = false;
     this.sceneId = null;
     this._gen++;
+    this._cancelMaterialize();
     if (this._rafId !== null && typeof cancelAnimationFrame === "function") {
       try { cancelAnimationFrame(this._rafId); } catch {}
     }
@@ -230,6 +364,28 @@ export class TokenStreamer {
       this._finishFadeImmediate(docId);
     }
     this._activeFades.clear();
+    if (wasEnabled && canvas?.tokens?.placeables) {
+      const roofHidden = this.controller?._roofHiddenTokens;
+      for (const tok of canvas.tokens.placeables) {
+        if (!tok || tok.destroyed || tok.isPreview) continue;
+        if (tok.nameplate) tok.nameplate.renderable = true;
+        if (tok.tooltip) tok.tooltip.renderable = true;
+        if (tok.bars) tok.bars.renderable = true;
+        if (tok.effects) tok.effects.renderable = true;
+        if (roofHidden?.has?.(tok)) continue;
+        tok.renderable = true;
+        if (tok.mesh && !tok.mesh.destroyed) {
+          tok.mesh.renderable = true;
+          const hiddenByShowstopper = typeof tok._ssOcclusionAlpha === "number" && Number.isFinite(tok._ssOcclusionAlpha) && tok._ssOcclusionAlpha <= 0.01;
+          if (tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) {
+            tok.mesh.visible = true;
+          }
+        }
+        if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) {
+          tok._ssJumpShadow.renderable = true;
+        }
+      }
+    }
     this.impostors.unmount();
 
     this._drawQueue = [];
@@ -245,6 +401,35 @@ export class TokenStreamer {
     this._lastStreamKey = "";
     this._nativeTokensActive = false;
     this._flightPrewarmTarget = null;
+
+    const curScene = canvas?.scene;
+    const curViewKey = curScene?.id ? `${curScene.id}::${curScene._view ?? canvas?.level?.id ?? ""}` : null;
+    if (
+      wasEnabled &&
+      prevSceneId &&
+      canvas?.ready &&
+      curScene?.id === prevSceneId &&
+      canvas.tokens?.objects
+    ) {
+      if (curViewKey) lazyFilteredViewKey = curViewKey;
+      if (!isLazyTokenLayerActiveForScene(curScene)) {
+        this._materializeMissingPlaceables(curScene, this._gen);
+      } else if (!this.controller?.active) {
+        this._materializeMissingPlaceables(curScene, this._gen, { allowWhenFlagsEnabled: true });
+      }
+    } else if (
+      !wasEnabled &&
+      curViewKey &&
+      lazyFilteredViewKey === curViewKey &&
+      canvas?.ready &&
+      canvas.tokens?.objects
+    ) {
+      if (!isLazyTokenLayerActiveForScene(curScene)) {
+        this._materializeMissingPlaceables(curScene, this._gen);
+      } else if (!this.controller?.active) {
+        this._materializeMissingPlaceables(curScene, this._gen, { allowWhenFlagsEnabled: true });
+      }
+    }
   }
 
   getStats() {
@@ -313,7 +498,8 @@ export class TokenStreamer {
    */
   prewarmTarget(worldX, worldY, targetScale) {
     if (!this.enabled || !canvas?.ready || !canvas.scene?.tokens) return;
-    if ((targetScale || 0) < MOUNT_EXIT_SCALE) return;
+    const minScale = this._nativeTokensActive ? MOUNT_EXIT_SCALE : MOUNT_ENTER_SCALE;
+    if ((targetScale || 0) < minScale) return;
 
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
     const safeScale = Math.max(MOUNT_EXIT_SCALE, targetScale || 0.45);
@@ -397,13 +583,17 @@ export class TokenStreamer {
     let anyRenderableToggled = false;
     for (let i = 0; i < placeables.length; i++) {
       const tok = placeables[i];
-      if (!tok || tok.destroyed || tok.isPreview) continue;
+      if (!tok || tok.destroyed || tok.isPreview || this.isTokenDrawing(tok)) continue;
       const doc = tok.document;
+      if (!doc) continue;
       const w = (doc?.width || 1) * grid;
       const h = (doc?.height || 1) * grid;
       const tx = doc?._source?.x ?? doc?.x ?? tok.x ?? 0;
       const ty = doc?._source?.y ?? doc?.y ?? tok.y ?? 0;
-      const onScreen = showTokens && (tx + w >= cullX0 && tx <= cullX1 && ty + h >= cullY0 && ty <= cullY1);
+      const docOnScreen = tx + w >= cullX0 && tx <= cullX1 && ty + h >= cullY0 && ty <= cullY1;
+      const isAnimating = Boolean(tok.movementAnimationPromise || (tok.animationContexts?.size > 0));
+      const animOnScreen = isAnimating && (tok.x + w >= cullX0 && tok.x <= cullX1 && tok.y + h >= cullY0 && tok.y <= cullY1);
+      const onScreen = showTokens && (docOnScreen || animOnScreen);
       const keepVisible = onScreen || tok.controlled;
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
@@ -423,7 +613,7 @@ export class TokenStreamer {
         }
         // Foundry v14 Token#_refreshVisibility sets mesh.visible = visible && renderable; restore it when returning to view,
         // unless Showstopper intentionally hid the token (e.g. flying above camera lens occlusion).
-        const hiddenByShowstopper = Number.isFinite(Number(tok._ssOcclusionAlpha)) && Number(tok._ssOcclusionAlpha) <= 0.01;
+        const hiddenByShowstopper = typeof tok._ssOcclusionAlpha === "number" && Number.isFinite(tok._ssOcclusionAlpha) && tok._ssOcclusionAlpha <= 0.01;
         if (wantRenderable && tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) {
           tok.mesh.visible = true;
         }
@@ -451,8 +641,15 @@ export class TokenStreamer {
 
     // Skip spawning/evicting transit placeables while camera is flying across the continent
     // (impostors & prewarmTarget keep both flight and landing seamless!)
-    if (this.controller?.isCameraFlying) return;
+    if (this.controller?.isCameraFlying) {
+      this._lastStreamKey = "";
+      return;
+    }
     this._flightPrewarmTarget = null;
+    if (this._drawQueue.length > 0 && !this._pumping && this._rafId === null) {
+      this._primeQueueTextures();
+      this._scheduleDrawPump();
+    }
 
     const mountX0 = curVp.x0 - MOUNT_VP_PAD_PX;
     const mountY0 = curVp.y0 - MOUNT_VP_PAD_PX;
@@ -540,9 +737,10 @@ export class TokenStreamer {
       const p = Promise.resolve(loadTexFn(src))
         .catch(() => null)
         .finally(() => {
+          if (gen !== this._gen) return;
           this._inflightTexLoads.delete(src);
           this._decodedTexSrcs.add(src);
-          if (this.enabled && gen === this._gen && this._drawQueue.length > 0) {
+          if (this.enabled && this._drawQueue.length > 0) {
             this._scheduleDrawPump();
           }
         });
@@ -591,7 +789,7 @@ export class TokenStreamer {
         const scanMax = Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length);
         for (let i = 0; i < scanMax; i++) {
           const cand = this._drawQueue[i];
-          if (isFlying && !cand?.isPrewarm) continue;
+          if (isFlying && !cand?.isPrewarm && !isAlwaysMountedTokenDoc(cand?.doc)) continue;
           if (this._isTexReady(this._getDocTexSrc(cand?.doc))) {
             pickIdx = i;
             break;
@@ -599,9 +797,10 @@ export class TokenStreamer {
         }
 
         const item = this._drawQueue[pickIdx];
-        if (isFlying && !item?.isPrewarm) {
+        if (isFlying && !item?.isPrewarm && !isAlwaysMountedTokenDoc(item?.doc)) {
           this._drawQueue.splice(pickIdx, 1);
           if (item?.doc?.id) this._queuedIds.delete(item.doc.id);
+          this._lastStreamKey = "";
           continue;
         }
 
@@ -634,8 +833,9 @@ export class TokenStreamer {
           if (dx < prewarmBox.x0 || dx > prewarmBox.x1 || dy < prewarmBox.y0 || dy > prewarmBox.y1) continue;
         } else {
           // Drop stale queue items if camera already zoomed out or panned far away
-          if (curVp && !this._nativeTokensActive && !isAlwaysMountedTokenDoc(doc)) continue;
-          if (curVp) {
+          const alwaysMounted = isAlwaysMountedTokenDoc(doc);
+          if (curVp && !this._nativeTokensActive && !alwaysMounted) continue;
+          if (curVp && !alwaysMounted) {
             const pad = MOUNT_VP_PAD_PX * 1.6;
             if (dx < curVp.x0 - pad || dx > curVp.x1 + pad || dy < curVp.y0 - pad || dy > curVp.y1 + pad) {
               continue;
@@ -647,13 +847,20 @@ export class TokenStreamer {
         if (existing && !existing.destroyed && existing.parent === layer.objects) continue;
 
         this._drawingIds.add(doc.id);
+        let abortedPump = false;
         try {
           const loadTexFn = globalThis.foundry?.canvas?.loadTexture ?? globalThis.loadTexture;
           if (texSrc && !this._isTexReady(texSrc) && typeof loadTexFn === "function") {
             await loadTexFn(texSrc);
-            this._decodedTexSrcs.add(texSrc);
+            if (gen === this._gen) this._decodedTexSrcs.add(texSrc);
           }
-          if (!this.enabled || gen !== this._gen || !canvas?.ready || doc.parent?.id !== this.sceneId) return;
+          if (!this.enabled || gen !== this._gen || !canvas?.ready) {
+            abortedPump = true;
+            break;
+          }
+          if (doc.parent?.id !== this.sceneId || !canvas.scene?.tokens?.has?.(doc.id) || !doc.viewed) {
+            continue;
+          }
 
           // Keep impostor visible beneath while native token draws & fades in
           const shouldFade = !item.isPrewarm && this.impostors.mounted;
@@ -668,17 +875,58 @@ export class TokenStreamer {
             layer.objects.addChild(obj);
           }
           await obj.draw();
-          if (!this.enabled || gen !== this._gen) return;
+          if (gen === this._gen) this._drawingIds.delete(doc.id);
+          if (!this.enabled || gen !== this._gen || !canvas?.ready) {
+            abortedPump = true;
+            break;
+          }
+          if (!canvas.scene?.tokens?.has?.(doc.id) || obj.destroyed) {
+            if (!obj.destroyed) {
+              try {
+                layer.objects.removeChild(obj);
+                obj.destroy({ children: true });
+              } catch {}
+            }
+            this.impostors.setFadeOverride(doc.id, null);
+            continue;
+          }
+
+          const latestVp = this._lastVp;
+          let offscreenAfterDraw = false;
+          if (latestVp) {
+            const gSz = canvas.grid?.size || 100;
+            const tw = (doc.width || 1) * gSz;
+            const th = (doc.height || 1) * gSz;
+            const curX = doc._source?.x ?? doc.x ?? obj.x ?? 0;
+            const curY = doc._source?.y ?? doc.y ?? obj.y ?? 0;
+            offscreenAfterDraw = (
+              curX + tw < latestVp.x0 - CULL_VP_PAD_PX ||
+              curX > latestVp.x1 + CULL_VP_PAD_PX ||
+              curY + th < latestVp.y0 - CULL_VP_PAD_PX ||
+              curY > latestVp.y1 + CULL_VP_PAD_PX
+            );
+          }
+
+          if ((!this._nativeTokensActive || offscreenAfterDraw) && !obj.controlled) {
+            obj.renderable = false;
+            if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
+            if (obj._ssJumpShadow && !obj._ssJumpShadow.destroyed) obj._ssJumpShadow.renderable = false;
+            this.impostors.setFadeOverride(doc.id, null);
+            this.impostors.upsertToken(doc);
+            this.impostors.flush();
+            drawnThisFrame++;
+            continue;
+          }
 
           this.lastSeenMs.set(doc.id, performance.now());
-          if (doc._source?.sight?.enabled && (doc.baseActor?.hasPlayerOwner || obj.controlled)) {
+          if ((doc.sight?.enabled ?? doc._source?.sight?.enabled) && (doc.baseActor?.hasPlayerOwner || obj.controlled)) {
             anyVisionDrawn = true;
           }
 
           // Start smooth 160ms over-composite crossfade via mesh.unoccludedAlpha (never touches tok.alpha or mesh.alpha!)
           if (shouldFade && obj.mesh && !obj.mesh.destroyed) {
             const hasUnoccluded = "unoccludedAlpha" in obj.mesh;
-            const targetOccluded = Number.isFinite(obj.mesh.occludedAlpha) ? obj.mesh.occludedAlpha : 0.5;
+            const targetOccluded = (Number.isFinite(obj.mesh.occludedAlpha) && obj.mesh.occludedAlpha > 0) ? obj.mesh.occludedAlpha : 0.5;
             const isTranslucent = Boolean(doc._source?.hidden || (Number(doc.alpha ?? doc._source?.alpha ?? 1) < 0.99));
             if (hasUnoccluded) {
               obj.mesh.unoccludedAlpha = 0.0;
@@ -693,9 +941,12 @@ export class TokenStreamer {
               targetOccluded,
               isTranslucent
             });
+            this.impostors.setFadeOverride(doc.id, 1.0);
+            this.impostors.flush();
           } else {
+            this.impostors.upsertToken(doc);
             this.impostors.setFadeOverride(doc.id, null);
-            this.impostors.markVisibilityDirty();
+            this.impostors.flush();
           }
 
           // Apply current LOD detail state immediately to newly drawn token
@@ -722,24 +973,35 @@ export class TokenStreamer {
           }
           drawnThisFrame++;
         } catch (err) {
-          this.impostors.setFadeOverride(doc.id, null);
+          if (gen === this._gen) this.impostors.setFadeOverride(doc.id, null);
           console.warn(`${MODULE_ID} | Lazy Token#draw() failed for ${doc.id}:`, err);
         } finally {
-          this._drawingIds.delete(doc.id);
+          if (gen === this._gen) this._drawingIds.delete(doc.id);
         }
+        if (abortedPump) break;
       }
 
-      if (drawnThisFrame > 0 && this.enabled && canvas?.ready) {
+      if (drawnThisFrame > 0 && this.enabled && gen === this._gen && canvas?.ready) {
         this.controller._roofTokenOccDirty = true;
         if (anyVisionDrawn) {
           canvas.perception?.update?.({ refreshVision: true, refreshOcclusion: true });
         }
       }
     } finally {
-      this._pumping = false;
-      const hasReadyOrPending = this._drawQueue.length > 0 && deferredWaitingTex < this._drawQueue.length;
-      if (hasReadyOrPending && this.enabled && gen === this._gen) {
-        this._scheduleDrawPump();
+      if (gen === this._gen) {
+        this._pumping = false;
+        const lookaheadLimit = Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length);
+        let hasReadyOrPending = false;
+        for (let i = 0; i < lookaheadLimit; i++) {
+          const qSrc = this._getDocTexSrc(this._drawQueue[i]?.doc);
+          if (!qSrc || !this._inflightTexLoads.has(qSrc)) {
+            hasReadyOrPending = true;
+            break;
+          }
+        }
+        if (hasReadyOrPending && this.enabled) {
+          this._scheduleDrawPump();
+        }
       }
     }
   }
@@ -761,6 +1023,7 @@ export class TokenStreamer {
     for (let i = 0; i < placeables.length; i++) {
       const tok = placeables[i];
       if (!tok || tok.destroyed || tok.isPreview) continue;
+      if ((coreDrawingCounts.get(tok) || 0) > 0 || !tok.mesh || tok.mesh.destroyed) continue;
       const doc = tok.document;
       if (!doc || this._drawingIds.has(doc.id) || isAlwaysMountedTokenDoc(doc)) continue;
 
@@ -792,6 +1055,7 @@ export class TokenStreamer {
           } catch {}
           tok._ssJumpShadow = null;
         }
+        this.controller?._roofHiddenTokens?.delete?.(tok);
         layer.objects.removeChild(tok);
         tok.destroy({ children: true });
         // Restore `_destroyed = false` so the live TokenDocument stays 100% healthy and re-drawable when camera returns!
@@ -808,7 +1072,7 @@ export class TokenStreamer {
     }
 
     // If more distant placeables remain above budget (e.g. after zooming out to orbital view), drain smoothly
-    if (evicted > 0 && candidates.length > evicted && (placeables.length - evicted) > targetKeep) {
+    if (evicted > 0 && candidates.length > evicted && placeables.length > targetKeep) {
       if (this._evictTimer === null) {
         const gen = this._gen;
         this._evictTimer = setTimeout(() => {
@@ -832,7 +1096,7 @@ export class TokenStreamer {
   onTokenUpdated(doc, changes) {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
     const moved = "x" in changes || "y" in changes || "level" in changes;
-    const lightChanged = "light" in changes;
+    const alwaysMountChanged = "light" in changes || "sight" in changes || "actorLink" in changes || Boolean(changes.flags?.[MODULE_ID]);
     const visualChanged = moved
       || "elevation" in changes
       || "hidden" in changes
@@ -851,19 +1115,24 @@ export class TokenStreamer {
     if (visualChanged) {
       this.impostors.upsertToken(doc);
     }
-    if (moved || lightChanged) {
-      const needsMount = !doc._object || doc._object.destroyed;
-      if (needsMount && lightChanged && isAlwaysMountedTokenDoc(doc) && doc.viewed) {
+    if (moved || alwaysMountChanged) {
+      const needsMount = !doc._object || doc._object.destroyed || doc._object.parent !== canvas?.tokens?.objects;
+      if (needsMount && alwaysMountChanged && isAlwaysMountedTokenDoc(doc) && doc.viewed) {
         if (!this._queuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
           this._drawQueue.unshift({ doc, distSq: 0 });
           this._queuedIds.add(doc.id);
           this._primeQueueTextures();
           this._scheduleDrawPump();
         }
-      } else if (moved && this._lastVp && needsMount) {
-        // If a previously unmounted NPC moved into the current viewport, queue its native draw
-        this._lastStreamKey = "";
-        this.scheduleSync(this._lastVp, true);
+      } else if (moved && this._lastVp) {
+        if (needsMount) {
+          // If a previously unmounted NPC moved into the current viewport, queue its native draw
+          this._lastStreamKey = "";
+          this.scheduleSync(this._lastVp, true);
+        } else {
+          // Refresh frustum culling so a mounted offscreen token walking into view becomes renderable immediately
+          this.scheduleSync(this._lastVp, false);
+        }
       }
     }
   }
@@ -878,11 +1147,30 @@ export class TokenStreamer {
   }
 
   onTokenDrawn(tok) {
-    if (!this.enabled || !tok?.document) return;
+    if (!this.enabled || !tok?.document || tok.isPreview) return;
     const doc = tok.document;
     if (doc.parent?.id !== this.sceneId) return;
-    this.impostors.upsertToken(doc);
-    this.impostors.flush();
+    if (this._drawingIds.has(doc.id)) return;
+    const gen = this._gen;
+    // PlaceableObject#draw() fires `drawToken` BEFORE restoring `tok.visible`/`tok.renderable`,
+    // and our patched `Token.prototype.draw` decrements `coreDrawingCounts` in `.finally()`.
+    // Chain onto the tracked draw promise so post-draw sync sees both restored visibility and `isTokenDrawing(tok) === false`.
+    const finish = () => {
+      if (!this.enabled || gen !== this._gen || tok.destroyed || doc.parent?.id !== this.sceneId) return;
+      if (this.isTokenDrawing(tok)) return;
+      if (!this._nativeTokensActive && !tok.controlled) {
+        tok.renderable = false;
+        if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+        if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = false;
+      } else if (this._lastVp) {
+        this.scheduleSync(this._lastVp, false);
+      }
+      this.impostors.upsertToken(doc);
+      this.impostors.flush();
+    };
+    const pending = coreDrawPromises.get(tok);
+    if (pending) pending.then(finish, finish);
+    else queueMicrotask(finish);
   }
 
   onVisibilityChanged() {

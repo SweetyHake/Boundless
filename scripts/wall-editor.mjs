@@ -3,6 +3,19 @@ const NATIVE_WALLS_MIN_SCALE = 0.22; // Stream all native Wall placeables when W
 const NATIVE_DOORS_MIN_SCALE = 0.28; // Stream native door Walls (DoorControl + DoorMesh) during gameplay
 const MAX_NATIVE_WALLS_IN_VIEW = 420;
 
+function getExistingSheet(doc) {
+  if (!doc) return null;
+  if ("_sheet" in doc) return doc._sheet;
+  return doc.sheet ?? null;
+}
+
+function isSheetActiveOrRendering(sheet, placeable = null) {
+  if (!sheet) return false;
+  if (sheet.rendered || sheet._preview || placeable?._preview?.previewType === "config") return true;
+  const renderingState = foundry?.applications?.api?.ApplicationV2?.RENDER_STATES?.RENDERING ?? 1;
+  return typeof sheet.state === "number" && sheet.state >= renderingState;
+}
+
 function makeVirtualWallId(levelId, wKey) {
   // Deterministic 16-char alphanumeric ID passing Foundry's strict document ID validation
   const input = `${levelId}|${wKey}`;
@@ -83,17 +96,18 @@ export class VirtualWallEditor {
     const origUpdateEmbedded = scene.updateEmbeddedDocuments;
     const origDeleteEmbedded = scene.deleteEmbeddedDocuments;
     const origWallsGet = wallsLayer.get;
+    const state = { active: true };
 
-    this._patches = { scene, wallsLayer, origUpdateEmbedded, origDeleteEmbedded, origWallsGet };
-
-    wallsLayer.get = (objectId) => {
-      const virt = this.mountedById.get(objectId);
-      if (virt) return virt.wall;
+    const wrappedWallsGet = (objectId) => {
+      if (state.active) {
+        const virt = this.mountedById.get(objectId);
+        if (virt) return virt.wall;
+      }
       return origWallsGet.call(wallsLayer, objectId);
     };
 
-    scene.updateEmbeddedDocuments = async (embeddedName, updates = [], operation = {}) => {
-      if (embeddedName !== "Wall" || !this.mountedById.size || !Array.isArray(updates) || !updates.length) {
+    const wrappedUpdateEmbedded = async (embeddedName, updates = [], operation = {}) => {
+      if (!state.active || embeddedName !== "Wall" || !this.mountedById.size || !Array.isArray(updates) || !updates.length) {
         return origUpdateEmbedded.call(scene, embeddedName, updates, operation);
       }
 
@@ -117,8 +131,8 @@ export class VirtualWallEditor {
       return results;
     };
 
-    scene.deleteEmbeddedDocuments = async (embeddedName, ids = [], operation = {}) => {
-      if (embeddedName !== "Wall" || !this.mountedById.size || !Array.isArray(ids) || !ids.length) {
+    const wrappedDeleteEmbedded = async (embeddedName, ids = [], operation = {}) => {
+      if (!state.active || embeddedName !== "Wall" || !this.mountedById.size || !Array.isArray(ids) || !ids.length) {
         return origDeleteEmbedded.call(scene, embeddedName, ids, operation);
       }
 
@@ -140,15 +154,36 @@ export class VirtualWallEditor {
       }
       return results;
     };
+
+    wallsLayer.get = wrappedWallsGet;
+    scene.updateEmbeddedDocuments = wrappedUpdateEmbedded;
+    scene.deleteEmbeddedDocuments = wrappedDeleteEmbedded;
+
+    this._patches = {
+      state,
+      scene,
+      wallsLayer,
+      origUpdateEmbedded,
+      origDeleteEmbedded,
+      origWallsGet,
+      wrappedUpdateEmbedded,
+      wrappedDeleteEmbedded,
+      wrappedWallsGet
+    };
   }
 
   _removePatches() {
     if (!this._patches) return;
-    const { scene, wallsLayer, origUpdateEmbedded, origDeleteEmbedded, origWallsGet } = this._patches;
+    const {
+      state, scene, wallsLayer,
+      origUpdateEmbedded, origDeleteEmbedded, origWallsGet,
+      wrappedUpdateEmbedded, wrappedDeleteEmbedded, wrappedWallsGet
+    } = this._patches;
+    state.active = false;
     try {
-      scene.updateEmbeddedDocuments = origUpdateEmbedded;
-      scene.deleteEmbeddedDocuments = origDeleteEmbedded;
-      wallsLayer.get = origWallsGet;
+      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) scene.updateEmbeddedDocuments = origUpdateEmbedded;
+      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
+      if (wallsLayer.get === wrappedWallsGet) wallsLayer.get = origWallsGet;
     } catch {}
     this._patches = null;
   }
@@ -177,7 +212,7 @@ export class VirtualWallEditor {
     // Unmount non-door walls immediately; keep visible doors mounted with their lines hidden (DoorControl & DoorMesh stay!)
     for (const entry of Array.from(this.mountedByKey.values())) {
       if (!entry.isDoor) {
-        this._removeMountedEntry(entry);
+        this._removeMountedEntry(entry, { closeSheet: true });
       } else if (entry.wall && !entry.wall.destroyed) {
         if (entry.wall.controlled) entry.wall.release({ broadcast: false });
         entry.wall.visible = false;
@@ -200,10 +235,53 @@ export class VirtualWallEditor {
     if (!entry?.wall || entry.wall.destroyed) return;
     if (entry.doc.ds === ds) return;
     entry.doc.updateSource({ ds });
+    entry.sig = this._wallSig({
+      levelId: entry.levelId,
+      c: entry.doc.c, move: entry.doc.move, sight: entry.doc.sight, light: entry.doc.light, sound: entry.doc.sound,
+      dir: entry.doc.dir || 0, door: entry.doc.door || 0, doorSound: entry.doc.doorSound || "",
+      threshold: entry.doc.threshold && (entry.doc.threshold.light || entry.doc.threshold.sight || entry.doc.threshold.sound)
+        ? { light: entry.doc.threshold.light ?? null, sight: entry.doc.threshold.sight ?? null, sound: entry.doc.threshold.sound ?? null, attenuation: Boolean(entry.doc.threshold.attenuation) }
+        : null,
+      animation: (entry.doc.animation?.type && entry.doc.animation?.texture) ? {
+        type: entry.doc.animation.type, texture: entry.doc.animation.texture,
+        flip: Boolean(entry.doc.animation.flip), double: Boolean(entry.doc.animation.double),
+        direction: entry.doc.animation.direction ?? 1, duration: entry.doc.animation.duration ?? 750, strength: entry.doc.animation.strength ?? 1
+      } : null
+    }, ds);
     entry.wall._onUpdate({ ds }, { sound: playSound }, game.user?.id);
     if (!this.active) entry.wall.visible = false;
     const dc = entry.wall.doorControl;
     if (dc && !dc.destroyed) dc.visible = dc.isVisible;
+    this._syncOpenWallSheet(entry, { ds }, { syncDoorControl: true });
+  }
+
+  _syncPreviewDoorControl(previewWall) {
+    if (!previewWall || previewWall.destroyed) return;
+    const dt = previewWall.document?.door;
+    const hasCtrl = (dt === CONST.WALL_DOOR_TYPES?.DOOR || dt === 1)
+      || ((dt === CONST.WALL_DOOR_TYPES?.SECRET || dt === 2) && game.user?.isGM);
+    if (hasCtrl) {
+      if (previewWall.doorControl && !previewWall.doorControl.destroyed) previewWall.doorControl.draw();
+      else previewWall.createDoorControl?.();
+    } else {
+      previewWall.clearDoorControl?.();
+    }
+  }
+
+  _syncOpenWallSheet(entry, patch, { syncDoorControl = false } = {}) {
+    const sheet = getExistingSheet(entry?.doc);
+    if (!sheet || !isSheetActiveOrRendering(sheet, entry?.wall)) return;
+    try {
+      if (sheet._preview) {
+        if (typeof sheet._previewChanges === "function") sheet._previewChanges(patch);
+        else sheet._preview.updateSource?.(patch);
+        if (syncDoorControl) this._syncPreviewDoorControl(sheet._preview.object);
+      } else if (entry.wall?._preview?.previewType === "config") {
+        entry.wall._preview.document?.updateSource?.(patch);
+        if (syncDoorControl) this._syncPreviewDoorControl(entry.wall._preview);
+      }
+      sheet.render(false);
+    } catch {}
   }
 
   _getViewedLayer() {
@@ -224,16 +302,16 @@ export class VirtualWallEditor {
 
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
-    const sx0 = Math.max(0, Math.floor(vp.x0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(vp.y0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(vp.x1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(vp.y1 / simSectorPx));
-
     const pad = 250;
     const vx0 = vp.x0 - pad, vy0 = vp.y0 - pad, vx1 = vp.x1 + pad, vy1 = vp.y1 + pad;
+    const sx0 = Math.max(0, Math.floor(vx0 / simSectorPx));
+    const sy0 = Math.max(0, Math.floor(vy0 / simSectorPx));
+    const sx1 = Math.min(simGrid - 1, Math.floor(vx1 / simSectorPx));
+    const sy1 = Math.min(simGrid - 1, Math.floor(vy1 / simSectorPx));
     const levelEdits = this.controller.wallEdits.get(lid);
     const segments = [];
 
+    const seenKeys = new Set();
     for (let sy = sy0; sy <= sy1; sy++) {
       for (let sx = sx0; sx <= sx1; sx++) {
         const sk = `${sx}_${sy}`;
@@ -244,6 +322,7 @@ export class VirtualWallEditor {
           for (let di = 0; di < sec.d.length; di++) {
             const resolved = this.controller.resolveVirtualWall(lid, "d", sk, di, sec.d[di]);
             if (!resolved) continue;
+            seenKeys.add(resolved.wKey);
             if (doorsOnly && !resolved.door) continue;
             const [x1, y1, x2, y2] = resolved.c;
             if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
@@ -261,6 +340,7 @@ export class VirtualWallEditor {
             }
             const resolved = this.controller.resolveVirtualWall(lid, "w", sk, wi, sec.w[wi]);
             if (!resolved) continue;
+            seenKeys.add(resolved.wKey);
             if (doorsOnly && !resolved.door) continue;
             const [x1, y1, x2, y2] = resolved.c;
             if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
@@ -270,20 +350,47 @@ export class VirtualWallEditor {
         }
       }
     }
+
+    // Also include walls/doors edited and dragged outside their original home sector
+    if (levelEdits?.size) {
+      for (const [wKey, ov] of levelEdits) {
+        if (!ov || seenKeys.has(wKey)) continue;
+        const parts = wKey.split(":");
+        if (parts.length !== 3) continue;
+        const [sk, kind, idxStr] = parts;
+        const idx = Number(idxStr);
+        const raw = spec.sectors[sk]?.[kind]?.[idx];
+        if (!raw) continue;
+        const resolved = this.controller.resolveVirtualWall(lid, kind, sk, idx, raw);
+        if (!resolved) continue;
+        if (doorsOnly && !resolved.door) continue;
+        const [x1, y1, x2, y2] = resolved.c;
+        if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
+            (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
+        segments.push(resolved);
+      }
+    }
     return segments;
   }
 
-  _removeMountedEntry(entry) {
+  _removeMountedEntry(entry, { closeSheet = false } = {}) {
     if (!entry) return;
     const wallsLayer = canvas?.walls;
     const w = entry.wall;
-    this.mountedByKey.delete(entry.wKey);
-    this.mountedById.delete(entry.id);
-    if (entry.dKey) this.mountedByDoorKey.delete(entry.dKey);
+    if (this.mountedByKey.get(entry.wKey) === entry) this.mountedByKey.delete(entry.wKey);
+    if (this.mountedById.get(entry.id) === entry) this.mountedById.delete(entry.id);
+    if (entry.dKey && this.mountedByDoorKey.get(entry.dKey) === entry) this.mountedByDoorKey.delete(entry.dKey);
+    const sheet = getExistingSheet(entry.doc);
+    if (closeSheet && sheet) {
+      try { sheet.close(); } catch {}
+    }
     if (!w) return;
     try {
       terminateWallDoorAnimations(w);
       if (w.controlled) w.release({ broadcast: false });
+      if (wallsLayer?.clipboard?.cut && wallsLayer.clipboard.objects?.length) {
+        wallsLayer.clipboard.objects = wallsLayer.clipboard.objects.filter(o => o !== w);
+      }
       wallsLayer?.quadtree?.remove(w);
       w.parent?.removeChild(w);
       if (!w.destroyed) w.destroy({ children: true });
@@ -293,16 +400,27 @@ export class VirtualWallEditor {
   _clearMountedWalls() {
     this._clearGen++;
     for (const entry of Array.from(this.mountedByKey.values())) {
-      this._removeMountedEntry(entry);
+      this._removeMountedEntry(entry, { closeSheet: true });
     }
     this.mountedByKey.clear();
     this.mountedById.clear();
     this.mountedByDoorKey.clear();
+    this._lastNeededKeys = null;
   }
 
   async _mountNativeWall(seg, gen) {
     if (gen !== this._clearGen || !canvas?.walls?.objects || !canvas.scene) return;
     if (this.mountedByKey.has(seg.wKey)) return;
+
+    // Preload animated door texture before creating Wall so Foundry's fire-and-forget createDoorMeshes()
+    // cannot leak an orphaned DoorMesh into canvas.primary if this wall is unmounted mid-load.
+    const editRev = this.controller.wallEditsRev || 0;
+    if (seg.animation?.type && seg.animation?.texture && typeof foundry.canvas?.loadTexture === "function") {
+      try { await foundry.canvas.loadTexture(seg.animation.texture); } catch {}
+      if (gen !== this._clearGen || (this.controller.wallEditsRev || 0) !== editRev || !canvas?.walls?.objects || !canvas.scene) return;
+      if (this._getViewedLayer()?.level?.id !== seg.levelId) return;
+      if ((this._lastNeededKeys && !this._lastNeededKeys.has(seg.wKey)) || this.mountedByKey.has(seg.wKey)) return;
+    }
 
     const id = makeVirtualWallId(seg.levelId, seg.wKey);
     const dKey = this._buildDoorKey(seg);
@@ -319,14 +437,40 @@ export class VirtualWallEditor {
       dir: seg.dir || 0,
       door: seg.door || 0,
       ds: liveDs,
+      doorSound: seg.doorSound || "",
       levels: [seg.levelId]
     };
-    if (seg.doorSound) initData.doorSound = seg.doorSound;
     if (seg.threshold) initData.threshold = foundry.utils.deepClone(seg.threshold);
-    if (seg.animation?.texture) initData.animation = foundry.utils.deepClone(seg.animation);
+    if (seg.animation?.type && seg.animation?.texture) initData.animation = foundry.utils.deepClone(seg.animation);
 
     const doc = new WallDocCls(initData, { parent: canvas.scene });
     doc._mmVirtualMeta = { id, wKey: seg.wKey, dKey, levelId: seg.levelId, kind: seg.kind, sk: seg.sk, idx: seg.idx };
+    // Virtual WallDocuments are not added to scene.walls so WallDocument#initializeEdge never runs;
+    // expose a live `edge` getter so Foundry v14 DoorMesh.animateSlide() and WallsLayer helpers never see `null`.
+    Object.defineProperty(doc, "edge", {
+      get() {
+        const c = this.c;
+        return Array.isArray(c) && c.length >= 4
+          ? { a: { x: c[0], y: c[1] }, b: { x: c[2], y: c[3] }, intersections: {} }
+          : null;
+      },
+      configurable: true
+    });
+
+    // Foundry v14 DocumentSheetV2#_processSubmitData checks `document.collection.has(document.id)` before calling `document.update()`;
+    // expose a lightweight proxy over `scene.walls` so WallConfig saves via `doc.update()` instead of throwing!
+    const realColl = canvas.scene.walls;
+    if (realColl) {
+      const collProxy = new Proxy(realColl, {
+        get(target, prop) {
+          if (prop === "has") return (k) => k === id || target.has(k);
+          if (prop === "get") return (k, opts) => (k === id ? doc : target.get(k, opts));
+          const val = Reflect.get(target, prop, target);
+          return typeof val === "function" ? val.bind(target) : val;
+        }
+      });
+      Object.defineProperty(doc, "collection", { get: () => collProxy, configurable: true });
+    }
 
     // Route direct DoorControl `doc.update({ ds })`, WallConfig `doc.update(...)`, and `doc.delete()`
     doc.update = async (data = {}, options = {}) => {
@@ -337,11 +481,40 @@ export class VirtualWallEditor {
       const res = await this._commitVirtualDeletes([id]);
       return res[0] || doc;
     };
+    // Ensure PlaceableConfig preview clones (`keepId: true` on same scene) inherit virtual update/delete
+    // so clicking the preview's DoorControl while WallConfig is open routes through VirtualWallEditor instead of ClientDatabaseBackend.
+    if (typeof doc.clone === "function") {
+      const origClone = doc.clone.bind(doc);
+      doc.clone = (data = {}, context = {}) => {
+        const cloned = origClone(data, context);
+        if (!context?.save && context?.keepId && cloned && cloned.id === id && cloned.parent === doc.parent) {
+          cloned.update = doc.update;
+          cloned.delete = doc.delete;
+        }
+        return cloned;
+      };
+    }
 
     const wall = canvas.walls.createObject(doc);
     // Bypass v14 ui.placeables sidebar filter so streamed native walls & doors render cleanly
     Object.defineProperty(wall, "isFilteredOut", { value: false, configurable: true });
+    // Serialize & guard Foundry's fire-and-forget Wall#createDoorMeshes() so destroying a wall mid-load never leaks an orphaned DoorMesh into canvas.primary
+    if (typeof wall.createDoorMeshes === "function") {
+      const origCreateDoorMeshes = wall.createDoorMeshes.bind(wall);
+      let doorMeshChain = Promise.resolve();
+      wall.createDoorMeshes = function () {
+        doorMeshChain = doorMeshChain.then(async () => {
+          if (this.destroyed || !canvas?.primary) return;
+          await origCreateDoorMeshes();
+          if (this.destroyed || !canvas?.primary) {
+            try { this.destroyDoorMeshes?.(); } catch {}
+          }
+        }).catch(() => {});
+        return doorMeshChain;
+      };
+    }
 
+    const sig = this._wallSig(seg, liveDs);
     const entry = {
       id,
       wKey: seg.wKey,
@@ -351,6 +524,7 @@ export class VirtualWallEditor {
       sk: seg.sk,
       idx: seg.idx,
       isDoor: Boolean(seg.door > 0),
+      sig,
       wall,
       doc
     };
@@ -360,9 +534,15 @@ export class VirtualWallEditor {
 
     canvas.walls.objects.addChild(wall);
     wall.renderFlags.clear();
-    await wall.draw();
+    let drawFailed = false;
+    try {
+      await wall.draw();
+    } catch (err) {
+      drawFailed = true;
+      console.warn(`${MODULE_ID} | Wall#draw failed for virtual wall ${seg.wKey}:`, err);
+    }
 
-    if (gen !== this._clearGen || !this.mountedById.has(id)) {
+    if (drawFailed || gen !== this._clearGen || this.mountedById.get(id) !== entry || wall.destroyed) {
       this._removeMountedEntry(entry);
       return;
     }
@@ -374,7 +554,41 @@ export class VirtualWallEditor {
     if (wall.doorControl && !wall.doorControl.destroyed) {
       wall.doorControl.visible = wall.doorControl.isVisible;
     }
-    canvas.walls.quadtree?.insert({ r: wall.bounds, t: wall });
+    wall._updateQuadtree?.();
+  }
+
+  _wallSig(seg, liveDs) {
+    return JSON.stringify([
+      seg.levelId || "",
+      seg.c, seg.move, seg.sight, seg.light, seg.sound, seg.dir || 0,
+      seg.door || 0, liveDs, seg.doorSound || "", seg.threshold || null, seg.animation || null
+    ]);
+  }
+
+  _syncMountedEntryInPlace(entry, seg, dKey, liveDs, nextSig) {
+    const patch = {
+      c: seg.c.slice(), move: seg.move, sight: seg.sight, light: seg.light, sound: seg.sound,
+      dir: seg.dir || 0, door: seg.door || 0, ds: liveDs,
+      doorSound: seg.doorSound || "",
+      threshold: seg.threshold ? foundry.utils.deepClone(seg.threshold) : { light: null, sight: null, sound: null, attenuation: false },
+      animation: (seg.animation?.type && seg.animation?.texture) ? foundry.utils.deepClone(seg.animation) : null
+    };
+    const diff = entry.doc.updateSource(patch);
+    entry.sig = nextSig;
+    entry.isDoor = Boolean(seg.door > 0);
+    if (entry.dKey && entry.dKey !== dKey) {
+      if (this.mountedByDoorKey.get(entry.dKey) === entry) this.mountedByDoorKey.delete(entry.dKey);
+    }
+    entry.dKey = dKey;
+    if (dKey) this.mountedByDoorKey.set(dKey, entry);
+    if (diff && !foundry.utils.isEmpty(diff)) {
+      if (entry.wall && !entry.wall.destroyed) {
+        try { entry.wall._onUpdate(diff, { sound: false }, game.user?.id); } catch {}
+        if (!this.active) entry.wall.visible = false;
+        entry.wall._updateQuadtree?.();
+      }
+      this._syncOpenWallSheet(entry, diff, { syncDoorControl: ("door" in diff) || ("ds" in diff) });
+    }
   }
 
   _drawMacroOverview(segments, scale) {
@@ -422,14 +636,14 @@ export class VirtualWallEditor {
     const minScale = isWallsEditMode ? NATIVE_WALLS_MIN_SCALE : NATIVE_DOORS_MIN_SCALE;
     const inNativeZoom = curVp.scale >= minScale;
 
-    const { simGrid, simSectorPx } = layer;
-    const sx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const qStep = 200;
+    const qx0 = Math.floor(curVp.x0 / qStep);
+    const qy0 = Math.floor(curVp.y0 / qStep);
+    const qx1 = Math.floor(curVp.x1 / qStep);
+    const qy1 = Math.floor(curVp.y1 / qStep);
 
     const rev = this.controller.wallEditsRev || 0;
-    const key = `${layer.level.id}:${sx0}_${sy0}_${sx1}_${sy1}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:r${rev}`;
+    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:r${rev}`;
     if (key === this._lastKey) return;
     this._lastKey = key;
 
@@ -456,18 +670,59 @@ export class VirtualWallEditor {
 
     const needed = new Map();
     for (const seg of segments) needed.set(seg.wKey, seg);
+    this._lastNeededKeys = new Set(needed.keys());
+    const lvlWallEdits = this.controller.wallEdits?.get(layer.level.id);
 
-    // Unmount walls/doors that panned out of view (keep controlled walls alive during a drag!)
+    // Unmount walls from other levels, deleted walls, or doors converted/reverted to plain walls in gameplay unconditionally (with closeSheet)
     for (const entry of Array.from(this.mountedByKey.values())) {
-      if (!needed.has(entry.wKey) && !entry.wall?.controlled) {
-        this._removeMountedEntry(entry);
+      const wrongLevel = entry.levelId !== layer.level.id;
+      const ov = !wrongLevel ? lvlWallEdits?.get(entry.wKey) : undefined;
+      const neededSeg = !wrongLevel ? needed.get(entry.wKey) : null;
+      const raw = (!wrongLevel && !neededSeg) ? layer.spec.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] : null;
+      const resolved = neededSeg || ((!wrongLevel && ov !== null && raw)
+        ? this.controller.resolveVirtualWall(layer.level.id, entry.kind, entry.sk, entry.idx, raw)
+        : null);
+      const isDeleted = ov === null || (!wrongLevel && !resolved);
+      const lostDoorInGameplay = !wrongLevel && !isWallsEditMode && Boolean(resolved && !resolved.door);
+      const sheet = getExistingSheet(entry.doc);
+      if (wrongLevel || isDeleted || lostDoorInGameplay) {
+        this._removeMountedEntry(entry, { closeSheet: true });
+      } else if (!neededSeg) {
+        if (!entry.wall?.controlled && !isSheetActiveOrRendering(sheet, entry.wall)) {
+          this._removeMountedEntry(entry);
+        } else if (resolved) {
+          const dKey = this._buildDoorKey(resolved);
+          const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, resolved.ds) : (resolved.ds || 0);
+          const nextSig = this._wallSig(resolved, liveDs);
+          if (entry.sig !== nextSig) {
+            if (sheet?.rendered) {
+              this._syncMountedEntryInPlace(entry, resolved, dKey, liveDs, nextSig);
+            } else {
+              this._removeMountedEntry(entry, { closeSheet: isSheetActiveOrRendering(sheet, entry.wall) });
+            }
+          }
+        }
       }
     }
 
     const gen = this._clearGen;
     for (const seg of needed.values()) {
-      if (!this.mountedByKey.has(seg.wKey)) {
+      const existing = this.mountedByKey.get(seg.wKey);
+      if (!existing) {
         this._mountNativeWall(seg, gen);
+      } else {
+        const dKey = this._buildDoorKey(seg);
+        const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, seg.ds) : (seg.ds || 0);
+        const nextSig = this._wallSig(seg, liveDs);
+        if (existing.sig !== nextSig) {
+          const sheet = getExistingSheet(existing.doc);
+          if (sheet?.rendered) {
+            this._syncMountedEntryInPlace(existing, seg, dKey, liveDs, nextSig);
+          } else {
+            this._removeMountedEntry(existing, { closeSheet: isSheetActiveOrRendering(sheet, existing.wall) });
+            this._mountNativeWall(seg, gen);
+          }
+        }
       }
     }
   }
@@ -510,10 +765,10 @@ export class VirtualWallEditor {
       if (!game.user?.isGM) continue;
       hasGeometryOrConfigEdit = true;
 
-      entry.doc.updateSource(patch);
+      const diff = entry.doc.updateSource(patch);
       const anim = entry.doc.animation;
-      const animOut = anim?.texture ? {
-        type: anim.type || "swing",
+      const animOut = (anim?.type && anim?.texture) ? {
+        type: anim.type,
         texture: anim.texture,
         flip: Boolean(anim.flip),
         double: Boolean(anim.double),
@@ -540,27 +795,57 @@ export class VirtualWallEditor {
         animation: animOut
       };
 
-      // Update door-key index if wall was converted to/from a door
+      entry.sig = this._wallSig({ levelId: entry.levelId, ...nextState }, nextState.ds);
+
+      // Update door-key index and doorStates/openDoors if wall was converted to/from a door or ds changed in WallConfig
       const prevDKey = entry.dKey;
       const nextIsDoor = Boolean(nextState.door > 0);
       const nextDKey = nextIsDoor
         ? (entry.kind === "w" ? `${entry.levelId}::${entry.sk}_w${entry.idx}` : `${entry.levelId}::${entry.sk}_${entry.idx}`)
         : null;
-      if (prevDKey && prevDKey !== nextDKey) this.mountedByDoorKey.delete(prevDKey);
+      if (prevDKey && prevDKey !== nextDKey) {
+        if (this.mountedByDoorKey.get(prevDKey) === entry) this.mountedByDoorKey.delete(prevDKey);
+        this.controller.openDoors.delete(prevDKey);
+        this.controller.doorStates.delete(prevDKey);
+        flagUpdate[`flags.${MODULE_ID}.doorStates.-=${prevDKey}`] = null;
+      }
       entry.isDoor = nextIsDoor;
       entry.dKey = nextDKey;
-      if (nextDKey) this.mountedByDoorKey.set(nextDKey, entry);
+      if (nextDKey) {
+        this.mountedByDoorKey.set(nextDKey, entry);
+        if (diff && "ds" in diff) {
+          this.controller.doorStates.set(nextDKey, nextState.ds);
+          if (nextState.ds === 1) {
+            this.controller.openDoors.set(nextDKey, {
+              levelId: entry.levelId,
+              x: (nextState.c[0] + nextState.c[2]) * 0.5,
+              y: (nextState.c[1] + nextState.c[3]) * 0.5
+            });
+          } else {
+            this.controller.openDoors.delete(nextDKey);
+          }
+          flagUpdate[`flags.${MODULE_ID}.doorStates.${nextDKey}`] = nextState.ds;
+        }
+      }
 
       flagUpdate[`flags.${MODULE_ID}.wallEdits.${entry.levelId}.${entry.wKey}`] = nextState;
       this.controller.setVirtualWallEditLocal(entry.levelId, entry.wKey, nextState);
 
       if (entry.wall && !entry.wall.destroyed) {
-        entry.wall._onUpdate(patch, operation, game.user?.id);
+        if (diff && !foundry.utils.isEmpty(diff)) {
+          try {
+            entry.wall._onUpdate(diff, operation, game.user?.id);
+          } catch (err) {
+            console.warn(`${MODULE_ID} | Wall#_onUpdate failed for virtual wall ${entry.wKey}:`, err);
+          }
+        }
         entry.wall.renderFlags.set({ refresh: true });
         entry.wall.applyRenderFlags();
         if (!this.active) entry.wall.visible = false;
-        canvas.walls?.quadtree?.remove(entry.wall);
-        canvas.walls?.quadtree?.insert({ r: entry.wall.bounds, t: entry.wall });
+        entry.wall._updateQuadtree?.();
+      }
+      if (diff && !foundry.utils.isEmpty(diff)) {
+        this._syncOpenWallSheet(entry, diff, { syncDoorControl: ("door" in diff) || ("ds" in diff) });
       }
       updatedDocs.push(entry.doc);
     }
@@ -583,9 +868,21 @@ export class VirtualWallEditor {
       const entry = this.mountedById.get(id);
       if (!entry) continue;
       flagUpdate[`flags.${MODULE_ID}.wallEdits.${entry.levelId}.${entry.wKey}`] = null;
+      if (entry.dKey) {
+        this.controller.openDoors.delete(entry.dKey);
+        this.controller.doorStates.delete(entry.dKey);
+        flagUpdate[`flags.${MODULE_ID}.doorStates.-=${entry.dKey}`] = null;
+      }
       this.controller.setVirtualWallEditLocal(entry.levelId, entry.wKey, null);
       deletedDocs.push(entry.doc);
-      this._removeMountedEntry(entry);
+      this._removeMountedEntry(entry, { closeSheet: true });
+    }
+
+    if (deletedDocs.length && canvas.walls?.clipboard?.objects?.length) {
+      const deletedIdSet = new Set(virtIds);
+      canvas.walls.clipboard.objects = canvas.walls.clipboard.objects.filter(
+        o => !o.document?._destroyed && !deletedIdSet.has(o.document?.id)
+      );
     }
 
     if (Object.keys(flagUpdate).length) {

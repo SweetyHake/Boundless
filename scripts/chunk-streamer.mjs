@@ -122,12 +122,15 @@ export class ChunkStreamer {
 
   /** Preload destination chunk silently while camera is flying to a distant POI. */
   prewarmPoint(worldX, worldY) {
-    if (this.states.size === 0) return;
+    if (this.states.size === 0 || !Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
     for (const [, st] of this.states) {
-      const { cfg, populated } = st;
+      const { cfg, populated, layer } = st;
       const cw = cfg.chunkWorldPx;
+      const cols = cfg.cols || Math.ceil((layer.worldPx || cw) / cw);
+      const rows = cfg.rows || Math.ceil((layer.worldPx || cw) / cw);
       const cx = Math.floor(worldX / cw);
       const cy = Math.floor(worldY / cw);
+      if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
       const ck = `${cx}_${cy}`;
       if ((populated.size === 0 || populated.has(ck)) && !st.loaded.has(ck) && !st.pending.has(ck)) {
         this._fetchChunk(st, ck);
@@ -136,34 +139,44 @@ export class ChunkStreamer {
   }
 
   update(vp) {
-    if (this.states.size === 0) return;
-    const now = performance.now();
+    if (this._updating || this.states.size === 0) return;
+    this._updating = true;
+    try {
+      const now = performance.now();
 
-    for (const [, st] of this.states) {
-      const needed = this._collectNeededChunks(st, vp);
-      st.lastNeeded = needed;
-      for (const ck of needed) {
-        const rec = st.loaded.get(ck);
-        if (rec) {
-          rec.lastUsedMs = now;
-        } else if (!st.pending.has(ck)) {
-          this._fetchChunk(st, ck);
+      for (const [, st] of this.states) {
+        const needed = this._collectNeededChunks(st, vp);
+        st.lastNeeded = needed;
+        for (const ck of needed) {
+          const rec = st.loaded.get(ck);
+          if (rec) {
+            rec.lastUsedMs = now;
+          } else if (!st.pending.has(ck)) {
+            this._fetchChunk(st, ck);
+          }
         }
+        this._enforceLru(st, needed, { deferRefresh: true });
       }
-      this._enforceLru(st, needed);
+    } finally {
+      this._updating = false;
     }
   }
 
-  _enforceLru(st, needed = st.lastNeeded) {
+  _enforceLru(st, needed = st.lastNeeded, { deferRefresh = false } = {}) {
     if (st.loaded.size <= MAX_LOADED_CHUNKS) return;
     const evictable = [];
     for (const [ck, rec] of st.loaded) {
       if (!needed?.has?.(ck)) evictable.push(rec);
     }
     evictable.sort((a, b) => a.lastUsedMs - b.lastUsedMs);
+    const evictedKeys = [];
     while (st.loaded.size > MAX_LOADED_CHUNKS && evictable.length > 0) {
       const victim = evictable.shift();
-      this._evictChunk(st, victim.key, true);
+      this._evictChunk(st, victim.key, false);
+      evictedKeys.push(victim.key);
+    }
+    for (let i = 0; i < evictedKeys.length; i++) {
+      this.controller?.onChunkUnloaded?.(st.layer, evictedKeys[i], { deferRefresh });
     }
   }
 
@@ -193,6 +206,18 @@ export class ChunkStreamer {
     const { layer } = st;
     const spec = layer.spec;
 
+    // If we are already at capacity and every loaded chunk is actively needed, skip mounting an unrequested stale chunk
+    if (st.loaded.size >= MAX_LOADED_CHUNKS && !st.lastNeeded?.has?.(ck)) {
+      let hasEvictable = false;
+      for (const loadedKey of st.loaded.keys()) {
+        if (!st.lastNeeded?.has?.(loadedKey)) {
+          hasEvictable = true;
+          break;
+        }
+      }
+      if (!hasEvictable) return;
+    }
+
     const overlayIds = [];
     if (data.overlays && typeof data.overlays === "object") {
       for (const [oid, ovSpec] of Object.entries(data.overlays)) {
@@ -216,7 +241,11 @@ export class ChunkStreamer {
       data,
       lastUsedMs: performance.now()
     });
-    this._enforceLru(st);
+    // Protect the freshly mounted chunk from immediate self-eviction before onChunkLoaded runs
+    const protect = new Set(st.lastNeeded || []);
+    protect.add(ck);
+    this._enforceLru(st, protect, { deferRefresh: true });
+    if (!st.loaded.has(ck)) return;
 
     // Trigger non-blocking incremental GPU light baking for this chunk + refresh local overlays/sim/doors
     this.controller?.onChunkLoaded?.(layer, ck, data);

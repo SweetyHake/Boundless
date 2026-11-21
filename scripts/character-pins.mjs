@@ -2,6 +2,9 @@ const MODULE_ID = "boundless";
 const CHAR_PIN_FADE_START = 0.38; // Begin showing world-space character portrait below this scale
 const CHAR_PIN_FADE_FULL = 0.20;  // 100% opaque at or below this scale
 const FOCUS_TARGET_SCALE = 0.85;  // Close tactical zoom when clicking character icon
+const GTA_MIN_WORLD_DIST_PX = 1800; // Minimum distance (18 cells) before TAB triggers GTA 5 sky-hop
+const GTA_SCREEN_DIAG_MULT = 1.15;  // Or farther than 1.15x current viewport diagonal
+const GTA_MACRO_SCALE_THRESHOLD = 0.45; // Always use GTA descent when switching from zoomed-out view
 const MAX_GM_FALLBACK_PCS = 6;
 
 function smoothstep(edge0, edge1, x) {
@@ -100,6 +103,20 @@ async function bakeCircularAvatarTexture(src, sizePx = 128) {
   return PIXI.Texture.from(c);
 }
 
+function shouldUseGtaSwitch(tokenDoc, curScale = null) {
+  if (!tokenDoc || !canvas?.stage) return false;
+  if (tokenDoc.level && canvas.level?.id && tokenDoc.level !== canvas.level.id) return true;
+  const scale0 = curScale ?? (canvas.stage.scale?.x || 1);
+  if (scale0 < GTA_MACRO_SCALE_THRESHOLD) return true;
+  const pos = getTokenWorldCenter(tokenDoc);
+  const pivot = canvas.stage.pivot;
+  const dist = Math.hypot(pos.x - (pivot?.x || 0), pos.y - (pivot?.y || 0));
+  const [sw = window.innerWidth || 1600, sh = window.innerHeight || 900] = canvas.screenDimensions || [];
+  const screenDiagWorld = Math.hypot(sw, sh) / Math.max(scale0, 1e-4);
+  const threshold = Math.max(GTA_MIN_WORLD_DIST_PX, screenDiagWorld * GTA_SCREEN_DIAG_MULT);
+  return dist >= threshold;
+}
+
 function getTokenWorldCenter(tokenDoc) {
   const obj = tokenDoc?._object;
   if (obj && !obj.destroyed && obj.center && Number.isFinite(obj.center.x) && Number.isFinite(obj.center.y)) {
@@ -112,6 +129,49 @@ function getTokenWorldCenter(tokenDoc) {
     x: (Number(tokenDoc?.x) || 0) + w * 0.5,
     y: (Number(tokenDoc?.y) || 0) + h * 0.5
   };
+}
+
+function hasTokenOwnerPermissionLazy(tok, user) {
+  if (!tok || !user) return false;
+  if (user.isGM) return true;
+  if (!tok.isLazyDelta) {
+    try { return Boolean(tok.testUserPermission?.(user, "OWNER")); } catch { return false; }
+  }
+  const ownerLvl = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.OWNER ?? 3;
+  const inheritLvl = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.INHERIT ?? -1;
+  const deltaOwn = tok._source?.delta?.ownership;
+  const baseOwn = tok.baseActor?.ownership;
+  const uid = user.id;
+
+  // True Foundry v14 merged ownership precedence: delta[uid] -> base[uid] -> delta.default -> base.default
+  if (uid && typeof deltaOwn?.[uid] === "number" && deltaOwn[uid] !== inheritLvl) {
+    return deltaOwn[uid] >= ownerLvl;
+  }
+  if (uid && typeof baseOwn?.[uid] === "number" && baseOwn[uid] !== inheritLvl) {
+    return baseOwn[uid] >= ownerLvl;
+  }
+  if (typeof deltaOwn?.default === "number" && deltaOwn.default !== inheritLvl) {
+    return deltaOwn.default >= ownerLvl;
+  }
+  if (typeof baseOwn?.default === "number" && baseOwn.default !== inheritLvl) {
+    return baseOwn.default >= ownerLvl;
+  }
+  if (!baseOwn && typeof tok.baseActor?.testUserPermission === "function") {
+    try {
+      return Boolean(tok.baseActor.testUserPermission(user, "OWNER"));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function getLiveStageTransform(stageScale, px, py, sw, sh) {
+  const a = stageScale;
+  const d = canvas.stage?.scale?.y || stageScale;
+  const posX = Number.isFinite(canvas.stage?.position?.x) ? canvas.stage.position.x : sw * 0.5;
+  const posY = Number.isFinite(canvas.stage?.position?.y) ? canvas.stage.position.y : sh * 0.5;
+  return { a, d, tx: posX - px * a, ty: posY - py * d };
 }
 
 function formatWorldDistance(dx, dy) {
@@ -139,6 +199,7 @@ export class CharacterPinManager {
   _rebuildQueued = false;
   _avatarTexCache = new Map(); // src -> Promise<PIXI.Texture | null>
   _avatarTexOwned = [];        // PIXI.Texture[] to destroy cleanly on unmount
+  _lastTacticalScale = FOCUS_TARGET_SCALE;
 
   constructor(controller = null) {
     this.controller = controller;
@@ -203,7 +264,7 @@ export class CharacterPinManager {
     const pushEntry = (tokenDoc, user, isSelf) => {
       if (!tokenDoc || seenTokenIds.has(tokenDoc.id)) return;
       seenTokenIds.add(tokenDoc.id);
-      const actor = tokenDoc.baseActor || tokenDoc.actor || null;
+      const actor = tokenDoc.baseActor || (!tokenDoc.isLazyDelta ? tokenDoc.actor : null) || null;
       const rawColor = user?.color?.css || (typeof user?.color === "string" ? user.color : null) || (isSelf ? "#f5c96b" : "#58d5ff");
       results.push({
         id: tokenDoc.id,
@@ -229,7 +290,7 @@ export class CharacterPinManager {
       let ownFallback = null;
       for (const tok of tokens) {
         if (tok.hidden) continue;
-        if (!tok.testUserPermission?.(game.user, "OWNER")) continue;
+        if (!hasTokenOwnerPermissionLazy(tok, game.user)) continue;
         if (viewedLevelId && tok.level === viewedLevelId) {
           ownFallback = tok;
           break;
@@ -253,7 +314,7 @@ export class CharacterPinManager {
           const base = tok.baseActor;
           const isPc = tok.actorLink || base?.type === "character" || base?.hasPlayerOwner;
           if (!isPc) continue;
-          const ownerUser = Array.from(game.users || []).find(u => !u.isGM && tok.testUserPermission?.(u, "OWNER")) || game.user;
+          const ownerUser = Array.from(game.users || []).find(u => !u.isGM && hasTokenOwnerPermissionLazy(tok, u)) || game.user;
           pushEntry(tok, ownerUser, count === 0);
           count++;
           if (count >= MAX_GM_FALLBACK_PCS) break;
@@ -470,10 +531,22 @@ export class CharacterPinManager {
   _getCircularAvatarTexture(src) {
     if (!src) return Promise.resolve(null);
     if (this._avatarTexCache.has(src)) return this._avatarTexCache.get(src);
+    const gen = this._mountGen || 0;
     const promise = bakeCircularAvatarTexture(src, 128).then((tex) => {
-      if (tex) this._avatarTexOwned.push(tex);
+      if (gen !== (this._mountGen || 0)) {
+        if (tex) try { tex.destroy(true); } catch {}
+        return null;
+      }
+      if (tex) {
+        this._avatarTexOwned.push(tex);
+      } else {
+        this._avatarTexCache.delete(src);
+      }
       return tex;
-    }).catch(() => null);
+    }).catch(() => {
+      if (gen === (this._mountGen || 0)) this._avatarTexCache.delete(src);
+      return null;
+    });
     this._avatarTexCache.set(src, promise);
     return promise;
   }
@@ -485,15 +558,24 @@ export class CharacterPinManager {
   }
 
   _stepPulse(delta) {
-    if (!this.container?.visible || !this.entries.length) return;
+    if (!this.enabled || !this.entries.length) return;
     let anyVisible = false;
+    let anyMoved = false;
     for (const e of this.entries) {
-      if (e.worldVisible) {
-        anyVisible = true;
-        break;
+      if (e.worldVisible) anyVisible = true;
+      const pos = getTokenWorldCenter(e.tokenDoc);
+      if (e._lastPosX !== undefined && (Math.abs(pos.x - e._lastPosX) > 0.5 || Math.abs(pos.y - e._lastPosY) > 0.5)) {
+        anyMoved = true;
       }
+      e._lastPosX = pos.x;
+      e._lastPosY = pos.y;
     }
-    if (!anyVisible) return;
+
+    if (anyMoved) {
+      this.updateViewport();
+    }
+
+    if (!this.container?.visible || !anyVisible) return;
 
     this._pulsePhase = (this._pulsePhase + (delta || 1) * 0.032) % (Math.PI * 2);
     const wave = (Math.sin(this._pulsePhase) + 1) * 0.5; // 0..1
@@ -504,9 +586,7 @@ export class CharacterPinManager {
       if (!e.worldVisible) continue;
       e.pulseRing.scale.set(ringScale);
       e.pulseRing.alpha = ringAlpha;
-      // Follow live animated token movement seamlessly
-      const pos = getTokenWorldCenter(e.tokenDoc);
-      e.root.position.set(pos.x, pos.y);
+      e.root.position.set(e._lastPosX ?? 0, e._lastPosY ?? 0);
     }
   }
 
@@ -534,11 +614,12 @@ export class CharacterPinManager {
     if (!this.enabled || !this.entries.length || !canvas?.stage) return;
 
     const stageScale = canvas.stage.scale?.x || 1;
-    const wt = canvas.stage.worldTransform;
     const viewedLevelId = canvas.level?.id || null;
     const pivot = canvas.stage.pivot;
     const worldAlpha = smoothstep(CHAR_PIN_FADE_START, CHAR_PIN_FADE_FULL, stageScale);
     const safe = this._getSafeScreenBounds();
+    const [sw = safe.sw, sh = safe.sh] = canvas.screenDimensions || [];
+    const wt = getLiveStageTransform(stageScale, pivot?.x || 0, pivot?.y || 0, sw, sh);
     const cx = (safe.left + safe.right) * 0.5;
     const cy = (safe.top + safe.bottom) * 0.5;
     const halfW = Math.max(40, (safe.right - safe.left) * 0.5);
@@ -650,7 +731,7 @@ export class CharacterPinManager {
   }
 
   onTokenUpdated(doc, changes) {
-    if (!this.enabled || !doc) return;
+    if (!this.enabled || !doc || doc.parent?.id !== canvas.scene?.id) return;
     const entry = this.entries.find(e => e.id === doc.id);
     if (!entry) {
       if ("actorId" in changes || "actorLink" in changes || "hidden" in changes) {
@@ -658,7 +739,7 @@ export class CharacterPinManager {
       }
       return;
     }
-    if ("texture" in changes || "name" in changes || "hidden" in changes) {
+    if ("texture" in changes || "ring" in changes || "name" in changes || "hidden" in changes || "actorId" in changes || "actorLink" in changes) {
       this.scheduleRebuild();
       return;
     }
@@ -675,11 +756,22 @@ export class CharacterPinManager {
     this.scheduleRebuild();
   }
 
-  async focusEntry(entry, { instant = false, scale = FOCUS_TARGET_SCALE } = {}) {
+  rememberTacticalScale() {
+    if (!canvas?.stage || this.controller?.isCameraFlying) return;
+    const cur = canvas.stage.scale?.x || 0;
+    if (cur >= 0.55 && cur <= 1.5) {
+      this._lastTacticalScale = cur;
+    } else if (cur < 0.55) {
+      this._lastTacticalScale = FOCUS_TARGET_SCALE;
+    }
+  }
+
+  async focusEntry(entry, { instant = false, scale = FOCUS_TARGET_SCALE, style = null } = {}) {
     const doc = entry?.tokenDoc;
     if (!doc || !canvas?.ready) return false;
 
     const pos = getTokenWorldCenter(doc);
+    const resolvedStyle = style ?? (shouldUseGtaSwitch(doc) ? "gta5" : undefined);
     const target = {
       x: pos.x,
       y: pos.y,
@@ -687,19 +779,42 @@ export class CharacterPinManager {
       targetScale: scale
     };
 
-    const completed = await this.controller?.poiManager?.flyTo?.(target, { instant, scale });
+    const completed = await this.controller?.poiManager?.flyTo?.(target, { instant, scale, style: resolvedStyle });
     if (!canvas?.ready) return Boolean(completed);
 
-    // Ensure token placeable is mounted and control it for instant play
-    try {
-      this.controller?.tokenStreamer?.scheduleSync?.(this.controller.getViewportWorldRect(0.28), true);
-      const tokObj = doc._object || canvas.tokens?.get?.(doc.id);
-      if (tokObj && !tokObj.destroyed && tokObj.isOwner && (!doc.level || doc.level === canvas.level?.id)) {
-        tokObj.control({ releaseOthers: true });
-      }
-    } catch {}
+    // Only select/control the token if the flight completed (not cancelled) and we are still on the same scene
+    if (completed && doc.parent?.id === canvas.scene?.id) {
+      try {
+        this.controller?.tokenStreamer?.scheduleSync?.(this.controller.getViewportWorldRect(0.28), true);
+        const tokObj = doc._object || canvas.tokens?.get?.(doc.id);
+        if (tokObj && !tokObj.destroyed && tokObj.isOwner && (!doc.level || doc.level === canvas.level?.id)) {
+          tokObj.control({ releaseOthers: true });
+        }
+      } catch {}
+    }
 
     this.updateViewport();
+    return Boolean(completed);
+  }
+
+  async focusTokenObject(tokenObj, { instant = false, scale = null, style = "gta5" } = {}) {
+    const doc = tokenObj?.document || tokenObj;
+    if (!doc || !canvas?.ready) return false;
+
+    const pos = getTokenWorldCenter(doc);
+    const landingScale = (Number.isFinite(scale) && scale > 0)
+      ? scale
+      : Math.max(0.65, Math.min(1.25, this._lastTacticalScale || FOCUS_TARGET_SCALE));
+
+    const target = {
+      x: pos.x,
+      y: pos.y,
+      levelId: doc.level || null,
+      targetScale: landingScale
+    };
+
+    const completed = await this.controller?.poiManager?.flyTo?.(target, { instant, scale: landingScale, style });
+    if (canvas?.ready) this.updateViewport();
     return Boolean(completed);
   }
 
@@ -721,13 +836,16 @@ export class CharacterPinManager {
   }
 
   unmount() {
+    this._mountGen = (this._mountGen || 0) + 1;
     if (this._tickerFn) {
       canvas.app?.ticker?.remove?.(this._tickerFn);
       this._tickerFn = null;
     }
     if (this.container) {
-      this.container.parent?.removeChild(this.container);
-      this.container.destroy({ children: true });
+      try { this.container.parent?.removeChild(this.container); } catch {}
+      if (!this.container.destroyed) {
+        try { this.container.destroy({ children: true }); } catch {}
+      }
       this.container = null;
     }
     if (this.edgeLayerEl) {
@@ -741,4 +859,68 @@ export class CharacterPinManager {
     this._avatarTexCache.clear();
     this.entries = [];
   }
+}
+
+let characterSwitchPatchInstalled = false;
+
+/**
+ * Intercept native Foundry v14 `TokenLayer#cycleTokens` (TAB / Shift+TAB) on active Boundless scenes
+ * so switching between characters triggers a GTA 5-style pull-up -> sky cruise -> gradual descent flight
+ * instead of a flat linear pan.
+ */
+export function installCharacterSwitchPatch(controller) {
+  if (characterSwitchPatchInstalled) return;
+  const TokenLayerCls = foundry.canvas?.layers?.TokenLayer ?? CONFIG.Token?.layerClass;
+  if (!TokenLayerCls?.prototype?.cycleTokens) return;
+
+  const origCycleTokens = TokenLayerCls.prototype.cycleTokens;
+  TokenLayerCls.prototype.cycleTokens = function (forwards = true, reset = false) {
+    if (!controller?.active || !canvas?.ready) {
+      return origCycleTokens.call(this, forwards, reset);
+    }
+
+    // Snapshot tactical scale before any in-flight GTA altitude changes it (handles rapid TAB -> TAB)
+    controller.charPins?.rememberTacticalScale?.();
+
+    // Suppress native flat `canvas.animatePan` triggered inside cycleTokens while capturing its args
+    // so nearby tokens still fall back to instant native panning.
+    const origAnimatePan = canvas.animatePan;
+    let panSuppressed = false;
+    let capturedPanArgs = null;
+    canvas.animatePan = (...args) => {
+      panSuppressed = true;
+      capturedPanArgs = args;
+      return Promise.resolve(false);
+    };
+
+    let next = null;
+    try {
+      next = origCycleTokens.call(this, forwards, reset);
+    } finally {
+      canvas.animatePan = origAnimatePan;
+    }
+
+    const targetToken = next || (panSuppressed ? this.controlled?.[0] : null);
+    if (targetToken) {
+      const doc = targetToken.document || targetToken;
+      if (shouldUseGtaSwitch(doc)) {
+        controller.charPins?.focusTokenObject?.(targetToken);
+      } else {
+        // Token is nearby on screen: keep crisp native Foundry pan without lifting the camera
+        controller.poiManager?.cancelFlight?.();
+        if (capturedPanArgs) {
+          origAnimatePan.apply(canvas, capturedPanArgs);
+        } else if (targetToken.center) {
+          origAnimatePan.call(canvas, { x: targetToken.center.x, y: targetToken.center.y });
+        }
+      }
+      return next;
+    }
+
+    // If no controllable token exists on the currently viewed level, fly back to the user's assigned character
+    controller.charPins?.focusCharacter?.();
+    return next;
+  };
+
+  characterSwitchPatchInstalled = true;
 }

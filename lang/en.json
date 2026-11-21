@@ -1,11 +1,11 @@
 {
   "BOUNDLESS": {
-    "Title": "Boundless — Seamless World",
+    "Title": "Boundless, Seamless World",
     "TabLabel": "Boundless",
     "StatusLoaded": "Seamless GPU renderer and spatial chunk streamer active.",
     "Config": {
       "SceneHeading": "Boundless Settings",
-      "LevelHeading": "Boundless — Level Layer",
+      "LevelHeading": "Boundless Level Layer",
       "Enabled": "Enable Boundless on Scene",
       "EnabledHint": "Enables the Quadtree pyramid, GPU lighting batch, and spatial world streaming.",
       "LevelEnabled": "Enable Boundless on this Level",
@@ -18,8 +18,6 @@
       "MaxLosPxHint": "Caps token line-of-sight raycast radius (default 4500 px = 225 ft).",
       "ChunkedFog": "Chunked Fog of War",
       "ChunkedFogHint": "High-resolution 50×50-cell chunked exploration memory bypassing Foundry's 4096 px limit. Follows the scene's native fog mode (Disabled, Individual, Shared) from the Visibility tab.",
-      "MacroAtmosphere": "Atmospheric Mist & Clouds",
-      "MacroAtmosphereHint": "Soft high-altitude mist and drifting cloud shadows on outdoor levels when zoomed out.",
       "ShowPois": "Show Location Markers (POI)",
       "ShowPoisHint": "Displays categorized clickable location pins with automatic anti-overlap decluttering on macro zoom-out.",
       "ShowCharacterPins": "Assigned Character Pin",
@@ -42,7 +40,7 @@
       "PoiColorScale": "Accent Color & Landing Scale",
       "PoiUseCurrentScale": "Use current camera scale",
       "PoiJournal": "Linked Journal",
-      "PoiJournalNone": "— None —",
+      "PoiJournalNone": "None",
       "PoiJournalNoAccess": "You do not have permission to view this journal.",
       "PoiOpenJournal": "Open Journal",
       "PoiHidden": "Hidden (GM only)",

@@ -6,6 +6,19 @@ const MAX_LIGHTS_IN_VIEW = 260;
 const MAX_SOUNDS_IN_VIEW = 200;
 const MAX_TILES_IN_VIEW = 160;
 
+function getExistingSheet(doc) {
+  if (!doc) return null;
+  if ("_sheet" in doc) return doc._sheet;
+  return doc.sheet ?? null;
+}
+
+function isSheetActiveOrRendering(sheet, placeable = null) {
+  if (!sheet) return false;
+  if (sheet.rendered || sheet._preview || placeable?._preview?.previewType === "config") return true;
+  const renderingState = foundry?.applications?.api?.ApplicationV2?.RENDER_STATES?.RENDERING ?? 1;
+  return typeof sheet.state === "number" && sheet.state >= renderingState;
+}
+
 function makeVirtualId(prefix, levelId, key) {
   const input = `${prefix}|${levelId}|${key}`;
   let h1 = 0x811c9dc5;
@@ -21,19 +34,61 @@ function makeVirtualId(prefix, levelId, key) {
 }
 
 function resolveOcclusionModeArray(modeSpec) {
-  if (Array.isArray(modeSpec)) return modeSpec.slice();
+  const validValues = new Set(
+    Object.values(CONST.OCCLUSION_MODES || {}).filter(v => typeof v === "number" && v > 0)
+  );
+  if (Array.isArray(modeSpec)) {
+    const out = new Set();
+    for (const m of modeSpec) {
+      if (typeof m === "string" && m in (CONST.OCCLUSION_MODES || {})) {
+        const v = CONST.OCCLUSION_MODES[m];
+        if (validValues.has(v)) out.add(v);
+      } else if (typeof m === "number" && validValues.has(m)) {
+        out.add(m);
+      }
+    }
+    return Array.from(out);
+  }
   if (typeof modeSpec === "number") {
     const out = [];
-    for (const bit of Object.values(CONST.OCCLUSION_MODES || {})) {
-      if (typeof bit === "number" && bit > 0 && (modeSpec & bit) === bit) out.push(bit);
+    for (const bit of validValues) {
+      if ((modeSpec & bit) === bit) out.push(bit);
     }
     return out;
   }
   if (typeof modeSpec === "string" && modeSpec in (CONST.OCCLUSION_MODES || {})) {
     const v = CONST.OCCLUSION_MODES[modeSpec];
-    return v ? [v] : [];
+    return validValues.has(v) ? [v] : [];
   }
   return [];
+}
+
+function drawShapeDataOutline(gfx, shape, lineColor = 0xEEEEEE, lineAlpha = 0.4) {
+  if (!gfx || !shape) return;
+  const s = canvas.dimensions?.uiScale || 1;
+  gfx.lineStyle(2 * s, lineColor, lineAlpha);
+  if (Array.isArray(shape.polygons) && shape.polygons.length > 0) {
+    for (const poly of shape.polygons) {
+      gfx.drawShape(poly);
+    }
+  } else if (typeof shape.radius === "number" && shape.radius > 0) {
+    gfx.drawCircle(shape.x || 0, shape.y || 0, shape.radius);
+  } else if (typeof shape.type === "number") {
+    gfx.drawShape(shape);
+  }
+}
+
+function attachVirtualCollectionProxy(doc, id, realColl) {
+  if (!doc || !realColl) return;
+  const collProxy = new Proxy(realColl, {
+    get(target, prop) {
+      if (prop === "has") return (k) => k === id || target.has(k);
+      if (prop === "get") return (k, opts) => (k === id ? doc : target.get(k, opts));
+      const val = Reflect.get(target, prop, target);
+      return typeof val === "function" ? val.bind(target) : val;
+    }
+  });
+  Object.defineProperty(doc, "collection", { get: () => collProxy, configurable: true });
 }
 
 export class VirtualLayerEditors {
@@ -109,24 +164,24 @@ export class VirtualLayerEditors {
     const origLightGet = lighting?.get;
     const origSoundGet = sounds?.get;
     const origTileGet = tiles?.get;
+    const state = { active: true };
 
-    this._patches = {
-      scene, lighting, sounds, tiles,
-      origUpdateEmbedded, origDeleteEmbedded,
-      origLightGet, origSoundGet, origTileGet
-    };
+    const wrappedLightGet = (lighting && origLightGet)
+      ? (id) => (state.active ? this.lightsById.get(id)?.placeable : null) || origLightGet.call(lighting, id)
+      : null;
+    const wrappedSoundGet = (sounds && origSoundGet)
+      ? (id) => (state.active ? this.soundsById.get(id)?.placeable : null) || origSoundGet.call(sounds, id)
+      : null;
+    const wrappedTileGet = (tiles && origTileGet)
+      ? (id) => (state.active ? this.tilesById.get(id)?.placeable : null) || origTileGet.call(tiles, id)
+      : null;
 
-    if (lighting && origLightGet) {
-      lighting.get = (id) => this.lightsById.get(id)?.placeable || origLightGet.call(lighting, id);
-    }
-    if (sounds && origSoundGet) {
-      sounds.get = (id) => this.soundsById.get(id)?.placeable || origSoundGet.call(sounds, id);
-    }
-    if (tiles && origTileGet) {
-      tiles.get = (id) => this.tilesById.get(id)?.placeable || origTileGet.call(tiles, id);
-    }
+    if (wrappedLightGet) lighting.get = wrappedLightGet;
+    if (wrappedSoundGet) sounds.get = wrappedSoundGet;
+    if (wrappedTileGet) tiles.get = wrappedTileGet;
 
-    scene.updateEmbeddedDocuments = async (embeddedName, updates = [], operation = {}) => {
+    const wrappedUpdateEmbedded = async (embeddedName, updates = [], operation = {}) => {
+      if (!state.active) return origUpdateEmbedded.call(scene, embeddedName, updates, operation);
       const mapById = embeddedName === "AmbientLight" ? this.lightsById
         : embeddedName === "AmbientSound" ? this.soundsById
         : embeddedName === "Tile" ? this.tilesById
@@ -158,7 +213,8 @@ export class VirtualLayerEditors {
       return results;
     };
 
-    scene.deleteEmbeddedDocuments = async (embeddedName, ids = [], operation = {}) => {
+    const wrappedDeleteEmbedded = async (embeddedName, ids = [], operation = {}) => {
+      if (!state.active) return origDeleteEmbedded.call(scene, embeddedName, ids, operation);
       const mapById = embeddedName === "AmbientLight" ? this.lightsById
         : embeddedName === "AmbientSound" ? this.soundsById
         : embeddedName === "Tile" ? this.tilesById
@@ -188,21 +244,36 @@ export class VirtualLayerEditors {
       }
       return results;
     };
+
+    scene.updateEmbeddedDocuments = wrappedUpdateEmbedded;
+    scene.deleteEmbeddedDocuments = wrappedDeleteEmbedded;
+
+    this._patches = {
+      state,
+      scene, lighting, sounds, tiles,
+      origUpdateEmbedded, origDeleteEmbedded,
+      origLightGet, origSoundGet, origTileGet,
+      wrappedUpdateEmbedded, wrappedDeleteEmbedded,
+      wrappedLightGet, wrappedSoundGet, wrappedTileGet
+    };
   }
 
   _removePatches() {
     if (!this._patches) return;
     const {
-      scene, lighting, sounds, tiles,
+      state, scene, lighting, sounds, tiles,
       origUpdateEmbedded, origDeleteEmbedded,
-      origLightGet, origSoundGet, origTileGet
+      origLightGet, origSoundGet, origTileGet,
+      wrappedUpdateEmbedded, wrappedDeleteEmbedded,
+      wrappedLightGet, wrappedSoundGet, wrappedTileGet
     } = this._patches;
+    state.active = false;
     try {
-      scene.updateEmbeddedDocuments = origUpdateEmbedded;
-      scene.deleteEmbeddedDocuments = origDeleteEmbedded;
-      if (lighting && origLightGet) lighting.get = origLightGet;
-      if (sounds && origSoundGet) sounds.get = origSoundGet;
-      if (tiles && origTileGet) tiles.get = origTileGet;
+      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) scene.updateEmbeddedDocuments = origUpdateEmbedded;
+      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
+      if (lighting && wrappedLightGet && lighting.get === wrappedLightGet) lighting.get = origLightGet;
+      if (sounds && wrappedSoundGet && sounds.get === wrappedSoundGet) sounds.get = origSoundGet;
+      if (tiles && wrappedTileGet && tiles.get === wrappedTileGet) tiles.get = origTileGet;
     } catch {}
     this._patches = null;
   }
@@ -212,10 +283,14 @@ export class VirtualLayerEditors {
     return lid ? this.controller?.levelLayers?.get(lid) || null : null;
   }
 
-  _destroyPlaceable(layer, entry, byKey, byId) {
+  _destroyPlaceable(layer, entry, byKey, byId, { closeSheet = false } = {}) {
     if (!entry) return;
-    byKey.delete(entry.key);
-    byId.delete(entry.id);
+    if (byKey.get(entry.key) === entry) byKey.delete(entry.key);
+    if (byId.get(entry.id) === entry) byId.delete(entry.id);
+    const sheet = getExistingSheet(entry.doc);
+    if (closeSheet && sheet) {
+      try { sheet.close(); } catch {}
+    }
     const obj = entry.placeable;
     if (!obj) return;
     try {
@@ -248,7 +323,7 @@ export class VirtualLayerEditors {
   _clearLights() {
     this._lightGen++;
     for (const entry of Array.from(this.lightsByKey.values())) {
-      this._destroyPlaceable(canvas?.lighting, entry, this.lightsByKey, this.lightsById);
+      this._destroyPlaceable(canvas?.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
     }
     this.lightsByKey.clear();
     this.lightsById.clear();
@@ -281,40 +356,46 @@ export class VirtualLayerEditors {
     }, { parent: canvas.scene });
 
     doc._mmVirtualLight = item;
+    attachVirtualCollectionProxy(doc, id, canvas.scene.lights);
     doc.update = async (data = {}) => (await this._commitLightUpdates([{ ...data, _id: id }]))[0] || doc;
     doc.delete = async () => (await this._commitLightDeletes([id]))[0] || doc;
 
     const placeable = canvas.lighting.createObject(doc);
-    Object.defineProperty(placeable, "isFilteredOut", { value: false, configurable: true });
-    // Prevent virtual editor placeables from spawning duplicate native PointLightSources (which would
-    // double-brighten lights and shine through virtual walls outside the active sim-bubble!).
-    // MegaLightBatch + dynamicLights already render the exact wall-shadowed light.
-    placeable.initializeLightSource = () => {};
-    placeable._refreshField = function () {
-      if (!this.field) return;
-      this.field.clear();
-      const shape = this.document?.shape;
-      if (!shape) return;
-      const s = canvas.dimensions?.uiScale || 1;
-      this.field.lineStyle(2 * s, 0xEEEEEE, 0.4).drawShape(shape);
+    const patchVirtualLight = (obj) => {
+      Object.defineProperty(obj, "isFilteredOut", { value: false, configurable: true });
+      // Prevent virtual editor placeables (and config/drag clones) from spawning duplicate native PointLightSources
+      // (which would double-brighten lights and shine through virtual walls outside the active sim-bubble!).
+      obj.initializeLightSource = () => {};
+      obj._refreshField = function () {
+        if (!this.field) return;
+        this.field.clear();
+        drawShapeDataOutline(this.field, this.document?.shape, 0xEEEEEE, 0.4);
+      };
+      obj.clone = function () {
+        const cloned = Object.getPrototypeOf(this).clone.call(this);
+        if (cloned) patchVirtualLight(cloned);
+        return cloned;
+      };
     };
+    patchVirtualLight(placeable);
 
-    const entry = { id, key: item.lKey, levelId: item.levelId, sk: item.sk, idx: item.idx, placeable, doc };
+    const entry = { id, key: item.lKey, levelId: item.levelId, sk: item.sk, idx: item.idx, sig: JSON.stringify(item), placeable, doc };
     this.lightsByKey.set(item.lKey, entry);
     this.lightsById.set(id, entry);
 
     canvas.lighting.objects.addChild(placeable);
     placeable.renderFlags.clear();
-    await placeable.draw();
+    let drawFailed = false;
+    try { await placeable.draw(); } catch { drawFailed = true; }
 
-    if (!this.lightActive || gen !== this._lightGen || !this.lightsById.has(id)) {
+    if (drawFailed || !this.lightActive || gen !== this._lightGen || this.lightsById.get(id) !== entry || placeable.destroyed) {
       this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
       return;
     }
 
     placeable.renderFlags.set({ refresh: true });
     placeable.applyRenderFlags();
-    canvas.lighting.quadtree?.insert({ r: placeable.bounds, t: placeable });
+    placeable._updateQuadtree?.();
   }
 
   syncLighting(force = false, vp = null) {
@@ -331,17 +412,23 @@ export class VirtualLayerEditors {
 
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
-    const sx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const pad = 350;
+    const qStep = 250;
+    const qx0 = Math.floor(curVp.x0 / qStep);
+    const qy0 = Math.floor(curVp.y0 / qStep);
+    const qx1 = Math.floor(curVp.x1 / qStep);
+    const qy1 = Math.floor(curVp.y1 / qStep);
     const inZoom = curVp.scale >= LIGHT_STREAM_MIN_SCALE;
-    const key = `${lid}:${sx0}_${sy0}_${sx1}_${sy1}:${inZoom ? 1 : 0}:r${this.controller.lightEditsRev || 0}`;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.lightEditsRev || 0}`;
     if (key === this._lastLightKey) return;
     this._lastLightKey = key;
 
-    const pad = 350;
+    const sx0 = Math.max(0, Math.floor((curVp.x0 - pad) / simSectorPx));
+    const sy0 = Math.max(0, Math.floor((curVp.y0 - pad) / simSectorPx));
+    const sx1 = Math.min(simGrid - 1, Math.floor((curVp.x1 + pad) / simSectorPx));
+    const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
     const items = [];
+    const seenKeys = new Set();
     for (let sy = sy0; sy <= sy1; sy++) {
       for (let sx = sx0; sx <= sx1; sx++) {
         const sk = `${sx}_${sy}`;
@@ -350,10 +437,28 @@ export class VirtualLayerEditors {
         for (let li = 0; li < list.length; li++) {
           const item = this.controller.resolveVirtualLight(lid, sk, li, list[li], level);
           if (!item) continue;
+          seenKeys.add(item.lKey);
           if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
               item.y < curVp.y0 - pad || item.y > curVp.y1 + pad) continue;
           items.push(item);
         }
+      }
+    }
+    const lvlLightEdits = this.controller.lightEdits?.get(lid);
+    if (lvlLightEdits?.size) {
+      for (const [lKey, ov] of lvlLightEdits) {
+        if (!ov || seenKeys.has(lKey)) continue;
+        const parts = lKey.split(":");
+        if (parts.length !== 3) continue;
+        const [sk, , idxStr] = parts;
+        const idx = Number(idxStr);
+        const raw = spec.sectors[sk]?.l?.[idx];
+        if (!raw) continue;
+        const item = this.controller.resolveVirtualLight(lid, sk, idx, raw, level);
+        if (!item) continue;
+        if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
+            item.y < curVp.y0 - pad || item.y > curVp.y1 + pad) continue;
+        items.push(item);
       }
     }
 
@@ -376,17 +481,63 @@ export class VirtualLayerEditors {
 
     const needed = new Map();
     for (const it of items) needed.set(it.lKey, it);
+    const lvlEdits = this.controller.lightEdits?.get(lid);
 
     for (const entry of Array.from(this.lightsByKey.values())) {
-      if (!needed.has(entry.key) && !entry.placeable?.controlled) {
+      const wrongLevel = entry.levelId !== lid;
+      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const sheet = getExistingSheet(entry.doc);
+      if (wrongLevel || isDeleted) {
+        this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
+      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
         this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
       }
     }
 
     const gen = this._lightGen;
     for (const it of needed.values()) {
-      if (!this.lightsByKey.has(it.lKey)) {
+      const existing = this.lightsByKey.get(it.lKey);
+      const nextSig = JSON.stringify(it);
+      if (!existing) {
         this._mountNativeLight(it, gen);
+      } else if (existing.sig !== nextSig) {
+        const sheet = getExistingSheet(existing.doc);
+        if (sheet?.rendered) {
+          const prevAngle = existing.doc.config?.angle ?? 360;
+          const patch = {
+            x: it.x, y: it.y, elevation: it.elevation, rotation: it.rotation || 0,
+            hidden: Boolean(it.hidden), walls: it.walls !== false,
+            config: {
+              dim: it.dim, bright: it.bright, angle: it.angle ?? 360,
+              color: it.color || null, alpha: it.alpha ?? 0.5,
+              darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 },
+              animation: { type: it.anim || null, speed: 3, intensity: 3 }
+            }
+          };
+          existing.doc.updateSource(patch);
+          existing.sig = nextSig;
+          const shapeChanged = (prevAngle >= 360) !== ((it.angle ?? 360) >= 360);
+          if (existing.placeable && !existing.placeable.destroyed) {
+            Promise.resolve(shapeChanged ? existing.placeable.draw() : null).then(() => {
+              if (!existing.placeable.destroyed) {
+                existing.placeable.renderFlags.set({ refresh: true });
+                existing.placeable.applyRenderFlags();
+                existing.placeable._updateQuadtree?.();
+              }
+            }).catch(() => {});
+          }
+          try {
+            if (sheet._preview && typeof sheet._previewChanges === "function") {
+              sheet._previewChanges(patch);
+            } else {
+              sheet._preview?.updateSource?.(patch);
+            }
+            sheet.render(false);
+          } catch {}
+        } else {
+          this._destroyPlaceable(canvas.lighting, existing, this.lightsByKey, this.lightsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+          this._mountNativeLight(it, gen);
+        }
       }
     }
   }
@@ -404,7 +555,10 @@ export class VirtualLayerEditors {
       const patch = foundry.utils.deepClone(u);
       delete patch._id;
       delete patch.id;
+      const prevAngle = entry.doc.config?.angle ?? 360;
       entry.doc.updateSource(patch);
+      const nextAngle = entry.doc.config?.angle ?? 360;
+      const shapeTypeChanged = (prevAngle >= 360) !== (nextAngle >= 360);
 
       const cfg = entry.doc.config || {};
       const colorCss = cfg.color ? foundry.utils.Color.from(cfg.color).css : null;
@@ -426,12 +580,17 @@ export class VirtualLayerEditors {
       };
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, nextState);
+      entry.sig = JSON.stringify({ levelId: entry.levelId, sk: entry.sk, idx: entry.idx, lKey: entry.key, ...nextState });
 
       if (entry.placeable && !entry.placeable.destroyed) {
-        entry.placeable.renderFlags.set({ refresh: true });
-        entry.placeable.applyRenderFlags();
-        canvas.lighting?.quadtree?.remove(entry.placeable);
-        canvas.lighting?.quadtree?.insert({ r: entry.placeable.bounds, t: entry.placeable });
+        if (shapeTypeChanged) {
+          try { await entry.placeable.draw(); } catch {}
+        }
+        if (!entry.placeable.destroyed) {
+          entry.placeable.renderFlags.set({ refresh: true });
+          entry.placeable.applyRenderFlags();
+          entry.placeable._updateQuadtree?.();
+        }
       }
       docs.push(entry.doc);
     }
@@ -455,7 +614,7 @@ export class VirtualLayerEditors {
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = null;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, null);
       docs.push(entry.doc);
-      this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
+      this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
     }
 
     if (Object.keys(flagUpdate).length) {
@@ -487,7 +646,7 @@ export class VirtualLayerEditors {
   _clearSounds() {
     this._soundGen++;
     for (const entry of Array.from(this.soundsByKey.values())) {
-      this._destroyPlaceable(canvas?.sounds, entry, this.soundsByKey, this.soundsById);
+      this._destroyPlaceable(canvas?.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
     }
     this.soundsByKey.clear();
     this.soundsById.clear();
@@ -509,36 +668,58 @@ export class VirtualLayerEditors {
       volume: item.volume,
       walls: item.walls,
       easing: item.easing,
+      hidden: Boolean(item.hidden),
       darkness: { min: item.darkMin, max: item.darkMax },
       levels: [item.levelId]
     }, { parent: canvas.scene });
 
     doc._mmVirtualSound = item;
+    attachVirtualCollectionProxy(doc, id, canvas.scene.sounds);
     doc.update = async (data = {}) => (await this._commitSoundUpdates([{ ...data, _id: id }]))[0] || doc;
     doc.delete = async () => (await this._commitSoundDeletes([id]))[0] || doc;
 
     const placeable = canvas.sounds.createObject(doc);
-    Object.defineProperty(placeable, "isFilteredOut", { value: false, configurable: true });
-    // Link active PointSoundSource so Foundry draws the live wall-constrained sound radius
-    const liveSrc = this.controller.audioStreamer?.activeSources?.get(`${item.levelId}::${item.sk}_${item.idx}`);
-    if (liveSrc) placeable.source = liveSrc;
+    // Prevent virtual editor placeables (and config/drag clones) from spawning duplicate PointSoundSources
+    const soundSourceKey = `${item.levelId}::${item.sk}_${item.idx}`;
+    const audioStreamer = this.controller.audioStreamer;
+    const patchVirtualSound = (obj) => {
+      Object.defineProperty(obj, "isFilteredOut", { value: false, configurable: true });
+      obj.initializeSoundSource = () => {};
+      obj._refreshField = function () {
+        if (!this.field) return;
+        this.field.clear();
+        const liveSrc = !this.isPreview ? audioStreamer?.activeSources?.get(soundSourceKey) : null;
+        if (liveSrc?.shape) {
+          drawShapeDataOutline(this.field, liveSrc.shape, 0x66ccff, 0.45);
+        } else {
+          drawShapeDataOutline(this.field, this.document?.shape, 0x66ccff, 0.4);
+        }
+      };
+      obj.clone = function () {
+        const cloned = Object.getPrototypeOf(this).clone.call(this);
+        if (cloned) patchVirtualSound(cloned);
+        return cloned;
+      };
+    };
+    patchVirtualSound(placeable);
 
-    const entry = { id, key: item.sKey, levelId: item.levelId, sk: item.sk, idx: item.idx, placeable, doc };
+    const entry = { id, key: item.sKey, levelId: item.levelId, sk: item.sk, idx: item.idx, sig: JSON.stringify(item), placeable, doc };
     this.soundsByKey.set(item.sKey, entry);
     this.soundsById.set(id, entry);
 
     canvas.sounds.objects.addChild(placeable);
     placeable.renderFlags.clear();
-    await placeable.draw();
+    let drawFailed = false;
+    try { await placeable.draw(); } catch { drawFailed = true; }
 
-    if (!this.soundActive || gen !== this._soundGen || !this.soundsById.has(id)) {
+    if (drawFailed || !this.soundActive || gen !== this._soundGen || this.soundsById.get(id) !== entry || placeable.destroyed) {
       this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
       return;
     }
 
     placeable.renderFlags.set({ refresh: true });
     placeable.applyRenderFlags();
-    canvas.sounds.quadtree?.insert({ r: placeable.bounds, t: placeable });
+    placeable._updateQuadtree?.();
   }
 
   syncSounds(force = false, vp = null) {
@@ -555,17 +736,23 @@ export class VirtualLayerEditors {
 
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
-    const sx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const pad = 400;
+    const qStep = 300;
+    const qx0 = Math.floor(curVp.x0 / qStep);
+    const qy0 = Math.floor(curVp.y0 / qStep);
+    const qx1 = Math.floor(curVp.x1 / qStep);
+    const qy1 = Math.floor(curVp.y1 / qStep);
     const inZoom = curVp.scale >= SOUND_STREAM_MIN_SCALE;
-    const key = `${lid}:${sx0}_${sy0}_${sx1}_${sy1}:${inZoom ? 1 : 0}:r${this.controller.soundEditsRev || 0}`;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.soundEditsRev || 0}`;
     if (key === this._lastSoundKey) return;
     this._lastSoundKey = key;
 
-    const pad = 400;
+    const sx0 = Math.max(0, Math.floor((curVp.x0 - pad) / simSectorPx));
+    const sy0 = Math.max(0, Math.floor((curVp.y0 - pad) / simSectorPx));
+    const sx1 = Math.min(simGrid - 1, Math.floor((curVp.x1 + pad) / simSectorPx));
+    const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
     const items = [];
+    const seenKeys = new Set();
     for (let sy = sy0; sy <= sy1; sy++) {
       for (let sx = sx0; sx <= sx1; sx++) {
         const sk = `${sx}_${sy}`;
@@ -574,10 +761,28 @@ export class VirtualLayerEditors {
         for (let si = 0; si < list.length; si++) {
           const item = this.controller.resolveVirtualSound(lid, sk, si, list[si], level);
           if (!item) continue;
+          seenKeys.add(item.sKey);
           if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
               item.y < curVp.y0 - pad || item.y > curVp.y1 + pad) continue;
           items.push(item);
         }
+      }
+    }
+    const lvlSoundEdits = this.controller.soundEdits?.get(lid);
+    if (lvlSoundEdits?.size) {
+      for (const [sKey, ov] of lvlSoundEdits) {
+        if (!ov || seenKeys.has(sKey)) continue;
+        const parts = sKey.split(":");
+        if (parts.length !== 3) continue;
+        const [sk, , idxStr] = parts;
+        const idx = Number(idxStr);
+        const raw = spec.sectors[sk]?.s?.[idx];
+        if (!raw) continue;
+        const item = this.controller.resolveVirtualSound(lid, sk, idx, raw, level);
+        if (!item) continue;
+        if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
+            item.y < curVp.y0 - pad || item.y > curVp.y1 + pad) continue;
+        items.push(item);
       }
     }
 
@@ -600,17 +805,52 @@ export class VirtualLayerEditors {
 
     const needed = new Map();
     for (const it of items) needed.set(it.sKey, it);
+    const lvlEdits = this.controller.soundEdits?.get(lid);
 
     for (const entry of Array.from(this.soundsByKey.values())) {
-      if (!needed.has(entry.key) && !entry.placeable?.controlled) {
+      const wrongLevel = entry.levelId !== lid;
+      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const sheet = getExistingSheet(entry.doc);
+      if (wrongLevel || isDeleted) {
+        this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
+      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
         this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
       }
     }
 
     const gen = this._soundGen;
     for (const it of needed.values()) {
-      if (!this.soundsByKey.has(it.sKey)) {
+      const existing = this.soundsByKey.get(it.sKey);
+      const nextSig = JSON.stringify(it);
+      if (!existing) {
         this._mountNativeSound(it, gen);
+      } else if (existing.sig !== nextSig) {
+        const sheet = getExistingSheet(existing.doc);
+        if (sheet?.rendered) {
+          const patch = {
+            x: it.x, y: it.y, elevation: it.elevation, radius: it.radius,
+            path: it.path, volume: it.volume, walls: it.walls, easing: it.easing,
+            hidden: Boolean(it.hidden), darkness: { min: it.darkMin, max: it.darkMax }
+          };
+          existing.doc.updateSource(patch);
+          existing.sig = nextSig;
+          if (existing.placeable && !existing.placeable.destroyed) {
+            existing.placeable.renderFlags.set({ refresh: true });
+            existing.placeable.applyRenderFlags();
+            existing.placeable._updateQuadtree?.();
+          }
+          try {
+            if (sheet._preview && typeof sheet._previewChanges === "function") {
+              sheet._previewChanges(patch);
+            } else {
+              sheet._preview?.updateSource?.(patch);
+            }
+            sheet.render(false);
+          } catch {}
+        } else {
+          this._destroyPlaceable(canvas.sounds, existing, this.soundsByKey, this.soundsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+          this._mountNativeSound(it, gen);
+        }
       }
     }
   }
@@ -620,6 +860,7 @@ export class VirtualLayerEditors {
     if (!scene || !updates.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const u of updates) {
       const id = u._id ?? u.id;
@@ -640,22 +881,30 @@ export class VirtualLayerEditors {
         easing: entry.doc.easing !== false,
         darkMin: entry.doc.darkness?.min ?? 0,
         darkMax: entry.doc.darkness?.max ?? 1,
-        elevation: entry.doc.elevation ?? 0
+        elevation: entry.doc.elevation ?? 0,
+        hidden: Boolean(entry.doc.hidden)
       };
       flagUpdate[`flags.${MODULE_ID}.soundEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualSoundEditLocal(entry.levelId, entry.key, nextState);
+      entry.sig = JSON.stringify({ levelId: entry.levelId, sk: entry.sk, idx: entry.idx, sKey: entry.key, ...nextState });
 
       if (entry.placeable && !entry.placeable.destroyed) {
         entry.placeable.renderFlags.set({ refresh: true });
         entry.placeable.applyRenderFlags();
-        canvas.sounds?.quadtree?.remove(entry.placeable);
-        canvas.sounds?.quadtree?.insert({ r: entry.placeable.bounds, t: entry.placeable });
+        entry.placeable._updateQuadtree?.();
       }
+      updatedEntries.push(entry);
       docs.push(entry.doc);
     }
 
     if (Object.keys(flagUpdate).length) {
       this.controller.applyVirtualSoundChangesLocal();
+      for (const entry of updatedEntries) {
+        if (entry.placeable && !entry.placeable.destroyed) {
+          entry.placeable.renderFlags.set({ refreshField: true });
+          entry.placeable.applyRenderFlags();
+        }
+      }
       await scene.update(flagUpdate);
     }
     return docs;
@@ -673,7 +922,7 @@ export class VirtualLayerEditors {
       flagUpdate[`flags.${MODULE_ID}.soundEdits.${entry.levelId}.${entry.key}`] = null;
       this.controller.setVirtualSoundEditLocal(entry.levelId, entry.key, null);
       docs.push(entry.doc);
-      this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
+      this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
     }
 
     if (Object.keys(flagUpdate).length) {
@@ -701,12 +950,22 @@ export class VirtualLayerEditors {
 
   _clearTiles() {
     this._tileGen++;
+    this._lastTileNeededKeys = null;
     for (const entry of Array.from(this.tilesByKey.values())) {
       this._setRawVirtualTileVisible(entry.fullId, true);
-      this._destroyPlaceable(canvas?.tiles, entry, this.tilesByKey, this.tilesById);
+      this._destroyPlaceable(canvas?.tiles, entry, this.tilesByKey, this.tilesById, { closeSheet: true });
     }
     this.tilesByKey.clear();
     this.tilesById.clear();
+  }
+
+  _cleanupLeakedTileMesh(placeable) {
+    if (!placeable?.mesh) return;
+    try {
+      if (canvas?.primary?.tiles?.get?.(placeable.objectId)?.object === placeable) {
+        canvas.primary.removeTile(placeable);
+      }
+    } catch {}
   }
 
   _setRawVirtualTileVisible(fullId, visible) {
@@ -720,24 +979,46 @@ export class VirtualLayerEditors {
     if (!this.tileActive || gen !== this._tileGen || !canvas?.tiles?.objects || !canvas.scene) return;
     if (this.tilesByKey.has(item.tKey)) return;
 
+    // Preload tile texture before creating native Tile so Tile#_draw cannot leak a PrimarySpriteMesh at (0,0)
+    // if the user leaves TilesLayer, switches levels, or pans away while loadTexture is in flight.
+    const editRev = this.controller.tileEditsRev || 0;
+    if (item.src && typeof foundry.canvas?.loadTexture === "function") {
+      try { await foundry.canvas.loadTexture(item.src, { fallback: "icons/svg/hazard.svg" }); } catch {}
+      if (!this.tileActive || gen !== this._tileGen || (this.controller.tileEditsRev || 0) !== editRev || !canvas?.tiles?.objects || !canvas.scene) return;
+      if (this._getViewedLayer()?.level?.id !== item.levelId) return;
+      if ((this._lastTileNeededKeys && !this._lastTileNeededKeys.has(item.tKey)) || this.tilesByKey.has(item.tKey)) return;
+    }
+
     const id = makeVirtualId("mt", item.levelId, item.tKey);
     const DocCls = CONFIG.Tile.documentClass;
     const occModes = resolveOcclusionModeArray(item.occlusionMode);
+    // In Foundry v14, TileDocument (x, y) is the anchor/pivot position (matching PrimarySpriteMesh anchor).
+    // Raw virtual tiles without anchorX/anchorY store top-left (x, y); convert to center pivot when anchor is omitted.
+    const ax = item.anchorX ?? 0.5;
+    const ay = item.anchorY ?? 0.5;
+    const docX = item.anchorX === undefined ? (item.x + item.w * 0.5) : item.x;
+    const docY = item.anchorY === undefined ? (item.y + item.h * 0.5) : item.y;
     const doc = new DocCls({
       _id: id,
-      x: item.x,
-      y: item.y,
+      x: docX,
+      y: docY,
       width: item.w,
       height: item.h,
       rotation: item.rot || 0,
       elevation: item.elevation,
       sort: item.sort || 0,
       alpha: item.alpha ?? 1,
+      hidden: Boolean(item.hidden),
       levels: [item.levelId],
       texture: {
         src: item.src,
         tint: item.tint || "#ffffff",
-        alphaThreshold: item.alphaThreshold ?? 0.75
+        alphaThreshold: item.alphaThreshold ?? 0.75,
+        anchorX: ax,
+        anchorY: ay,
+        scaleX: item.scaleX ?? 1,
+        scaleY: item.scaleY ?? 1,
+        fit: item.fit ?? "fill"
       },
       occlusion: {
         modes: occModes,
@@ -750,6 +1031,7 @@ export class VirtualLayerEditors {
     }, { parent: canvas.scene });
 
     doc._mmVirtualTile = item;
+    attachVirtualCollectionProxy(doc, id, canvas.scene.tiles);
     doc.update = async (data = {}) => (await this._commitTileUpdates([{ ...data, _id: id }]))[0] || doc;
     doc.delete = async () => (await this._commitTileDeletes([id]))[0] || doc;
 
@@ -757,15 +1039,20 @@ export class VirtualLayerEditors {
     Object.defineProperty(placeable, "isFilteredOut", { value: false, configurable: true });
 
     const fullId = `${item.levelId}::${item.tid}`;
-    const entry = { id, key: item.tKey, fullId, levelId: item.levelId, tid: item.tid, placeable, doc };
+    const entry = { id, key: item.tKey, fullId, levelId: item.levelId, tid: item.tid, sig: JSON.stringify(item), placeable, doc };
     this.tilesByKey.set(item.tKey, entry);
     this.tilesById.set(id, entry);
 
     canvas.tiles.objects.addChild(placeable);
     placeable.renderFlags.clear();
-    await placeable.draw();
+    let drawFailed = false;
+    try { await placeable.draw(); } catch { drawFailed = true; }
 
-    if (!this.tileActive || gen !== this._tileGen || !this.tilesById.has(id)) {
+    if (drawFailed || !this.tileActive || gen !== this._tileGen || this.tilesById.get(id) !== entry || placeable.destroyed) {
+      if (this.tilesByKey.get(item.tKey) === entry) {
+        this._setRawVirtualTileVisible(fullId, true);
+      }
+      this._cleanupLeakedTileMesh(placeable);
       this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
       return;
     }
@@ -774,7 +1061,7 @@ export class VirtualLayerEditors {
     placeable.applyRenderFlags();
     // Hide raw streamed PrimarySpriteMesh while native Tile renders its own mesh
     this._setRawVirtualTileVisible(fullId, false);
-    canvas.tiles.quadtree?.insert({ r: placeable.bounds, t: placeable });
+    placeable._updateQuadtree?.();
   }
 
   syncTiles(force = false, vp = null) {
@@ -791,12 +1078,14 @@ export class VirtualLayerEditors {
 
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
-    const sx0 = Math.max(0, Math.floor(curVp.x0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(curVp.y0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(curVp.x1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(curVp.y1 / simSectorPx));
+    const pad = 300;
+    const qStep = 200;
+    const qx0 = Math.floor(curVp.x0 / qStep);
+    const qy0 = Math.floor(curVp.y0 / qStep);
+    const qx1 = Math.floor(curVp.x1 / qStep);
+    const qy1 = Math.floor(curVp.y1 / qStep);
     const inZoom = curVp.scale >= TILE_STREAM_MIN_SCALE;
-    const key = `${lid}:${sx0}_${sy0}_${sx1}_${sy1}:${inZoom ? 1 : 0}:r${this.controller.tileEditsRev || 0}`;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.tileEditsRev || 0}`;
     if (key === this._lastTileKey) return;
     this._lastTileKey = key;
 
@@ -804,6 +1093,11 @@ export class VirtualLayerEditors {
       this._clearTiles();
       return;
     }
+
+    const sx0 = Math.max(0, Math.floor((curVp.x0 - pad) / simSectorPx));
+    const sy0 = Math.max(0, Math.floor((curVp.y0 - pad) / simSectorPx));
+    const sx1 = Math.min(simGrid - 1, Math.floor((curVp.x1 + pad) / simSectorPx));
+    const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
 
     const tids = new Set();
     if (spec.sectors) {
@@ -817,20 +1111,52 @@ export class VirtualLayerEditors {
       for (let tid = 0; tid < specTiles.length; tid++) tids.add(tid);
     }
 
+    // Also include tiles edited & dragged outside their original home sector
+    const lvlTileEdits = this.controller.tileEdits?.get(lid);
+    if (lvlTileEdits?.size) {
+      for (const [tKey, ov] of lvlTileEdits) {
+        if (!ov || !tKey.startsWith("t:")) continue;
+        const tid = Number(tKey.slice(2));
+        if (Number.isInteger(tid) && specTiles[tid]) tids.add(tid);
+      }
+    }
+
     const items = [];
     for (const tid of tids) {
       const item = this.controller.resolveVirtualTile(lid, tid, specTiles[tid], level);
       if (!item || !item.src) continue;
-      if (item.x + item.w < curVp.x0 || item.x > curVp.x1 || item.y + item.h < curVp.y0 || item.y > curVp.y1) continue;
+      const ax = item.anchorX ?? 0.5;
+      const ay = item.anchorY ?? 0.5;
+      const w = item.w || 0;
+      const h = item.h || 0;
+      const pivX = item.anchorX === undefined ? (item.x + w * 0.5) : item.x;
+      const pivY = item.anchorY === undefined ? (item.y + h * 0.5) : item.y;
+      const rad = ((item.rot || 0) * Math.PI) / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      const dx = (0.5 - ax) * w;
+      const dy = (0.5 - ay) * h;
+      const cx = pivX + (cos * dx - sin * dy);
+      const cy = pivY + (sin * dx + cos * dy);
+      const halfDiag = Math.hypot(w, h) * 0.5;
+      if (cx + halfDiag < curVp.x0 - pad || cx - halfDiag > curVp.x1 + pad || cy + halfDiag < curVp.y0 - pad || cy - halfDiag > curVp.y1 + pad) continue;
       items.push(item);
       if (items.length >= MAX_TILES_IN_VIEW) break;
     }
 
     const needed = new Map();
     for (const it of items) needed.set(it.tKey, it);
+    this._lastTileNeededKeys = new Set(needed.keys());
+    const lvlEdits = this.controller.tileEdits?.get(lid);
 
     for (const entry of Array.from(this.tilesByKey.values())) {
-      if (!needed.has(entry.key) && !entry.placeable?.controlled) {
+      const wrongLevel = entry.levelId !== lid;
+      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const sheet = getExistingSheet(entry.doc);
+      if (wrongLevel || isDeleted) {
+        this._setRawVirtualTileVisible(entry.fullId, true);
+        this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById, { closeSheet: true });
+      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
         this._setRawVirtualTileVisible(entry.fullId, true);
         this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
       }
@@ -838,8 +1164,60 @@ export class VirtualLayerEditors {
 
     const gen = this._tileGen;
     for (const it of needed.values()) {
-      if (!this.tilesByKey.has(it.tKey)) {
+      const existing = this.tilesByKey.get(it.tKey);
+      const nextSig = JSON.stringify(it);
+      if (!existing) {
         this._mountNativeTile(it, gen);
+      } else if (existing.sig !== nextSig) {
+        const sheet = getExistingSheet(existing.doc);
+        if (sheet?.rendered) {
+          const prevSrc = existing.doc.texture?.src || "";
+          const ax = it.anchorX ?? 0.5;
+          const ay = it.anchorY ?? 0.5;
+          const patch = {
+            x: it.anchorX === undefined ? (it.x + it.w * 0.5) : it.x,
+            y: it.anchorY === undefined ? (it.y + it.h * 0.5) : it.y,
+            width: it.w, height: it.h, rotation: it.rot || 0, elevation: it.elevation,
+            sort: it.sort || 0, alpha: it.alpha ?? 1, hidden: Boolean(it.hidden),
+            texture: {
+              src: it.src, tint: it.tint || "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
+              anchorX: ax, anchorY: ay, scaleX: it.scaleX ?? 1, scaleY: it.scaleY ?? 1, fit: it.fit ?? "fill"
+            },
+            occlusion: { modes: resolveOcclusionModeArray(it.occlusionMode), alpha: it.occludedAlpha ?? 0.2 },
+            restrictions: { light: Boolean(it.restrictsLight), weather: Boolean(it.restrictsWeather) }
+          };
+          existing.doc.updateSource(patch);
+          existing.sig = nextSig;
+          const srcChanged = (it.src || "") !== prevSrc;
+          if (existing.placeable && !existing.placeable.destroyed) {
+            Promise.resolve(srcChanged ? existing.placeable.draw() : null).then(() => {
+              if (existing.placeable.destroyed) {
+                this._cleanupLeakedTileMesh(existing.placeable);
+              } else {
+                existing.placeable.renderFlags.set({ refresh: true });
+                existing.placeable.applyRenderFlags();
+                existing.placeable._updateQuadtree?.();
+                if (srcChanged && sheet?.rendered && sheet._preview?.rendered && sheet._preview.texture?.src === existing.doc.texture?.src) {
+                  sheet._preview.object?.renderFlags?.set?.({ redraw: true });
+                }
+              }
+            }).catch(() => {
+              if (existing.placeable?.destroyed) this._cleanupLeakedTileMesh(existing.placeable);
+            });
+          }
+          try {
+            if (sheet._preview && typeof sheet._previewChanges === "function") {
+              sheet._previewChanges(patch);
+            } else {
+              sheet._preview?.updateSource?.(patch);
+            }
+            sheet.render(false);
+          } catch {}
+        } else {
+          this._setRawVirtualTileVisible(existing.fullId, true);
+          this._destroyPlaceable(canvas.tiles, existing, this.tilesByKey, this.tilesById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+          this._mountNativeTile(it, gen);
+        }
       }
     }
   }
@@ -857,12 +1235,14 @@ export class VirtualLayerEditors {
       const patch = foundry.utils.deepClone(u);
       delete patch._id;
       delete patch.id;
+      const prevSrc = entry.doc.texture?.src || "";
       entry.doc.updateSource(patch);
 
       const d = entry.doc;
+      const nextSrc = d.texture?.src || "";
       const occModes = Array.from(d.occlusion?.modes || []);
       const nextState = {
-        src: d.texture?.src || "",
+        src: nextSrc,
         x: Math.round(d.x),
         y: Math.round(d.y),
         w: Math.round(d.width),
@@ -871,8 +1251,14 @@ export class VirtualLayerEditors {
         elevation: d.elevation ?? 0,
         sort: d.sort || 0,
         alpha: d.alpha ?? 1,
+        hidden: Boolean(d.hidden),
         tint: d.texture?.tint ? foundry.utils.Color.from(d.texture.tint).css : null,
         alphaThreshold: d.texture?.alphaThreshold ?? 0.75,
+        anchorX: d.texture?.anchorX ?? 0.5,
+        anchorY: d.texture?.anchorY ?? 0.5,
+        scaleX: d.texture?.scaleX ?? 1,
+        scaleY: d.texture?.scaleY ?? 1,
+        fit: d.texture?.fit ?? "fill",
         occlusionMode: occModes,
         occludedAlpha: d.occlusion?.alpha ?? 0.2,
         restrictsLight: Boolean(d.restrictions?.light),
@@ -881,12 +1267,21 @@ export class VirtualLayerEditors {
 
       flagUpdate[`flags.${MODULE_ID}.tileEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualTileEditLocal(entry.levelId, entry.key, nextState);
+      const entryLayer = this.controller.levelLayers?.get(entry.levelId) || this._getViewedLayer();
+      const resolvedNow = this.controller.resolveVirtualTile(entry.levelId, entry.tid, entryLayer?.spec?.tiles?.[entry.tid], entryLayer?.level);
+      entry.sig = JSON.stringify(resolvedNow || nextState);
 
       if (entry.placeable && !entry.placeable.destroyed) {
-        entry.placeable.renderFlags.set({ refresh: true });
-        entry.placeable.applyRenderFlags();
-        canvas.tiles?.quadtree?.remove(entry.placeable);
-        canvas.tiles?.quadtree?.insert({ r: entry.placeable.bounds, t: entry.placeable });
+        if (nextSrc !== prevSrc) {
+          try { await entry.placeable.draw(); } catch {}
+        }
+        if (entry.placeable.destroyed) {
+          this._cleanupLeakedTileMesh(entry.placeable);
+        } else {
+          entry.placeable.renderFlags.set({ refresh: true });
+          entry.placeable.applyRenderFlags();
+          entry.placeable._updateQuadtree?.();
+        }
       }
       docs.push(entry.doc);
     }
@@ -910,7 +1305,7 @@ export class VirtualLayerEditors {
       flagUpdate[`flags.${MODULE_ID}.tileEdits.${entry.levelId}.${entry.key}`] = null;
       this.controller.setVirtualTileEditLocal(entry.levelId, entry.key, null);
       docs.push(entry.doc);
-      this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
+      this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById, { closeSheet: true });
     }
 
     if (Object.keys(flagUpdate).length) {
