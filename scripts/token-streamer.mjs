@@ -598,7 +598,12 @@ export class TokenStreamer {
       const keepVisible = onScreen || tok.controlled;
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
-      const blockedByRoof = Boolean(roofHidden?.has?.(tok));
+      let blockedByRoof = Boolean(roofHidden?.has?.(tok));
+      // Synchronous roof check before revealing/keeping a token on zoom-in/pan so it never flashes above an unmounted roof
+      if (!blockedByRoof && keepVisible && this.controller?.isTokenUnderBakedRoof?.(tok)) {
+        roofHidden?.add?.(tok);
+        blockedByRoof = true;
+      }
       const wantRenderable = keepVisible && !blockedByRoof;
       if (tok.renderable !== wantRenderable) {
         if (!wantRenderable && this._activeFades.has(doc.id)) {
@@ -948,6 +953,14 @@ export class TokenStreamer {
             this.impostors.upsertToken(doc);
             this.impostors.setFadeOverride(doc.id, null);
             this.impostors.flush();
+          }
+
+          // Immediately suppress newly drawn token if sitting beneath an unmounted/baked roof so it never flashes for 1 frame
+          if (this.controller?.isTokenUnderBakedRoof?.(obj)) {
+            this.controller._roofHiddenTokens?.add?.(obj);
+            obj.renderable = false;
+            if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
+            if (obj._ssJumpShadow && !obj._ssJumpShadow.destroyed) obj._ssJumpShadow.renderable = false;
           }
 
           // Apply current LOD detail state immediately to newly drawn token

@@ -3589,6 +3589,7 @@ class MegaWorld1000 {
       const m = this.meshPool.pop();
       m.name = null;
       m.visible = true;
+      m.alpha = 1.0;
       m.occluded = false;
       m.angle = 0;
       m.scale.set(1, 1);
@@ -3616,6 +3617,7 @@ class MegaWorld1000 {
     if (!m) return;
     // Clear any Showstopper Depth-of-Field filter & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
+    m.alpha = 1.0;
     m._boundlessTile = false;
     if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
     m.pluginName = m.constructor?.classPluginName || "batchOcclusion";
@@ -3959,7 +3961,9 @@ class MegaWorld1000 {
     this._syncBaseLayerVisibility(this.getViewportWorldRect(0.0));
     this._syncIndoorLightVisibility();
     if (anyTilesOrOverlaysChanged) {
-      this._roofTokenOccDirty = true;
+      // Sync roof token occlusion immediately in the same frame so zooming in never flashes tokens through unmounted roofs
+      this.syncRoofTokenOcclusion();
+      this._roofTokenOccDirty = false;
       if (this.texMgr.needsPrune()) {
         this._pruneNeeded = true;
       }
@@ -4121,6 +4125,7 @@ class MegaWorld1000 {
     // then swap atomically in 1 frame so semi-transparent floors/shadows never double-blend or flicker CanvasDepthMask!
     e.alpha = 1.0;
     e.awaitingSwap = hasOtherZCovering;
+    m.alpha = 1.0;
     m.unoccludedAlpha = 1.0;
     m.visible = !hasOtherZCovering;
     e.mesh = m;
@@ -4371,6 +4376,7 @@ class MegaWorld1000 {
       wallsMesh.sortLayer = PrimaryCanvasGroup.SORT_LAYERS.TILES;
       wallsMesh.sort = 15;
       wallsMesh.occlusionMode = CONST.OCCLUSION_MODES.NONE;
+      wallsMesh.alpha = 1.0;
       wallsMesh.unoccludedAlpha = 1.0;
       wallsMesh.occludedAlpha = 1.0;
       wallsMesh.hoverFade = false;
@@ -4618,7 +4624,10 @@ class MegaWorld1000 {
       if (mountedVt > 0) {
         canvas.primary.sortDirty = true;
         this.invalidateShowstopperSurfaces();
-        if (anyVtOcc) this._occlusionDirty = true;
+        if (anyVtOcc) {
+          this._occlusionDirty = true;
+          this._roofTokenOccDirty = true;
+        }
         if (anyVtLight) {
           this._depthDirty = true;
           if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
@@ -4860,8 +4869,9 @@ class MegaWorld1000 {
       }
       if (retiredRoof) {
         this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
+        this.syncRoofTokenOcclusion();
         this.invalidateShowstopperSurfaces();
       }
     }
@@ -5351,6 +5361,7 @@ class MegaWorld1000 {
       wallsMesh.sortLayer = PrimaryCanvasGroup.SORT_LAYERS.TILES;
       wallsMesh.sort = 15;
       wallsMesh.occlusionMode = CONST.OCCLUSION_MODES.NONE;
+      wallsMesh.alpha = 1.0;
       wallsMesh.unoccludedAlpha = 1.0;
       wallsMesh.occludedAlpha = 1.0;
       wallsMesh.hoverFade = false;
@@ -5381,6 +5392,7 @@ class MegaWorld1000 {
         : CONST.OCCLUSION_MODES.NONE;
       // Match Foundry v14 foreground tiles: ceiling defineSurface regions at level.elevation.top must NOT occlude this level's own roofs
       roofMesh._occludedBySameElevationSurfaces = false;
+      roofMesh.alpha = 1.0;
       roofMesh.unoccludedAlpha = 1.0;
       roofMesh.occludedAlpha = 0.05;
       roofMesh.hoverFade = canRevealNow;
@@ -5648,6 +5660,7 @@ class MegaWorld1000 {
       ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
       : CONST.OCCLUSION_MODES.NONE;
     m.occlusionMode = resolveOcclusionMode(tSpec.occlusionMode, defaultOcc);
+    m.alpha = tSpec.alpha ?? 1.0;
     m.unoccludedAlpha = tSpec.alpha ?? 1.0;
     m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
     m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && m.occlusionMode !== CONST.OCCLUSION_MODES.SURFACE);
@@ -7119,7 +7132,11 @@ class MegaWorld1000 {
               const ovSpec = spec.overlays[oid];
               if (!isPointUnderRoofSpec(tx, ty, ovSpec)) continue;
               const mountedRoof = this.activeOverlays.get(`${lid}::${oid}`)?.roofMesh;
-              if (!mountedRoof || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
+              if (!mountedRoof || mountedRoof.destroyed || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
+                return true;
+              }
+              // Guard against a freshly mounted/unoccluded roof mesh still fading up from low alpha
+              if (mountedRoof.alpha < 0.9 && !this._isRoofRevealed(mountedRoof, canvas.masks?.occlusion?.occludedSurfaces)) {
                 return true;
               }
             }
@@ -7128,7 +7145,7 @@ class MegaWorld1000 {
       }
     }
 
-    // 2. Check zoomed-out virtual tiles with minZ > current targetZ that sit above this point (including sectorless inline lists & dragged tileEdits)
+    // 2. Check virtual tiles with minZ (or elevated roof/canopy tiles) sitting above this point that are NOT yet mounted & opaque
     if (spec.tiles?.length) {
       const candidateTids = new Set();
       if (spec.sectors) {
@@ -7152,8 +7169,10 @@ class MegaWorld1000 {
       for (const tid of candidateTids) {
         const tSpec = this.resolveVirtualTile(lid, tid, spec.tiles[tid], level);
         if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
-        if (tSpec.minZ !== undefined && layer.lastTargetZ < tSpec.minZ) {
-          if (this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
+        if (tSpec.minZ !== undefined) {
+          const mountedVt = this.activeVirtualTiles.get(`${lid}::${tid}`)?.mesh;
+          const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= 0.9 || this._isRoofRevealed(mountedVt, canvas.masks?.occlusion?.occludedSurfaces)));
+          if (!vtReadyOpaque && this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
             return true;
           }
         }
@@ -7304,20 +7323,24 @@ class MegaWorld1000 {
     return best;
   }
 
+  isTokenUnderBakedRoof(tok) {
+    if (!this.active || !tok || tok.destroyed || tok.isPreview || tok.controlled) return false;
+    const doc = tok.document;
+    const lid = doc?.level || canvas.level?.id;
+    const rawElev = Number(doc?.elevation ?? 0);
+    const visElev = Number.isFinite(Number(tok._ssJumpState?.elevation))
+      ? Number(tok._ssJumpState.elevation)
+      : (Number.isFinite(Number(tok._ssVisualElevation)) ? Number(tok._ssVisualElevation) : rawElev);
+    const tokElev = Math.max(rawElev, visElev);
+    return this.isPointUnderBakedRoof(lid, tok.center.x, tok.center.y, tokElev);
+  }
+
   syncRoofTokenOcclusion() {
     if (!this.active || !canvas?.tokens?.placeables) return;
 
     const nextHidden = new Set();
     for (const tok of canvas.tokens.placeables) {
-      if (!tok || tok.destroyed || tok.isPreview || tok.controlled) continue;
-      const doc = tok.document;
-      const lid = doc?.level || canvas.level?.id;
-      const rawElev = Number(doc?.elevation ?? 0);
-      const visElev = Number.isFinite(Number(tok._ssJumpState?.elevation))
-        ? Number(tok._ssJumpState.elevation)
-        : (Number.isFinite(Number(tok._ssVisualElevation)) ? Number(tok._ssVisualElevation) : rawElev);
-      const tokElev = Math.max(rawElev, visElev);
-      if (this.isPointUnderBakedRoof(lid, tok.center.x, tok.center.y, tokElev)) {
+      if (this.isTokenUnderBakedRoof(tok)) {
         nextHidden.add(tok);
         if (tok.renderable) tok.renderable = false;
         if (tok.mesh && !tok.mesh.destroyed && tok.mesh.renderable) tok.mesh.renderable = false;
