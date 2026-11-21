@@ -2628,6 +2628,9 @@ class MegaWorld1000 {
   activeVirtualTiles = new Map();
   virtualTilePending = new Set();
 
+  // Lightweight public event bus for third-party integrations (e.g. burn-living-map) — avoids per-frame polling
+  _eventListeners = new Map();
+
   // Physics Sim-Bubble (Walls in per-level `level.edges`: ONLY around active tokens & open doors)
   simSectors = new Map(); // "${levelId}::${sx}_${sy}" -> { level, edgeIds }
   doorStates = new Map(); // dKey -> ds (0: closed, 1: open, 2: locked)
@@ -3432,6 +3435,153 @@ class MegaWorld1000 {
       `${MODULE_ID} | Mounted level "${canvas.level?.name}" | Visible Boundless layers: ${lvlSummary} | ` +
       `GPU light batch: ${this.lightBatch.totalLights} lights (${this.lightBatch.totalVertices} verts).`
     );
+    this._emit("mount", { scene });
+    Hooks.callAll("boundlessMount", this);
+  }
+
+  /**
+   * Subscribe to Boundless lifecycle events ("mount", "unmount", "virtualTileMount", "virtualTileRetire", "overlayMount", "overlayRetire").
+   * Returns an unsubscribe function.
+   */
+  on(event, fn) {
+    if (typeof event !== "string" || typeof fn !== "function") return () => {};
+    let set = this._eventListeners.get(event);
+    if (!set) {
+      set = new Set();
+      this._eventListeners.set(event, set);
+    }
+    set.add(fn);
+    return () => this.off(event, fn);
+  }
+
+  off(event, fn) {
+    const set = this._eventListeners.get(event);
+    if (!set) return;
+    set.delete(fn);
+    if (set.size === 0) this._eventListeners.delete(event);
+  }
+
+  _emit(event, payload) {
+    const set = this._eventListeners.get(event);
+    if (!set || set.size === 0) return;
+    for (const fn of [...set]) {
+      try {
+        fn(payload);
+      } catch (err) {
+        console.error(`${MODULE_ID} | Event listener error (${event}):`, err);
+      }
+    }
+  }
+
+  /**
+   * Build a lightweight 256x256 CPU alpha map from a level's z=0 texture (via 2D canvas, zero WebGL stalls)
+   * so lower visible levels can skip mounting props & pyramid tiles completely hidden beneath opaque upper floors.
+   */
+  _buildLevelOpacityMask(layer, e, tex) {
+    if (!layer || layer.isUpper || layer.opacityMask || e.z !== 0) return;
+    const src = tex?.baseTexture?.resource?.source;
+    if (!src) return;
+    try {
+      const dim = 512;
+      const cv = typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(dim, dim)
+        : document.createElement("canvas");
+      cv.width = dim;
+      cv.height = dim;
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+      ctx.clearRect(0, 0, dim, dim);
+      ctx.drawImage(src, 0, 0, dim, dim);
+      const rgba = ctx.getImageData(0, 0, dim, dim).data;
+      const alpha = new Uint8Array(dim * dim);
+      let opaqueCount = 0;
+      for (let i = 0, p = 3; i < alpha.length; i++, p += 4) {
+        const a = rgba[p];
+        alpha[i] = a;
+        if (a >= 240) opaqueCount++;
+      }
+      if (opaqueCount === 0) return;
+      layer.opacityMask = {
+        alpha,
+        w: dim,
+        h: dim,
+        x0: e.x0,
+        y0: e.y0,
+        worldW: e.sizePx,
+        worldH: e.sizePx
+      };
+      const myElev = getLevelBottomElevation(layer.level);
+      let invalidatedLower = false;
+      for (const other of this.visibleLevelLayers) {
+        if (other !== layer && !other.level?.isView && getLevelBottomElevation(other.level) < myElev) {
+          other.lastTileKey = "";
+          other.lastPyramidKey = "";
+          invalidatedLower = true;
+        }
+      }
+      if (invalidatedLower) {
+        queueMicrotask(() => {
+          if (this.active) this.updatePyramid();
+        });
+      }
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to build opacity mask for level "${layer.level?.name}":`, err);
+    }
+  }
+
+  /**
+   * Returns true if world rect (rx, ry, rw, rh) on a lower (non-viewed) level is 100% covered
+   * by opaque floor pixels (alpha >= 240, with 1-texel safety margin) of higher visible level(s).
+   */
+  _isRectOccludedByUpperLevels(layer, rx, ry, rw, rh) {
+    if (!layer || layer.level?.isView || layer.isUpper) return false;
+    const myElev = getLevelBottomElevation(layer.level);
+    let uppers = null;
+    for (let i = 0; i < this.visibleLevelLayers.length; i++) {
+      const u = this.visibleLevelLayers[i];
+      if (!u.isUpper && u.opacityMask && getLevelBottomElevation(u.level) > myElev) {
+        if (!uppers) uppers = [u.opacityMask];
+        else uppers.push(u.opacityMask);
+      }
+    }
+    if (!uppers) return false;
+
+    // Fast path: single upper level covers entire rect (most common: Floor 1 over Basement)
+    for (let uIdx = 0; uIdx < uppers.length; uIdx++) {
+      const m = uppers[uIdx];
+      if (rx < m.x0 || ry < m.y0 || rx + rw > m.x0 + m.worldW || ry + rh > m.y0 + m.worldH) continue;
+      const sx = m.w / m.worldW;
+      const sy = m.h / m.worldH;
+      const ix0 = Math.max(0, Math.floor((rx - m.x0) * sx));
+      const iy0 = Math.max(0, Math.floor((ry - m.y0) * sy));
+      const ix1 = Math.min(m.w - 1, Math.ceil((rx + rw - m.x0) * sx));
+      const iy1 = Math.min(m.h - 1, Math.ceil((ry + rh - m.y0) * sy));
+      const data = m.alpha;
+      const mw = m.w;
+      let allOpaque = true;
+      for (let py = iy0; py <= iy1; py++) {
+        const row = py * mw;
+        for (let px = ix0; px <= ix1; px++) {
+          if (data[row + px] < 240) {
+            allOpaque = false;
+            break;
+          }
+        }
+        if (!allOpaque) break;
+      }
+      if (allOpaque) return true;
+    }
+    return false;
+  }
+
+  _isVirtualTileOccludedByUpper(layer, tSpec) {
+    if (!layer || layer.level?.isView || layer.isUpper || !tSpec) return false;
+    const ax0 = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+    const ay0 = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+    const pivX = tSpec.anchorX === undefined ? (tSpec.x + tSpec.w * 0.5) : tSpec.x;
+    const pivY = tSpec.anchorY === undefined ? (tSpec.y + tSpec.h * 0.5) : tSpec.y;
+    const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
+    return this._isRectOccludedByUpperLevels(layer, pivX - halfDiag, pivY - halfDiag, halfDiag * 2, halfDiag * 2);
   }
 
   acquireMesh() {
@@ -3745,8 +3895,15 @@ class MegaWorld1000 {
           if (overlapsBounds) {
             desiredMap.set(baseKey, { levelId: lid, z: 0, x: 0, y: 0, key: baseKey, src: `${mBase}/0/0_0.webp` });
             if (targetZ > 0) {
+              const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
+              const checkUpperOcc = !layer.level?.isView && !layer.isUpper;
               for (let ty = ty0; ty <= ty1; ty++) {
                 for (let tx = tx0; tx <= tx1; tx++) {
+                  if (checkUpperOcc) {
+                    const wx = bounds.x + tx * tileWorldSize;
+                    const wy = bounds.y + ty * tileWorldSize;
+                    if (this._isRectOccludedByUpperLevels(layer, wx, wy, tileWorldSize, tileWorldSize)) continue;
+                  }
                   const spec = this.resolvePyramidTile(layer, targetZ, tx, ty);
                   desiredMap.set(spec.key, spec);
                 }
@@ -3974,6 +4131,7 @@ class MegaWorld1000 {
     if (!layer.isUpper) {
       m.pluginName = "batch";
       m.updateCanvasTransform = NOOP_TRANSFORM;
+      if (e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
     }
     this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
@@ -4692,6 +4850,7 @@ class MegaWorld1000 {
       for (const ovKey of retiringOvKeys) {
         const ov = this.activeOverlays.get(ovKey);
         if (!ov) continue;
+        if (ov.roofMesh) this._emit("overlayRetire", { key: ovKey, ov, mesh: ov.roofMesh });
         if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
         if (ov.roofMesh) {
           this.retireMesh(ov.roofMesh);
@@ -5050,6 +5209,7 @@ class MegaWorld1000 {
           continue;
         }
         const hadRoof = Boolean(ov.roofMesh);
+        if (ov.roofMesh) this._emit("overlayRetire", { key: fullId, ov, mesh: ov.roofMesh });
         if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
         if (ov.roofMesh) this.retireMesh(ov.roofMesh);
         this.activeOverlays.delete(fullId);
@@ -5063,6 +5223,7 @@ class MegaWorld1000 {
       } else {
         ov.retiring = false;
         if (hideRoofsForUpperView && ov.roofMesh) {
+          this._emit("overlayRetire", { key: fullId, ov, mesh: ov.roofMesh });
           this.retireMesh(ov.roofMesh);
           ov.roofMesh = null;
           this._depthDirty = true;
@@ -5231,7 +5392,9 @@ class MegaWorld1000 {
       this._syncShowstopperMeshDof(roofMesh);
     }
 
-    this.activeOverlays.set(fullId, { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof, retiring: false });
+    const ovEntry = { levelId: lid, oid, ovSpec, wallsMesh, roofMesh, srcWalls: ovSpec.walls, srcRoof: ovSpec.roof, retiring: false };
+    this.activeOverlays.set(fullId, ovEntry);
+    if (roofMesh) this._emit("overlayMount", { key: fullId, ov: ovEntry });
     if (localZNow >= 6 && !wallsMesh && ovSpec.walls) {
       this._ensureOverlayWallsMesh(fullId, layer, ovSpec);
     }
@@ -5300,22 +5463,26 @@ class MegaWorld1000 {
           if (Number.isInteger(tid) && tiles[tid]) candidateTids.add(tid);
         }
       }
+      const checkUpperOcc = !level?.isView && !layer.isUpper;
       for (const tid of candidateTids) {
         const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
         if (!tSpec || tSpec.hidden) continue;
         if (tSpec.minZ !== undefined && effectiveZ < tSpec.minZ) continue;
         if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
+        if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, tSpec)) continue;
         if (tileIntersectsSectors(tSpec)) {
           needed.add(`${lid}::${tid}`);
         }
       }
     } else {
       // Fallback for small inline tile lists without spatial sector index (matched to active sector bounds so tileKey stays exact)
+      const checkUpperOcc = !level?.isView && !layer.isUpper;
       for (let tid = 0; tid < tiles.length; tid++) {
         const t = this.resolveVirtualTile(lid, tid, tiles[tid], level);
         if (!t || t.hidden) continue;
         if (t.minZ !== undefined && effectiveZ < t.minZ) continue;
         if (t.maxZ !== undefined && targetZ > t.maxZ) continue;
+        if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, t)) continue;
         if (tileIntersectsSectors(t)) {
           needed.add(`${lid}::${tid}`);
         }
@@ -5326,20 +5493,23 @@ class MegaWorld1000 {
     let removedAny = false;
     let removedAnyLight = false;
     let removedAnyOcc = false;
+    const checkUpperOccRetire = !level?.isView && !layer.isUpper;
     for (const [fullId, vt] of this.activeVirtualTiles) {
       if (vt.levelId !== lid) continue;
       if (!needed.has(fullId)) {
-        // While actively zooming/panning, keep still-valid offscreen meshes mounted (only retire ones failing minZ/maxZ/hidden)
+        // While actively zooming/panning, keep still-valid offscreen meshes mounted (only retire ones failing minZ/maxZ/hidden or covered by upper floor)
         // to avoid mount/retire thrashing and 3rd-party shadow rebuild storms (`burn-living-map`); `_vtIdleCleanupNeeded` trims offscreen once idle.
         if (isMoving) {
           const ts = vt.tSpec;
           const stillValidByLod = Boolean(ts && !ts.hidden
             && (ts.minZ === undefined || effectiveZ >= ts.minZ)
-            && (ts.maxZ === undefined || targetZ <= ts.maxZ));
+            && (ts.maxZ === undefined || targetZ <= ts.maxZ)
+            && !(checkUpperOccRetire && this._isVirtualTileOccludedByUpper(layer, ts)));
           if (stillValidByLod) continue;
         }
         if (vt.mesh?.restrictsLight || vt.mesh?.restrictsWeather) removedAnyLight = true;
         if (vt.mesh && vt.mesh.occlusionMode !== CONST.OCCLUSION_MODES.NONE) removedAnyOcc = true;
+        this._emit("virtualTileRetire", { key: fullId, vt, mesh: vt.mesh });
         if (vt.mesh) this.retireMesh(vt.mesh);
         this.activeVirtualTiles.delete(fullId);
         removedAny = true;
@@ -5429,6 +5599,7 @@ class MegaWorld1000 {
     const effZNow = Math.max(zNow, showInteriorNow ? (layer.zOffset + 5) : 0);
     if (tSpec.minZ !== undefined && effZNow < tSpec.minZ) return null;
     if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return null;
+    if (!layer.level?.isView && !layer.isUpper && this._isVirtualTileOccludedByUpper(layer, tSpec)) return null;
 
     const { simGrid, simSectorPx } = layer;
     const ax0 = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
@@ -5501,7 +5672,9 @@ class MegaWorld1000 {
       m.updateCanvasTransform = NOOP_TRANSFORM;
     }
     this._syncShowstopperMeshDof(m);
-    this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src, tSpec });
+    const vtEntry = { levelId: lid, mesh: m, src: tSpec.src, tSpec };
+    this.activeVirtualTiles.set(fullId, vtEntry);
+    this._emit("virtualTileMount", { key: fullId, vt: vtEntry });
     return m;
   }
 
@@ -6350,7 +6523,8 @@ class MegaWorld1000 {
   }
 
   applyVirtualTileChangesLocal() {
-    for (const [, vt] of this.activeVirtualTiles) {
+    for (const [fullId, vt] of this.activeVirtualTiles) {
+      this._emit("virtualTileRetire", { key: fullId, vt, mesh: vt.mesh });
       if (vt.mesh) this.retireMesh(vt.mesh);
     }
     this.activeVirtualTiles.clear();
@@ -7454,7 +7628,12 @@ class MegaWorld1000 {
   }
 
   unmount() {
-    if (this.active) this._saveCameraNow();
+    const wasActive = this.active;
+    if (wasActive) {
+      this._saveCameraNow();
+      this._emit("unmount", {});
+      Hooks.callAll("boundlessUnmount", this);
+    }
     this.active = false;
     this._mounting = false;
     this._mountGen++;
