@@ -2641,6 +2641,7 @@ class MegaWorld1000 {
   _patchedFilters = new Map();
   _origSmaaEnabled = null;
   _origIfVoidEnabled = null;
+  _origTextureGcMode = null;
   _hiddenNativeLevelBg = new Map(); // levelId -> PrimarySpriteMesh
 
   // Subsystems: POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, spatial ambient audio, door socket sync
@@ -3332,6 +3333,12 @@ class MegaWorld1000 {
       canvas.masks.depth.autoRender = false;
       this._depthDirty = true;
     if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+    }
+
+    // Prevent PIXI TextureGCSystem from silently evicting _glTextures out from under our byte-budgeted LRUTextureManager every 60s
+    if (canvas.app?.renderer?.textureGC && PIXI?.GC_MODES?.MANUAL !== undefined) {
+      this._origTextureGcMode = canvas.app.renderer.textureGC.mode;
+      canvas.app.renderer.textureGC.mode = PIXI.GC_MODES.MANUAL;
     }
 
     // Load virtual wall/light/sound/tile edits and persisted doorStates before mounting chunkStreamer & GPU light batch
@@ -4331,6 +4338,13 @@ class MegaWorld1000 {
     let frameGpuUploadBytes = 0;
     let frameFreshUploads = 0;
 
+    const bindTextureNow = (tex) => {
+      const bt = tex?.baseTexture;
+      if (bt && !bt.destroyed && canvas.app?.renderer?.texture?.bind) {
+        try { canvas.app.renderer.texture.bind(bt); } catch {}
+      }
+    };
+
     // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
     if (this.pendingTileMounts.length > 0) {
       const maxMounts = isMoving ? 12 : 24;
@@ -4351,10 +4365,9 @@ class MegaWorld1000 {
         if (this._mountTileMesh(e, tex, item.instant)) {
           mounted++;
           if (estBytes > 0) {
-            // Upload awaitingSwap tiles to WebGL immediately within this frame's 2-tile budget so atomic swap never bursts 8+ uploads in one frame!
-            if (e.awaitingSwap && tex?.baseTexture && canvas.app?.renderer?.texture?.bind) {
-              try { canvas.app.renderer.texture.bind(tex.baseTexture); } catch {}
-            }
+            // Pre-upload EVERY fresh tile (visible, awaitingSwap, AND offscreen-padded!) within this frame's 2-tile budget
+            // so zooming out into the 28% padding never bursts 8-11 deferred gl.texImage2D uploads in a single render frame!
+            bindTextureNow(tex);
             frameGpuUploadBytes += estBytes;
             frameFreshUploads++;
           }
@@ -4385,6 +4398,8 @@ class MegaWorld1000 {
         if (this._mountOverlayMeshes(item, curVp)) {
           mountedOv++;
           if (estBytes > 0) {
+            if (estimateFreshUploadBytes(item.tRoof) > 0) bindTextureNow(item.tRoof);
+            if (estimateFreshUploadBytes(item.tWalls) > 0) bindTextureNow(item.tWalls);
             frameGpuUploadBytes += estBytes;
             frameFreshUploads++;
             if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
@@ -4424,6 +4439,7 @@ class MegaWorld1000 {
         if (m) {
           mountedVt++;
           if (estBytes > 0) {
+            bindTextureNow(item.tex);
             frameGpuUploadBytes += estBytes;
             frameFreshUploads++;
           }
@@ -7497,6 +7513,13 @@ class MegaWorld1000 {
         canvas.masks.depth.renderDirty = true;
       }
       this._origDepthAutoRender = null;
+    }
+
+    if (this._origTextureGcMode !== null) {
+      if (canvas?.app?.renderer?.textureGC) {
+        canvas.app.renderer.textureGC.mode = this._origTextureGcMode;
+      }
+      this._origTextureGcMode = null;
     }
 
     for (const [, bgMesh] of this._hiddenNativeLevelBg) {
