@@ -634,7 +634,8 @@ export class VirtualWallEditor {
 
     const isWallsEditMode = this.active && Boolean(game.user?.isGM);
     const minScale = isWallsEditMode ? NATIVE_WALLS_MIN_SCALE : NATIVE_DOORS_MIN_SCALE;
-    const inNativeZoom = curVp.scale >= minScale;
+    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const inNativeZoom = effScale >= minScale;
 
     const qStep = 200;
     const qx0 = Math.floor(curVp.x0 / qStep);

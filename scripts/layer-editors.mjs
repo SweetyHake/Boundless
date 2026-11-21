@@ -418,7 +418,8 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const inZoom = curVp.scale >= LIGHT_STREAM_MIN_SCALE;
+    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const inZoom = effScale >= LIGHT_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.lightEditsRev || 0}`;
     if (key === this._lastLightKey) return;
     this._lastLightKey = key;
@@ -742,7 +743,8 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const inZoom = curVp.scale >= SOUND_STREAM_MIN_SCALE;
+    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const inZoom = effScale >= SOUND_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.soundEditsRev || 0}`;
     if (key === this._lastSoundKey) return;
     this._lastSoundKey = key;
@@ -1084,7 +1086,8 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const inZoom = curVp.scale >= TILE_STREAM_MIN_SCALE;
+    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const inZoom = effScale >= TILE_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.tileEditsRev || 0}`;
     if (key === this._lastTileKey) return;
     this._lastTileKey = key;

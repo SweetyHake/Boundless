@@ -562,12 +562,14 @@ export class TokenStreamer {
     if (!curVp) return;
 
     const now = performance.now();
-    // Hysteresis prevents rapid mount/unmount thrashing around the transition zoom level
-    if (curVp.scale >= MOUNT_ENTER_SCALE) this._nativeTokensActive = true;
-    else if (curVp.scale < MOUNT_EXIT_SCALE) this._nativeTokensActive = false;
+    const grid = canvas.grid?.size || 100;
+    const effScale = curVp.scale * (grid / 100);
+    // Hysteresis prevents rapid mount/unmount thrashing around the transition zoom level (in absolute px/cell)
+    if (effScale >= MOUNT_ENTER_SCALE) this._nativeTokensActive = true;
+    else if (effScale < MOUNT_EXIT_SCALE) this._nativeTokensActive = false;
     const showTokens = this._nativeTokensActive;
 
-    const showDetail = curVp.scale >= LOD_DETAIL_MIN_SCALE;
+    const showDetail = effScale >= LOD_DETAIL_MIN_SCALE;
     const lodChanged = showDetail !== this._lastLodDetail;
     this._lastLodDetail = showDetail;
 
@@ -575,7 +577,6 @@ export class TokenStreamer {
     const cullY0 = curVp.y0 - CULL_VP_PAD_PX;
     const cullX1 = curVp.x1 + CULL_VP_PAD_PX;
     const cullY1 = curVp.y1 + CULL_VP_PAD_PX;
-    const grid = canvas.grid?.size || 100;
 
     // 1. Fast frustum `renderable` culling & zoom LOD on currently mounted native tokens (runs even during camera flight!)
     const roofHidden = this.controller?._roofHiddenTokens;
@@ -950,7 +951,8 @@ export class TokenStreamer {
           }
 
           // Apply current LOD detail state immediately to newly drawn token
-          const showDetail = (this._lastVp?.scale ?? 1) >= LOD_DETAIL_MIN_SCALE;
+          const effScaleNow = (this._lastVp?.scale ?? 1) * ((canvas.grid?.size || 100) / 100);
+          const showDetail = effScaleNow >= LOD_DETAIL_MIN_SCALE;
           if (!showDetail) {
             if (obj.nameplate) obj.nameplate.renderable = false;
             if (obj.tooltip) obj.tooltip.renderable = false;

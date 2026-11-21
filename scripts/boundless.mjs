@@ -126,6 +126,11 @@ function smoothstep(edge0, edge1, x) {
   return t * t * (3 - 2 * t);
 }
 
+function getEffectiveScale(scale) {
+  const grid = canvas?.grid?.size || canvas?.dimensions?.size || 100;
+  return (Number(scale) || 0) * (grid / 100);
+}
+
 function hasSpecOverlays(overlays) {
   if (!overlays) return false;
   if (Array.isArray(overlays)) return overlays.length > 0;
@@ -1789,7 +1794,8 @@ class MegaLightBatch {
     if (effects) this._attachSingleBatch(batch, effects);
     if (this._lastVp) {
       const vp = this._lastVp;
-      const showDetail = !this.macroBatch || vp.scale >= 0.020;
+      const effScale = getEffectiveScale(vp.scale);
+      const showDetail = !this.macroBatch || effScale >= 0.020;
       this._cullBatch(batch, vp.x0 - LIGHT_PAD_WORLD_PX, vp.y0 - LIGHT_PAD_WORLD_PX, vp.x1 + LIGHT_PAD_WORLD_PX, vp.y1 + LIGHT_PAD_WORLD_PX, showDetail);
       this._updateMacroCrossfade(vp.scale);
     }
@@ -1828,15 +1834,16 @@ class MegaLightBatch {
   _updateMacroCrossfade(scale) {
     const mb = this.macroBatch;
     if (!mb) return;
-    const showMacro = scale < 0.036;
+    const effScale = getEffectiveScale(scale);
+    const showMacro = effScale < 0.036;
     if (!showMacro) {
       mb.illumMesh.visible = false;
       mb.colorMesh.visible = false;
       return;
     }
-    // Smoothly fade orbital glow out across [0.018..0.035] once detailed chunks are mounted
+    // Smoothly fade orbital glow out across [0.018..0.035] (in 100-PPI equivalent scale) once detailed chunks are mounted
     const targetAlpha = this.chunkBatches.size > 0
-      ? (1.0 - smoothstep(0.018, 0.035, scale))
+      ? (1.0 - smoothstep(0.018, 0.035, effScale))
       : 1.0;
     if (Math.abs(targetAlpha - mb.lastAlpha) > 0.015) {
       mb.lastAlpha = targetAlpha;
@@ -1882,7 +1889,7 @@ class MegaLightBatch {
 
     // 2. Streamed per-chunk detailed shadowed light batches (active when zoomed below orbital scale)
     if (this.chunkBatches.size > 0) {
-      const showDetail = !this.macroBatch || vp.scale >= 0.020;
+      const showDetail = !this.macroBatch || getEffectiveScale(vp.scale) >= 0.020;
       for (const batch of this.chunkBatches.values()) {
         this._cullBatch(batch, x0, y0, x1, y1, showDetail);
       }
@@ -2026,7 +2033,7 @@ class MegaLightBatch {
       u.uBakedRoofRepeat = this.bakedRoofRepeat;
     }
 
-    u.uMacroLift = smoothstep(0.14, 0.025, scale);
+    u.uMacroLift = smoothstep(0.14, 0.025, getEffectiveScale(scale));
   }
 
   _applyMetaEffectiveWeight(meta) {
@@ -2121,7 +2128,7 @@ class MegaLightBatch {
         visChanged = true;
       }
     }
-    const showDetail = !this.macroBatch || !this._lastVp || this._lastVp.scale >= 0.020;
+    const showDetail = !this.macroBatch || !this._lastVp || getEffectiveScale(this._lastVp.scale) >= 0.020;
     for (const batch of this.chunkBatches.values()) {
       if (!batch.weightsDirty || !batch.weightBuffer) continue;
       batch.weightBuffer.update();
@@ -2798,6 +2805,16 @@ class MegaWorld1000 {
     return span / (1 << z);
   }
 
+  _shouldMountRoofs(layer, scale = canvas?.stage?.scale?.x ?? 1) {
+    if (!layer) return false;
+    if (!layer.hasPyramid) return true;
+    const effScale = getEffectiveScale(scale);
+    const threshold = layer._roofsMountedMode ? 0.14 : 0.16;
+    const active = effScale >= threshold;
+    layer._roofsMountedMode = active;
+    return active;
+  }
+
   _computeTargetZ(layer, scale, { hysteresis = false } = {}) {
     const { worldPx, tilePx, maxZoomZ, superGrid } = layer;
     const prevZ = hysteresis && Number.isInteger(layer.lastTargetZ) && layer.lastTargetZ >= 0 ? layer.lastTargetZ : -1;
@@ -3245,6 +3262,7 @@ class MegaWorld1000 {
       this._origDepthAutoRender = canvas.masks.depth.autoRender;
       canvas.masks.depth.autoRender = false;
       this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
 
     // Load virtual wall/light/sound/tile edits and persisted doorStates before mounting chunkStreamer & GPU light batch
@@ -3586,6 +3604,7 @@ class MegaWorld1000 {
       this.layerEditors.syncViewport(false, vp);
     }
     this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
 
     let anyTilesOrOverlaysChanged = false;
     let maxTargetZ = 0;
@@ -3638,12 +3657,10 @@ class MegaWorld1000 {
           const desiredSrcs = new Set();
           for (const spec of desiredMap.values()) desiredSrcs.add(spec.src);
 
-          const revealTargetZ = layer.zOffset + 5;
-          const revealTileZ = layer.zOffset + 6;
           for (const [k, entry] of this.tilesByKey) {
             if (entry.levelId !== lid) continue;
             const inDesired = desiredMap.has(k);
-            const keepReveal = Boolean(entry.isReveal && targetZ === revealTargetZ && entry.z === revealTileZ);
+            const keepReveal = Boolean(entry.isReveal && this._revealTileKeys.has(k));
             if (!keepReveal && entry.isReveal) {
               entry.isReveal = false;
               this._revealTileKeys.delete(k);
@@ -3835,6 +3852,7 @@ class MegaWorld1000 {
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
     this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     if (canvas.masks?.depth) canvas.masks.depth._elevationDirty = true;
     return true;
   }
@@ -3998,7 +4016,8 @@ class MegaWorld1000 {
 
         const layer = this.levelLayers.get(ov.levelId);
         const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
-        if (layer && localZ === 5 && ov.srcWalls) {
+        const needRevealSubtile = Boolean(layer && ((localZ < 5) || (localZ === 5 && ov.srcWalls)));
+        if (needRevealSubtile) {
           if (revealed) {
             if (ov.wallsMesh) {
               if (!ov.wallsMesh.visible) ov.wallsMesh.visible = true;
@@ -4006,8 +4025,8 @@ class MegaWorld1000 {
             } else if (ov.ovSpec && ov.srcWalls) {
               this._ensureOverlayWallsMesh(k, layer, ov.ovSpec);
             }
-            const revealZ = layer.zOffset + 6;
-            if (layer.hasPyramid && layer.maxZoomZ >= revealZ && ov.ovSpec) {
+            const revealZ = Math.min(layer.maxZoomZ, layer.zOffset + (ov.srcWalls ? 6 : 5));
+            if (layer.hasPyramid && revealZ > layer.lastTargetZ && ov.ovSpec) {
               const { bounds } = layer;
               const { nx, ny } = this._getPyramidGridDims(layer, revealZ);
               const tileWorldSize = this._getPyramidTileSize(layer, revealZ);
@@ -4042,10 +4061,12 @@ class MegaWorld1000 {
       if (sig !== this._lastRoofOccSig) {
         this._lastRoofOccSig = sig;
         this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
       }
     } else if (this._lastRoofOccSig) {
       this._lastRoofOccSig = "";
       this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
 
     // Reconcile localized z=6 interior reveal tiles on z=5
@@ -4111,6 +4132,7 @@ class MegaWorld1000 {
         this._tilesDirty = true;
         this._occlusionDirty = true;
         this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
         this._roofTokenOccDirty = true;
         this.invalidateShowstopperSurfaces();
@@ -4147,6 +4169,7 @@ class MegaWorld1000 {
         if (anyVtOcc) this._occlusionDirty = true;
         if (anyVtLight) {
           this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
           this._depthElevSyncNeeded = true;
         }
       }
@@ -4158,6 +4181,7 @@ class MegaWorld1000 {
       this.lightBatch.syncDepthElevations(this._hasMultiElevationDepth());
       if (canvas.masks?.depth) canvas.masks.depth._elevationDirty = true;
       this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
 
     if (this._depthDirty || this._depthDeferred) {
@@ -4286,23 +4310,24 @@ class MegaWorld1000 {
     for (const [ovKey, ov] of this.activeOverlays) {
       const layer = this.levelLayers.get(ov.levelId);
       const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
+      const roofsMounted = this._shouldMountRoofs(layer, vp.scale);
       const st = levelReadyState.get(ov.levelId);
       if (ov.retiring) {
         const z4Ready = !layer?.hasPyramid || Boolean(st?.allReadyOpaque) || localZ === 0;
         const spec = ov.ovSpec;
         const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
         const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);
-        if (localZ < 5 && (z4Ready || offScreen)) {
+        if (!roofsMounted && (z4Ready || offScreen)) {
           retiringOvKeys.push(ovKey);
-        } else if (localZ < 5) {
+        } else if (!roofsMounted) {
           stillActive = true;
         }
         continue;
       }
       const isZ6 = localZ >= 6;
-      const canReveal = localZ >= 5;
-      const revealOnZ5 = Boolean(localZ === 5 && ov.roofMesh && this._isRoofRevealed(ov.roofMesh, occSurfaces));
-      const a = isZ6 ? (st ? st.finestZ6Alpha : 1.0) : (revealOnZ5 ? 1.0 : 0.0);
+      const canReveal = roofsMounted;
+      const revealOnLowerZ = Boolean(!isZ6 && ov.roofMesh && this._isRoofRevealed(ov.roofMesh, occSurfaces));
+      const a = isZ6 ? (st ? st.finestZ6Alpha : 1.0) : (revealOnLowerZ ? 1.0 : 0.0);
       if (ov.wallsMesh) {
         ov.wallsMesh.visible = a > 0.02;
         if (Math.abs(ov.wallsMesh.unoccludedAlpha - a) > 0.001) {
@@ -4340,6 +4365,7 @@ class MegaWorld1000 {
       }
       if (retiredRoof) {
         this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
         this.invalidateShowstopperSurfaces();
       }
@@ -4541,14 +4567,14 @@ class MegaWorld1000 {
   _syncIndoorLightVisibility() {
     if (!this.active || !this.lightBatch) return;
     const viewedBottom = getLevelBottomElevation(canvas.level);
+    const curScale = canvas.stage?.scale?.x ?? 1;
     let wantMacroRoofMask = false;
     for (const layer of this.visibleLevelLayers) {
       if (!layer.spec?.overlays) continue;
       const topElev = getLevelRoofElevation(layer.level);
       const hideRoofsForUpperView = !layer.level.isView && viewedBottom >= topElev;
       if (hideRoofsForUpperView) continue;
-      const localZ = layer.lastTargetZ - layer.zOffset;
-      if (localZ < 5) {
+      if (!this._shouldMountRoofs(layer, curScale)) {
         wantMacroRoofMask = true;
         break;
       }
@@ -4609,9 +4635,10 @@ class MegaWorld1000 {
     const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
     const localZ = targetZ - layer.zOffset;
     const showWalls = localZ >= 6;
-    const canReveal = localZ >= 5;
-    // Below localZ 5 roofs never reveal: they are baked in pyramid tiles, indoor lights are GPU-suppressed, and tokens inside are occluded via O(1) sector check
-    const shouldMountRoofs = localZ >= 5;
+    // Mount interactive roofs based on absolute screen cell size (pxPerCell >= 16px, with hysteresis),
+    // not raw pyramid Z, so small or high-PPI (256 PPI) maps keep roofs & CanvasDepthMask lighting rock-solid across tactical zoom!
+    const shouldMountRoofs = this._shouldMountRoofs(layer, vp.scale);
+    const canReveal = shouldMountRoofs;
 
     const sx0 = Math.max(0, Math.floor(vp.x0 / simSectorPx));
     const sy0 = Math.max(0, Math.floor(vp.y0 / simSectorPx));
@@ -4677,6 +4704,7 @@ class MegaWorld1000 {
         this.activeOverlays.delete(fullId);
         if (hadRoof) {
           this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
           this._depthElevSyncNeeded = true;
           retiredAnyRoof = true;
         }
@@ -4687,6 +4715,7 @@ class MegaWorld1000 {
           this.retireMesh(ov.roofMesh);
           ov.roofMesh = null;
           this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
           this._depthElevSyncNeeded = true;
           retiredAnyRoof = true;
           changed = true;
@@ -4776,7 +4805,8 @@ class MegaWorld1000 {
 
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const localZNow = layer.lastTargetZ - layer.zOffset;
-    if (localZNow < 5) return false;
+    const roofsMountedNow = this._shouldMountRoofs(layer, curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
+    if (!roofsMountedNow) return false;
 
     const tWalls = isTextureUsable(item.tWalls) ? item.tWalls : (item.tWalls && ovSpec.walls ? this.texMgr.getSync(ovSpec.walls) : null);
     const tRoof = isTextureUsable(item.tRoof) ? item.tRoof : (item.tRoof && ovSpec.roof ? this.texMgr.getSync(ovSpec.roof) : null);
@@ -4816,7 +4846,7 @@ class MegaWorld1000 {
     }
 
     if (tRoof) {
-      const canRevealNow = localZNow >= 5;
+      const canRevealNow = roofsMountedNow;
       roofMesh = this.acquireMesh();
       roofMesh.name = `Tile.BoundlessRoof.${fullId}`;
       roofMesh.anchor.set(0.5, 0.5);
@@ -4871,7 +4901,11 @@ class MegaWorld1000 {
     const sx1 = Math.min(simGrid - 1, Math.floor(vp.x1 / simSectorPx));
     const sy1 = Math.min(simGrid - 1, Math.floor(vp.y1 / simSectorPx));
 
-    const tileKey = `${targetZ}_${sx0}_${sy0}_${sx1}_${sy1}_r${this.tileEditsRev}`;
+    // Evaluate tile minZ using absolute cell size so 256 PPI / smaller maps don't drop interior props (minZ:5) at tactical zoom!
+    const effScale = getEffectiveScale(vp.scale);
+    const effectiveZ = Math.max(targetZ, effScale >= 0.22 ? (layer.zOffset + 5) : 0);
+
+    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}_r${this.tileEditsRev}`;
     if (tileKey === layer.lastTileKey) return false;
     layer.lastTileKey = tileKey;
 
@@ -4910,7 +4944,7 @@ class MegaWorld1000 {
       for (const tid of candidateTids) {
         const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
         if (!tSpec || tSpec.hidden) continue;
-        if (tSpec.minZ !== undefined && targetZ < tSpec.minZ) continue;
+        if (tSpec.minZ !== undefined && effectiveZ < tSpec.minZ) continue;
         if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
         if (tileIntersectsSectors(tSpec)) {
           needed.add(`${lid}::${tid}`);
@@ -4921,7 +4955,7 @@ class MegaWorld1000 {
       for (let tid = 0; tid < tiles.length; tid++) {
         const t = this.resolveVirtualTile(lid, tid, tiles[tid], level);
         if (!t || t.hidden) continue;
-        if (t.minZ !== undefined && targetZ < t.minZ) continue;
+        if (t.minZ !== undefined && effectiveZ < t.minZ) continue;
         if (t.maxZ !== undefined && targetZ > t.maxZ) continue;
         if (tileIntersectsSectors(t)) {
           needed.add(`${lid}::${tid}`);
@@ -4949,6 +4983,7 @@ class MegaWorld1000 {
       if (removedAnyOcc) this._occlusionDirty = true;
       if (removedAnyLight) {
         this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
       }
     }
@@ -5004,7 +5039,9 @@ class MegaWorld1000 {
     }
 
     const zNow = layer.lastTargetZ;
-    if (tSpec.minZ !== undefined && zNow < tSpec.minZ) return null;
+    const effScaleNow = getEffectiveScale(curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
+    const effZNow = Math.max(zNow, effScaleNow >= 0.22 ? (layer.zOffset + 5) : 0);
+    if (tSpec.minZ !== undefined && effZNow < tSpec.minZ) return null;
     if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return null;
 
     const { simGrid, simSectorPx } = layer;
@@ -5098,6 +5135,7 @@ class MegaWorld1000 {
       );
     }
     this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
   }
 
   // Multi-Level Physics Sim-Bubble & Dynamic Lights: strictly driven by tokens (on their own level!), active visionSources, and open doors
@@ -5929,6 +5967,7 @@ class MegaWorld1000 {
     this.layerEditors.syncTiles(true);
     this._occlusionDirty = true;
     this._depthDirty = true;
+    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     this._depthElevSyncNeeded = true;
   }
 

@@ -21,7 +21,8 @@ export class MegaAudioStreamer {
     const anchors = [];
     if (vp) {
       const vpScale = Number(vp.scale ?? canvas.stage?.scale?.x ?? 1);
-      if (vpScale >= SOUND_VP_MIN_SCALE) {
+      const effScale = vpScale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+      if (effScale >= SOUND_VP_MIN_SCALE) {
         anchors.push({
           x0: vp.x0 - SOUND_PAD_WORLD_PX,
           y0: vp.y0 - SOUND_PAD_WORLD_PX,
