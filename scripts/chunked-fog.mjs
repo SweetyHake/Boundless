@@ -1,4 +1,5 @@
-const MODULE_ID = "boundless";
+import { MODULE_ID } from "./utils.mjs";
+
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const CHUNK_WORLD_PX = 5000; // 50x50 cells per chunk (20x20 grid on 1000x1000 world)
 const CHUNK_TEX_PX = 256;    // ~5.12 px per cell -> 12.5x sharper than Foundry's 4096px global fog limit

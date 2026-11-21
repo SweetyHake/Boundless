@@ -1,4 +1,12 @@
-const MODULE_ID = "boundless";
+import {
+  MODULE_ID,
+  getEffectiveScale,
+  getExistingSheet,
+  isSheetActiveOrRendering,
+  makeVirtualId,
+  attachVirtualCollectionProxy
+} from "./utils.mjs";
+
 const LIGHT_STREAM_MIN_SCALE = 0.22;
 const SOUND_STREAM_MIN_SCALE = 0.18;
 const TILE_STREAM_MIN_SCALE = 0.18;
@@ -6,37 +14,18 @@ const MAX_LIGHTS_IN_VIEW = 260;
 const MAX_SOUNDS_IN_VIEW = 200;
 const MAX_TILES_IN_VIEW = 160;
 
-function getExistingSheet(doc) {
-  if (!doc) return null;
-  if ("_sheet" in doc) return doc._sheet;
-  return doc.sheet ?? null;
-}
-
-function isSheetActiveOrRendering(sheet, placeable = null) {
-  if (!sheet) return false;
-  if (sheet.rendered || sheet._preview || placeable?._preview?.previewType === "config") return true;
-  const renderingState = foundry?.applications?.api?.ApplicationV2?.RENDER_STATES?.RENDERING ?? 1;
-  return typeof sheet.state === "number" && sheet.state >= renderingState;
-}
-
-function makeVirtualId(prefix, levelId, key) {
-  const input = `${prefix}|${levelId}|${key}`;
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 0x01000193);
-    h2 = Math.imul(h2 ^ (ch + i), 0x85ebca6b);
-  }
-  const p1 = (h1 >>> 0).toString(36).padStart(7, "0").slice(0, 7);
-  const p2 = (h2 >>> 0).toString(36).padStart(7, "0").slice(0, 7);
-  return `${prefix}${p1}${p2}`.slice(0, 16);
+let _validOcclusionModesCache = null;
+function getValidOcclusionModes() {
+  if (_validOcclusionModesCache) return _validOcclusionModesCache;
+  const set = new Set(
+    Object.values(CONST.OCCLUSION_MODES || {}).filter(v => typeof v === "number" && v > 0)
+  );
+  if (set.size > 0) _validOcclusionModesCache = set;
+  return set;
 }
 
 function resolveOcclusionModeArray(modeSpec) {
-  const validValues = new Set(
-    Object.values(CONST.OCCLUSION_MODES || {}).filter(v => typeof v === "number" && v > 0)
-  );
+  const validValues = getValidOcclusionModes();
   if (Array.isArray(modeSpec)) {
     const out = new Set();
     for (const m of modeSpec) {
@@ -76,19 +65,6 @@ function drawShapeDataOutline(gfx, shape, lineColor = 0xEEEEEE, lineAlpha = 0.4)
   } else if (typeof shape.type === "number") {
     gfx.drawShape(shape);
   }
-}
-
-function attachVirtualCollectionProxy(doc, id, realColl) {
-  if (!doc || !realColl) return;
-  const collProxy = new Proxy(realColl, {
-    get(target, prop) {
-      if (prop === "has") return (k) => k === id || target.has(k);
-      if (prop === "get") return (k, opts) => (k === id ? doc : target.get(k, opts));
-      const val = Reflect.get(target, prop, target);
-      return typeof val === "function" ? val.bind(target) : val;
-    }
-  });
-  Object.defineProperty(doc, "collection", { get: () => collProxy, configurable: true });
 }
 
 export class VirtualLayerEditors {
@@ -418,7 +394,7 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= LIGHT_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.lightEditsRev || 0}`;
     if (key === this._lastLightKey) return;
@@ -743,7 +719,7 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= SOUND_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.soundEditsRev || 0}`;
     if (key === this._lastSoundKey) return;
@@ -1086,7 +1062,7 @@ export class VirtualLayerEditors {
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
-    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= TILE_STREAM_MIN_SCALE;
     const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.tileEditsRev || 0}`;
     if (key === this._lastTileKey) return;

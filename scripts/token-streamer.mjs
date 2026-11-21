@@ -1,21 +1,7 @@
 import { TokenImpostorLayer } from "./token-impostors.mjs";
+import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation } from "./utils.mjs";
 
-const MODULE_ID = "boundless";
-const SHOWSTOPPER_ID = "showstopper";
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
-
-function getShowstopperMovementApi() {
-  try {
-    const mod = globalThis.game?.modules?.get?.(SHOWSTOPPER_ID);
-    if (mod && !mod.active) return null;
-    return mod?.api?.tokenMovement
-      || globalThis.showstopper?.tokenMovement
-      || globalThis.showstopper?.api?.tokenMovement
-      || null;
-  } catch {
-    return null;
-  }
-}
 const MOUNT_ENTER_SCALE = 0.11;     // Start streaming native NPC placeables when descending past 0.11x (11px/token)
 const MOUNT_EXIT_SCALE = 0.085;     // Hysteresis exit: hand back to GPU Impostor Atlas below 0.085x
 const MOUNT_VP_PAD_PX = 1600;       // Pre-draw native tokens 16 cells outside viewport edge
@@ -964,8 +950,7 @@ export class TokenStreamer {
           }
 
           // Apply current LOD detail state immediately to newly drawn token
-          const effScaleNow = (this._lastVp?.scale ?? 1) * ((canvas.grid?.size || 100) / 100);
-          const showDetail = effScaleNow >= LOD_DETAIL_MIN_SCALE;
+          const showDetail = getEffectiveScale(this._lastVp?.scale ?? 1) >= LOD_DETAIL_MIN_SCALE;
           if (!showDetail) {
             if (obj.nameplate) obj.nameplate.renderable = false;
             if (obj.tooltip) obj.tooltip.renderable = false;
@@ -976,9 +961,7 @@ export class TokenStreamer {
           // Sync Showstopper elevation perspective / hover / shadow for newly streamed elevated tokens
           const ssApi = getShowstopperMovementApi();
           if (ssApi?.getTokenMovementSetting?.("vertical")) {
-            const baseElev = Number.isFinite(Number(canvas?.level?.elevation?.base))
-              ? Number(canvas.level.elevation.base)
-              : (Number(canvas?.level?.elevation?.bottom) || 0);
+            const baseElev = getLevelBaseElevation(canvas?.level);
             const tokElev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
             const obsElev = Number(ssApi.getObserverElevation?.() ?? baseElev);
             if (Math.abs(tokElev - baseElev) > 0.05 || Math.abs(obsElev - baseElev) > 0.05) {

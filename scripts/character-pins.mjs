@@ -1,4 +1,5 @@
-const MODULE_ID = "boundless";
+import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform } from "./utils.mjs";
+
 const CHAR_PIN_FADE_START = 0.38; // Begin showing world-space character portrait below this scale
 const CHAR_PIN_FADE_FULL = 0.20;  // 100% opaque at or below this scale
 const FOCUS_TARGET_SCALE = 0.85;  // Close tactical zoom when clicking character icon
@@ -6,23 +7,6 @@ const GTA_MIN_WORLD_DIST_PX = 1800; // Minimum distance (18 cells) before TAB tr
 const GTA_SCREEN_DIAG_MULT = 1.15;  // Or farther than 1.15x current viewport diagonal
 const GTA_MACRO_SCALE_THRESHOLD = 0.45; // Always use GTA descent when switching from zoomed-out view
 const MAX_GM_FALLBACK_PCS = 6;
-
-function smoothstep(edge0, edge1, x) {
-  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
-  return t * t * (3 - 2 * t);
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function loc(key, fallback = "") {
-  return game.i18n?.has?.(key) ? game.i18n.localize(key) : (fallback || key);
-}
 
 function isDefaultAvatar(src) {
   if (!src) return true;
@@ -164,14 +148,6 @@ function hasTokenOwnerPermissionLazy(tok, user) {
     }
   }
   return false;
-}
-
-function getLiveStageTransform(stageScale, px, py, sw, sh) {
-  const a = stageScale;
-  const d = canvas.stage?.scale?.y || stageScale;
-  const posX = Number.isFinite(canvas.stage?.position?.x) ? canvas.stage.position.x : sw * 0.5;
-  const posY = Number.isFinite(canvas.stage?.position?.y) ? canvas.stage.position.y : sh * 0.5;
-  return { a, d, tx: posX - px * a, ty: posY - py * d };
 }
 
 function formatWorldDistance(dx, dy) {

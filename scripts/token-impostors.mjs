@@ -1,23 +1,15 @@
-const MODULE_ID = "boundless";
+import {
+  MODULE_ID,
+  isTextureUsable,
+  getLevelBaseElevation as getFiniteLevelBaseElevation,
+  getLevelRoofElevation as getFiniteLevelRoofElevation
+} from "./utils.mjs";
+
 const CELL_PX = 128;
 const PAD_PX = 4;
 const CONTENT_PX = CELL_PX - PAD_PX * 2; // 120x120 crisp art inside 128x128 cell (4px guard band against mip bleed)
 const ATLAS_PX = 2048;                   // 16x16 = 256 unique crisp 128x128 token portraits (~16 MB VRAM)
 const MAX_CONCURRENT_DECODES = 6;
-
-function getFiniteLevelBaseElevation(level) {
-  const base = Number(level?.elevation?.base);
-  if (Number.isFinite(base)) return base;
-  const bottom = Number(level?.elevation?.bottom);
-  if (Number.isFinite(bottom)) return bottom;
-  return 0;
-}
-
-function getFiniteLevelRoofElevation(level) {
-  const top = Number(level?.elevation?.top);
-  if (Number.isFinite(top)) return top;
-  return getFiniteLevelBaseElevation(level) + 20;
-}
 
 const IMPOSTOR_VERT = `
 precision highp float;
@@ -503,10 +495,7 @@ export class TokenImpostorLayer {
     u.uVisionTex = useVision ? visionTex : PIXI.Texture.WHITE;
 
     const lb = this.controller?.lightBatch;
-    const hasRoof = Boolean(
-      lb?.useBakedRoofMask && lb.bakedRoofMask &&
-      !lb.bakedRoofMask.destroyed && lb.bakedRoofMask.baseTexture && !lb.bakedRoofMask.baseTexture.destroyed
-    );
+    const hasRoof = Boolean(lb?.useBakedRoofMask && isTextureUsable(lb.bakedRoofMask));
     u.uUseBakedRoofMask = hasRoof;
     if (hasRoof) {
       u.uBakedRoofMask = lb.bakedRoofMask;

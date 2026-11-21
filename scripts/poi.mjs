@@ -1,4 +1,4 @@
-const MODULE_ID = "boundless";
+import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform } from "./utils.mjs";
 
 // 3-tier hierarchical POI zoom visibility & landing defaults:
 // 1) major  (Region / Capital)  -> visible from orbit; clicking lands at macro overview (0.085x) where sub-pins appear
@@ -218,11 +218,6 @@ function drawPoiGlyph(g, iconKey, r, color) {
   g.endFill();
 }
 
-function smoothstep(edge0, edge1, x) {
-  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
-  return t * t * (3 - 2 * t);
-}
-
 function sampleBezier(a1, a2, u) {
   return (((1 - 3 * a2 + 3 * a1) * u + (3 * a2 - 6 * a1)) * u + 3 * a1) * u;
 }
@@ -248,18 +243,6 @@ function cubicBezier(x1, y1, x2, y2, t) {
 // Smooth, unhurried cruise with an ultra-silky landing deceleration
 function easeCameraFlight(t) {
   return cubicBezier(0.36, 0.0, 0.22, 1.0, t);
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function loc(key, fallback = "") {
-  return game.i18n?.has?.(key) ? game.i18n.localize(key) : (fallback || key);
 }
 
 /**
@@ -487,14 +470,6 @@ export function getDefault1000Pois() {
       .filter(s => s.suffix !== "village")
       .map(({ suffix, ...rest }) => ({ id: `def_${suffix}`, ...rest }))
   ];
-}
-
-function getLiveStageTransform(stageScale, px, py, sw, sh) {
-  const a = stageScale;
-  const d = canvas.stage?.scale?.y || stageScale;
-  const posX = Number.isFinite(canvas.stage?.position?.x) ? canvas.stage.position.x : sw * 0.5;
-  const posY = Number.isFinite(canvas.stage?.position?.y) ? canvas.stage.position.y : sh * 0.5;
-  return { a, d, tx: posX - px * a, ty: posY - py * d };
 }
 
 function rectsOverlap(a, b, pad = 0) {

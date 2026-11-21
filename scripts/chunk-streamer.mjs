@@ -1,4 +1,5 @@
-const MODULE_ID = "boundless";
+import { MODULE_ID } from "./utils.mjs";
+
 const CHUNK_STREAM_MIN_SCALE = 0.022; // Below ~0.022x (true continental orbit), macro pyramid + soft Gaussian macroLights handle rendering with 0 chunk fetches
 const CHUNK_VP_PAD_PX = 14000;        // Prefetch neighboring chunks 140 cells outside screen edge
 const CHUNK_TOKEN_PAD_PX = 8000;      // Keep chunks loaded within 80 cells around every active token

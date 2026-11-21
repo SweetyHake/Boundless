@@ -1,4 +1,5 @@
-const MODULE_ID = "boundless";
+import { MODULE_ID } from "./utils.mjs";
+
 const TILE_PX = 1024;
 const UPLOAD_CONCURRENCY = 4;
 const VIDEO_EXT_RE = /\.(webm|mp4|m4v|ogv)(\?|$)/i;

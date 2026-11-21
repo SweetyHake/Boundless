@@ -1,3 +1,5 @@
+import { getEffectiveScale } from "./utils.mjs";
+
 const SOUND_PAD_WORLD_PX = 1600;
 const SOUND_VP_MIN_SCALE = 0.25;
 
@@ -21,7 +23,7 @@ export class MegaAudioStreamer {
     const anchors = [];
     if (vp) {
       const vpScale = Number(vp.scale ?? canvas.stage?.scale?.x ?? 1);
-      const effScale = vpScale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+      const effScale = getEffectiveScale(vpScale);
       if (effScale >= SOUND_VP_MIN_SCALE) {
         anchors.push({
           x0: vp.x0 - SOUND_PAD_WORLD_PX,
@@ -56,6 +58,8 @@ export class MegaAudioStreamer {
         levelId: tok.document?.level || canvas.level?.id
       });
     }
+
+    if (anchors.length === 0 && this.activeSources.size === 0) return;
 
     const needed = new Map(); // soundKey -> { layer, item }
 
