@@ -13,8 +13,8 @@ import { bakeSceneToBoundless } from "./scene-baker.mjs";
 const MODULE_ID = "boundless";
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const MAX_LOS_RADIUS_PX = 4500; // 45 cells (225 ft) horizon prevents 100kpx full-world raycasts
-const MAX_VRAM_TEXTURES = 768;  // High entry cap so small 256px prop textures don't evict pyramid/roof textures
-const MAX_VRAM_BYTES = 1024 * 1024 * 1024; // ~1 GB VRAM budget (mipmapped RGBA estimate) for high-PPI multi-level LRU cache
+const MAX_VRAM_TEXTURES = 1024; // High entry cap so small 256px prop textures across multi-level scenes don't evict pyramid/roof textures
+const MAX_VRAM_BYTES = 1536 * 1024 * 1024; // ~1.5 GB VRAM budget (mipmapped RGBA estimate) for high-PPI multi-level LRU cache
 const MAX_GPU_UPLOAD_BYTES_PER_FRAME = 16 * 1024 * 1024; // ~16 MB/frame fresh WebGL texture upload cap to avoid mipmap stalls
 const CROSSFADE_MS = 160;       // Smooth invisible LOD blend duration
 const LIGHT_PAD_WORLD_PX = 900; // > max 40ft (800px) light radius so lights never pop on viewport edge
@@ -3609,7 +3609,12 @@ class MegaWorld1000 {
     let anyTilesOrOverlaysChanged = false;
     let maxTargetZ = 0;
 
-    for (const layer of this.visibleLevelLayers) {
+    // Process currently viewed level FIRST so its pyramid tiles & virtual props always jump ahead of hidden lower levels (e.g. basement)
+    const orderedLayers = this.visibleLevelLayers.length > 1
+      ? this.visibleLevelLayers.slice().sort((a, b) => (b.level?.isView ? 1 : 0) - (a.level?.isView ? 1 : 0))
+      : this.visibleLevelLayers;
+
+    for (const layer of orderedLayers) {
       const { bounds } = layer;
       const targetZ = this._computeTargetZ(layer, vp.scale, { hysteresis: true });
       layer.lastTargetZ = targetZ;
@@ -3781,7 +3786,11 @@ class MegaWorld1000 {
     this._tilesDirty = true;
 
     const isPinned = spec.z <= 1;
-    this.texMgr.load(spec.src, { mipmap: true, isPinned, priority: isPinned ? 0 : 1 }).then(tex => {
+    const isViewedLayer = Boolean(layer.level?.isView);
+    const visVp = this.getViewportWorldRect(0.0);
+    const onVisScreen = !(x0 + sizePx < visVp.x0 || x0 > visVp.x1 || y0 + sizePx < visVp.y0 || y0 > visVp.y1);
+    const loadPriority = (isPinned || (isViewedLayer && onVisScreen)) ? 0 : 1;
+    this.texMgr.load(spec.src, { mipmap: true, isPinned, priority: loadPriority }).then(tex => {
       if (!this.active) return;
       const e = this.tilesByKey.get(spec.key);
       if (e !== entry) return;
@@ -3796,7 +3805,9 @@ class MegaWorld1000 {
       if (instant || e.z <= 1) {
         this._mountTileMesh(e, tex, instant);
       } else {
-        this.pendingTileMounts.push({ key: spec.key, entry, tex, instant });
+        const qItem = { key: spec.key, entry, tex, instant };
+        if (isViewedLayer && onVisScreen) this.pendingTileMounts.unshift(qItem);
+        else this.pendingTileMounts.push(qItem);
         this._tilesDirty = true;
       }
     });
@@ -3831,19 +3842,26 @@ class MegaWorld1000 {
       : CONST.OCCLUSION_MODES.SURFACE;
     m.occludedAlpha = layer.isUpper ? 0.08 : 1.0;
     m.hoverFade = layer.isUpper;
-    m.restrictsLight = true;
-    m.restrictsWeather = true;
+    // Never write coarse z=0 fallback (64px/texel blur) into CanvasDepthMask so rapid zoom-outs never shift lighting edges
+    m.restrictsLight = e.z > 0;
+    m.restrictsWeather = e.z > 0;
 
-    let hasFinerAbove = false;
-    for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && other.ready && other.z > e.z && other.alpha > 0.25 &&
-          this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
-        hasFinerAbove = true;
-        break;
+    let hasOtherZCovering = false;
+    if (!instant && e.z > 0 && !e.isReveal) {
+      for (const [, other] of this.tilesByKey) {
+        if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z !== e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+            this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
+          hasOtherZCovering = true;
+          break;
+        }
       }
     }
-    e.alpha = (instant || hasFinerAbove || !this.hasReadyAncestorCovering(e)) ? 1.0 : 0.0;
-    m.unoccludedAlpha = e.alpha;
+    // Keep replacement LOD tiles hidden at alpha=1.0 until all visible tiles of the new LOD are ready,
+    // then swap atomically in 1 frame so semi-transparent floors/shadows never double-blend or flicker CanvasDepthMask!
+    e.alpha = 1.0;
+    e.awaitingSwap = hasOtherZCovering;
+    m.unoccludedAlpha = 1.0;
+    m.visible = !hasOtherZCovering;
     e.mesh = m;
     e.ready = true;
     canvas.primary.addChild(m);
@@ -3851,14 +3869,64 @@ class MegaWorld1000 {
     this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
-    this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth._elevationDirty = true;
+    if (m.visible) {
+      this._depthDirty = true;
+      if (canvas.masks?.depth) {
+        canvas.masks.depth.renderDirty = true;
+        canvas.masks.depth._elevationDirty = true;
+      }
+    }
+    return true;
+  }
+
+  _isViewportCoveredByHigherTiles(layer, visVp) {
+    if (!layer?.bounds || !visVp) return false;
+    const lid = layer.level.id;
+    const rx0 = Math.max(layer.bounds.x, visVp.x0);
+    const ry0 = Math.max(layer.bounds.y, visVp.y0);
+    const rx1 = Math.min(layer.bounds.x + layer.bounds.w, visVp.x1);
+    const ry1 = Math.min(layer.bounds.y + layer.bounds.h, visVp.y1);
+    if (rx1 <= rx0 || ry1 <= ry0) return true;
+    const rw = rx1 - rx0;
+    const rh = ry1 - ry0;
+    const samples = [
+      [rx0 + rw * 0.15, ry0 + rh * 0.15],
+      [rx0 + rw * 0.50, ry0 + rh * 0.15],
+      [rx0 + rw * 0.85, ry0 + rh * 0.15],
+      [rx0 + rw * 0.15, ry0 + rh * 0.50],
+      [rx0 + rw * 0.50, ry0 + rh * 0.50],
+      [rx0 + rw * 0.85, ry0 + rh * 0.50],
+      [rx0 + rw * 0.15, ry0 + rh * 0.85],
+      [rx0 + rw * 0.50, ry0 + rh * 0.85],
+      [rx0 + rw * 0.85, ry0 + rh * 0.85]
+    ];
+    for (const [px, py] of samples) {
+      let covered = false;
+      for (const [, other] of this.tilesByKey) {
+        if (other.levelId === lid && other.ready && other.z > 0 && other.mesh?.visible && other.alpha >= 0.98 &&
+            px >= other.x0 && px <= other.x0 + other.sizePx &&
+            py >= other.y0 && py <= other.y0 + other.sizePx) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) return false;
+    }
     return true;
   }
 
   rectsOverlap(ax, ay, asz, bx, by, bsz) {
     return !(ax + asz <= bx + 1 || ax + 1 >= bx + bsz || ay + asz <= by + 1 || ay + 1 >= by + bsz);
+  }
+
+  hasReadyOtherZCovering(e) {
+    for (const [, other] of this.tilesByKey) {
+      if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z !== e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+          this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   hasReadyAncestorCovering(e) {
@@ -4142,14 +4210,14 @@ class MegaWorld1000 {
 
     // Frame-budgeted virtual tile mounting (prevents 300+ mesh/texture upload stalls on zoom-out)
     if (this.pendingVirtualTileMounts.length > 0) {
-      const maxVtMounts = this.isCameraFlying ? 16 : 48;
+      const maxVtMounts = this.isCameraFlying ? 24 : 96;
       let mountedVt = 0;
       let anyVtLight = false;
       let anyVtOcc = false;
       const curVp = this.getViewportWorldRect(0.28);
       const tStart = performance.now();
       while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
-        if (mountedVt > 0 && (performance.now() - tStart) > 4.0) break;
+        if (mountedVt > 0 && (performance.now() - tStart) > 4.5) break;
         const peek = this.pendingVirtualTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
         if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
@@ -4169,7 +4237,7 @@ class MegaWorld1000 {
         if (anyVtOcc) this._occlusionDirty = true;
         if (anyVtLight) {
           this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+          if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
           this._depthElevSyncNeeded = true;
         }
       }
@@ -4207,9 +4275,9 @@ class MegaWorld1000 {
       this.syncRoofTokenOcclusion();
     }
 
-    // Frame-budgeted tile mounting (respects shared frameGpuUploadBytes budget for fresh uploads)
+    // Frame-budgeted tile mounting (respects shared frameGpuUploadBytes budget for fresh uploads; already-resident GPU tiles mount fast)
     if (this.pendingTileMounts.length > 0) {
-      const maxMounts = this.isCameraFlying ? 2 : 6;
+      const maxMounts = this.isCameraFlying ? 6 : 24;
       let mounted = 0;
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
         const peek = this.pendingTileMounts[0];
@@ -4236,74 +4304,114 @@ class MegaWorld1000 {
 
     const step = dtMs / CROSSFADE_MS;
     const vp = this.getViewportWorldRect(0.28);
+    const visVp = this.getViewportWorldRect(0.0);
     const toDelete = [];
     let stillActive = false;
+    let anyPyramidSwapped = false;
 
     const levelReadyState = new Map();
     for (const layer of this.visibleLevelLayers) {
       levelReadyState.set(layer.level.id, {
         allReadyOpaque: layer.lastTargetZ > 0,
+        visDesiredReady: layer.lastTargetZ > 0,
         hasDesiredNonZero: false,
+        hasVisDesiredNonZero: false,
         finestZ6Alpha: 0.0
       });
     }
 
+    // Pass 1: inspect readiness of desired tiles per level (both full padded rect and exact visible screen)
+    for (const [, e] of this.tilesByKey) {
+      if (e.z === 0 || !e.desired || e.isReveal) continue;
+      const st = levelReadyState.get(e.levelId);
+      if (!st) continue;
+      st.hasDesiredNonZero = true;
+      const inVis = !(e.x0 + e.sizePx < visVp.x0 || e.x0 > visVp.x1 || e.y0 + e.sizePx < visVp.y0 || e.y0 > visVp.y1);
+      if (inVis) {
+        st.hasVisDesiredNonZero = true;
+        if (!e.ready) st.visDesiredReady = false;
+      }
+      if (!e.ready || e.alpha < 0.99 || e.awaitingSwap) {
+        st.allReadyOpaque = false;
+        stillActive = true;
+      }
+    }
+
+    // Pass 2: atomic 1-frame LOD swap once all visible desired tiles are ready (zero double-alpha blending & zero depth flicker!)
     for (const [k, e] of this.tilesByKey) {
       const st = levelReadyState.get(e.levelId);
       if (e.z === 0) continue;
 
-      if (!e.desired) {
+      if (e.desired) {
+        if (e.ready && e.awaitingSwap) {
+          const canSwapNow = Boolean(st?.visDesiredReady)
+            || !this.hasReadyOtherZCovering(e);
+          if (canSwapNow) {
+            e.awaitingSwap = false;
+            e.alpha = 1.0;
+            if (e.mesh) {
+              e.mesh.unoccludedAlpha = 1.0;
+              e.mesh.visible = true;
+            }
+            anyPyramidSwapped = true;
+          } else {
+            stillActive = true;
+          }
+        } else if (e.ready && e.alpha < 1.0) {
+          e.alpha = Math.min(1.0, e.alpha + step);
+          if (e.mesh) e.mesh.unoccludedAlpha = e.alpha;
+          if (e.alpha < 1.0) stillActive = true;
+        }
+        if (st && e.layer && (e.z - e.layer.zOffset) >= 6 && !e.isReveal && e.ready && !e.awaitingSwap && e.alpha > st.finestZ6Alpha) {
+          st.finestZ6Alpha = e.alpha;
+        }
+      } else {
         stillActive = true;
         const onScreen = !(e.x0 + e.sizePx < vp.x0 || e.x0 > vp.x1 || e.y0 + e.sizePx < vp.y0 || e.y0 > vp.y1);
         if (!onScreen || !e.ready) {
           toDelete.push(k);
           continue;
         }
-        if (e.z < e.layer.lastTargetZ) {
+        if (st?.visDesiredReady && st?.hasVisDesiredNonZero) {
+          toDelete.push(k);
+          anyPyramidSwapped = true;
+        } else if (e.z < e.layer.lastTargetZ) {
           if (this.isTileFullyReplacedByDesired(e, vp)) {
             toDelete.push(k);
+            anyPyramidSwapped = true;
           }
-        } else {
-          if (this.hasAnyReadyDesiredUnderneath(e)) {
-            e.fadingOut = true;
-          }
+        } else if (e.fadingOut) {
+          e.alpha = Math.max(0.0, e.alpha - step);
+          if (e.mesh) e.mesh.unoccludedAlpha = e.alpha;
+          if (e.alpha <= 0.01) toDelete.push(k);
         }
-      } else if (st) {
-        st.hasDesiredNonZero = true;
-        if (!e.ready || e.alpha < 0.99) {
-          st.allReadyOpaque = false;
-          stillActive = true;
-        }
-      }
-
-      if (e.fadingOut) {
-        e.alpha = Math.max(0.0, e.alpha - step);
-        if (e.mesh) e.mesh.unoccludedAlpha = e.alpha;
-        if (e.alpha <= 0.01) toDelete.push(k);
-        else stillActive = true;
-      } else if (e.desired && e.ready && e.alpha < 1.0) {
-        e.alpha = Math.min(1.0, e.alpha + step);
-        if (e.mesh) e.mesh.unoccludedAlpha = e.alpha;
-        if (e.alpha < 1.0) stillActive = true;
-      }
-
-      if (st && e.layer && (e.z - e.layer.zOffset) >= 6 && !e.isReveal && e.ready && e.alpha > st.finestZ6Alpha) {
-        st.finestZ6Alpha = e.alpha;
       }
     }
 
-    // Hide z=0 base mesh & native Foundry background mesh while sharper tiles fully cover the viewport
+    // Hide z=0 base mesh & native Foundry background mesh whenever ANY sharper tiles (z > 0, including outgoing LOD) cover the visible screen!
     for (const layer of this.visibleLevelLayers) {
       if (!layer.hasPyramid) continue;
       const lid = layer.level.id;
       const st = levelReadyState.get(lid);
       const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
-      const fullyCovered = Boolean(st?.allReadyOpaque && st?.hasDesiredNonZero);
+      const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
+        || this._isViewportCoveredByHigherTiles(layer, visVp);
       if (z0?.mesh) {
         const shouldShowBase = !fullyCovered;
-        if (z0.mesh.visible !== shouldShowBase) z0.mesh.visible = shouldShowBase;
+        if (z0.mesh.visible !== shouldShowBase) {
+          z0.mesh.visible = shouldShowBase;
+          anyPyramidSwapped = true;
+        }
       }
       this._setNativeLevelBgVisible(layer.level, !fullyCovered);
+    }
+
+    if (anyPyramidSwapped) {
+      canvas.primary.sortDirty = true;
+      if (canvas.masks?.depth) {
+        canvas.masks.depth._elevationDirty = true;
+        canvas.masks.depth.renderDirty = true;
+      }
     }
 
     const retiringOvKeys = [];
@@ -4990,23 +5098,36 @@ class MegaWorld1000 {
 
     const reqRev = this.tileEditsRev;
     const gen = this._mountGen;
+    const isViewedLayer = Boolean(level?.isView);
+    const visVp = this.getViewportWorldRect(0.0);
+    const isOnVisScreen = (t) => {
+      const ax0 = t.anchorX !== undefined ? t.anchorX : 0.5;
+      const ay0 = t.anchorY !== undefined ? t.anchorY : 0.5;
+      const pivX = t.anchorX === undefined ? (t.x + t.w * 0.5) : t.x;
+      const pivY = t.anchorY === undefined ? (t.y + t.h * 0.5) : t.y;
+      const halfDiag = Math.hypot(t.w || 0, t.h || 0) * Math.max(ax0, 1 - ax0, ay0, 1 - ay0);
+      return pivX + halfDiag >= visVp.x0 && pivX - halfDiag <= visVp.x1 && pivY + halfDiag >= visVp.y0 && pivY - halfDiag <= visVp.y1;
+    };
     for (const fullId of needed) {
       if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId) || this._pendingVirtualTileKeys.has(fullId)) continue;
       const tid = Number(fullId.split("::")[1]);
       const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
       if (!tSpec?.src || tSpec.hidden) continue;
 
+      const onVis = isViewedLayer && isOnVisScreen(tSpec);
       const syncTex = this.texMgr.getSync(tSpec.src);
       if (syncTex) {
         this._pendingVirtualTileKeys.add(fullId);
-        this.pendingVirtualTileMounts.push({ fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex: syncTex });
+        const qItem = { fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex: syncTex };
+        if (onVis) this.pendingVirtualTileMounts.unshift(qItem);
+        else this.pendingVirtualTileMounts.push(qItem);
         this._tilesDirty = true;
         changed = true;
         continue;
       }
 
       this.virtualTilePending.add(fullId);
-      this.texMgr.load(tSpec.src, { mipmap: true }).then(tex => {
+      this.texMgr.load(tSpec.src, { mipmap: true, priority: onVis ? 0 : 1 }).then(tex => {
         if (this._mountGen === gen && this.levelLayers.get(lid) === layer && this.tileEditsRev === reqRev) {
           this.virtualTilePending.delete(fullId);
         }
@@ -5017,7 +5138,9 @@ class MegaWorld1000 {
           return;
         }
         this._pendingVirtualTileKeys.add(fullId);
-        this.pendingVirtualTileMounts.push({ fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex });
+        const qItem = { fullId, lid, tid, layer, tSpec, defaultElev, reqRev, gen, tex };
+        if (onVis) this.pendingVirtualTileMounts.unshift(qItem);
+        else this.pendingVirtualTileMounts.push(qItem);
         this._tilesDirty = true;
       });
       changed = true;
