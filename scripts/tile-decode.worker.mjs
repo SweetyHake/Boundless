@@ -22,7 +22,7 @@ self.onmessage = async (event) => {
   }
 
   if (msg.type !== "decode") return;
-  const { id, url, premultiply } = msg;
+  const { id, url, premultiply, maxDim } = msg;
   const ctrl = new AbortController();
   inflight.set(id, ctrl);
   const t0 = performance.now();
@@ -42,10 +42,27 @@ self.onmessage = async (event) => {
       return;
     }
 
-    const bitmap = await createImageBitmap(blob, {
+    const decodeOpts = {
       premultiplyAlpha: premultiply === false ? "none" : "premultiply",
       colorSpaceConversion: "none"
-    });
+    };
+    let bitmap = await createImageBitmap(blob, decodeOpts);
+
+    if (maxDim > 0 && (bitmap.width > maxDim || bitmap.height > maxDim) && !ctrl.signal.aborted) {
+      const ratio = maxDim / Math.max(bitmap.width, bitmap.height);
+      const rw = Math.max(1, Math.round(bitmap.width * ratio));
+      const rh = Math.max(1, Math.round(bitmap.height * ratio));
+      try {
+        const resized = await createImageBitmap(bitmap, {
+          ...decodeOpts,
+          resizeWidth: rw,
+          resizeHeight: rh,
+          resizeQuality: "high"
+        });
+        try { bitmap.close(); } catch {}
+        bitmap = resized;
+      } catch {}
+    }
 
     if (ctrl.signal.aborted) {
       try { bitmap.close(); } catch {}

@@ -2445,7 +2445,7 @@ class LRUTextureManager {
     }).catch(() => null);
   }
 
-  load(src, { mipmap = true, isPinned = false, priority = 1 } = {}) {
+  load(src, { mipmap = true, isPinned = false, priority = 1, maxDim = 0 } = {}) {
     if (!src) return Promise.resolve(null);
     if (isPinned) this.pinned.add(src);
     const existing = this.getSync(src);
@@ -2459,7 +2459,7 @@ class LRUTextureManager {
     const useWorker = isWorkerDecodableUrl(src) && this.workerPool.isSupported();
     let p;
     if (useWorker) {
-      p = this.workerPool.decode(src, { priority }).then(bitmap => {
+      p = this.workerPool.decode(src, { priority, maxDim }).then(bitmap => {
         if (!bitmap) return null;
         if (gen !== this._gen) {
           try { bitmap.close(); } catch {}
@@ -2671,6 +2671,10 @@ class MegaWorld1000 {
   isCameraFlying = false;
   _lastPanMs = 0;
   _pruneNeeded = false;
+  _lastOccRefreshMs = 0;
+  _showstopperDirty = false;
+  _lastShowstopperMs = 0;
+  _vtIdleCleanupNeeded = false;
   _prewarmGen = 0;
 
   isActivelyMoving() {
@@ -2863,6 +2867,16 @@ class MegaWorld1000 {
     const threshold = layer._roofsMountedMode ? 0.21 : 0.24;
     const active = effScale >= threshold;
     layer._roofsMountedMode = active;
+    return active;
+  }
+
+  _shouldMountInteriorTiles(layer, scale = canvas?.stage?.scale?.x ?? 1) {
+    if (!layer) return false;
+    if (!layer.hasPyramid) return true;
+    const effScale = getEffectiveScale(scale);
+    const threshold = layer._interiorTilesMounted ? 0.40 : 0.45;
+    const active = effScale >= threshold;
+    layer._interiorTilesMounted = active;
     return active;
   }
 
@@ -3297,9 +3311,12 @@ class MegaWorld1000 {
     this._restoreCamera(scene);
     this.syncZoomLimits({ animate: false });
 
-    // Soft lighting/coloration glow does not need 2x HiDPI FBO fill-rate (4x fewer shaded pixels at 144Hz)
+    // Soft lighting/coloration/fog blur does not need 2x HiDPI FBO fill-rate (4x fewer shaded pixels at 144Hz)
     this._capFilterResolution(canvas.effects?.coloration?.filter, 1.0);
     this._capFilterResolution(canvas.effects?.illumination?.filter, 1.0);
+    for (const f of canvas.visibility?.filters || []) {
+      this._capFilterResolution(f, 1.0);
+    }
 
     // Disable heavy 3-pass fullscreen SMAAFilter on Boundless (mipmapped 2D tiles look sharper without it)
     const smaa = canvas.stage?.filters?.find(f => f?.constructor?.name === "SMAAFilter");
@@ -3527,9 +3544,18 @@ class MegaWorld1000 {
     });
   }
 
-  invalidateShowstopperSurfaces() {
+  invalidateShowstopperSurfaces(immediate = false) {
     const ssApi = getShowstopperMovementApi();
     if (!ssApi?.invalidateSupportingSurfaces) return;
+    if (!immediate && this.isActivelyMoving()) {
+      const now = performance.now();
+      if ((now - this._lastShowstopperMs) < 200) {
+        this._showstopperDirty = true;
+        return;
+      }
+    }
+    this._showstopperDirty = false;
+    this._lastShowstopperMs = performance.now();
     try {
       ssApi.invalidateSupportingSurfaces();
     } catch {}
@@ -4301,7 +4327,9 @@ class MegaWorld1000 {
     };
     const isMoving = this.isActivelyMoving();
     const gpuUploadBudget = isMoving ? (10 * 1024 * 1024) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
+    const maxFreshUploads = isMoving ? 2 : 4;
     let frameGpuUploadBytes = 0;
+    let frameFreshUploads = 0;
 
     // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
     if (this.pendingTileMounts.length > 0) {
@@ -4310,7 +4338,7 @@ class MegaWorld1000 {
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
         const peek = this.pendingTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+        if (estBytes > 0 && (frameFreshUploads >= maxFreshUploads || (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget))) break;
         const item = this.pendingTileMounts.shift();
         const e = this.tilesByKey.get(item.key);
         if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
@@ -4322,13 +4350,20 @@ class MegaWorld1000 {
         }
         if (this._mountTileMesh(e, tex, item.instant)) {
           mounted++;
-          frameGpuUploadBytes += estBytes;
+          if (estBytes > 0) {
+            // Upload awaitingSwap tiles to WebGL immediately within this frame's 2-tile budget so atomic swap never bursts 8+ uploads in one frame!
+            if (e.awaitingSwap && tex?.baseTexture && canvas.app?.renderer?.texture?.bind) {
+              try { canvas.app.renderer.texture.bind(tex.baseTexture); } catch {}
+            }
+            frameGpuUploadBytes += estBytes;
+            frameFreshUploads++;
+          }
         }
       }
       if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
     }
 
-    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly; fresh 4K roofs cap at 1/frame
+    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly; fresh roofs cap at 1/frame
     //    (allow mounting even while pyramid tiles queue if visible z>=5 tiles are waiting on these roofs so interiors never flash!)
     if (this.pendingOverlayMounts.length > 0) {
       const maxCachedOvMounts = isMoving ? 8 : 16;
@@ -4341,6 +4376,7 @@ class MegaWorld1000 {
         const peek = this.pendingOverlayMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
         if (estBytes > 0) {
+          if (frameFreshUploads >= maxFreshUploads) break;
           if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
           if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
         }
@@ -4348,8 +4384,11 @@ class MegaWorld1000 {
         if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
         if (this._mountOverlayMeshes(item, curVp)) {
           mountedOv++;
-          frameGpuUploadBytes += estBytes;
-          if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
+          if (estBytes > 0) {
+            frameGpuUploadBytes += estBytes;
+            frameFreshUploads++;
+            if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
+          }
         }
       }
       if (mountedOv > 0) {
@@ -4365,7 +4404,7 @@ class MegaWorld1000 {
       if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
     }
 
-    // 3. Frame-budgeted virtual tile mounting (strict time & upload budget during zoom/pan so hundreds of props never stall frames)
+    // 3. Frame-budgeted virtual tile mounting (strict time, count & fresh-upload budget during zoom/pan so hundreds of props never stall frames)
     if (this.pendingVirtualTileMounts.length > 0) {
       const maxVtMounts = isMoving ? 16 : 48;
       const vtTimeBudgetMs = isMoving ? 1.5 : 3.5;
@@ -4378,13 +4417,16 @@ class MegaWorld1000 {
         if (mountedVt > 0 && (performance.now() - tStart) > vtTimeBudgetMs) break;
         const peek = this.pendingVirtualTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (estBytes > 0 && frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+        if (estBytes > 0 && (frameFreshUploads >= maxFreshUploads || (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget))) break;
         const item = this.pendingVirtualTileMounts.shift();
         if (item?.fullId) this._pendingVirtualTileKeys.delete(item.fullId);
         const m = this._mountVirtualTileMesh(item, curVp);
         if (m) {
           mountedVt++;
-          frameGpuUploadBytes += estBytes;
+          if (estBytes > 0) {
+            frameGpuUploadBytes += estBytes;
+            frameFreshUploads++;
+          }
           if (m.restrictsLight || m.restrictsWeather) anyVtLight = true;
           if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) anyVtOcc = true;
         }
@@ -4420,8 +4462,16 @@ class MegaWorld1000 {
     }
 
     if (this._occlusionDirty) {
-      this._occlusionDirty = false;
-      canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
+      const nowOcc = performance.now();
+      if (!isMoving || (nowOcc - this._lastOccRefreshMs) >= 120) {
+        this._occlusionDirty = false;
+        this._lastOccRefreshMs = nowOcc;
+        canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
+      }
+    }
+
+    if (this._showstopperDirty && (!isMoving || (performance.now() - this._lastShowstopperMs) >= 200)) {
+      this.invalidateShowstopperSurfaces(true);
     }
 
     if (this._waitingForRoofsBeforeIndoor) {
@@ -4431,6 +4481,17 @@ class MegaWorld1000 {
     if (this._roofTokenOccDirty) {
       this._roofTokenOccDirty = false;
       this.syncRoofTokenOcclusion();
+    }
+
+    // Once camera settles after zoom/pan, perform a single clean pass to trim far-offscreen virtual tiles & fill padding
+    if (this._vtIdleCleanupNeeded && !isMoving && this.pendingTileMounts.length === 0) {
+      this._vtIdleCleanupNeeded = false;
+      const idleVp = this.getViewportWorldRect(0.28);
+      for (const layer of this.visibleLevelLayers) {
+        if (!layer.spec?.tiles?.length) continue;
+        layer.lastTileKey = "";
+        this.syncVirtualTiles(layer, layer.lastTargetZ >= 0 ? layer.lastTargetZ : this._computeTargetZ(layer, idleVp.scale), idleVp);
+      }
     }
 
     // Incremental VRAM pruning strictly while camera is idle (max 4 textures/frame) to prevent D3D11/WebGL texture-delete pipeline stalls during zoom
@@ -5036,8 +5097,8 @@ class MegaWorld1000 {
       const gen = this._mountGen;
       this.overlayPending.add(fullId);
       Promise.all([
-        needWalls ? this.texMgr.load(ovSpec.walls, { mipmap: true, priority: 0 }) : Promise.resolve(null),
-        needRoof ? this.texMgr.load(ovSpec.roof, { mipmap: true, priority: 0 }) : Promise.resolve(null)
+        needWalls ? this.texMgr.load(ovSpec.walls, { mipmap: true, priority: 0, maxDim: 2048 }) : Promise.resolve(null),
+        needRoof ? this.texMgr.load(ovSpec.roof, { mipmap: true, priority: 0, maxDim: 2048 }) : Promise.resolve(null)
       ]).then(([tWalls, tRoof]) => {
         if (this._mountGen === gen && this.levelLayers.get(lid) === layer) {
           this.overlayPending.delete(fullId);
@@ -5170,13 +5231,16 @@ class MegaWorld1000 {
     const sx1 = Math.min(simGrid - 1, Math.floor(vp.x1 / simSectorPx));
     const sy1 = Math.min(simGrid - 1, Math.floor(vp.y1 / simSectorPx));
 
-    // Evaluate tile minZ using absolute cell size so 256 PPI / smaller maps don't drop interior props (minZ:5) at tactical zoom!
-    const effScale = getEffectiveScale(vp.scale);
-    const effectiveZ = Math.max(targetZ, effScale >= 0.22 ? (layer.zOffset + 5) : 0);
+    // Evaluate interior tile minZ using absolute cell size (with hysteresis) so 564+ hidden-under-roof props
+    // don't mount and flood canvas.primary / burn-living-map at macro zoom (scale 0.05..0.15)!
+    const showInterior = this._shouldMountInteriorTiles(layer, vp.scale);
+    const effectiveZ = Math.max(targetZ, showInterior ? (layer.zOffset + 5) : 0);
 
-    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}_r${this.tileEditsRev}`;
+    const isMoving = this.isActivelyMoving();
+    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}_${isMoving ? "m" : "s"}_r${this.tileEditsRev}`;
     if (tileKey === layer.lastTileKey) return false;
     layer.lastTileKey = tileKey;
+    if (isMoving) this._vtIdleCleanupNeeded = true;
 
     const secX0 = sx0 * simSectorPx;
     const secY0 = sy0 * simSectorPx;
@@ -5239,6 +5303,15 @@ class MegaWorld1000 {
     for (const [fullId, vt] of this.activeVirtualTiles) {
       if (vt.levelId !== lid) continue;
       if (!needed.has(fullId)) {
+        // While actively zooming/panning, keep still-valid offscreen meshes mounted (only retire ones failing minZ/maxZ/hidden)
+        // to avoid mount/retire thrashing and 3rd-party shadow rebuild storms (`burn-living-map`); `_vtIdleCleanupNeeded` trims offscreen once idle.
+        if (isMoving) {
+          const ts = vt.tSpec;
+          const stillValidByLod = Boolean(ts && !ts.hidden
+            && (ts.minZ === undefined || effectiveZ >= ts.minZ)
+            && (ts.maxZ === undefined || targetZ <= ts.maxZ));
+          if (stillValidByLod) continue;
+        }
         if (vt.mesh?.restrictsLight || vt.mesh?.restrictsWeather) removedAnyLight = true;
         if (vt.mesh && vt.mesh.occlusionMode !== CONST.OCCLUSION_MODES.NONE) removedAnyOcc = true;
         if (vt.mesh) this.retireMesh(vt.mesh);
@@ -5252,7 +5325,7 @@ class MegaWorld1000 {
       if (removedAnyOcc) this._occlusionDirty = true;
       if (removedAnyLight) {
         this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
         this._depthElevSyncNeeded = true;
       }
     }
@@ -5275,7 +5348,10 @@ class MegaWorld1000 {
       const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
       if (!tSpec?.src || tSpec.hidden) continue;
 
-      const onVis = isViewedLayer && isOnVisScreen(tSpec);
+      const inVisRect = isOnVisScreen(tSpec);
+      // During active zoom/pan only stream props actually inside the visible screen; offscreen padding fills once idle
+      if (isMoving && !inVisRect) continue;
+      const onVis = isViewedLayer && inVisRect;
       const syncTex = this.texMgr.getSync(tSpec.src);
       if (syncTex) {
         this._pendingVirtualTileKeys.add(fullId);
@@ -5323,8 +5399,8 @@ class MegaWorld1000 {
     }
 
     const zNow = layer.lastTargetZ;
-    const effScaleNow = getEffectiveScale(curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
-    const effZNow = Math.max(zNow, effScaleNow >= 0.22 ? (layer.zOffset + 5) : 0);
+    const showInteriorNow = this._shouldMountInteriorTiles(layer, curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
+    const effZNow = Math.max(zNow, showInteriorNow ? (layer.zOffset + 5) : 0);
     if (tSpec.minZ !== undefined && effZNow < tSpec.minZ) return null;
     if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return null;
 
@@ -7365,6 +7441,10 @@ class MegaWorld1000 {
     this.isCameraFlying = false;
     this._lastPanMs = 0;
     this._pruneNeeded = false;
+    this._lastOccRefreshMs = 0;
+    this._showstopperDirty = false;
+    this._lastShowstopperMs = 0;
+    this._vtIdleCleanupNeeded = false;
 
     this.poiManager.unmount();
     this.charPins.unmount();

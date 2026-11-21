@@ -120,7 +120,7 @@ export class TileWorkerPool {
    * Decode an image URL into an `ImageBitmap` off the main thread.
    * Resolves to `ImageBitmap` or rejects with `{ aborted: true }` / Error.
    */
-  decode(src, { priority = 1, premultiply = true } = {}) {
+  decode(src, { priority = 1, premultiply = true, maxDim = 0 } = {}) {
     if (!isWorkerDecodableUrl(src) || !this._ensureWorkers()) {
       return Promise.reject(new Error("worker_unsupported"));
     }
@@ -130,7 +130,7 @@ export class TileWorkerPool {
     this._trackSrc(src, id);
 
     return new Promise((resolve, reject) => {
-      const job = { id, src, url, priority, premultiply, resolve, reject };
+      const job = { id, src, url, priority, premultiply, maxDim, resolve, reject };
       // Insert in priority order (smaller priority number = higher urgency)
       let insertAt = this._queue.length;
       for (let i = 0; i < this._queue.length; i++) {
@@ -297,7 +297,8 @@ export class TileWorkerPool {
           type: "decode",
           id: job.id,
           url: job.url,
-          premultiply: job.premultiply
+          premultiply: job.premultiply,
+          maxDim: job.maxDim || 0
         });
       } catch (err) {
         this._active.delete(job.id);
