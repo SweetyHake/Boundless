@@ -23,6 +23,7 @@ const WORLD_MIN_SCALE = 0.008;        // Seamless full-world zoom-out
 const CAMERA_STORAGE_PREFIX = "boundless.camera";
 const CAMERA_SAVE_DEBOUNCE_MS = 250;
 const SHOWSTOPPER_ID = "showstopper";
+const NOOP_TRANSFORM = () => {};
 const SUPPORT_SOLE_KERNEL = [
   [0, 0, 4],
   [-0.7, -0.7, 1.5],
@@ -3447,6 +3448,8 @@ class MegaWorld1000 {
       m._ssDofBlurPx = 0;
       m._boundlessMesh = true;
       m._boundlessTile = false;
+      if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
+      m.pluginName = m.constructor?.classPluginName || "batchOcclusion";
       return m;
     }
     const PrimarySpriteMesh = foundry.canvas.primary.PrimarySpriteMesh;
@@ -3464,6 +3467,8 @@ class MegaWorld1000 {
     // Clear any Showstopper Depth-of-Field filter & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
     m._boundlessTile = false;
+    if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
+    m.pluginName = m.constructor?.classPluginName || "batchOcclusion";
     m.texture = PIXI.Texture.EMPTY;
     m.debounceSetOcclusion?.cancel?.();
     m.hoverFade = false;
@@ -3965,6 +3970,11 @@ class MegaWorld1000 {
     e.ready = true;
     canvas.primary.addChild(m);
     m.updateCanvasTransform?.();
+    // Static ground/lower pyramid tiles never fade on occlusion or move, so use fast PIXI batch shader & skip per-frame quadtree churn
+    if (!layer.isUpper) {
+      m.pluginName = "batch";
+      m.updateCanvasTransform = NOOP_TRANSFORM;
+    }
     this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
@@ -5484,6 +5494,12 @@ class MegaWorld1000 {
 
     canvas.primary.addChild(m);
     m.updateCanvasTransform?.();
+    // Decorative props with no occlusion/hoverFade/light restrictions render identically via fast PIXI "batch" shader
+    // (halving draw calls & shader switches alongside burn-living-map shadows) and avoid per-frame quadtree rebuilds!
+    if (m.occlusionMode === CONST.OCCLUSION_MODES.NONE && !m.hoverFade && !m.restrictsLight && !m.restrictsWeather) {
+      m.pluginName = "batch";
+      m.updateCanvasTransform = NOOP_TRANSFORM;
+    }
     this._syncShowstopperMeshDof(m);
     this.activeVirtualTiles.set(fullId, { levelId: lid, mesh: m, src: tSpec.src, tSpec });
     return m;
