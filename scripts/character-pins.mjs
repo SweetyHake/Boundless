@@ -171,7 +171,8 @@ export class CharacterPinManager {
   _tickerFn = null;
   _pulsePhase = 0;
   _lastSidebarCheckMs = 0;
-  _cachedRightInset = 24;
+  _cachedLeftInset = 116;
+  _cachedRightInset = 44;
   _rebuildQueued = false;
   _avatarTexCache = new Map(); // src -> Promise<PIXI.Texture | null>
   _avatarTexOwned = [];        // PIXI.Texture[] to destroy cleanly on unmount
@@ -570,14 +571,17 @@ export class CharacterPinManager {
     const now = performance.now();
     if (now - this._lastSidebarCheckMs > 250) {
       this._lastSidebarCheckMs = now;
+      const leftCol = document.getElementById("ui-left-column-1") || document.getElementById("scene-controls");
+      const lcRect = leftCol?.getBoundingClientRect?.();
+      this._cachedLeftInset = (lcRect && lcRect.right > 20) ? Math.round(lcRect.right + 34) : 116;
       const sidebar = document.getElementById("sidebar");
       const sbRect = sidebar?.getBoundingClientRect?.();
-      this._cachedRightInset = (sbRect && sbRect.width > 50) ? Math.round(sbRect.width + 32) : 44;
+      this._cachedRightInset = (sbRect && sbRect.width > 50) ? Math.round(sbRect.width + 34) : 76;
     }
     const sw = window.innerWidth || 1280;
     const sh = window.innerHeight || 720;
     return {
-      left: 88,
+      left: Math.min(Math.max(44, this._cachedLeftInset), Math.max(44, sw - 220)),
       right: Math.max(200, sw - this._cachedRightInset),
       top: 66,
       bottom: Math.max(160, sh - 92),
