@@ -326,8 +326,11 @@ export class VirtualLayerEditors {
         angle: item.angle ?? 360,
         color: item.color || null,
         alpha: item.alpha ?? 0.5,
+        attenuation: item.attenuation ?? 0.5,
+        luminosity: item.luminosity ?? 0.5,
+        ...(Number.isFinite(item.coloration) ? { coloration: item.coloration } : {}),
         darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
-        animation: { type: item.anim || null, speed: 3, intensity: 3 }
+        animation: { type: item.anim || null, speed: item.speed ?? 3, intensity: item.intensity ?? 3 }
       }
     }, { parent: canvas.scene });
 
@@ -487,8 +490,11 @@ export class VirtualLayerEditors {
             config: {
               dim: it.dim, bright: it.bright, angle: it.angle ?? 360,
               color: it.color || null, alpha: it.alpha ?? 0.5,
+              attenuation: it.attenuation ?? 0.5,
+              luminosity: it.luminosity ?? 0.5,
+              ...(Number.isFinite(it.coloration) ? { coloration: it.coloration } : {}),
               darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 },
-              animation: { type: it.anim || null, speed: 3, intensity: 3 }
+              animation: { type: it.anim || null, speed: it.speed ?? 3, intensity: it.intensity ?? 3 }
             }
           };
           existing.doc.updateSource(patch);
@@ -553,7 +559,12 @@ export class VirtualLayerEditors {
         angle: cfg.angle ?? 360,
         rotation: entry.doc.rotation ?? 0,
         darkMin: cfg.darkness?.min ?? 0,
-        darkMax: cfg.darkness?.max ?? 1
+        darkMax: cfg.darkness?.max ?? 1,
+        speed: cfg.animation?.speed ?? 3,
+        intensity: cfg.animation?.intensity ?? 3,
+        attenuation: cfg.attenuation ?? 0.5,
+        luminosity: cfg.luminosity ?? 0.5,
+        ...(Number.isFinite(cfg.coloration) ? { coloration: cfg.coloration } : {})
       };
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, nextState);

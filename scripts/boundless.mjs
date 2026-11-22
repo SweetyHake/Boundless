@@ -183,6 +183,25 @@ export function parseSparseTileSet(raw) {
   return set;
 }
 
+function computeShaderAttenuation(att = 0.5) {
+  const a = Math.max(0, Math.min(1, Number.isFinite(att) ? att : 0.5));
+  return (Math.cos(Math.PI * Math.pow(a, 1.5)) - 1) / -2;
+}
+
+function extractLightStyle(src) {
+  const s = src && typeof src === "object" ? src : null;
+  const num = (v, fb) => (v !== undefined && v !== null && Number.isFinite(Number(v)) ? Number(v) : fb);
+  return {
+    speed: num(s?.speed, 3),
+    intensity: num(s?.intensity, 3),
+    attenuation: num(s?.attenuation, 0.5),
+    luminosity: num(s?.luminosity, 0.5),
+    coloration: (s?.coloration !== undefined && s?.coloration !== null && Number.isFinite(Number(s.coloration)))
+      ? Number(s.coloration)
+      : null
+  };
+}
+
 const LIGHT_BATCH_VERT = `
 precision highp float;
 
@@ -190,6 +209,7 @@ attribute vec2 aCenter;
 attribute vec2 aOffset;   // Normalized local offset from center in dimPx units
 attribute vec4 aParams;   // x: dimPx, y: ratio, z: alpha, w: phase (< 0 means static)
 attribute vec3 aColor;
+attribute vec4 aStyle;    // x: attenuation, y: luminosity, z: speed, w: intensity
 attribute float aWeight;
 attribute float aDepthElev; // Mapped Foundry depthElevation [0..1] for multi-level floor occlusion
 
@@ -210,6 +230,8 @@ varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
 varying float vIsMacro;
+varying float vAttenuation;
+varying float vLuminosity;
 
 void main() {
   if (aWeight <= 0.001 || aParams.x <= 0.0) {
@@ -223,6 +245,8 @@ void main() {
     vDepthElev = 1.0;
     vDimPx = 0.0;
     vIsMacro = 0.0;
+    vAttenuation = 0.5;
+    vLuminosity = 0.5;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
     return;
   }
@@ -231,18 +255,20 @@ void main() {
   vec2 worldPos = aCenter + aOffset * effectiveRadius;
   vec3 tPos = translationMatrix * vec3(worldPos, 1.0);
 
-  // Match Foundry v14 Torch (animateFlickering: speed=3, intensity=3 -> amp=0.27, pulse in [0.55..0.82])
+  // Match Foundry v14 Torch flickering with per-light speed & intensity (default speed=3, intensity=3 -> amp=0.27, pulse in [0.55..0.82])
   float pulse = 1.0;
   float effRatio = aParams.y;
   if (aParams.w >= 0.0) {
-    float t = uTime * 1.8 + aParams.w;
+    float t = uTime * (max(aStyle.z, 0.0) * 0.6) + aParams.w;
     float s = 0.5
       + 0.28 * sin(t)
       + 0.14 * sin(t * 2.37 + 1.1)
       + 0.08 * sin(t * 4.13 + 2.7);
-    float n = clamp(s, 0.0, 1.0) * 0.27;
-    pulse = 0.55 + n;
-    effRatio = aParams.y > 0.001 ? clamp(aParams.y * 0.9 + n * 0.222, 0.0, 1.0) : 0.0;
+    float amp = clamp(aStyle.w * 0.09, 0.0, 0.9);
+    float pulseBase = clamp(0.82 - amp, 0.15, 0.95);
+    float n = clamp(s, 0.0, 1.0) * amp;
+    pulse = pulseBase + n;
+    effRatio = aParams.y > 0.001 ? clamp(aParams.y * (1.0 - amp * 0.37) + n * 0.222, 0.0, 1.0) : 0.0;
   }
 
   vOffset = aOffset;
@@ -255,6 +281,8 @@ void main() {
   vDepthElev = aDepthElev;
   vDimPx = aParams.x;
   vIsMacro = aParams.w < -1.5 ? 1.0 : 0.0;
+  vAttenuation = aStyle.x;
+  vLuminosity = aStyle.y;
 
   gl_Position = vec4((projectionMatrix * tPos).xy, 0.0, 1.0);
 }
@@ -291,6 +319,8 @@ varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
 varying float vIsMacro;
+varying float vAttenuation;
+varying float vLuminosity;
 
 vec3 switchColor(vec3 innerColor, vec3 outerColor, float dist, float ratio, float att) {
   float attStr = att * 0.7;
@@ -342,9 +372,11 @@ void main() {
     float macroFalloff = exp(-3.6 * dist * dist) * (1.0 - smoothstep(0.72, 1.0, dist));
     outCol = mix(bg, dimCol, macroFalloff * 0.65 * vWeight);
   } else {
-    vec3 finalCol = switchColor(brightCol, dimCol, dist, vRatio, uAttenuation);
-    float edgeFade = (1.0 - smoothstep(1.0 - max(uAttenuation, 0.0001), 1.0, dist)) * depthMask;
-    outCol = mix(bg, finalCol, edgeFade);
+    float att = clamp(vAttenuation, 0.0, 1.0);
+    vec3 finalCol = switchColor(brightCol, dimCol, dist, vRatio, att);
+    float edgeFade = (1.0 - smoothstep(1.0 - max(att, 0.0001), 1.0, dist)) * depthMask;
+    float lumScale = clamp(vLuminosity * 2.0, 0.0, 2.0);
+    outCol = mix(bg, finalCol, clamp(edgeFade * lumScale, 0.0, 1.0));
   }
 
   gl_FragColor = vec4(outCol, 1.0);
@@ -376,6 +408,8 @@ varying float vWeight;
 varying float vDepthElev;
 varying float vDimPx;
 varying float vIsMacro;
+varying float vAttenuation;
+varying float vLuminosity;
 
 const vec3 BT709 = vec3(0.2126, 0.7152, 0.0722);
 float perceivedBrightness(vec3 c) { return sqrt(dot(BT709, c * c)); }
@@ -412,9 +446,11 @@ void main() {
   if (vIsMacro > 0.5) {
     edgeFade = exp(-3.6 * dist * dist) * (1.0 - smoothstep(0.72, 1.0, dist)) * 0.55;
   } else {
-    edgeFade = (1.0 - smoothstep(1.0 - max(uAttenuation, 0.0001), 1.0, dist)) * depthMask;
+    float att = clamp(vAttenuation, 0.0, 1.0);
+    edgeFade = (1.0 - smoothstep(1.0 - max(att, 0.0001), 1.0, dist)) * depthMask;
   }
-  vec3 outCol = vColor * vColorAlpha * reflection * edgeFade;
+  float lumGain = 1.0 + max(0.0, vLuminosity - 0.5);
+  vec3 outCol = vColor * vColorAlpha * reflection * edgeFade * lumGain;
 
   gl_FragColor = vec4(outCol, 1.0);
 }
@@ -534,6 +570,7 @@ class MegaLightBatch {
     const offsets = [];
     const params = [];
     const colors = [];
+    const styles = [];
     const indices = [];
     let vc = 0;
 
@@ -558,6 +595,7 @@ class MegaLightBatch {
         offsets.push(ox, oy);
         params.push(rad, 0.0, alpha, -2.0);
         colors.push(r, g, b);
+        styles.push(FOUNDRY_DEFAULT_ATTENUATION, 0.5, 3, 3);
       }
       indices.push(v0, v1, v2, v0, v2, v3);
     }
@@ -575,6 +613,7 @@ class MegaLightBatch {
       .addAttribute("aOffset", new Float32Array(offsets), 2)
       .addAttribute("aParams", new Float32Array(params), 4)
       .addAttribute("aColor", new Float32Array(colors), 3)
+      .addAttribute("aStyle", new Float32Array(styles), 4)
       .addAttribute("aWeight", weightBuffer, 1)
       .addAttribute("aDepthElev", new PIXI.Buffer(depthElevs, false, false), 1)
       .addIndex(new IdxArr(indices));
@@ -654,16 +693,18 @@ class MegaLightBatch {
     const offsetsArr = [];
     const paramsArr = [];
     const colorsArr = [];
+    const stylesArr = [];
     const indicesArr = [];
     const combinedMacroLights = [];
     let vertCursor = 0;
     let lightCount = 0;
 
-    const pushVertex = (lx, ly, ox, oy, dimPx, ratio, alpha, phase, r, g, b) => {
+    const pushVertex = (lx, ly, ox, oy, dimPx, ratio, alpha, phase, r, g, b, att = FOUNDRY_DEFAULT_ATTENUATION, lum = 0.5, spd = 3, inten = 3) => {
       centersArr.push(lx, ly);
       offsetsArr.push(ox, oy);
       paramsArr.push(dimPx, ratio, alpha, phase);
       colorsArr.push(r, g, b);
+      stylesArr.push(att, lum, spd, inten);
       return vertCursor++;
     };
 
@@ -860,10 +901,13 @@ class MegaLightBatch {
               }
             }
 
+            const style = extractLightStyle(extra);
             bakedLights.push({
               li, lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation,
               dimPx, ratio, r, g, b, phase, offsets, isIndoor,
-              walls: useWalls, angle, rotation, darkMin, darkMax, extra
+              walls: useWalls, angle, rotation, darkMin, darkMax, extra,
+              ...style,
+              shaderAtt: computeShaderAttenuation(style.attenuation)
             });
           }
           if (bakedLights.length) {
@@ -894,19 +938,19 @@ class MegaLightBatch {
 
                 if (bl.offsets) {
                   const nPts = bl.offsets.length >> 1;
-                  const centerIdx = pushVertex(lx, ly, 0, 0, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
+                  const centerIdx = pushVertex(lx, ly, 0, 0, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   const ringStart = vertCursor;
                   for (let i = 0; i < nPts; i++) {
-                    pushVertex(lx, ly, bl.offsets[i * 2], bl.offsets[i * 2 + 1], bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
+                    pushVertex(lx, ly, bl.offsets[i * 2], bl.offsets[i * 2 + 1], bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   }
                   for (let i = 0; i < nPts; i++) {
                     indicesArr.push(centerIdx, ringStart + i, ringStart + ((i + 1) % nPts));
                   }
                 } else {
-                  const v0 = pushVertex(lx, ly, -1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
-                  const v1 = pushVertex(lx, ly, 1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
-                  const v2 = pushVertex(lx, ly, 1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
-                  const v3 = pushVertex(lx, ly, -1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b);
+                  const v0 = pushVertex(lx, ly, -1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v1 = pushVertex(lx, ly, 1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v2 = pushVertex(lx, ly, 1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v3 = pushVertex(lx, ly, -1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   indicesArr.push(v0, v1, v2, v0, v2, v3);
                 }
 
@@ -919,6 +963,8 @@ class MegaLightBatch {
                   id: lightId, levelId, elevation: bl.elevation, sk, lx, ly, dimPx: bl.dimPx, vStart, vCount,
                   weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor: bl.isIndoor,
                   walls: bl.walls, angle: bl.angle, rotation: bl.rotation, darkMin: bl.darkMin, darkMax: bl.darkMax,
+                  speed: bl.speed, intensity: bl.intensity, coloration: bl.coloration,
+                  attenuation: bl.attenuation, luminosity: bl.luminosity,
                   raw: rawEntry
                 });
                 if (lx - bl.dimPx < minX) minX = lx - bl.dimPx;
@@ -1049,7 +1095,8 @@ class MegaLightBatch {
                 angle: extra?.angle ?? 360,
                 rotation: extra?.rotation ?? 0,
                 darkMin: extra?.darkMin ?? 0,
-                darkMax: extra?.darkMax ?? 1
+                darkMax: extra?.darkMax ?? 1,
+                ...extractLightStyle(extra)
               };
           if (!resolved || resolved.hidden) continue;
           const lx = resolved.x, ly = resolved.y;
@@ -1061,10 +1108,13 @@ class MegaLightBatch {
           const useWalls = resolved.walls !== false;
           const darkMin = resolved.darkMin ?? 0;
           const darkMax = resolved.darkMax ?? 1;
+          const style = extractLightStyle(resolved);
+          const shaderAtt = computeShaderAttenuation(style.attenuation);
           if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
           const effectiveRaw = [lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation];
+          if (extra) effectiveRaw.push(extra);
           const ratio = Math.min(1, ((brightFt || 0) * pxPerFt) / dimPx);
           const aVal = alpha ?? 0.5;
           let r = 0, g = 0, b = 0;
@@ -1107,7 +1157,7 @@ class MegaLightBatch {
             const pts = poly.points;
             const nPts = pts.length >> 1;
             if (nPts >= 3) {
-              const centerIdx = pushVertex(lx, ly, 0, 0, dimPx, ratio, aVal, phase, r, g, b);
+              const centerIdx = pushVertex(lx, ly, 0, 0, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
               const ringStart = vertCursor;
               const invR = 1 / dimPx;
               for (let i = 0; i < nPts; i++) {
@@ -1118,7 +1168,7 @@ class MegaLightBatch {
                   ox /= len;
                   oy /= len;
                 }
-                pushVertex(lx, ly, ox, oy, dimPx, ratio, aVal, phase, r, g, b);
+                pushVertex(lx, ly, ox, oy, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
               }
               for (let i = 0; i < nPts; i++) {
                 indicesArr.push(centerIdx, ringStart + i, ringStart + ((i + 1) % nPts));
@@ -1128,10 +1178,10 @@ class MegaLightBatch {
           }
 
           if (!builtPoly) {
-            const v0 = pushVertex(lx, ly, -1, -1, dimPx, ratio, aVal, phase, r, g, b);
-            const v1 = pushVertex(lx, ly, 1, -1, dimPx, ratio, aVal, phase, r, g, b);
-            const v2 = pushVertex(lx, ly, 1, 1, dimPx, ratio, aVal, phase, r, g, b);
-            const v3 = pushVertex(lx, ly, -1, 1, dimPx, ratio, aVal, phase, r, g, b);
+            const v0 = pushVertex(lx, ly, -1, -1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v1 = pushVertex(lx, ly, 1, -1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v2 = pushVertex(lx, ly, 1, 1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v3 = pushVertex(lx, ly, -1, 1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
             indicesArr.push(v0, v1, v2, v0, v2, v3);
           }
 
@@ -1159,6 +1209,8 @@ class MegaLightBatch {
             id: lightId, levelId, elevation, sk, lx, ly, dimPx, vStart, vCount,
             weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor,
             walls: useWalls, angle, rotation, darkMin, darkMax,
+            speed: style.speed, intensity: style.intensity, coloration: style.coloration,
+            attenuation: style.attenuation, luminosity: style.luminosity,
             raw: effectiveRaw
           });
 
@@ -1216,6 +1268,7 @@ class MegaLightBatch {
       .addAttribute("aOffset", new Float32Array(offsetsArr), 2)
       .addAttribute("aParams", new Float32Array(paramsArr), 4)
       .addAttribute("aColor", new Float32Array(colorsArr), 3)
+      .addAttribute("aStyle", new Float32Array(stylesArr), 4)
       .addAttribute("aWeight", this.weightBuffer, 1)
       .addAttribute("aDepthElev", this.depthElevBuffer, 1)
       .addIndex(this.indexBuffer);
@@ -1476,6 +1529,7 @@ class MegaLightBatch {
       offsetsArr: [],
       paramsArr: [],
       colorsArr: [],
+      stylesArr: [],
       indicesArr: [],
       sectorBounds: [],
       metas: [],
@@ -1541,7 +1595,8 @@ class MegaLightBatch {
                 angle: extra?.angle ?? 360,
                 rotation: extra?.rotation ?? 0,
                 darkMin: extra?.darkMin ?? 0,
-                darkMax: extra?.darkMax ?? 1
+                darkMax: extra?.darkMax ?? 1,
+                ...extractLightStyle(extra)
               };
           if (!resolved || resolved.hidden) continue;
           const lx = resolved.x, ly = resolved.y;
@@ -1551,6 +1606,8 @@ class MegaLightBatch {
           const useWalls = resolved.walls !== false;
           const darkMin = resolved.darkMin ?? 0;
           const darkMax = resolved.darkMax ?? 1;
+          const style = extractLightStyle(resolved);
+          const shaderAtt = computeShaderAttenuation(style.attenuation);
           if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
@@ -1571,6 +1628,7 @@ class MegaLightBatch {
             job.offsetsArr.push(ox, oy);
             job.paramsArr.push(dimPx, ratio, aVal, phase);
             job.colorsArr.push(r, g, b);
+            job.stylesArr.push(shaderAtt, style.luminosity, style.speed, style.intensity);
             return job.vertCursor++;
           };
 
@@ -1656,6 +1714,8 @@ class MegaLightBatch {
           if (darkMin > 0 || darkMax < 1) this._hasDarknessRangedLights = true;
           const lightId = `${job.levelId}::${sk}_${li}`;
           const suppressed = Boolean(this._isSuppressedFn?.(lightId));
+          const rawEntry = [lx, ly, resolved.dim, resolved.bright, resolved.color, aVal, resolved.anim, elevation];
+          if (extra) rawEntry.push(extra);
           job.metas.push({
             id: lightId,
             levelId: job.levelId,
@@ -1663,7 +1723,9 @@ class MegaLightBatch {
             vStart, vCount: job.vertCursor - vStart,
             weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor,
             walls: useWalls, angle, rotation, darkMin, darkMax,
-            raw: [lx, ly, resolved.dim, resolved.bright, resolved.color, aVal, resolved.anim, elevation]
+            speed: style.speed, intensity: style.intensity, coloration: style.coloration,
+            attenuation: style.attenuation, luminosity: style.luminosity,
+            raw: rawEntry
           });
           if (lx - dimPx < minX) minX = lx - dimPx;
           if (ly - dimPx < minY) minY = ly - dimPx;
@@ -1727,6 +1789,7 @@ class MegaLightBatch {
       .addAttribute("aOffset", new Float32Array(job.offsetsArr), 2)
       .addAttribute("aParams", new Float32Array(job.paramsArr), 4)
       .addAttribute("aColor", new Float32Array(job.colorsArr), 3)
+      .addAttribute("aStyle", new Float32Array(job.stylesArr), 4)
       .addAttribute("aWeight", weightBuffer, 1)
       .addAttribute("aDepthElev", depthElevBuffer, 1)
       .addIndex(indexBuffer);
@@ -3512,7 +3575,7 @@ class MegaWorld1000 {
   }
 
   /**
-   * Subscribe to Boundless lifecycle events ("mount", "unmount", "virtualTileMount", "virtualTileRetire", "overlayMount", "overlayRetire").
+   * Subscribe to Boundless lifecycle events ("mount", "unmount", "virtualTileMount", "virtualTileRetire", "overlayMount", "overlayRetire", "dynamicLightMount", "dynamicLightRetire").
    * Returns an unsubscribe function.
    */
   on(event, fn) {
@@ -6124,6 +6187,7 @@ class MegaWorld1000 {
 
         for (const [lid, ls] of this.dynamicLights) {
           if (!neededDynLights.has(lid)) {
+            this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
             ls.destroy();
             this.dynamicLights.delete(lid);
             this.lightBatch.setLightWeight(lid, 1.0);
@@ -6143,18 +6207,23 @@ class MegaWorld1000 {
           if (!meta) continue;
           const [lx, ly, dimFt, brightFt, color, alpha, anim] = meta.raw;
           const ls = new LightCls({ sourceId: `MegaLight.${lid}` });
-          ls.initialize({
+          const initData = {
             x: lx, y: ly, level: meta.levelId, elevation: meta.elevation,
             walls: meta.walls !== false, vision: false,
             angle: meta.angle ?? 360,
             rotation: meta.rotation ?? 0,
             dim: (dimFt || 0) * pxPerFt, bright: (brightFt || 0) * pxPerFt,
             color, alpha,
-            animation: anim ? { type: anim, speed: 3, intensity: 3 } : {}
-          });
+            attenuation: meta.attenuation ?? 0.5,
+            luminosity: meta.luminosity ?? 0.5,
+            animation: anim ? { type: anim, speed: meta.speed ?? 3, intensity: meta.intensity ?? 3 } : {}
+          };
+          if (Number.isFinite(meta.coloration)) initData.coloration = meta.coloration;
+          ls.initialize(initData);
           ls.add();
           this.dynamicLights.set(lid, ls);
           this.lightBatch.setLightWeight(lid, 0.0);
+          this._emit("dynamicLightMount", { id: lid, light: ls, meta });
           lightsChanged = true;
         }
       }
@@ -6615,7 +6684,8 @@ class MegaWorld1000 {
         angle: ov.angle ?? 360,
         rotation: ov.rotation ?? 0,
         darkMin: ov.darkMin ?? 0,
-        darkMax: ov.darkMax ?? 1
+        darkMax: ov.darkMax ?? 1,
+        ...extractLightStyle(ov)
       };
     }
     const [x, y, dim, bright, color, alpha, anim, customElev, extra] = raw;
@@ -6630,7 +6700,8 @@ class MegaWorld1000 {
       angle: ex?.angle ?? 360,
       rotation: ex?.rotation ?? 0,
       darkMin: ex?.darkMin ?? 0,
-      darkMax: ex?.darkMax ?? 1
+      darkMax: ex?.darkMax ?? 1,
+      ...extractLightStyle(ex)
     };
   }
 
@@ -6642,7 +6713,10 @@ class MegaWorld1000 {
   }
 
   applyVirtualLightChangesLocal() {
-    for (const [, ls] of this.dynamicLights) ls.destroy();
+    for (const [lid, ls] of this.dynamicLights) {
+      this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
+      ls.destroy();
+    }
     this.dynamicLights.clear();
     this.lastDynLightKey = "";
     // scheduleLightBatchRebuild runs updateSimAndLightBubbles(true) strictly AFTER rebuilding lightMetaById
@@ -7130,6 +7204,16 @@ class MegaWorld1000 {
       }
       if ((l.config?.darkness?.min ?? 0) > 0) extra.darkMin = l.config.darkness.min;
       if ((l.config?.darkness?.max ?? 1) < 1) extra.darkMax = l.config.darkness.max;
+      const animSpeed = l.config?.animation?.speed;
+      if (Number.isFinite(animSpeed) && animSpeed !== 3) extra.speed = animSpeed;
+      const animIntensity = l.config?.animation?.intensity;
+      if (Number.isFinite(animIntensity) && animIntensity !== 3) extra.intensity = animIntensity;
+      const coloration = l.config?.coloration;
+      if (Number.isFinite(coloration) && coloration !== 1) extra.coloration = coloration;
+      const attenuation = l.config?.attenuation;
+      if (Number.isFinite(attenuation) && attenuation !== 0.5) extra.attenuation = attenuation;
+      const luminosity = l.config?.luminosity;
+      if (Number.isFinite(luminosity) && luminosity !== 0.5) extra.luminosity = luminosity;
       const tuple = [
         l.x, l.y,
         l.config?.dim || 0,
@@ -7922,7 +8006,10 @@ class MegaWorld1000 {
     this.doorStates.clear();
     this.openDoors.clear();
 
-    for (const [, ls] of this.dynamicLights) ls.destroy();
+    for (const [lid, ls] of this.dynamicLights) {
+      this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
+      ls.destroy();
+    }
     this.dynamicLights.clear();
     this.lightBatch.destroy();
     this.lightBatch.disposeBakedRoofMask();
