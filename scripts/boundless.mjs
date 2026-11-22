@@ -5289,9 +5289,11 @@ class MegaWorld1000 {
           this.overlayPending.delete(fullId);
         }
         if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || this.activeOverlays.has(fullId) || this._pendingOverlayKeys.has(fullId)) return;
-        if (!tWalls && !tRoof) return;
+        const okWalls = isTextureUsable(tWalls) ? tWalls : null;
+        const okRoof = isTextureUsable(tRoof) ? tRoof : null;
+        if (!okWalls && !okRoof) return;
         this._pendingOverlayKeys.add(fullId);
-        this.pendingOverlayMounts.push({ fullId, lid, oid: rawOid, layer, ovSpec, topElev, tWalls, tRoof });
+        this.pendingOverlayMounts.push({ fullId, lid, oid: rawOid, layer, ovSpec, topElev, tWalls: okWalls, tRoof: okRoof });
       });
       changed = true;
     }
