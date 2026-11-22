@@ -4283,9 +4283,10 @@ class MegaWorld1000 {
     if (isFg) m._occludedBySameElevationSurfaces = false;
     m.occludedAlpha = layer.isUpper ? 0.08 : 1.0;
     m.hoverFade = layer.isUpper;
-    // Never write coarse z=0 fallback (64px/texel blur) or foreground wall artwork into CanvasDepthMask
-    m.restrictsLight = !isFg && e.z > 0;
-    m.restrictsWeather = !isFg && e.z > 0;
+    // On single-level worlds skip coarse z=0 depth writes; on multi-level scenes z=0 MUST write depth so lower-level (basement) lights never bleed through floors when zoomed all the way out!
+    const needZ0Depth = this.visibleLevelLayers.length > 1;
+    m.restrictsLight = !isFg && (e.z > 0 || needZ0Depth);
+    m.restrictsWeather = !isFg && (e.z > 0 || needZ0Depth);
 
     // Only defer visibility (`awaitingSwap`) when zooming IN (`other.z < e.z`, coarser ancestor fully covers this tile).
     // When zooming OUT (`e.z < other.z`), the new coarser tile sorts BEHIND old finer tiles (`m.sort` increases with z)
@@ -4407,8 +4408,7 @@ class MegaWorld1000 {
       canvas.primary.sortDirty = true;
     }
     if (anyBgChanged) {
-      this._depthDirty = true;
-      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+      this._markDepthDirty({ elev: true, syncElev: this.visibleLevelLayers.length > 1 });
     }
     return anyBgChanged || anyFgChanged;
   }
