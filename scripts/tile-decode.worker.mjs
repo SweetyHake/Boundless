@@ -34,6 +34,10 @@ self.onmessage = async (event) => {
       cache: "default"
     });
     if (!resp.ok) {
+      if (resp.status === 404 || resp.status === 410) {
+        self.postMessage({ id, notFound: true, error: `HTTP ${resp.status}` });
+        return;
+      }
       throw new Error(`HTTP ${resp.status}`);
     }
     const blob = await resp.blob();

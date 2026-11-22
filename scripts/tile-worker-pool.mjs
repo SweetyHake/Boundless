@@ -331,6 +331,10 @@ export class TileWorkerPool {
       const err = new Error("aborted");
       err.aborted = true;
       act.reject(err);
+    } else if (msg.notFound) {
+      const err = new Error(msg.error || "not_found");
+      err.notFound = true;
+      act.reject(err);
     } else if (msg.bitmap) {
       this.stats.workerDecoded++;
       this.stats.totalDecodeMs += Number(msg.decodeMs) || 0;

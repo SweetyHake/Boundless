@@ -145,6 +145,44 @@ function resolveOcclusionMode(modeSpec, fallback = CONST.OCCLUSION_MODES.NONE) {
   return fallback;
 }
 
+/**
+ * Parse an optional sparse pyramid tile index (`foregroundTiles`) into a `Set<"z/x_y">`.
+ * Supports:
+ *  - Object keyed by zoom level: `{ "0": ["0_0"], "3": ["1_2", "2_2"] }`
+ *  - Flat array of strings: `["0/0_0", "3/1_2"]` or `["0_0_0", "3_1_2"]`
+ * Returns `null` when omitted (meaning all grid tiles are assumed present).
+ */
+export function parseSparseTileSet(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const set = new Set();
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (typeof item !== "string") continue;
+      const clean = item.trim().replace(/\.webp$/i, "");
+      if (!clean) continue;
+      if (clean.includes("/")) {
+        set.add(clean);
+      } else {
+        const m = /^(\d+)_(\d+)_(\d+)$/.exec(clean);
+        if (m) set.add(`${m[1]}/${m[2]}_${m[3]}`);
+      }
+    }
+    return set;
+  }
+  for (const [zKey, coords] of Object.entries(raw)) {
+    const z = Number(zKey);
+    if (!Number.isInteger(z) || z < 0 || !Array.isArray(coords)) continue;
+    for (const c of coords) {
+      if (typeof c === "string" && c.trim()) {
+        set.add(`${z}/${c.trim().replace(/\.webp$/i, "")}`);
+      } else if (Array.isArray(c) && c.length >= 2) {
+        set.add(`${z}/${c[0]}_${c[1]}`);
+      }
+    }
+  }
+  return set;
+}
+
 const LIGHT_BATCH_VERT = `
 precision highp float;
 
@@ -2351,6 +2389,7 @@ class LRUTextureManager {
   bytesBySrc = new Map();   // src -> estimated VRAM bytes (RGBA + mipmaps)
   totalBytes = 0;
   pinned = new Set();       // Static icons + z0..z2 low-level pyramid stay resident
+  missingSrcs = new Set();  // Negative cache for HTTP 404/410 sparse tiles (avoids fallback retries)
   workerOwned = new Map();  // src -> { tex: PIXI.Texture, bitmap: ImageBitmap }
   workerPool = new TileWorkerPool();
   _gen = 0;
@@ -2410,7 +2449,7 @@ class LRUTextureManager {
   }
 
   load(src, { mipmap = true, isPinned = false, priority = 1, maxDim = 0 } = {}) {
-    if (!src) return Promise.resolve(null);
+    if (!src || this.missingSrcs.has(src)) return Promise.resolve(null);
     if (isPinned) this.pinned.add(src);
     const existing = this.getSync(src);
     if (existing) return Promise.resolve(existing);
@@ -2453,6 +2492,10 @@ class LRUTextureManager {
         }
       }).catch(err => {
         if (err?.aborted || gen !== this._gen) return null;
+        if (err?.notFound) {
+          this.missingSrcs.add(src);
+          return null;
+        }
         return this._loadFallback(src, mipmap, gen);
       }).finally(() => {
         if (this.promises.get(src) === p) this.promises.delete(src);
@@ -2529,6 +2572,7 @@ class LRUTextureManager {
       this.bytesBySrc.clear();
       this.totalBytes = 0;
     }
+    this.missingSrcs.clear();
     this.promises.clear();
   }
 
@@ -2598,6 +2642,7 @@ class MegaWorld1000 {
   simSectors = new Map(); // "${levelId}::${sx}_${sy}" -> { level, edgeIds }
   doorStates = new Map(); // dKey -> ds (0: closed, 1: open, 2: locked)
   openDoors = new Map();  // dKey -> { levelId, x, y, sx, sy, eid }
+  closingDoorTimers = new Map(); // dKey -> timeoutId (keeps dynamic lights alive until DoorMesh animation ends)
   lastSimKey = "";
 
   // Hybrid Multi-Level Lighting: GPU MegaLightBatch (2 draw calls) + dynamic PointLightSources ONLY near open doors / active visionSources
@@ -2610,6 +2655,7 @@ class MegaWorld1000 {
   _origIfVoidEnabled = null;
   _origTextureGcMode = null;
   _hiddenNativeLevelBg = new Map(); // levelId -> PrimarySpriteMesh
+  _hiddenNativeLevelFg = new Map(); // levelId -> PrimarySpriteMesh
 
   // Subsystems: POI fast-travel pins, character avatar tracker, high-res chunked Fog of War, spatial ambient audio, door socket sync
   poiManager = new PoiManager(this);
@@ -2706,37 +2752,46 @@ class MegaWorld1000 {
     const maxBudget = 12;
 
     for (const layer of this.visibleLevelLayers) {
-      if (!layer.hasPyramid || layer.maxZoomZ < 1 || urls.length >= maxBudget) continue;
+      if ((!layer.hasPyramid && !layer.hasForegroundPyramid) || urls.length >= maxBudget) continue;
       const { bounds } = layer;
-      const destZ = Math.max(1, this._computeTargetZ(layer, safeScale));
-      // Warm intermediate levels first (closest in time during descent), then destination level
-      const levelsToWarm = [];
-      if (destZ - 2 >= 1) levelsToWarm.push(destZ - 2);
-      if (destZ - 1 >= 1) levelsToWarm.push(destZ - 1);
-      levelsToWarm.push(destZ);
-
-      for (const z of levelsToWarm) {
+      const channels = [];
+      if (layer.hasPyramid && layer.maxZoomZ >= 1) channels.push("bg");
+      if (layer.hasForegroundPyramid && layer.foregroundMaxZoomZ >= 1) channels.push("fg");
+      for (const ch of channels) {
         if (urls.length >= maxBudget) break;
-        const { nx, ny } = this._getPyramidGridDims(layer, z);
-        const tileWorldSize = this._getPyramidTileSize(layer, z);
-        const padFactor = z === destZ ? 0.9 : 0.4;
-        const bx0 = Math.max(bounds.x, worldX - halfW * padFactor);
-        const by0 = Math.max(bounds.y, worldY - halfH * padFactor);
-        const bx1 = Math.min(bounds.x + bounds.w, worldX + halfW * padFactor);
-        const by1 = Math.min(bounds.y + bounds.h, worldY + halfH * padFactor);
-        if (bx0 >= bx1 || by0 >= by1) continue;
+        const maxZ = ch === "fg" ? layer.foregroundMaxZoomZ : layer.maxZoomZ;
+        const destZ = Math.max(1, this._computeTargetZ(layer, safeScale, { maxZoomZ: maxZ }));
+        // Warm intermediate levels first (closest in time during descent), then destination level
+        const levelsToWarm = [];
+        if (destZ - 2 >= 1) levelsToWarm.push(destZ - 2);
+        if (destZ - 1 >= 1) levelsToWarm.push(destZ - 1);
+        levelsToWarm.push(destZ);
 
-        const tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
-        const ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-        const tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
-        const ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
+        for (const z of levelsToWarm) {
+          if (urls.length >= maxBudget) break;
+          const { nx, ny } = this._getPyramidGridDims(layer, z);
+          const tileWorldSize = this._getPyramidTileSize(layer, z);
+          const padFactor = z === destZ ? 0.9 : 0.4;
+          const bx0 = Math.max(bounds.x, worldX - halfW * padFactor);
+          const by0 = Math.max(bounds.y, worldY - halfH * padFactor);
+          const bx1 = Math.min(bounds.x + bounds.w, worldX + halfW * padFactor);
+          const by1 = Math.min(bounds.y + bounds.h, worldY + halfH * padFactor);
+          if (bx0 >= bx1 || by0 >= by1) continue;
 
-        for (let ty = ty0; ty <= ty1 && urls.length < maxBudget; ty++) {
-          for (let tx = tx0; tx <= tx1 && urls.length < maxBudget; tx++) {
-            const spec = this.resolvePyramidTile(layer, z, tx, ty);
-            if (!spec?.src || queued.has(spec.src) || this.texMgr.getSync(spec.src)) continue;
-            queued.add(spec.src);
-            urls.push(spec.src);
+          const tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
+          const ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
+          const tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+          const ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
+
+          for (let ty = ty0; ty <= ty1 && urls.length < maxBudget; ty++) {
+            for (let tx = tx0; tx <= tx1 && urls.length < maxBudget; tx++) {
+              const spec = ch === "fg"
+                ? this.resolveForegroundPyramidTile(layer, z, tx, ty)
+                : this.resolvePyramidTile(layer, z, tx, ty);
+              if (!spec?.src || queued.has(spec.src) || this.texMgr.getSync(spec.src)) continue;
+              queued.add(spec.src);
+              urls.push(spec.src);
+            }
           }
         }
       }
@@ -2848,12 +2903,14 @@ class MegaWorld1000 {
     return active;
   }
 
-  _computeTargetZ(layer, scale, { hysteresis = false } = {}) {
-    const { worldPx, tilePx, maxZoomZ, superGrid } = layer;
-    const prevZ = hysteresis && Number.isInteger(layer.lastTargetZ) && layer.lastTargetZ >= 0 ? layer.lastTargetZ : -1;
+  _computeTargetZ(layer, scale, { hysteresis = false, maxZoomZ = null, prevZOverride = null } = {}) {
+    const { worldPx, tilePx, superGrid } = layer;
+    const effMaxZ = maxZoomZ ?? layer.maxZoomZ;
+    const rawPrevZ = prevZOverride !== null ? prevZOverride : layer.lastTargetZ;
+    const prevZ = hysteresis && Number.isInteger(rawPrevZ) && rawPrevZ >= 0 ? rawPrevZ : -1;
     const applyHyst = (exact) => {
       const z = Math.ceil(exact);
-      if (prevZ >= 0 && prevZ <= maxZoomZ) {
+      if (prevZ >= 0 && prevZ <= effMaxZ) {
         if (z === prevZ + 1 && exact < prevZ + 0.08) return prevZ;
         if (z === prevZ - 1 && exact > prevZ - 1 - 0.08) return prevZ;
       }
@@ -2865,13 +2922,13 @@ class MegaWorld1000 {
       const localRatio = (regionPx * scale) / tilePx;
       if (localRatio >= 0.92) {
         const localZ = Math.max(0, Math.ceil(Math.log2(Math.max(1, localRatio))));
-        return Math.min(maxZoomZ, (macroMaxZ + 1) + localZ);
+        return Math.min(effMaxZ, (macroMaxZ + 1) + localZ);
       }
       const macroExact = Math.log2(Math.max(0.5, (worldPx * scale) / tilePx));
       return Math.max(0, Math.min(macroMaxZ, applyHyst(macroExact)));
     }
     const exactZ = Math.log2((worldPx * scale) / tilePx);
-    return Math.max(0, Math.min(maxZoomZ, applyHyst(exactZ)));
+    return Math.max(0, Math.min(effMaxZ, applyHyst(exactZ)));
   }
 
   async _expandSuperGridManifest(raw) {
@@ -3029,6 +3086,25 @@ class MegaWorld1000 {
 
     const hasPyramid = Boolean(pyramidBaseUrl);
     const maxZoomZ = rawSpec.maxZoomZ ?? (hasPyramid ? (7 + zOffset) : 0);
+
+    const cfgFgBaseUrl = typeof levelCfg.foregroundPyramidBaseUrl === "string"
+      ? levelCfg.foregroundPyramidBaseUrl.trim()
+      : levelCfg.foregroundPyramidBaseUrl;
+    const rawFgBaseUrl = typeof rawSpec.foregroundPyramidBaseUrl === "string"
+      ? rawSpec.foregroundPyramidBaseUrl.trim()
+      : rawSpec.foregroundPyramidBaseUrl;
+    const foregroundPyramidBaseUrl = cfgFgBaseUrl || rawFgBaseUrl || null;
+    const hasForegroundPyramid = Boolean(foregroundPyramidBaseUrl);
+    const foregroundMaxZoomZ = rawSpec.foregroundMaxZoomZ ?? (hasForegroundPyramid ? (rawSpec.maxZoomZ ?? (7 + zOffset)) : 0);
+    const cfgFgElev = levelCfg.foregroundElevation;
+    const rawFgElev = rawSpec.foregroundElevation;
+    const foregroundElevation = (cfgFgElev !== undefined && cfgFgElev !== null && Number.isFinite(Number(cfgFgElev)))
+      ? Number(cfgFgElev)
+      : ((rawFgElev !== undefined && rawFgElev !== null && Number.isFinite(Number(rawFgElev)))
+          ? Number(rawFgElev)
+          : null);
+    const foregroundTileSet = parseSparseTileSet(rawSpec.foregroundTiles);
+
     const defaultBounds = superGrid
       ? { x: 0, y: 0, w: sgW || worldPx, h: sgH || worldPx }
       : { x: 0, y: 0, w: worldPx, h: worldPx };
@@ -3039,6 +3115,11 @@ class MegaWorld1000 {
       spec: rawSpec,
       hasPyramid,
       pyramidBaseUrl,
+      hasForegroundPyramid,
+      foregroundPyramidBaseUrl,
+      foregroundMaxZoomZ,
+      foregroundElevation,
+      foregroundTileSet,
       superGrid,
       zOffset,
       maxZoomZ,
@@ -3049,9 +3130,11 @@ class MegaWorld1000 {
       bounds,
       isUpper: !level.isView && (getLevelBottomElevation(level) > getLevelBottomElevation(canvas.level)),
       lastPyramidKey: "",
+      lastForegroundPyramidKey: "",
       lastOverlayKey: "",
       lastTileKey: "",
-      lastTargetZ: -1
+      lastTargetZ: -1,
+      lastForegroundTargetZ: -1
     };
   }
 
@@ -3342,6 +3425,9 @@ class MegaWorld1000 {
         const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
         preloadTasks.push(this.texMgr.load(`${mBase}/0/0_0.webp`, { mipmap: true, isPinned: true }));
       }
+      if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
+        preloadTasks.push(this.texMgr.load(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`, { mipmap: true, isPinned: true }));
+      }
     }
     await Promise.all(preloadTasks);
     if (this._mountGen !== mountGen) return;
@@ -3352,28 +3438,51 @@ class MegaWorld1000 {
 
     // Warm z=1 tiles silently in background for every visible pyramid layer (clipped to actual bounds for non-square maps)
     for (const layer of layers) {
-      if (!layer.hasPyramid || layer.maxZoomZ < 1) continue;
-      const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
       const z1TileSz = this._getPyramidTileSize(layer, 1);
       const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
       const maxY1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.h || layer.worldPx) - 0.001) / z1TileSz));
-      for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
-        this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+      if (layer.hasPyramid && layer.maxZoomZ >= 1) {
+        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+        for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
+          this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+        }
+      }
+      if (layer.hasForegroundPyramid && layer.foregroundMaxZoomZ >= 1) {
+        const fgBase = layer.foregroundPyramidBaseUrl;
+        for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
+          if (this.hasForegroundTile(layer, 1, x, y)) {
+            this.texMgr.load(`${fgBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+          }
+        }
       }
     }
 
-    // Mount permanent z=0 base layer for every visible pyramid level
+    // Mount permanent z=0 base layer for every visible pyramid level (background and optional foreground walls)
     for (const layer of layers) {
       if (layer.hasPyramid) {
         const baseKey = `${layer.level.id}::0_0_0`;
-        if (this.tilesByKey.has(baseKey)) continue;
-        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
-        this.ensureTile(layer, {
-          key: baseKey,
-          levelId: layer.level.id,
-          z: 0, x: 0, y: 0,
-          src: `${mBase}/0/0_0.webp`
-        }, true);
+        if (!this.tilesByKey.has(baseKey)) {
+          const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+          this.ensureTile(layer, {
+            key: baseKey,
+            levelId: layer.level.id,
+            channel: "bg",
+            z: 0, x: 0, y: 0,
+            src: `${mBase}/0/0_0.webp`
+          }, true);
+        }
+      }
+      if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
+        const fgBaseKey = `${layer.level.id}::fg::0_0_0`;
+        if (!this.tilesByKey.has(fgBaseKey)) {
+          this.ensureTile(layer, {
+            key: fgBaseKey,
+            levelId: layer.level.id,
+            channel: "fg",
+            z: 0, x: 0, y: 0,
+            src: `${layer.foregroundPyramidBaseUrl}/0/0_0.webp`
+          }, true);
+        }
       }
     }
 
@@ -3622,7 +3731,9 @@ class MegaWorld1000 {
     m.name = null;
     m.alpha = 1.0;
     m._boundlessTile = false;
+    m._boundlessFgTile = false;
     if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
+    if (Object.prototype.hasOwnProperty.call(m, "_occludedBySameElevationSurfaces")) delete m._occludedBySameElevationSurfaces;
     m.pluginName = null;
     m.texture = PIXI.Texture.EMPTY;
     m.debounceSetOcclusion?.cancel?.();
@@ -3810,6 +3921,126 @@ class MegaWorld1000 {
     return { levelId: lid, z: 7, x, y, key: `${lid}::7_${x}_${y}`, src: `${base}/7/${x}_${y}.webp` };
   }
 
+  hasForegroundTile(layer, z, x, y) {
+    if (!layer?.hasForegroundPyramid) return false;
+    const set = layer.foregroundTileSet;
+    if (!set) return true;
+    return set.has(`${z}/${x}_${y}`);
+  }
+
+  resolveForegroundPyramidTile(layer, z, x, y) {
+    if (!this.hasForegroundTile(layer, z, x, y)) return null;
+    const lid = layer.level.id;
+    return {
+      levelId: lid,
+      channel: "fg",
+      z,
+      x,
+      y,
+      key: `${lid}::fg::${z}_${x}_${y}`,
+      src: `${layer.foregroundPyramidBaseUrl}/${z}/${x}_${y}.webp`
+    };
+  }
+
+  _syncPyramidChannel(layer, vp, channel) {
+    const isFg = channel === "fg";
+    if (isFg ? !layer.hasForegroundPyramid : !layer.hasPyramid) return false;
+
+    const { bounds } = layer;
+    const targetZ = isFg
+      ? this._computeTargetZ(layer, vp.scale, {
+          hysteresis: true,
+          maxZoomZ: layer.foregroundMaxZoomZ,
+          prevZOverride: layer.lastForegroundTargetZ
+        })
+      : layer.lastTargetZ;
+    if (isFg) layer.lastForegroundTargetZ = targetZ;
+
+    const bx0 = Math.max(bounds.x, vp.x0);
+    const by0 = Math.max(bounds.y, vp.y0);
+    const bx1 = Math.min(bounds.x + bounds.w, vp.x1);
+    const by1 = Math.min(bounds.y + bounds.h, vp.y1);
+    const overlapsBounds = bx0 < bx1 && by0 < by1;
+
+    let tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;
+    if (targetZ > 0 && overlapsBounds) {
+      const { nx, ny } = this._getPyramidGridDims(layer, targetZ);
+      const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
+      tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
+      ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
+      tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
+      ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
+    }
+
+    const pyrKey = `${overlapsBounds ? 1 : 0}_${targetZ}_${tx0}_${ty0}_${tx1}_${ty1}`;
+    const prevKey = isFg ? layer.lastForegroundPyramidKey : layer.lastPyramidKey;
+    if (pyrKey === prevKey) return false;
+
+    if (isFg) layer.lastForegroundPyramidKey = pyrKey;
+    else layer.lastPyramidKey = pyrKey;
+
+    const lid = layer.level.id;
+    const desiredMap = new Map();
+    if (overlapsBounds) {
+      if (isFg) {
+        const fgBase = this.resolveForegroundPyramidTile(layer, 0, 0, 0);
+        if (fgBase) desiredMap.set(fgBase.key, fgBase);
+      } else {
+        const baseKey = `${lid}::0_0_0`;
+        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+        desiredMap.set(baseKey, { levelId: lid, channel: "bg", z: 0, x: 0, y: 0, key: baseKey, src: `${mBase}/0/0_0.webp` });
+      }
+      if (targetZ > 0) {
+        const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
+        const checkUpperOcc = !layer.level?.isView && !layer.isUpper;
+        for (let ty = ty0; ty <= ty1; ty++) {
+          for (let tx = tx0; tx <= tx1; tx++) {
+            if (checkUpperOcc) {
+              const wx = bounds.x + tx * tileWorldSize;
+              const wy = bounds.y + ty * tileWorldSize;
+              if (this._isRectOccludedByUpperLevels(layer, wx, wy, tileWorldSize, tileWorldSize)) continue;
+            }
+            const spec = isFg
+              ? this.resolveForegroundPyramidTile(layer, targetZ, tx, ty)
+              : this.resolvePyramidTile(layer, targetZ, tx, ty);
+            if (spec) desiredMap.set(spec.key, spec);
+          }
+        }
+      }
+    }
+
+    const desiredSrcs = new Set();
+    for (const spec of desiredMap.values()) desiredSrcs.add(spec.src);
+
+    for (const [k, entry] of this.tilesByKey) {
+      if (entry.levelId !== lid || (entry.channel || "bg") !== channel) continue;
+      const inDesired = desiredMap.has(k);
+      const keepReveal = !isFg && Boolean(entry.isReveal && this._revealTileKeys.has(k));
+      if (!keepReveal && entry.isReveal) {
+        entry.isReveal = false;
+        this._revealTileKeys.delete(k);
+      }
+      entry.desired = inDesired || keepReveal;
+      if (entry.desired) {
+        entry.fadingOut = false;
+        desiredSrcs.add(entry.src);
+      } else {
+        if (!entry.ready && entry.z > 2) {
+          this.tilesByKey.delete(k);
+          if (!desiredSrcs.has(entry.src)) this.texMgr.cancel(entry.src);
+        }
+      }
+    }
+
+    for (const [k, spec] of desiredMap) {
+      if (!this.tilesByKey.has(k)) {
+        this.ensureTile(layer, spec, spec.z === 0);
+      }
+    }
+    this._tilesDirty = true;
+    return true;
+  }
+
   getViewportWorldRect(padFraction = 0.25, worldPx = null) {
     const scale = canvas.stage.scale.x || 1;
     const pivot = canvas.stage.pivot;
@@ -3865,87 +4096,16 @@ class MegaWorld1000 {
       : this.visibleLevelLayers;
 
     for (const layer of orderedLayers) {
-      const { bounds } = layer;
       const targetZ = this._computeTargetZ(layer, vp.scale, { hysteresis: true });
       layer.lastTargetZ = targetZ;
       if (targetZ > maxTargetZ) maxTargetZ = targetZ;
 
-      // 1. Quadtree Pyramid streaming for this level (if it has a pyramid)
-      if (layer.hasPyramid) {
-        const bx0 = Math.max(bounds.x, vp.x0);
-        const by0 = Math.max(bounds.y, vp.y0);
-        const bx1 = Math.min(bounds.x + bounds.w, vp.x1);
-        const by1 = Math.min(bounds.y + bounds.h, vp.y1);
-        const overlapsBounds = bx0 < bx1 && by0 < by1;
-
-        let tx0 = 0, ty0 = 0, tx1 = 0, ty1 = 0;
-        if (targetZ > 0 && overlapsBounds) {
-          const { nx, ny } = this._getPyramidGridDims(layer, targetZ);
-          const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
-          tx0 = Math.max(0, Math.floor((bx0 - bounds.x) / tileWorldSize));
-          ty0 = Math.max(0, Math.floor((by0 - bounds.y) / tileWorldSize));
-          tx1 = Math.min(nx - 1, Math.floor((bx1 - 0.001 - bounds.x) / tileWorldSize));
-          ty1 = Math.min(ny - 1, Math.floor((by1 - 0.001 - bounds.y) / tileWorldSize));
-        }
-
-        const pyrKey = `${overlapsBounds ? 1 : 0}_${targetZ}_${tx0}_${ty0}_${tx1}_${ty1}`;
-        if (pyrKey !== layer.lastPyramidKey) {
-          layer.lastPyramidKey = pyrKey;
-          anyTilesOrOverlaysChanged = true;
-
-          const lid = layer.level.id;
-          const baseKey = `${lid}::0_0_0`;
-          const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
-          const desiredMap = new Map();
-          if (overlapsBounds) {
-            desiredMap.set(baseKey, { levelId: lid, z: 0, x: 0, y: 0, key: baseKey, src: `${mBase}/0/0_0.webp` });
-            if (targetZ > 0) {
-              const tileWorldSize = this._getPyramidTileSize(layer, targetZ);
-              const checkUpperOcc = !layer.level?.isView && !layer.isUpper;
-              for (let ty = ty0; ty <= ty1; ty++) {
-                for (let tx = tx0; tx <= tx1; tx++) {
-                  if (checkUpperOcc) {
-                    const wx = bounds.x + tx * tileWorldSize;
-                    const wy = bounds.y + ty * tileWorldSize;
-                    if (this._isRectOccludedByUpperLevels(layer, wx, wy, tileWorldSize, tileWorldSize)) continue;
-                  }
-                  const spec = this.resolvePyramidTile(layer, targetZ, tx, ty);
-                  desiredMap.set(spec.key, spec);
-                }
-              }
-            }
-          }
-
-          const desiredSrcs = new Set();
-          for (const spec of desiredMap.values()) desiredSrcs.add(spec.src);
-
-          for (const [k, entry] of this.tilesByKey) {
-            if (entry.levelId !== lid) continue;
-            const inDesired = desiredMap.has(k);
-            const keepReveal = Boolean(entry.isReveal && this._revealTileKeys.has(k));
-            if (!keepReveal && entry.isReveal) {
-              entry.isReveal = false;
-              this._revealTileKeys.delete(k);
-            }
-            entry.desired = inDesired || keepReveal;
-            if (entry.desired) {
-              entry.fadingOut = false;
-              desiredSrcs.add(entry.src);
-            } else {
-              if (!entry.ready && entry.z > 2) {
-                this.tilesByKey.delete(k);
-                if (!desiredSrcs.has(entry.src)) this.texMgr.cancel(entry.src);
-              }
-            }
-          }
-
-          for (const [k, spec] of desiredMap) {
-            if (!this.tilesByKey.has(k)) {
-              this.ensureTile(layer, spec, spec.z === 0);
-            }
-          }
-          this._tilesDirty = true;
-        }
+      // 1. Quadtree Pyramid streaming for this level (background floor + optional foreground walls)
+      if (this._syncPyramidChannel(layer, vp, "bg")) {
+        anyTilesOrOverlaysChanged = true;
+      }
+      if (this._syncPyramidChannel(layer, vp, "fg")) {
+        anyTilesOrOverlaysChanged = true;
       }
 
       // 2. Interactive House Overlays (roofs stay mounted at all zoom levels for seamless depth/light & token occlusion; walls show at targetZ >= 6)
@@ -4031,6 +4191,7 @@ class MegaWorld1000 {
     const entry = {
       key: spec.key,
       levelId: layer.level.id,
+      channel: spec.channel || "bg",
       layer,
       z: spec.z,
       x: spec.x,
@@ -4059,7 +4220,10 @@ class MegaWorld1000 {
       const e = this.tilesByKey.get(spec.key);
       if (e !== entry) return;
       if (!tex || !isTextureUsable(tex)) {
-        if (!e.ready) this.tilesByKey.delete(spec.key);
+        if (!e.ready) {
+          this.tilesByKey.delete(spec.key);
+          this._tilesDirty = true;
+        }
         return;
       }
       if (e.fadingOut || (!e.desired && e.z > 0)) {
@@ -4079,45 +4243,58 @@ class MegaWorld1000 {
 
   _mountTileMesh(e, tex, instant) {
     if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0)) return false;
+    const isFg = e.channel === "fg";
     if (!isTextureUsable(tex)) {
       if (this.tilesByKey.get(e.key) === e) {
         this.tilesByKey.delete(e.key);
-        if (e.layer) e.layer.lastPyramidKey = "";
+        if (e.layer) {
+          if (isFg) e.layer.lastForegroundPyramidKey = "";
+          else e.layer.lastPyramidKey = "";
+        }
       }
       return false;
     }
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const layer = e.layer;
-    const levelElev = getLevelBottomElevation(layer.level);
+    const tileElev = isFg
+      ? (layer.foregroundElevation ?? getLevelRoofElevation(layer.level))
+      : getLevelBottomElevation(layer.level);
 
     const m = this.acquireMesh();
     m._boundlessTile = true;
-    m.name = `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
+    m._boundlessFgTile = isFg;
+    m.name = isFg
+      ? `Level.${layer.level?.index ?? 0}.BoundlessFgTile.${e.key}`
+      : `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
     m.anchor.set(0, 0);
     m.texture = tex;
     m.tint = e.tint ?? 0xffffff;
     m.position.set(e.x0, e.y0);
     m.width = e.sizePx + 0.5;
     m.height = e.sizePx + 0.5;
-    m.elevation = levelElev;
+    m.elevation = tileElev;
     m.sortLayer = PrimaryCanvasGroup.SORT_LAYERS.SCENE;
-    m.sort = 1 + e.z * 10;
+    // Foreground walls sit at level.elevation.top (above bottom tokens) with SCENE sortLayer (below TILES roofs/props)
+    // and negative sort (< 1) so the next upper level's floor at the same elevation always draws cleanly above them.
+    m.sort = isFg ? (-200 + e.z * 10) : (1 + e.z * 10);
     m.occlusionMode = layer.isUpper
       ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
       : CONST.OCCLUSION_MODES.SURFACE;
+    if (isFg) m._occludedBySameElevationSurfaces = false;
     m.occludedAlpha = layer.isUpper ? 0.08 : 1.0;
     m.hoverFade = layer.isUpper;
-    // Never write coarse z=0 fallback (64px/texel blur) into CanvasDepthMask so rapid zoom-outs never shift lighting edges
-    m.restrictsLight = e.z > 0;
-    m.restrictsWeather = e.z > 0;
+    // Never write coarse z=0 fallback (64px/texel blur) or foreground wall artwork into CanvasDepthMask
+    m.restrictsLight = !isFg && e.z > 0;
+    m.restrictsWeather = !isFg && e.z > 0;
 
     // Only defer visibility (`awaitingSwap`) when zooming IN (`other.z < e.z`, coarser ancestor fully covers this tile).
-    // When zooming OUT (`e.z < other.z`), the new coarser tile sorts BEHIND old finer tiles (`m.sort = 1 + e.z * 10`)
+    // When zooming OUT (`e.z < other.z`), the new coarser tile sorts BEHIND old finer tiles (`m.sort` increases with z)
     // so making it immediately visible fills surrounding space around old tiles with zero black borders!
+    const eCh = e.channel || "bg";
     let hasOtherZCovering = false;
     if (!instant && e.z > 0 && !e.isReveal) {
       for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+        if (other.levelId === e.levelId && (other.channel || "bg") === eCh && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
             this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
           hasOtherZCovering = true;
           break;
@@ -4140,18 +4317,18 @@ class MegaWorld1000 {
     if (!layer.isUpper) {
       if (!m.restrictsLight && !m.restrictsWeather) m.pluginName = "batch";
       m.updateCanvasTransform = NOOP_TRANSFORM;
-      if (e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
+      if (!isFg && e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
     }
     this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
-    if (m.visible) {
+    if (m.visible && !isFg) {
       this._markDepthDirty({ elev: true });
     }
     return true;
   }
 
-  _isViewportCoveredByHigherTiles(layer, visVp) {
+  _isViewportCoveredByHigherTiles(layer, visVp, channel = "bg") {
     if (!layer?.bounds || !visVp) return false;
     const lid = layer.level.id;
     const rx0 = Math.max(layer.bounds.x, visVp.x0);
@@ -4161,7 +4338,7 @@ class MegaWorld1000 {
     if (rx1 <= rx0 || ry1 <= ry0) return true;
     const visHigher = [];
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === lid && other.ready && !other.awaitingSwap && other.z > 0 && other.mesh?.visible && other.alpha >= 0.98 &&
+      if (other.levelId === lid && (other.channel || "bg") === channel && other.ready && !other.awaitingSwap && other.z > 0 && other.mesh?.visible && other.alpha >= 0.98 &&
           other.x0 < rx1 && other.x0 + other.sizePx > rx0 &&
           other.y0 < ry1 && other.y0 + other.sizePx > ry0) {
         visHigher.push(other);
@@ -4189,30 +4366,51 @@ class MegaWorld1000 {
     return true;
   }
 
-  _syncBaseLayerVisibility(visVp, levelReadyState = null) {
-    let anyChanged = false;
+  _syncBaseLayerVisibility(visVp, levelReadyState = null, fgReadyState = null) {
+    let anyBgChanged = false;
+    let anyFgChanged = false;
     for (const layer of this.visibleLevelLayers) {
-      if (!layer.hasPyramid) continue;
       const lid = layer.level.id;
-      const st = levelReadyState?.get?.(lid);
-      const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
-      const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
-        || this._isViewportCoveredByHigherTiles(layer, visVp);
-      if (z0?.mesh) {
-        const shouldShowBase = !fullyCovered;
-        if (z0.mesh.visible !== shouldShowBase) {
-          z0.mesh.visible = shouldShowBase;
-          anyChanged = true;
+      if (layer.hasPyramid) {
+        const st = levelReadyState?.get?.(lid);
+        const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
+        const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
+          || this._isViewportCoveredByHigherTiles(layer, visVp, "bg");
+        if (z0?.mesh) {
+          const shouldShowBase = !fullyCovered;
+          if (z0.mesh.visible !== shouldShowBase) {
+            z0.mesh.visible = shouldShowBase;
+            anyBgChanged = true;
+          }
         }
+        this._setNativeLevelTextureVisible(layer.level, "background", !fullyCovered);
       }
-      this._setNativeLevelBgVisible(layer.level, !fullyCovered);
+      if (layer.hasForegroundPyramid) {
+        const stFg = fgReadyState?.get?.(lid);
+        const fgZ0 = this.tilesByKey.get(`${lid}::fg::0_0_0`);
+        // For sparse foreground pyramids, once targetZ > 0 and all visible desired fg tiles are ready
+        // (even 0 tiles in an empty open-field area), hide the coarse z=0 fallback so walls never double-render.
+        const fgCovered = Boolean(
+          layer.lastForegroundTargetZ > 0 && stFg?.visDesiredReady
+        ) || this._isViewportCoveredByHigherTiles(layer, visVp, "fg");
+        if (fgZ0?.mesh) {
+          const shouldShowFgBase = !fgCovered;
+          if (fgZ0.mesh.visible !== shouldShowFgBase) {
+            fgZ0.mesh.visible = shouldShowFgBase;
+            anyFgChanged = true;
+          }
+        }
+        this._setNativeLevelTextureVisible(layer.level, "foreground", !fgCovered);
+      }
     }
-    if (anyChanged) {
+    if (anyBgChanged || anyFgChanged) {
       canvas.primary.sortDirty = true;
+    }
+    if (anyBgChanged) {
       this._depthDirty = true;
       if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
-    return anyChanged;
+    return anyBgChanged || anyFgChanged;
   }
 
   rectsOverlap(ax, ay, asz, bx, by, bsz) {
@@ -4220,8 +4418,9 @@ class MegaWorld1000 {
   }
 
   hasReadyOtherZCovering(e) {
+    const ch = e.channel || "bg";
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
           this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
         return true;
       }
@@ -4230,8 +4429,9 @@ class MegaWorld1000 {
   }
 
   hasReadyAncestorCovering(e) {
+    const ch = e.channel || "bg";
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && other.ready && other.z > 0 && other.z < e.z && other.alpha >= 0.9 &&
+      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.ready && other.z > 0 && other.z < e.z && other.alpha >= 0.9 &&
           this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
         return true;
       }
@@ -4240,6 +4440,7 @@ class MegaWorld1000 {
   }
 
   isTileFullyReplacedByDesired(e, vp = null) {
+    const ch = e.channel || "bg";
     const s = e.sizePx;
     let rx0 = e.x0;
     let ry0 = e.y0;
@@ -4270,7 +4471,7 @@ class MegaWorld1000 {
     for (const [px, py] of pts) {
       let covered = false;
       for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && other.desired && other.ready && !other.awaitingSwap && other.mesh?.visible && other.z > 0 && other.alpha >= 0.98 &&
+        if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.desired && other.ready && !other.awaitingSwap && other.mesh?.visible && other.z > 0 && other.alpha >= 0.98 &&
             px >= other.x0 && px <= other.x0 + other.sizePx &&
             py >= other.y0 && py <= other.y0 + other.sizePx) {
           covered = true;
@@ -4313,8 +4514,9 @@ class MegaWorld1000 {
   }
 
   hasAnyReadyDesiredUnderneath(e) {
+    const ch = e.channel || "bg";
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && other.desired && other.ready && other.z < e.z && other.alpha >= 0.99 &&
+      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.desired && other.ready && other.z < e.z && other.alpha >= 0.99 &&
           this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
         return true;
       }
@@ -4322,17 +4524,18 @@ class MegaWorld1000 {
     return false;
   }
 
-  _setNativeLevelBgVisible(level, visible) {
-    const lt = canvas.primary?.levelTextures?.find(m => m.name === `Level.${level.index}.background`);
+  _setNativeLevelTextureVisible(level, kind, visible) {
+    const store = kind === "foreground" ? this._hiddenNativeLevelFg : this._hiddenNativeLevelBg;
+    const lt = canvas.primary?.levelTextures?.find(m => m.name === `Level.${level.index}.${kind}`);
     if (!lt) return;
     if (!visible) {
       if (lt.visible) {
         lt.visible = false;
-        this._hiddenNativeLevelBg.set(level.id, lt);
+        store.set(level.id, lt);
       }
-    } else if (this._hiddenNativeLevelBg.has(level.id)) {
+    } else if (store.has(level.id)) {
       lt.visible = true;
-      this._hiddenNativeLevelBg.delete(level.id);
+      store.delete(level.id);
     }
   }
 
@@ -4533,7 +4736,10 @@ class MegaWorld1000 {
         const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
         if (!isTextureUsable(tex)) {
           this.tilesByKey.delete(item.key);
-          if (e.layer) e.layer.lastPyramidKey = "";
+          if (e.layer) {
+            if (e.channel === "fg") e.layer.lastForegroundPyramidKey = "";
+            else e.layer.lastPyramidKey = "";
+          }
           continue;
         }
         if (this._mountTileMesh(e, tex, item.instant)) {
@@ -4703,8 +4909,10 @@ class MegaWorld1000 {
     const toDelete = [];
     let stillActive = false;
     let anyPyramidSwapped = false;
+    let anyBgPyramidSwapped = false;
 
     const levelReadyState = new Map();
+    const fgReadyState = new Map();
     for (const layer of this.visibleLevelLayers) {
       levelReadyState.set(layer.level.id, {
         allReadyOpaque: layer.lastTargetZ > 0,
@@ -4713,12 +4921,21 @@ class MegaWorld1000 {
         hasVisDesiredNonZero: false,
         finestZ6Alpha: 0.0
       });
+      if (layer.hasForegroundPyramid) {
+        fgReadyState.set(layer.level.id, {
+          allReadyOpaque: layer.lastForegroundTargetZ > 0,
+          visDesiredReady: layer.lastForegroundTargetZ > 0,
+          hasDesiredNonZero: false,
+          hasVisDesiredNonZero: false
+        });
+      }
     }
 
-    // Pass 1: inspect readiness of desired tiles per level (both full padded rect and exact visible screen)
+    // Pass 1: inspect readiness of desired tiles per level and channel (background & optional foreground)
     for (const [, e] of this.tilesByKey) {
       if (e.z === 0 || !e.desired || e.isReveal) continue;
-      const st = levelReadyState.get(e.levelId);
+      const isFg = e.channel === "fg";
+      const st = isFg ? fgReadyState.get(e.levelId) : levelReadyState.get(e.levelId);
       if (!st) continue;
       st.hasDesiredNonZero = true;
       const inVis = !(e.x0 + e.sizePx < visVp.x0 || e.x0 > visVp.x1 || e.y0 + e.sizePx < visVp.y0 || e.y0 > visVp.y1);
@@ -4743,7 +4960,8 @@ class MegaWorld1000 {
 
     // Pass 2: atomic 1-frame LOD swap once all visible desired tiles are ready (zero double-alpha blending & zero depth flicker!)
     for (const [k, e] of this.tilesByKey) {
-      const st = levelReadyState.get(e.levelId);
+      const isFg = e.channel === "fg";
+      const st = isFg ? fgReadyState.get(e.levelId) : levelReadyState.get(e.levelId);
       if (e.z === 0) continue;
 
       if (e.desired) {
@@ -4758,6 +4976,7 @@ class MegaWorld1000 {
               e.mesh.visible = true;
             }
             anyPyramidSwapped = true;
+            if (!isFg) anyBgPyramidSwapped = true;
           } else {
             stillActive = true;
           }
@@ -4766,7 +4985,7 @@ class MegaWorld1000 {
           if (e.mesh) e.mesh.unoccludedAlpha = e.alpha;
           if (e.alpha < 1.0) stillActive = true;
         }
-        if (st && e.layer && (e.z - e.layer.zOffset) >= 6 && !e.isReveal && e.ready && !e.awaitingSwap && e.alpha > st.finestZ6Alpha) {
+        if (!isFg && st && e.layer && (e.z - e.layer.zOffset) >= 6 && !e.isReveal && e.ready && !e.awaitingSwap && e.alpha > st.finestZ6Alpha) {
           st.finestZ6Alpha = e.alpha;
         }
       } else {
@@ -4776,13 +4995,22 @@ class MegaWorld1000 {
           toDelete.push(k);
           continue;
         }
-        if (st?.visDesiredReady && st?.hasVisDesiredNonZero) {
+        const curTargetZ = isFg ? e.layer.lastForegroundTargetZ : e.layer.lastTargetZ;
+        const baseKey = isFg ? `${e.levelId}::fg::0_0_0` : `${e.levelId}::0_0_0`;
+        const baseReady = Boolean(this.tilesByKey.get(baseKey)?.ready) || (isFg && !this.hasForegroundTile(e.layer, 0, 0, 0));
+        const canDropOld = (curTargetZ === 0 && baseReady)
+          || (isFg
+              ? Boolean(st?.visDesiredReady && curTargetZ > 0)
+              : Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero));
+        if (canDropOld) {
           toDelete.push(k);
           anyPyramidSwapped = true;
-        } else if (e.z < e.layer.lastTargetZ) {
+          if (!isFg) anyBgPyramidSwapped = true;
+        } else if (e.z < curTargetZ) {
           if (this.isTileFullyReplacedByDesired(e, vp)) {
             toDelete.push(k);
             anyPyramidSwapped = true;
+            if (!isFg) anyBgPyramidSwapped = true;
           }
         } else if (e.fadingOut) {
           e.alpha = Math.max(0.0, e.alpha - step);
@@ -4792,17 +5020,17 @@ class MegaWorld1000 {
       }
     }
 
-    // Hide z=0 base mesh & native Foundry background mesh whenever ANY sharper tiles (z > 0, including outgoing LOD) cover the full visible screen!
-    if (this._syncBaseLayerVisibility(visVp, levelReadyState)) {
+    // Hide z=0 base meshes & native Foundry level textures whenever sharper tiles (z > 0) cover the screen
+    if (this._syncBaseLayerVisibility(visVp, levelReadyState, fgReadyState)) {
       anyPyramidSwapped = true;
     }
 
     if (anyPyramidSwapped) {
       canvas.primary.sortDirty = true;
-      if (canvas.masks?.depth) {
-        canvas.masks.depth._elevationDirty = true;
-        canvas.masks.depth.renderDirty = true;
-      }
+    }
+    if (anyBgPyramidSwapped && canvas.masks?.depth) {
+      canvas.masks.depth._elevationDirty = true;
+      canvas.masks.depth.renderDirty = true;
     }
 
     const retiringOvKeys = [];
@@ -6077,7 +6305,20 @@ class MegaWorld1000 {
       }));
     }
 
-    if (differsFromBaked) {
+    const prevCloseTimer = this.closingDoorTimers.get(dKey);
+    if (prevCloseTimer) {
+      clearTimeout(prevCloseTimer);
+      this.closingDoorTimers.delete(dKey);
+    }
+
+    const mountedWall = this.wallEditor?.mountedByDoorKey?.get(dKey)?.wall;
+    const deferRebakeMs = (!differsFromBaked && isOpen !== wasOpen
+      && mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
+      && globalThis.showstopper?.doorLighting?.isEnabled?.())
+      ? (Number(mountedWall.document?.animation?.duration) || 750)
+      : 0;
+
+    if (differsFromBaked || deferRebakeMs > 0) {
       this.openDoors.set(dKey, { levelId, x: dx, y: dy, sx, sy, eid });
     } else {
       this.openDoors.delete(dKey);
@@ -6085,6 +6326,19 @@ class MegaWorld1000 {
 
     // Drive native Wall._onUpdate (DoorControl icon, DoorMesh animation, native door sound)
     this.wallEditor.applyDoorStateToMounted(dKey, ds, { playSound });
+
+    if (deferRebakeMs > 0) {
+      const timerId = setTimeout(() => {
+        this.closingDoorTimers.delete(dKey);
+        if (!this.active) return;
+        const nowOpen = this.getCurrentDoorState(dKey, defaultDs) === 1;
+        if (nowOpen !== (defaultDs === 1)) return;
+        this.openDoors.delete(dKey);
+        this.updateSimAndLightBubbles(false);
+        canvas.perception?.update({ refreshLighting: true, refreshVision: true });
+      }, deferRebakeMs + 60);
+      this.closingDoorTimers.set(dKey, timerId);
+    }
 
     if (isOpen !== wasOpen) {
       this.updateSimAndLightBubbles(false);
@@ -7639,6 +7893,10 @@ class MegaWorld1000 {
       if (bgMesh && !bgMesh.destroyed) bgMesh.visible = true;
     }
     this._hiddenNativeLevelBg.clear();
+    for (const [, fgMesh] of this._hiddenNativeLevelFg) {
+      if (fgMesh && !fgMesh.destroyed) fgMesh.visible = true;
+    }
+    this._hiddenNativeLevelFg.clear();
 
     this.pendingTileMounts = [];
     this.pendingOverlayMounts = [];
@@ -7658,6 +7916,8 @@ class MegaWorld1000 {
         for (const eid of data.edgeIds) data.level.edges.delete(eid);
       }
     }
+    for (const timerId of this.closingDoorTimers.values()) clearTimeout(timerId);
+    this.closingDoorTimers.clear();
     this.simSectors.clear();
     this.doorStates.clear();
     this.openDoors.clear();
