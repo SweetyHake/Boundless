@@ -1,170 +1,53 @@
-import { POI_ICON_META, inferPoiIcon, openPoiEditorDialog } from "./poi.mjs";
 import { bakeSceneToBoundless, buildDefaultBakeDir } from "./scene-baker.mjs";
+import { MODULE_ID, loc, escapeHtml } from "./utils.mjs";
 
-const MODULE_ID = "boundless";
-
-function loc(key) {
-  return game.i18n.localize(key);
+function resolveSceneFromContextEl(li) {
+  const el = li instanceof HTMLElement ? li : li?.[0];
+  if (!el || el.dataset?.levelId) return null;
+  const sceneId = el.dataset?.sceneId || el.dataset?.entryId || el.dataset?.documentId;
+  return sceneId ? (game.scenes?.get?.(sceneId) ?? null) : null;
 }
 
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-async function promptBakeLevel(controller, level) {
-  if (!level) return;
-  const DialogV2 = foundry.applications.api.DialogV2;
-  const body = game.i18n.format("BOUNDLESS.Config.BakeConfirmBody", { level: level.name || level.id });
-  const content = `
-    <p>${escapeHtml(body)}</p>
-    <div class="form-group">
-      <label>${escapeHtml(loc("BOUNDLESS.Config.BakeRemoveOriginals"))}</label>
-      <div class="form-fields">
-        <input type="checkbox" name="removeOriginals" checked>
-      </div>
-    </div>
-  `;
-
-  const result = await DialogV2.prompt({
-    window: { title: loc("BOUNDLESS.Config.BakeConfirmTitle") },
-    content,
-    ok: {
-      label: loc("BOUNDLESS.Config.BakeConfirmTitle"),
-      callback: (event, button) => ({
-        removeOriginals: Boolean(button.form.elements.removeOriginals?.checked)
-      })
-    },
-    rejectClose: false
-  });
-  if (!result) return;
-
-  try {
-    const stats = await controller.bakeNativeToLevel(level.id, {
-      removeOriginals: result.removeOriginals,
-      scene: level.parent || canvas.scene
-    });
-    ui.notifications.info(game.i18n.format("BOUNDLESS.Config.BakeDone", {
-      level: level.name || level.id,
-      tiles: stats.tiles,
-      walls: stats.walls,
-      lights: stats.lights,
-      sounds: stats.sounds
-    }));
-  } catch (err) {
-    console.error(`${MODULE_ID} | Level bake failed:`, err);
-    ui.notifications.error(game.i18n.format("BOUNDLESS.Baker.Failed", { error: err?.message || String(err) }));
-  }
-}
-
-async function openBakePyramidDialog(controller, scene, { singleLevelId = null } = {}) {
+export async function openOptimizeSceneDialog(controller, scene) {
   if (!scene || !game.user?.isGM) return;
   const DialogV2 = foundry.applications.api.DialogV2;
-  const defaultDir = buildDefaultBakeDir(scene);
-  const levelObj = singleLevelId ? scene.levels?.get?.(singleLevelId) : null;
-  const levelsCount = scene.levels?.size || 1;
-  const desc = levelObj
-    ? game.i18n.format("BOUNDLESS.Baker.DialogBodyLevel", { level: levelObj.name || levelObj.id })
-    : game.i18n.format("BOUNDLESS.Baker.DialogBodyScene", { scene: scene.name || scene.id });
+
+  const desc = game.i18n.format("BOUNDLESS.Optimize.DialogBody", {
+    scene: scene.name || scene.id
+  });
 
   const content = `
     <div class="boundless-baker-form">
       <p class="hint">${escapeHtml(desc)}</p>
-
       <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.TargetDir"))}</label>
-        <div class="form-fields">
-          <input type="text" name="targetDir" value="${escapeHtml(defaultDir)}" required>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Baker.TargetDirHint"))}</p>
-      </div>
-
-      ${(!singleLevelId && levelsCount > 1) ? `
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.AllLevels"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" name="allLevels" checked>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Baker.AllLevelsHint"))}</p>
-      </div>` : ""}
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.CreateCopy"))}</label>
+        <label>${escapeHtml(loc("BOUNDLESS.Optimize.CreateCopy"))}</label>
         <div class="form-fields">
           <input type="checkbox" name="createCopy" checked>
         </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Baker.CreateCopyHint"))}</p>
-      </div>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.RemoveOriginals"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" name="removeOriginals" checked>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Baker.RemoveOriginalsHint"))}</p>
-      </div>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.ClearBackground"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" name="clearBackground" checked>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Baker.ClearBackgroundHint"))}</p>
-      </div>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Baker.WebpQuality"))}</label>
-        <div class="form-fields">
-          <input type="range" name="quality" min="60" max="95" step="5" value="85">
-          <span class="range-value">85%</span>
-        </div>
+        <p class="hint">${escapeHtml(loc("BOUNDLESS.Optimize.CreateCopyHint"))}</p>
       </div>
     </div>
   `;
 
   const opts = await DialogV2.prompt({
-    window: { title: loc("BOUNDLESS.Baker.DialogTitle"), icon: "fa-solid fa-wand-magic-sparkles" },
-    position: { width: 460 },
+    window: { title: loc("BOUNDLESS.Optimize.DialogTitle"), icon: "fa-solid fa-bolt" },
+    position: { width: 420 },
     content,
-    render: (ev, dialog) => {
-      const el = dialog?.element ?? ev?.target?.element;
-      const range = el?.querySelector?.('input[name="quality"]');
-      const out = el?.querySelector?.(".range-value");
-      if (range && out) {
-        range.addEventListener("input", () => { out.textContent = `${range.value}%`; });
-      }
-    },
     ok: {
-      label: loc("BOUNDLESS.Baker.StartButton"),
-      icon: "fa-solid fa-wand-magic-sparkles",
-      callback: (event, button) => {
-        const f = button.form.elements;
-        return {
-          targetDir: f.targetDir?.value?.trim() || defaultDir,
-          allLevels: f.allLevels ? Boolean(f.allLevels.checked) : true,
-          createCopy: Boolean(f.createCopy?.checked),
-          removeOriginals: Boolean(f.removeOriginals?.checked),
-          clearBackground: Boolean(f.clearBackground?.checked),
-          quality: Math.max(0.6, Math.min(0.95, (Number(f.quality?.value) || 85) / 100))
-        };
-      }
+      label: loc("BOUNDLESS.Optimize.StartButton"),
+      icon: "fa-solid fa-bolt",
+      callback: (_event, button) => ({
+        createCopy: Boolean(button.form.elements.createCopy?.checked)
+      })
     },
     rejectClose: false
   });
   if (!opts) return;
 
   const abortCtrl = new AbortController();
-  const fallbackLevelId = scene.initialLevel?.id || scene.firstLevel?.id || Array.from(scene.levels || [])[0]?.id || null;
-  const levelIds = singleLevelId
-    ? [singleLevelId]
-    : (opts.allLevels ? null : (canvas.scene?.id === scene.id && canvas.level?.id ? [canvas.level.id] : (fallbackLevelId ? [fallbackLevelId] : null)));
-
   const progressDialog = new DialogV2({
-    window: { title: loc("BOUNDLESS.Baker.ProgressTitle"), icon: "fa-solid fa-spinner fa-spin" },
-    position: { width: 420 },
+    window: { title: loc("BOUNDLESS.Optimize.ProgressTitle"), icon: "fa-solid fa-spinner fa-spin" },
+    position: { width: 400 },
     content: `
       <div class="boundless-baker-progress">
         <p class="boundless-baker-status">${escapeHtml(loc("BOUNDLESS.Baker.StepPreparing"))}</p>
@@ -179,6 +62,7 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
       callback: () => { abortCtrl.abort(); }
     }]
   });
+
   let finished = false;
   progressDialog.addEventListener?.("close", () => {
     if (!finished) abortCtrl.abort();
@@ -187,12 +71,12 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
 
   try {
     const stats = await bakeSceneToBoundless(controller, scene, {
-      targetDir: opts.targetDir,
-      levelIds,
+      targetDir: buildDefaultBakeDir(scene),
+      levelIds: null,
       createCopy: opts.createCopy,
-      removeOriginals: opts.removeOriginals,
-      clearBackground: opts.clearBackground,
-      quality: opts.quality,
+      removeOriginals: true,
+      clearBackground: true,
+      quality: 0.85,
       activateCopy: true,
       signal: abortCtrl.signal,
       onProgress: ({ pct, text }) => {
@@ -208,347 +92,54 @@ async function openBakePyramidDialog(controller, scene, { singleLevelId = null }
     });
     finished = true;
     await progressDialog.close().catch(() => {});
-    ui.notifications.info(game.i18n.format("BOUNDLESS.Baker.Done", {
-      scene: stats.scene.name,
-      tilesUploaded: stats.tilesUploaded,
-      walls: stats.walls,
-      lights: stats.lights,
-      tiles: stats.tiles,
-      sounds: stats.sounds
+    ui.notifications.info(game.i18n.format("BOUNDLESS.Optimize.Done", {
+      scene: stats.scene.name
     }));
   } catch (err) {
     finished = true;
     await progressDialog.close().catch(() => {});
     if (err?.name === "AbortError") {
-      ui.notifications.warn(loc("BOUNDLESS.Baker.Cancelled"));
+      ui.notifications.warn(loc("BOUNDLESS.Optimize.Cancelled"));
     } else {
-      console.error(`${MODULE_ID} | Scene bake failed:`, err);
-      ui.notifications.error(game.i18n.format("BOUNDLESS.Baker.Failed", { error: err?.message || String(err) }));
+      console.error(`${MODULE_ID} | Scene optimization failed:`, err);
+      ui.notifications.error(game.i18n.format("BOUNDLESS.Optimize.Failed", {
+        error: err?.message || String(err)
+      }));
     }
   }
-}
-
-function renderPoiListMarkup(pois) {
-  if (!pois?.length) {
-    return `<p class="boundless-muted">${escapeHtml(loc("BOUNDLESS.Config.PoiEmpty"))}</p>`;
-  }
-  return pois.map(p => {
-    const iconKey = inferPoiIcon(p);
-    const meta = POI_ICON_META[iconKey] || POI_ICON_META.pin;
-    const dotColor = p.hidden ? "#b87aff" : (p.color || meta.defaultColor || "#f5c96b");
-    return `
-      <div class="boundless-poi-row" data-poi-id="${escapeHtml(p.id)}">
-        <div class="boundless-poi-meta">
-          <i class="fa-solid ${escapeHtml(p.hidden ? "fa-eye-slash" : meta.fa)}" style="color: ${escapeHtml(dotColor)};"></i>
-          <span>${escapeHtml(p.name)}</span>
-          <span class="boundless-poi-coords">(${Math.round(p.x)}, ${Math.round(p.y)})</span>
-        </div>
-        <div class="boundless-poi-btns">
-          <button type="button" data-bl-action="flyPoi" data-poi-id="${escapeHtml(p.id)}" title="${escapeHtml(loc("BOUNDLESS.Config.PoiFly"))}">
-            <i class="fa-solid fa-crosshairs"></i>
-          </button>
-          <button type="button" data-bl-action="editPoi" data-poi-id="${escapeHtml(p.id)}" title="${escapeHtml(loc("BOUNDLESS.Config.PoiEdit"))}">
-            <i class="fa-solid fa-pen"></i>
-          </button>
-          <button type="button" data-bl-action="deletePoi" data-poi-id="${escapeHtml(p.id)}" title="${escapeHtml(loc("BOUNDLESS.Config.PoiDelete"))}">
-            <i class="fa-solid fa-trash"></i>
-          </button>
-        </div>
-      </div>
-    `;
-  }).join("");
 }
 
 export function registerConfigUI(controller) {
-  Hooks.on("renderSceneConfig", (app, html) => {
-    const root = html instanceof HTMLElement ? html : html?.[0];
-    const scene = app.document;
-    if (!root || !scene) return;
+  const addSceneOptimizeOption = (_app, options) => {
+    if (!Array.isArray(options)) return;
+    const label = loc("BOUNDLESS.Optimize.ContextMenu");
+    if (options.some(opt => (opt.name ?? opt.label) === label)) return;
 
-    const nav = root.querySelector('nav.sheet-tabs, nav.tabs');
-    const lastTab = root.querySelector('.tab[data-tab="misc"][data-group="sheet"]')
-      || Array.from(root.querySelectorAll('.tab[data-group="sheet"]')).at(-1);
-    if (!nav || !lastTab) return;
-
-    const isActiveTab = app.tabGroups?.sheet === "boundless";
-    let tabBtn = nav.querySelector('a[data-tab="boundless"]');
-    if (!tabBtn) {
-      tabBtn = document.createElement("a");
-      tabBtn.dataset.action = "tab";
-      tabBtn.dataset.group = "sheet";
-      tabBtn.dataset.tab = "boundless";
-      tabBtn.innerHTML = `<i class="fa-solid fa-map"></i><span>${escapeHtml(loc("BOUNDLESS.TabLabel"))}</span>`;
-      nav.appendChild(tabBtn);
-    }
-    tabBtn.classList.toggle("active", isActiveTab);
-
-    // Replace existing injected tab on re-renders so updated/baked scene flags are never clobbered by stale DOM inputs
-    const existingTab = root.querySelector('.tab[data-tab="boundless"]');
-    if (existingTab) existingTab.remove();
-
-    const cfg = scene.flags?.[MODULE_ID] || {};
-    const enabled = Boolean(cfg.enabled);
-    const manifestUrl = cfg.manifestUrl || "";
-    const maxLosPx = cfg.maxLosPx ?? 4500;
-    const chunkedFog = cfg.chunkedFog !== false;
-    const showPois = cfg.showPois !== false;
-    const showCharacterPins = cfg.showCharacterPins !== false;
-    const virtualizeTokens = cfg.virtualizeTokens !== false;
-    const effectivePois = controller.getEffectivePOIs(scene);
-    const hasCustomPois = Array.isArray(cfg.pois);
-    const isCurrentScene = canvas.scene?.id === scene.id;
-
-    // Add tab content div matching native v14 SceneConfig markup
-    const section = document.createElement("div");
-    section.className = isActiveTab ? "tab scrollable active" : "tab scrollable";
-    section.dataset.group = "sheet";
-    section.dataset.tab = "boundless";
-
-    section.innerHTML = `
-      <fieldset class="boundless-fieldset">
-        <legend>${escapeHtml(loc("BOUNDLESS.Config.SceneHeading"))}</legend>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.Enabled"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.enabled" ${enabled ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.EnabledHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.ManifestUrl"))}</label>
-          <div class="form-fields">
-            <input type="text" name="flags.${MODULE_ID}.manifestUrl" value="${escapeHtml(manifestUrl)}" placeholder="modules/boundless/assets/pyramid/pyramid_manifest.json">
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.ManifestUrlHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.MaxLosPx"))}</label>
-          <div class="form-fields">
-            <input type="number" name="flags.${MODULE_ID}.maxLosPx" value="${escapeHtml(maxLosPx)}" min="500" max="50000" step="100">
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.MaxLosPxHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.ChunkedFog"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.chunkedFog" ${chunkedFog ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.ChunkedFogHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.ShowPois"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.showPois" ${showPois ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.ShowPoisHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.ShowCharacterPins"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.showCharacterPins" ${showCharacterPins ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.ShowCharacterPinsHint"))}</p>
-        </div>
-
-        <div class="form-group">
-          <label>${escapeHtml(loc("BOUNDLESS.Config.VirtualizeTokens"))}</label>
-          <div class="form-fields">
-            <input type="checkbox" name="flags.${MODULE_ID}.virtualizeTokens" ${virtualizeTokens ? "checked" : ""}>
-          </div>
-          <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.VirtualizeTokensHint"))}</p>
-        </div>
-      </fieldset>
-
-      <fieldset class="boundless-fieldset">
-        <legend>${escapeHtml(loc("BOUNDLESS.Config.PoiHeading"))}</legend>
-        <div class="boundless-poi-list">${renderPoiListMarkup(effectivePois)}</div>
-        <div class="boundless-actions">
-          <button type="button" data-bl-action="addPoi">
-            <i class="fa-solid fa-plus"></i> ${escapeHtml(loc("BOUNDLESS.Config.PoiAddHere"))}
-          </button>
-          <button type="button" data-bl-action="resetPois" ${hasCustomPois ? "" : "disabled"}>
-            <i class="fa-solid fa-rotate-left"></i> ${escapeHtml(loc("BOUNDLESS.Config.PoiReset"))}
-          </button>
-        </div>
-      </fieldset>
-
-      <fieldset class="boundless-fieldset">
-        <legend>${escapeHtml(loc("BOUNDLESS.Config.ActionsHeading"))}</legend>
-        <div class="boundless-actions">
-          <button type="button" class="boundless-primary-btn" data-bl-action="bakePyramid">
-            <i class="fa-solid fa-wand-magic-sparkles"></i> ${escapeHtml(loc("BOUNDLESS.Baker.BakeSceneButton"))}
-          </button>
-          <button type="button" data-bl-action="bakeLevel">
-            <i class="fa-solid fa-layer-group"></i> ${escapeHtml(loc("BOUNDLESS.Config.BakeLevel"))}
-          </button>
-          <button type="button" data-bl-action="resetFog">
-            <i class="fa-solid fa-cloud"></i> ${escapeHtml(loc("BOUNDLESS.Config.ResetFog"))}
-          </button>
-        </div>
-      </fieldset>
-    `;
-
-    lastTab.after(section);
-
-    const refreshPoiDom = () => {
-      const listEl = section.querySelector(".boundless-poi-list");
-      const resetBtn = section.querySelector('button[data-bl-action="resetPois"]');
-      const current = controller.getEffectivePOIs(scene);
-      if (listEl) listEl.innerHTML = renderPoiListMarkup(current);
-      if (resetBtn) resetBtn.disabled = !Array.isArray(scene.flags?.[MODULE_ID]?.pois);
+    const canOptimize = (li) => {
+      if (!game.user?.isGM) return false;
+      const scene = resolveSceneFromContextEl(li);
+      if (!scene) return false;
+      return !scene.flags?.[MODULE_ID]?.enabled;
     };
 
-    section.addEventListener("click", async (ev) => {
-      const btn = ev.target.closest("button[data-bl-action]");
-      if (!btn) return;
-      ev.preventDefault();
-      const action = btn.dataset.blAction;
+    const runOptimize = (li) => {
+      const scene = resolveSceneFromContextEl(li);
+      if (scene) openOptimizeSceneDialog(controller, scene);
+    };
 
-      if (action === "addPoi") {
-        const added = await openPoiEditorDialog(controller, scene);
-        if (added) refreshPoiDom();
-      } else if (action === "editPoi") {
-        const current = controller.getEffectivePOIs(scene);
-        const target = current.find(p => p.id === btn.dataset.poiId);
-        if (target) {
-          const edited = await openPoiEditorDialog(controller, scene, target);
-          if (edited) refreshPoiDom();
-        }
-      } else if (action === "deletePoi") {
-        await controller.removePOI(btn.dataset.poiId, scene);
-        refreshPoiDom();
-      } else if (action === "resetPois") {
-        await controller.resetPOIs(scene);
-        refreshPoiDom();
-      } else if (action === "flyPoi") {
-        if (canvas.scene?.id !== scene.id) return;
-        const current = controller.getEffectivePOIs(scene);
-        const target = current.find(p => p.id === btn.dataset.poiId);
-        if (target) controller.poiManager.flyTo(target);
-      } else if (action === "resetFog") {
-        if (canvas.scene?.id === scene.id && canvas.fog) {
-          await canvas.fog.reset();
-        } else {
-          // Inactive scene: clear persisted fog flags directly on `scene` and users without touching the currently viewed scene!
-          const nowTs = Date.now();
-          const fogResetPatch = {};
-          if (scene.flags?.[MODULE_ID]?.sharedFog) {
-            fogResetPatch[`flags.${MODULE_ID}.-=sharedFog`] = null;
-          }
-          for (const lvl of (scene.levels || [])) {
-            fogResetPatch[`flags.${MODULE_ID}.fogResetAt.${lvl.id}`] = nowTs;
-          }
-          if (Object.keys(fogResetPatch).length) {
-            await scene.update(fogResetPatch);
-          }
-          if (game.user?.isGM && game.users) {
-            const updates = [];
-            for (const u of game.users) {
-              if (u?.flags?.[MODULE_ID]?.fog?.[scene.id]) {
-                updates.push({ _id: u.id, [`flags.${MODULE_ID}.fog.-=${scene.id}`]: null });
-              }
-            }
-            if (updates.length) {
-              if (typeof User?.updateDocuments === "function") await User.updateDocuments(updates);
-              else for (const u of game.users) if (u?.flags?.[MODULE_ID]?.fog?.[scene.id]) await u.update({ [`flags.${MODULE_ID}.fog.-=${scene.id}`]: null });
-            }
-          }
-          ui.notifications.info(loc("BOUNDLESS.Config.ResetFogDone"));
-        }
-      } else if (action === "bakePyramid") {
-        await openBakePyramidDialog(controller, scene);
-      } else if (action === "bakeLevel") {
-        const targetLvl = canvas.scene?.id === scene.id
-          ? canvas.level
-          : (scene.initialLevel || scene.firstLevel || Array.from(scene.levels || [])[0]);
-        if (targetLvl) await promptBakeLevel(controller, targetLvl);
-      }
+    options.push({
+      name: label,
+      label,
+      icon: '<i class="fa-solid fa-bolt"></i>',
+      condition: canOptimize,
+      visible: canOptimize,
+      callback: (li) => runOptimize(li),
+      onClick: (_event, li) => runOptimize(li)
     });
-  });
+  };
 
-  Hooks.on("renderLevelConfig", (app, html) => {
-    const root = html instanceof HTMLElement ? html : html?.[0];
-    const level = app.document;
-    if (!root || !level) return;
-
-    const existingFieldset = root.querySelector(".boundless-level-fieldset");
-    if (existingFieldset) existingFieldset.remove();
-
-    const scrollBody = root.querySelector("section.scrollable")
-      || root.querySelector(".standard-form, .window-content form > div, form");
-    if (!scrollBody) return;
-
-    const cfg = level.flags?.[MODULE_ID] || {};
-    const hasExplicitEnabled = cfg.enabled !== undefined;
-    const sceneEnabled = Boolean(level.parent?.flags?.[MODULE_ID]?.enabled);
-    const enabled = hasExplicitEnabled ? Boolean(cfg.enabled) : sceneEnabled;
-    const manifestUrl = cfg.manifestUrl || "";
-    const pyramidBaseUrl = cfg.pyramidBaseUrl || "";
-
-    const fieldset = document.createElement("fieldset");
-    fieldset.className = "boundless-fieldset boundless-level-fieldset";
-    fieldset.innerHTML = `
-      <legend>${escapeHtml(loc("BOUNDLESS.Config.LevelHeading"))}</legend>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Config.LevelEnabled"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" data-bl-level-enabled ${hasExplicitEnabled ? `name="flags.${MODULE_ID}.enabled"` : ""} ${enabled ? "checked" : ""}>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.LevelEnabledHint"))}</p>
-      </div>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Config.ManifestUrl"))}</label>
-        <div class="form-fields">
-          <input type="text" name="flags.${MODULE_ID}.manifestUrl" value="${escapeHtml(manifestUrl)}" placeholder="">
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Config.PyramidBaseUrl"))}</label>
-        <div class="form-fields">
-          <input type="text" name="flags.${MODULE_ID}.pyramidBaseUrl" value="${escapeHtml(pyramidBaseUrl)}" placeholder="">
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Config.PyramidBaseUrlHint"))}</p>
-      </div>
-
-      <div class="boundless-actions">
-        <button type="button" class="boundless-primary-btn" data-bl-action="bakeThisLevelPyramid">
-          <i class="fa-solid fa-wand-magic-sparkles"></i> ${escapeHtml(loc("BOUNDLESS.Baker.BakeLevelButton"))}
-        </button>
-        <button type="button" data-bl-action="bakeThisLevel">
-          <i class="fa-solid fa-layer-group"></i> ${escapeHtml(loc("BOUNDLESS.Config.BakeThisLevel"))}
-        </button>
-      </div>
-    `;
-
-    // Only submit `flags.boundless.enabled` if already explicitly set OR the GM intentionally toggles it;
-    // saving LevelConfig on a non-Boundless scene will never accidentally persist `enabled: false`!
-    const enabledInput = fieldset.querySelector("input[data-bl-level-enabled]");
-    if (enabledInput && !hasExplicitEnabled) {
-      enabledInput.addEventListener("change", () => {
-        enabledInput.setAttribute("name", `flags.${MODULE_ID}.enabled`);
-      }, { once: true });
-    }
-
-    scrollBody.appendChild(fieldset);
-
-    fieldset.addEventListener("click", async (ev) => {
-      const btn = ev.target.closest("button[data-bl-action]");
-      if (!btn) return;
-      ev.preventDefault();
-      if (btn.dataset.blAction === "bakeThisLevelPyramid") {
-        await openBakePyramidDialog(controller, level.parent || canvas.scene, { singleLevelId: level.id });
-      } else if (btn.dataset.blAction === "bakeThisLevel") {
-        await promptBakeLevel(controller, level);
-      }
-    });
-  });
+  // Foundry v14 AppV2 scene sidebar directory & top scene navigation context menus
+  Hooks.on("getSceneDirectoryContextOptions", addSceneOptimizeOption);
+  Hooks.on("getSceneNavigationContextOptions", addSceneOptimizeOption);
+  Hooks.on("getSceneContextOptions", addSceneOptimizeOption);
 }

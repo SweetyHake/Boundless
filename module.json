@@ -2,7 +2,7 @@
   "id": "boundless",
   "title": "Boundless",
   "description": "Seamless streaming engine for giant multi-level worlds (500×500 to 6000×6000+ cells) in Foundry VTT v14: Quadtree pyramid with Web Worker decoding, shadowed GPU light batching, chunked fog of war, POI fast-travel, native layer streaming, and client-side Lazy TokenLayer.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "compatibility": {
     "minimum": "14",
     "verified": "14"

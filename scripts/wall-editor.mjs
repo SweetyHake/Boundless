@@ -1,35 +1,17 @@
-const MODULE_ID = "boundless";
+import {
+  MODULE_ID,
+  getEffectiveScale,
+  getExistingSheet,
+  isSheetActiveOrRendering,
+  makeVirtualWallId,
+  attachVirtualCollectionProxy
+} from "./utils.mjs";
+
 const NATIVE_WALLS_MIN_SCALE = 0.22; // Stream all native Wall placeables when WallsLayer is active
-const NATIVE_DOORS_MIN_SCALE = 0.28; // Stream native door Walls (DoorControl + DoorMesh) during gameplay
+const NATIVE_DOORS_MIN_SCALE = 0.05; // Keep native door Walls (DoorMesh + DoorControl) mounted across map overview
+const DOOR_CONTROL_MIN_SCALE = 0.12; // Hide tiny DoorControl icons only at far orbital zoom while DoorMesh stays visible
 const MAX_NATIVE_WALLS_IN_VIEW = 420;
-
-function getExistingSheet(doc) {
-  if (!doc) return null;
-  if ("_sheet" in doc) return doc._sheet;
-  return doc.sheet ?? null;
-}
-
-function isSheetActiveOrRendering(sheet, placeable = null) {
-  if (!sheet) return false;
-  if (sheet.rendered || sheet._preview || placeable?._preview?.previewType === "config") return true;
-  const renderingState = foundry?.applications?.api?.ApplicationV2?.RENDER_STATES?.RENDERING ?? 1;
-  return typeof sheet.state === "number" && sheet.state >= renderingState;
-}
-
-function makeVirtualWallId(levelId, wKey) {
-  // Deterministic 16-char alphanumeric ID passing Foundry's strict document ID validation
-  const input = `${levelId}|${wKey}`;
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 0x01000193);
-    h2 = Math.imul(h2 ^ (ch + i), 0x85ebca6b);
-  }
-  const p1 = (h1 >>> 0).toString(36).padStart(7, "0").slice(0, 7);
-  const p2 = (h2 >>> 0).toString(36).padStart(7, "0").slice(0, 7);
-  return `mm${p1}${p2}`;
-}
+const MAX_NATIVE_DOORS_IN_VIEW = 220;
 
 function getMacroWallColor(seg) {
   if (seg.door) {
@@ -222,10 +204,11 @@ export class VirtualWallEditor {
   }
 
   refreshDoorVisibility() {
+    const showCtrl = this._showDoorControls !== false;
     for (const entry of this.mountedByDoorKey.values()) {
       const dc = entry.wall?.doorControl;
       if (dc && !dc.destroyed) {
-        dc.visible = dc.isVisible;
+        dc.visible = showCtrl && dc.isVisible;
       }
     }
   }
@@ -459,18 +442,7 @@ export class VirtualWallEditor {
 
     // Foundry v14 DocumentSheetV2#_processSubmitData checks `document.collection.has(document.id)` before calling `document.update()`;
     // expose a lightweight proxy over `scene.walls` so WallConfig saves via `doc.update()` instead of throwing!
-    const realColl = canvas.scene.walls;
-    if (realColl) {
-      const collProxy = new Proxy(realColl, {
-        get(target, prop) {
-          if (prop === "has") return (k) => k === id || target.has(k);
-          if (prop === "get") return (k, opts) => (k === id ? doc : target.get(k, opts));
-          const val = Reflect.get(target, prop, target);
-          return typeof val === "function" ? val.bind(target) : val;
-        }
-      });
-      Object.defineProperty(doc, "collection", { get: () => collProxy, configurable: true });
-    }
+    attachVirtualCollectionProxy(doc, id, canvas.scene.walls);
 
     // Route direct DoorControl `doc.update({ ds })`, WallConfig `doc.update(...)`, and `doc.delete()`
     doc.update = async (data = {}, options = {}) => {
@@ -508,6 +480,19 @@ export class VirtualWallEditor {
           await origCreateDoorMeshes();
           if (this.destroyed || !canvas?.primary) {
             try { this.destroyDoorMeshes?.(); } catch {}
+            return;
+          }
+          const lvl = canvas.scene?.levels?.get?.(seg.levelId);
+          const lvlElev = Number.isFinite(lvl?.elevation?.bottom) ? lvl.elevation.bottom : 0;
+          if (lvlElev !== 0 && this.doorMeshes?.size) {
+            for (const m of this.doorMeshes) {
+              if (m.elevation < lvlElev) {
+                m.elevation = lvlElev;
+                if (m._closedPosition) m._closedPosition.elevation = lvlElev;
+                if (m._animatedPosition) m._animatedPosition.elevation = lvlElev;
+              }
+            }
+            canvas.primary.sortDirty = true;
           }
         }).catch(() => {});
         return doorMeshChain;
@@ -552,7 +537,7 @@ export class VirtualWallEditor {
     // When WallsLayer is inactive, hide wall edit lines (DoorControl & DoorMesh live on their own layers!)
     if (!this.active) wall.visible = false;
     if (wall.doorControl && !wall.doorControl.destroyed) {
-      wall.doorControl.visible = wall.doorControl.isVisible;
+      wall.doorControl.visible = (this._showDoorControls !== false) && wall.doorControl.isVisible;
     }
     wall._updateQuadtree?.();
   }
@@ -634,8 +619,9 @@ export class VirtualWallEditor {
 
     const isWallsEditMode = this.active && Boolean(game.user?.isGM);
     const minScale = isWallsEditMode ? NATIVE_WALLS_MIN_SCALE : NATIVE_DOORS_MIN_SCALE;
-    const effScale = curVp.scale * ((canvas.grid?.size || canvas.dimensions?.size || 100) / 100);
+    const effScale = getEffectiveScale(curVp.scale);
     const inNativeZoom = effScale >= minScale;
+    const showDoorControls = isWallsEditMode || effScale >= DOOR_CONTROL_MIN_SCALE;
 
     const qStep = 200;
     const qx0 = Math.floor(curVp.x0 / qStep);
@@ -644,11 +630,14 @@ export class VirtualWallEditor {
     const qy1 = Math.floor(curVp.y1 / qStep);
 
     const rev = this.controller.wallEditsRev || 0;
-    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:r${rev}`;
+    const prevShowDoorControls = this._showDoorControls;
+    this._showDoorControls = showDoorControls;
+    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
     if (key === this._lastKey) return;
     this._lastKey = key;
+    if (prevShowDoorControls !== showDoorControls) this.refreshDoorVisibility();
 
-    // Gameplay mode zoomed out (< 0.28): unmount all doors for 0 overhead on macro map
+    // Gameplay mode at extreme orbital zoom (< 0.05): unmount doors for 0 overhead on continental maps
     if (!isWallsEditMode && !inNativeZoom) {
       this._clearMountedWalls();
       if (this.macroGfx) { this.macroGfx.clear(); this.macroGfx.visible = false; }
@@ -656,6 +645,13 @@ export class VirtualWallEditor {
     }
 
     const segments = this._collectViewportSegments(curVp, { doorsOnly: !isWallsEditMode });
+
+    // On massive continental maps with > 220 doors in viewport at far zoom, avoid mounting hundreds of native Wall objects
+    if (!isWallsEditMode && segments.length > MAX_NATIVE_DOORS_IN_VIEW) {
+      this._clearMountedWalls();
+      if (this.macroGfx) { this.macroGfx.clear(); this.macroGfx.visible = false; }
+      return;
+    }
 
     // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview
     if (isWallsEditMode && (!inNativeZoom || segments.length > MAX_NATIVE_WALLS_IN_VIEW)) {
