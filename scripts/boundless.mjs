@@ -2758,14 +2758,14 @@ class MegaWorld1000 {
     return this.isCameraFlying || (this._lastPanMs > 0 && (performance.now() - this._lastPanMs) < 160);
   }
 
-  _getCameraStorageKey(scene = canvas.scene, levelId = canvas.level?.id) {
+  _getCameraStorageKey(scene = canvas.scene) {
     if (!scene?.id) return null;
     const worldId = game.world?.id || "world";
-    return `${CAMERA_STORAGE_PREFIX}.${worldId}.${scene.id}.${levelId || "default"}`;
+    return `${CAMERA_STORAGE_PREFIX}.${worldId}.${scene.id}`;
   }
 
-  _saveCameraNow() {
-    if (!this.active || this._restoringCamera || !canvas?.ready || !canvas.stage?.pivot) return;
+  _saveCameraNow(force = false) {
+    if (!this.active || this._restoringCamera || (!force && !canvas?.ready) || !canvas?.stage?.pivot || !canvas.stage.scale) return;
     const key = this._getCameraStorageKey();
     if (!key) return;
     const x = canvas.stage.pivot.x;
@@ -2883,10 +2883,18 @@ class MegaWorld1000 {
   }
 
   _restoreCamera(scene) {
-    const key = this._getCameraStorageKey(scene, canvas.level?.id);
+    const key = this._getCameraStorageKey(scene);
     if (!key) return false;
     try {
-      const raw = localStorage.getItem(key);
+      let raw = localStorage.getItem(key);
+      if (!raw && canvas.level?.id) {
+        const legacyKey = `${key}.${canvas.level.id}`;
+        raw = localStorage.getItem(legacyKey);
+        if (raw) {
+          localStorage.setItem(key, raw);
+          localStorage.removeItem(legacyKey);
+        }
+      }
       if (!raw) return false;
       const saved = JSON.parse(raw);
       if (!Number.isFinite(saved?.x) || !Number.isFinite(saved?.y) || !Number.isFinite(saved?.scale) || saved.scale <= 0) {
@@ -7886,7 +7894,7 @@ class MegaWorld1000 {
   unmount() {
     const wasActive = this.active;
     if (wasActive) {
-      this._saveCameraNow();
+      this._saveCameraNow(true);
       this._emit("unmount", {});
       Hooks.callAll("boundlessUnmount", this);
     }
