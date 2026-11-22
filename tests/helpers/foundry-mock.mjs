@@ -62,7 +62,7 @@ export function installFoundryMocks() {
     world: { id: "test-world" },
     modules: new Map(),
     settings: { register() {}, get() { return false; } },
-    i18n: { localize: (k) => k, has: () => false }
+    i18n: { localize: (k) => k, format: (k) => k, has: () => false }
   };
 
   class MockBaseTexture {

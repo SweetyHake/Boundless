@@ -1561,12 +1561,14 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   const scenePatch = {};
   const processedByLevelManifest = new Set();
 
-  // 1. Handle per-level manifests and inline manifests first
+  // 1. Handle per-level manifests and inline manifests first (including Kartograf exports where
+  //    `level.flags.boundless.manifestUrl` inherits `scene.flags.boundless.enabled` without per-level `enabled: true`)
   for (let i = 0; i < allLevels.length; i++) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const lvl = allLevels[i];
     const lcfg = lvl.flags?.[MODULE_ID];
-    if (!lcfg?.enabled) continue;
+    const levelActive = (lcfg?.enabled === true) || (Boolean(cfg.enabled) && lcfg?.enabled !== false);
+    if (!levelActive || !lcfg) continue;
     const lid = lvl.id;
     const baseElev = getLevelBaseElevation(lvl);
 
@@ -1631,14 +1633,18 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     }
   }
 
-  // 2. Handle scene-level manifestUrl
-  if (cfg.enabled && sceneManifestUrl) {
+  // 2. Handle scene-level manifestUrl for any remaining active levels not already handled per-level
+  const hasRemainingSceneLevels = allLevels.some(lvl =>
+    !processedByLevelManifest.has(lvl.id) && lvl.flags?.[MODULE_ID]?.enabled !== false
+  );
+  if (cfg.enabled && sceneManifestUrl && hasRemainingSceneLevels) {
     report(55, game.i18n.localize("BOUNDLESS.Baker.StepManifest"));
     const rawManifest = await fetchManifestJson(sceneManifestUrl, signal);
     if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
       throw new Error("Chunked and superGrid manifests cannot be edited in place.");
     }
-    let updatedManifest;
+    let updatedManifest = rawManifest;
+    let sceneManifestTouched = false;
     if (rawManifest.levels && typeof rawManifest.levels === "object") {
       const nextLevels = { ...rawManifest.levels };
       for (const lvl of allLevels) {
@@ -1663,6 +1669,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         totalSounds += merged.counts.sounds;
         totalTiles += merged.counts.tiles;
         editedLevelIds.push(lid);
+        sceneManifestTouched = true;
       }
       updatedManifest = { ...rawManifest, levels: nextLevels };
     } else {
@@ -1686,20 +1693,21 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         totalSounds += merged.counts.sounds;
         totalTiles += merged.counts.tiles;
         editedLevelIds.push(lid);
-      } else {
-        updatedManifest = rawManifest;
+        sceneManifestTouched = true;
       }
     }
 
-    const { dir, filename, redirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
-    await ensureDirectoryRecursive(dir);
-    const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
-    await uploadFileSilent(dir, file);
-    const finalUrl = `${dir}/${filename}`;
-    controller.manifestCache?.delete?.(sceneManifestUrl);
-    controller.manifestCache?.delete?.(finalUrl);
-    if (redirected) {
-      scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+    if (sceneManifestTouched) {
+      const { dir, filename, redirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
+      await ensureDirectoryRecursive(dir);
+      const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
+      await uploadFileSilent(dir, file);
+      const finalUrl = `${dir}/${filename}`;
+      controller.manifestCache?.delete?.(sceneManifestUrl);
+      controller.manifestCache?.delete?.(finalUrl);
+      if (redirected) {
+        scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+      }
     }
   }
 
@@ -1781,13 +1789,15 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const lvl = srcLevels[i];
     const lcfg = lvl.flags?.[MODULE_ID];
+    const levelActive = (lcfg?.enabled === true) || (Boolean(cfg.enabled) && lcfg?.enabled !== false);
+    if (!levelActive) continue;
     let spec = null;
-    if (lcfg?.enabled && lcfg.inlineManifest) {
+    if (lcfg?.inlineManifest) {
       spec = lcfg.inlineManifest;
-    } else if (lcfg?.enabled && lcfg.manifestUrl) {
+    } else if (lcfg?.manifestUrl) {
       const lm = await fetchManifestJson(lcfg.manifestUrl, signal);
       spec = lm.levels?.[lvl.id] || lm;
-    } else if (cfg.enabled && sceneManifest && lcfg?.enabled !== false) {
+    } else if (cfg.enabled && sceneManifest) {
       if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
         spec = sceneManifest.levels[lvl.id] || null;
       } else if ((!sceneLevelId && i === 0) || sceneLevelId === lvl.id) {

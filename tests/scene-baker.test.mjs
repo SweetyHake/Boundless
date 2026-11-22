@@ -7,6 +7,7 @@ installFoundryMocks();
 const {
   mergeEditsIntoLevelSpec,
   extractNativeDocsFromLevelSpec,
+  bakeSceneEditsToManifest,
   virtualWallToDocData,
   virtualLightToDocData,
   virtualSoundToDocData,
@@ -157,4 +158,92 @@ test("extractNativeDocsFromLevelSpec restores Foundry v14 document schemas accur
   assert.equal(extracted.tiles[0].y, 300);
   assert.equal(extracted.tiles[0].texture.anchorX, 0.5);
   assert.equal(extracted.tiles[0].restrictions.light, true);
+});
+
+test("bakeSceneEditsToManifest handles per-level manifestUrl inheriting scene.flags.boundless.enabled (Kartograf layout)", async () => {
+  const prevFetch = globalThis.fetch;
+  const prevFP = globalThis.FilePicker;
+  const prevUser = globalThis.game.user;
+  const uploaded = new Map();
+  const manifests = {
+    "maps/estate/m0.json": {
+      worldPx: 4000,
+      simGrid: 2,
+      simSectorPx: 2000,
+      tiles: [],
+      sectors: { "0_0": { w: [], d: [], l: [[100, 100, 20, 10, "#ffaa00", 0.5, ""]], s: [], t: [], o: [] } }
+    },
+    "maps/estate/m1.json": {
+      worldPx: 4000,
+      simGrid: 2,
+      simSectorPx: 2000,
+      tiles: [],
+      sectors: { "0_0": { w: [], d: [], l: [[500, 500, 30, 15, "#ffc870", 0.4, "torch"]], s: [], t: [], o: [] } }
+    }
+  };
+
+  try {
+    globalThis.game.user = { isGM: true };
+    globalThis.fetch = async (url) => {
+      const clean = String(url).split("?")[0];
+      const data = manifests[clean];
+      if (!data) return { ok: false, status: 404 };
+      return { ok: true, json: async () => structuredClone(data) };
+    };
+    globalThis.FilePicker = {
+      createDirectory: async () => {},
+      browse: async () => {},
+      upload: async (_src, dir, file) => {
+        const text = await file.text();
+        const path = `${dir}/${file.name}`;
+        uploaded.set(path, JSON.parse(text));
+        return { path };
+      }
+    };
+    globalThis.foundry.applications = { apps: { FilePicker: globalThis.FilePicker } };
+
+    let scenePatch = null;
+    const levels = [
+      { id: "lvl0", name: "Basement", elevation: { bottom: 0, top: 9, base: 0 }, flags: { boundless: { manifestUrl: "maps/estate/m0.json?v=1" } } },
+      { id: "lvl1", name: "Floor 1", elevation: { bottom: 10, top: 19, base: 10 }, flags: { boundless: { manifestUrl: "maps/estate/m1.json?v=1" } } }
+    ];
+    const scene = {
+      id: "scEstate",
+      name: "Estate",
+      levels,
+      flags: {
+        boundless: {
+          enabled: true,
+          manifestUrl: "maps/estate/m0.json?v=1",
+          lightEdits: {
+            lvl1: {
+              "0_0:l:0": { x: 600, y: 600, dim: 45, bright: 20, color: "#00ffff", alpha: 0.7, anim: "pulse", elevation: 16 }
+            }
+          }
+        }
+      },
+      async update(patch) { scenePatch = patch; },
+      async deleteEmbeddedDocuments() {}
+    };
+    const controller = {
+      manifestCache: new Map([["maps/estate/m0.json?v=1", {}], ["maps/estate/m1.json?v=1", {}]]),
+      lightBatch: { clearPolyCacheDB: async () => {} },
+      collectLevelSpatialData: () => ({ sectors: {}, tiles: [], tileIdsToDelete: [], wallIdsToDelete: [], lightIdsToDelete: [], soundIdsToDelete: [] }),
+      mount: async () => {}
+    };
+
+    const res = await bakeSceneEditsToManifest(controller, scene, { absorbNative: false });
+    assert.equal(res.levelsBaked, 2);
+    assert.ok(uploaded.has("maps/estate/m0.json"));
+    assert.ok(uploaded.has("maps/estate/m1.json"));
+    // Floor 1 edit was actually merged into m1.json and cleared from scene flags
+    assert.equal(uploaded.get("maps/estate/m1.json").sectors["0_0"].l[0][0], 600);
+    assert.equal(uploaded.get("maps/estate/m1.json").sectors["0_0"].l[0][6], "pulse");
+    assert.equal(scenePatch["flags.boundless.lightEdits.-=lvl1"], null);
+    assert.equal(controller.manifestCache.size, 0);
+  } finally {
+    globalThis.fetch = prevFetch;
+    globalThis.FilePicker = prevFP;
+    globalThis.game.user = prevUser;
+  }
 });
