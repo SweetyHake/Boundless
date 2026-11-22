@@ -7,6 +7,17 @@
     "minimum": "14",
     "verified": "14"
   },
+  "relationships": {
+    "recommends": [
+      {
+        "id": "fvtt-perf-optim",
+        "type": "module",
+        "manifest": "https://github.com/Codas/foundryvtt-performance-hacks/releases/latest/download/module.json",
+        "reason": "Boosts canvas FPS with token UI batching, HUD/effect caching, lighting render scaling, and precomputed light noise shaders.",
+        "compatibility": {}
+      }
+    ]
+  },
   "socket": true,
   "authors": [
     {
