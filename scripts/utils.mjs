@@ -136,3 +136,47 @@ export function getVirtualTileBounds(tSpec) {
   const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax, 1 - ax, ay, 1 - ay);
   return { pivX, pivY, halfDiag };
 }
+
+/** Convert Foundry v14 wall threshold (in scene distance units) into pixel-scaled Edge threshold (including darkness). */
+export function buildEdgeThresholdPx(threshold, pxPerFt) {
+  if (!threshold || typeof threshold !== "object") return undefined;
+  const light = Number.isFinite(Number(threshold.light)) ? Number(threshold.light) * pxPerFt : null;
+  const sight = Number.isFinite(Number(threshold.sight)) ? Number(threshold.sight) * pxPerFt : null;
+  const sound = Number.isFinite(Number(threshold.sound)) ? Number(threshold.sound) * pxPerFt : null;
+  if (light === null && sight === null && sound === null) return undefined;
+  return {
+    light,
+    darkness: light,
+    sight,
+    sound,
+    attenuation: Boolean(threshold.attenuation)
+  };
+}
+
+export function hasSpecOverlays(overlays) {
+  if (!overlays) return false;
+  if (Array.isArray(overlays)) return overlays.length > 0;
+  for (const k in overlays) {
+    if (Object.prototype.hasOwnProperty.call(overlays, k)) return true;
+  }
+  return false;
+}
+
+export function isPointUnderRoofSpec(px, py, ov) {
+  if (!ov?.roof || ov.walls?.includes("anchor_")) return false;
+  const dx = px - ov.cx;
+  const dy = py - ov.cy;
+  const rot = ((ov.rot || 0) % 360 + 360) % 360;
+  if (rot === 0 || rot === 180) {
+    return Math.abs(dx) <= ov.w * 0.5 && Math.abs(dy) <= ov.h * 0.5;
+  }
+  if (rot === 90 || rot === 270) {
+    return Math.abs(dx) <= ov.h * 0.5 && Math.abs(dy) <= ov.w * 0.5;
+  }
+  const rad = -rot * (Math.PI / 180);
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  const lx = dx * c - dy * s;
+  const ly = dx * s + dy * c;
+  return Math.abs(lx) <= ov.w * 0.5 && Math.abs(ly) <= ov.h * 0.5;
+}
