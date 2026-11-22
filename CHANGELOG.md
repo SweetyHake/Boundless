@@ -1,5 +1,9 @@
 # Журнал изменений
 
+## 1.1.3
+- Добавлена полная поддержка расширенных параметров света `{speed, intensity, coloration, attenuation, luminosity}` из 9-го поля записи для живых `PointLightSource`, запечённого батча `MegaLightBatch` (атрибут `aStyle` с формулой `computedAttenuation` из Foundry v14), редактора света и сборщика сцен.
+- Добавлены события шины `dynamicLightMount` и `dynamicLightRetire` (отправляется до `destroy()`).
+
 ## 1.1.2
 - Добавлена поддержка второй `foreground`-пирамиды на уровень (`foregroundPyramidBaseUrl`, `foregroundMaxZoomZ`, `foregroundElevation`, разреженный индекс `foregroundTiles` и кэш отсутствующих тайлов в воркере) для отображения стен поверх токенов и под крышами, а также автоматическая нарезка `level.foreground.src` в `scene-baker.mjs`.
 - Исправлена засветка огнями нижних этажей (подвала) при максимальном отдалении (`z=0`) на многоуровневых сценах за счёт записи глубины базового тайла в `CanvasDepthMask`.
