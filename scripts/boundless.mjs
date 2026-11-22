@@ -9,7 +9,7 @@ import { ChunkStreamer } from "./chunk-streamer.mjs";
 import { LRUTextureManager } from "./texture-manager.mjs";
 import { MegaLightBatch, LIGHT_PAD_WORLD_PX, extractLightStyle } from "./light-batch.mjs";
 import { registerConfigUI } from "./config-ui.mjs";
-import { bakeSceneToBoundless } from "./scene-baker.mjs";
+import { bakeSceneToBoundless, bakeSceneEditsToManifest, unbakeSceneFromBoundless } from "./scene-baker.mjs";
 import {
   MODULE_ID,
   getShowstopperMovementApi,
@@ -22,7 +22,8 @@ import {
   getVirtualTileBounds,
   buildEdgeThresholdPx,
   hasSpecOverlays,
-  isPointUnderRoofSpec
+  isPointUnderRoofSpec,
+  computePredictiveViewportRect
 } from "./utils.mjs";
 
 const SOCKET_NAME = `module.${MODULE_ID}`;
@@ -352,12 +353,74 @@ class MegaWorld1000 {
   _zoomSyncQueued = false;
   isCameraFlying = false;
   _lastPanMs = 0;
+  _camPrevX = null;
+  _camPrevY = null;
+  _camPrevMs = 0;
+  _camVelX = 0;
+  _camVelY = 0;
+  _webglContextLostFn = null;
+  _webglContextLostView = null;
   _pruneNeeded = false;
   _lastOccRefreshMs = 0;
   _showstopperDirty = false;
   _lastShowstopperMs = 0;
   _vtIdleCleanupNeeded = false;
   _prewarmGen = 0;
+
+  applyVramProfile(profile = null) {
+    let chosen = profile;
+    if (chosen === null || chosen === undefined) {
+      try {
+        chosen = game.settings?.get?.(MODULE_ID, "vramProfile") ?? "auto";
+      } catch {
+        chosen = "auto";
+      }
+    }
+    const resolved = this.texMgr.setVramProfile(chosen);
+    if (this.active && this.texMgr.needsPrune()) {
+      this._pruneNeeded = true;
+    }
+    return resolved;
+  }
+
+  _updateCameraVelocity(now = performance.now()) {
+    const pivot = canvas?.stage?.pivot;
+    const scale = canvas?.stage?.scale?.x || 1;
+    if (!pivot) return;
+    if (this._camPrevMs > 0 && this._camPrevX !== null && this._camPrevY !== null) {
+      const dtMs = now - this._camPrevMs;
+      if (dtMs > 4 && dtMs < 250) {
+        const dx = pivot.x - this._camPrevX;
+        const dy = pivot.y - this._camPrevY;
+        const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
+        const maxJump = Math.max(sw, sh) / scale * 2.5;
+        if (Math.hypot(dx, dy) > maxJump) {
+          this._camVelX = 0;
+          this._camVelY = 0;
+        } else {
+          const dtSec = dtMs / 1000;
+          const vx = dx / dtSec;
+          const vy = dy / dtSec;
+          const alpha = Math.min(1, dtSec * 14);
+          this._camVelX = this._camVelX * (1 - alpha) + vx * alpha;
+          this._camVelY = this._camVelY * (1 - alpha) + vy * alpha;
+        }
+      } else if (dtMs >= 250) {
+        this._camVelX = 0;
+        this._camVelY = 0;
+      }
+    }
+    this._camPrevX = pivot.x;
+    this._camPrevY = pivot.y;
+    this._camPrevMs = now;
+  }
+
+  _getCameraVelocity(now = performance.now()) {
+    if (!this._camPrevMs || (now - this._camPrevMs) > 220) {
+      return { velX: 0, velY: 0 };
+    }
+    return { velX: this._camVelX, velY: this._camVelY };
+  }
 
   isActivelyMoving() {
     return this.isCameraFlying || (this._lastPanMs > 0 && (performance.now() - this._lastPanMs) < 160);
@@ -1067,6 +1130,16 @@ class MegaWorld1000 {
     // Persist camera on F5 / tab close and restore last saved view immediately before tile streaming starts
     this._beforeUnloadFn = () => this._saveCameraNow();
     window.addEventListener("beforeunload", this._beforeUnloadFn);
+    this.applyVramProfile();
+    const glView = canvas.app?.view;
+    if (glView && typeof glView.addEventListener === "function") {
+      this._webglContextLostView = glView;
+      this._webglContextLostFn = () => {
+        console.warn(`${MODULE_ID} | WebGL context lost; releasing non-pinned texture cache.`);
+        this.texMgr.clear(false);
+      };
+      glView.addEventListener("webglcontextlost", this._webglContextLostFn, false);
+    }
     this._restoreCamera(scene);
     this.syncZoomLimits({ animate: false });
 
@@ -1110,6 +1183,14 @@ class MegaWorld1000 {
     this.chunkStreamer.mount(layers);
 
     // Build unified GPU light batch across all visible Boundless levels (monolithic or chunked macroLights)
+    const worldId = game.world?.id || "world";
+    const visibleLevelIds = layers.map(l => l.level.id);
+    await this.lightBatch.hydratePolyCacheFromDB(worldId, scene.id, visibleLevelIds);
+    if (this._mountGen !== mountGen || !this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+      if (this._mountGen === mountGen) this.unmount();
+      return;
+    }
+
     const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
     const hasAnyOverlays = layers.some(l => l.spec?.overlays && (Array.isArray(l.spec.overlays) ? l.spec.overlays.length > 0 : Object.keys(l.spec.overlays).length > 0));
     // Keep indoor lights suppressed briefly until pixel-accurate bakedRoofMask finishes (or roofs mount in depthMask)
@@ -1122,6 +1203,9 @@ class MegaWorld1000 {
       (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
       this._getLightBatchBuildOpts()
     );
+    if (this.lightBatch.lastPolyCacheMisses > 0) {
+      this.lightBatch.persistPolyCacheToDB(worldId, scene.id, visibleLevelIds).catch(() => {});
+    }
     this.lightBatch.attachTo(canvas.effects);
 
     // Asynchronously bake 2048x2048 pixel-accurate roof alpha mask so macro lighting (localZ < 5) matches depthMask 1:1
@@ -1749,30 +1833,25 @@ class MegaWorld1000 {
     return true;
   }
 
-  getViewportWorldRect(padFraction = 0.25, worldPx = null) {
+  getViewportWorldRect(padFraction = 0.25, worldPx = null, { predictive = false } = {}) {
     const scale = canvas.stage.scale.x || 1;
     const pivot = canvas.stage.pivot;
     const [sw, sh] = canvas.screenDimensions;
-    const wWorld = sw / scale;
-    const hWorld = sh / scale;
-    const padX = wWorld * padFraction;
-    const padY = hWorld * padFraction;
     const maxW = worldPx || canvas.dimensions?.width || 100000;
     const maxH = worldPx || canvas.dimensions?.height || 100000;
-    return {
-      scale,
-      x0: Math.max(0, pivot.x - wWorld * 0.5 - padX),
-      y0: Math.max(0, pivot.y - hWorld * 0.5 - padY),
-      x1: Math.min(maxW, pivot.x + wWorld * 0.5 + padX),
-      y1: Math.min(maxH, pivot.y + hWorld * 0.5 + padY)
-    };
+    const vel = predictive ? this._getCameraVelocity() : { velX: 0, velY: 0 };
+    return computePredictiveViewportRect(pivot.x, pivot.y, sw, sh, scale, maxW, maxH, {
+      padFraction,
+      velX: vel.velX,
+      velY: vel.velY
+    });
   }
 
   updatePyramid() {
     if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready || this._inUpdatePyramid) return;
     this._inUpdatePyramid = true;
     try {
-    const vp = this.getViewportWorldRect(0.28);
+    const vp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
 
     // Update GPU light frustum culling, spatial chunk streaming, POI pin scale, chunked fog culling, spatial audio, and native streamed walls/doors
     this.chunkStreamer.update(vp);
@@ -4478,6 +4557,11 @@ class MegaWorld1000 {
         (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
         this._getLightBatchBuildOpts()
       );
+      if (this.lightBatch.lastPolyCacheMisses > 0 && canvas.scene?.id) {
+        const worldId = game.world?.id || "world";
+        const visibleLevelIds = this.visibleLevelLayers.map(l => l.level.id);
+        this.lightBatch.persistPolyCacheToDB(worldId, canvas.scene.id, visibleLevelIds).catch(() => {});
+      }
       // Re-queue GPU light baking for all resident chunks on chunked worlds so edits never wipe chunk lights
       this.chunkStreamer.requeueAllLoadedChunks();
       this._syncIndoorLightVisibility();
@@ -4913,6 +4997,18 @@ class MegaWorld1000 {
    */
   bakeSceneToPyramid(scene = canvas.scene, options = {}) {
     return bakeSceneToBoundless(this, scene, options);
+  }
+
+  bakeEditsToManifest(scene = canvas.scene, options = {}) {
+    return bakeSceneEditsToManifest(this, scene, options);
+  }
+
+  unbakeScene(scene = canvas.scene, options = {}) {
+    return unbakeSceneFromBoundless(this, scene, options);
+  }
+
+  clearLightPolyCacheDB(sceneId = null) {
+    return this.lightBatch.clearPolyCacheDB(sceneId);
   }
 
   /**
@@ -5550,10 +5646,20 @@ class MegaWorld1000 {
       window.removeEventListener("beforeunload", this._beforeUnloadFn);
       this._beforeUnloadFn = null;
     }
+    if (this._webglContextLostFn && this._webglContextLostView) {
+      this._webglContextLostView.removeEventListener("webglcontextlost", this._webglContextLostFn, false);
+    }
+    this._webglContextLostFn = null;
+    this._webglContextLostView = null;
     this._restoringCamera = false;
     this._zoomSyncQueued = false;
     this.isCameraFlying = false;
     this._lastPanMs = 0;
+    this._camPrevX = null;
+    this._camPrevY = null;
+    this._camPrevMs = 0;
+    this._camVelX = 0;
+    this._camVelY = 0;
     this._pruneNeeded = false;
     this._lastOccRefreshMs = 0;
     this._showstopperDirty = false;
@@ -5731,6 +5837,25 @@ registerWallEditorControls(controller);
 registerLayerEditorControls(controller);
 
 Hooks.once("init", () => {
+  if (game.settings?.register) {
+    game.settings.register(MODULE_ID, "vramProfile", {
+      name: "BOUNDLESS.Settings.VramProfile",
+      hint: "BOUNDLESS.Settings.VramProfileHint",
+      scope: "client",
+      config: true,
+      type: String,
+      choices: {
+        auto: "BOUNDLESS.Settings.VramAuto",
+        low: "BOUNDLESS.Settings.VramLow",
+        balanced: "BOUNDLESS.Settings.VramBalanced",
+        high: "BOUNDLESS.Settings.VramHigh",
+        ultra: "BOUNDLESS.Settings.VramUltra"
+      },
+      default: "auto",
+      onChange: (value) => controller.applyVramProfile(value)
+    });
+  }
+  controller.applyVramProfile();
   installLazyTokenLayerPatch();
   installHoverFadeHitTestPatch();
   installCharacterSwitchPatch(controller);
@@ -5763,7 +5888,9 @@ Hooks.on("updateLevel", (level, changes) => {
 
 Hooks.on("canvasPan", () => {
   if (!controller.active || controller._restoringCamera || controller._mounting) return;
-  controller._lastPanMs = performance.now();
+  const now = performance.now();
+  controller._lastPanMs = now;
+  controller._updateCameraVelocity(now);
   controller.scheduleCameraSave();
   controller.updatePyramid();
 });

@@ -1,7 +1,10 @@
-import { MODULE_ID } from "./utils.mjs";
+import { MODULE_ID, getLevelBaseElevation } from "./utils.mjs";
+import { extractLightStyle } from "./light-batch.mjs";
 
 const TILE_PX = 1024;
 const UPLOAD_CONCURRENCY = 4;
+const DOC_CREATE_BATCH_SIZE = 250;
+const UNBAKE_MAX_IMAGE_PX = 8192;
 const VIDEO_EXT_RE = /\.(webm|mp4|m4v|ogv)(\?|$)/i;
 
 function getFilePickerImpl() {
@@ -750,5 +753,1211 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       job.loadedImg?.close?.();
       job.loadedFgImg?.close?.();
     }
+  }
+}
+
+// ============================================================================
+// Pure helpers for Bake Edits & Unbake (fully unit-testable without Foundry)
+// ============================================================================
+
+function toPlainEditRecord(edits) {
+  if (!edits) return null;
+  if (edits instanceof Map) {
+    const out = {};
+    for (const [k, v] of edits) out[k] = v;
+    return out;
+  }
+  return typeof edits === "object" ? edits : null;
+}
+
+function resolveOccModesArray(modeSpec) {
+  const occConst = globalThis.CONST?.OCCLUSION_MODES || {};
+  const valid = new Set(Object.values(occConst).filter(v => typeof v === "number" && v > 0));
+  if (Array.isArray(modeSpec)) {
+    const out = new Set();
+    for (const m of modeSpec) {
+      if (typeof m === "string" && m in occConst && valid.has(occConst[m])) out.add(occConst[m]);
+      else if (typeof m === "number" && (valid.size ? valid.has(m) : m > 0)) out.add(m);
+    }
+    return Array.from(out);
+  }
+  if (typeof modeSpec === "number" && modeSpec > 0) {
+    if (!valid.size) return [modeSpec];
+    const out = [];
+    for (const bit of valid) {
+      if ((modeSpec & bit) === bit) out.push(bit);
+    }
+    return out;
+  }
+  if (typeof modeSpec === "string" && modeSpec in occConst && valid.has(occConst[modeSpec])) {
+    return [occConst[modeSpec]];
+  }
+  return [];
+}
+
+function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelId) {
+  const wKey = `${sk}:${kind}:${idx}`;
+  const dKey = `${levelId}:${sk}:${kind === "w" ? "w:" : ""}${idx}`;
+  const liveDs = (doorStatesObj && dKey in doorStatesObj) ? doorStatesObj[dKey] : undefined;
+
+  if (wallEditsObj && Object.prototype.hasOwnProperty.call(wallEditsObj, wKey)) {
+    const ov = wallEditsObj[wKey];
+    if (ov === null) return null;
+    return {
+      c: Array.isArray(ov.c) ? ov.c.slice(0, 4) : [0, 0, 0, 0],
+      move: ov.move ?? 20,
+      sight: ov.sight ?? 20,
+      light: ov.light ?? 20,
+      sound: ov.sound ?? 20,
+      dir: ov.dir || 0,
+      door: ov.door || 0,
+      ds: liveDs !== undefined ? liveDs : (ov.ds || 0),
+      doorSound: ov.doorSound || "",
+      threshold: ov.threshold || null,
+      animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null
+    };
+  }
+  if (kind === "d") {
+    const [x1, y1, x2, y2, doorType, defaultDs, extra] = raw;
+    return {
+      c: [x1, y1, x2, y2],
+      move: extra?.move ?? 20,
+      sight: extra?.sight ?? 20,
+      light: extra?.light ?? 20,
+      sound: extra?.sound ?? 20,
+      dir: extra?.dir || 0,
+      door: doorType || 1,
+      ds: liveDs !== undefined ? liveDs : (defaultDs || 0),
+      doorSound: extra?.doorSound || "",
+      threshold: extra?.threshold || null,
+      animation: (extra?.animation?.type && extra?.animation?.texture) ? extra.animation : null
+    };
+  }
+  const [x1, y1, x2, y2, move, sight, light, sound, dir, extra] = raw;
+  return {
+    c: [x1, y1, x2, y2],
+    move: move ?? 20,
+    sight: sight ?? 20,
+    light: light ?? 20,
+    sound: sound ?? 20,
+    dir: dir || 0,
+    door: 0,
+    ds: 0,
+    doorSound: "",
+    threshold: extra?.threshold || null,
+    animation: null
+  };
+}
+
+function encodeWallToSector(seg) {
+  const [x1, y1, x2, y2] = seg.c;
+  if (seg.door > 0) {
+    const extra = {};
+    if (seg.move !== undefined && seg.move !== 20) extra.move = seg.move;
+    if (seg.sight !== undefined && seg.sight !== 20) extra.sight = seg.sight;
+    if (seg.light !== undefined && seg.light !== 20) extra.light = seg.light;
+    if (seg.sound !== undefined && seg.sound !== 20) extra.sound = seg.sound;
+    if (seg.dir) extra.dir = seg.dir;
+    if (seg.doorSound) extra.doorSound = seg.doorSound;
+    if (seg.animation?.type && seg.animation?.texture) extra.animation = { ...seg.animation };
+    if (seg.threshold && (seg.threshold.light || seg.threshold.sight || seg.threshold.sound)) {
+      extra.threshold = { ...seg.threshold };
+    }
+    return {
+      kind: "d",
+      tuple: Object.keys(extra).length
+        ? [x1, y1, x2, y2, seg.door, seg.ds || 0, extra]
+        : [x1, y1, x2, y2, seg.door, seg.ds || 0]
+    };
+  }
+  const tuple = [x1, y1, x2, y2, seg.move, seg.sight, seg.light, seg.sound, seg.dir || 0];
+  if (seg.threshold && (seg.threshold.light || seg.threshold.sight || seg.threshold.sound)) {
+    tuple.push({ threshold: { ...seg.threshold } });
+  }
+  return { kind: "w", tuple };
+}
+
+function resolveLightItem(sk, idx, raw, lightEditsObj, defaultElev) {
+  const lKey = `${sk}:l:${idx}`;
+  if (lightEditsObj && Object.prototype.hasOwnProperty.call(lightEditsObj, lKey)) {
+    const ov = lightEditsObj[lKey];
+    if (ov === null) return null;
+    return {
+      x: ov.x,
+      y: ov.y,
+      dim: ov.dim ?? 0,
+      bright: ov.bright ?? 0,
+      color: ov.color ?? null,
+      alpha: ov.alpha ?? 0.5,
+      anim: ov.anim || "",
+      elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev,
+      hidden: Boolean(ov.hidden),
+      walls: ov.walls !== false,
+      angle: ov.angle ?? 360,
+      rotation: ov.rotation ?? 0,
+      darkMin: ov.darkMin ?? 0,
+      darkMax: ov.darkMax ?? 1,
+      ...extractLightStyle(ov)
+    };
+  }
+  const [x, y, dim, bright, color, alpha, anim, customElev, extra] = raw;
+  const ex = extra && typeof extra === "object" ? extra : null;
+  return {
+    x,
+    y,
+    dim: dim || 0,
+    bright: bright || 0,
+    color: color ?? null,
+    alpha: alpha ?? 0.5,
+    anim: anim || "",
+    elevation: Number.isFinite(customElev) ? customElev : defaultElev,
+    hidden: Boolean(ex?.hidden),
+    walls: ex?.walls !== false,
+    angle: ex?.angle ?? 360,
+    rotation: ex?.rotation ?? 0,
+    darkMin: ex?.darkMin ?? 0,
+    darkMax: ex?.darkMax ?? 1,
+    ...extractLightStyle(ex)
+  };
+}
+
+function encodeLightTuple(item) {
+  const extra = {};
+  if (item.hidden) extra.hidden = true;
+  if (item.walls === false) extra.walls = false;
+  if ((item.angle ?? 360) < 360) {
+    extra.angle = item.angle;
+    if (item.rotation) extra.rotation = item.rotation;
+  }
+  if ((item.darkMin ?? 0) > 0) extra.darkMin = item.darkMin;
+  if ((item.darkMax ?? 1) < 1) extra.darkMax = item.darkMax;
+  if (Number.isFinite(item.speed) && item.speed !== 3) extra.speed = item.speed;
+  if (Number.isFinite(item.intensity) && item.intensity !== 3) extra.intensity = item.intensity;
+  if (Number.isFinite(item.coloration) && item.coloration !== 1) extra.coloration = item.coloration;
+  if (Number.isFinite(item.attenuation) && item.attenuation !== 0.5) extra.attenuation = item.attenuation;
+  if (Number.isFinite(item.luminosity) && item.luminosity !== 0.5) extra.luminosity = item.luminosity;
+  const tuple = [
+    item.x,
+    item.y,
+    item.dim || 0,
+    item.bright || 0,
+    item.color ?? null,
+    item.alpha ?? 0.5,
+    item.anim || "",
+    item.elevation
+  ];
+  if (Object.keys(extra).length) tuple.push(extra);
+  return tuple;
+}
+
+function resolveSoundItem(sk, idx, raw, soundEditsObj, defaultElev) {
+  const sKey = `${sk}:s:${idx}`;
+  if (soundEditsObj && Object.prototype.hasOwnProperty.call(soundEditsObj, sKey)) {
+    const ov = soundEditsObj[sKey];
+    if (ov === null) return null;
+    return {
+      x: ov.x,
+      y: ov.y,
+      radius: ov.radius ?? 20,
+      path: ov.path || "",
+      volume: ov.volume ?? 0.6,
+      walls: ov.walls !== false,
+      easing: ov.easing !== false,
+      darkMin: ov.darkMin ?? 0,
+      darkMax: ov.darkMax ?? 1,
+      elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev,
+      hidden: Boolean(ov.hidden)
+    };
+  }
+  const [x, y, radius, path, volume, walls, easing, darkMin, darkMax, customElev, extra] = raw;
+  const ex = extra && typeof extra === "object" ? extra : null;
+  return {
+    x,
+    y,
+    radius: radius || 20,
+    path: path || "",
+    volume: volume ?? 0.6,
+    walls: walls !== false,
+    easing: easing !== false,
+    darkMin: darkMin ?? 0,
+    darkMax: darkMax ?? 1,
+    elevation: Number.isFinite(customElev) ? customElev : defaultElev,
+    hidden: Boolean(ex?.hidden)
+  };
+}
+
+function encodeSoundTuple(item) {
+  const row = [
+    item.x,
+    item.y,
+    item.radius || 20,
+    item.path || "",
+    item.volume ?? 0.6,
+    item.walls !== false,
+    item.easing !== false,
+    item.darkMin ?? 0,
+    item.darkMax ?? 1,
+    item.elevation
+  ];
+  if (item.hidden) row.push({ hidden: true });
+  return row;
+}
+
+function resolveTileItem(tid, raw, tileEditsObj, defaultElev) {
+  const tKey = `t:${tid}`;
+  if (tileEditsObj && Object.prototype.hasOwnProperty.call(tileEditsObj, tKey)) {
+    const ov = tileEditsObj[tKey];
+    if (ov === null) return null;
+    const preserved = {};
+    if (raw && typeof raw === "object") {
+      for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable"]) {
+        if (raw[k] !== undefined) preserved[k] = raw[k];
+      }
+    }
+    return { ...preserved, ...ov, elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev };
+  }
+  if (!raw || typeof raw !== "object") return null;
+  return { ...raw, elevation: Number.isFinite(raw.elevation) ? raw.elevation : defaultElev };
+}
+
+function indexTileIntoSectors(tileSpec, tid, ensureSec, simGrid, simSectorPx) {
+  const rot = tileSpec.rot || 0;
+  const ax = tileSpec.anchorX !== undefined ? tileSpec.anchorX : 0.5;
+  const ay = tileSpec.anchorY !== undefined ? tileSpec.anchorY : 0.5;
+  const pivX = tileSpec.anchorX === undefined ? (tileSpec.x + tileSpec.w * 0.5) : tileSpec.x;
+  const pivY = tileSpec.anchorY === undefined ? (tileSpec.y + tileSpec.h * 0.5) : tileSpec.y;
+  const rad = (rot * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const dx = (0.5 - ax) * tileSpec.w;
+  const dy = (0.5 - ay) * tileSpec.h;
+  const cx = pivX + (cos * dx - sin * dy);
+  const cy = pivY + (sin * dx + cos * dy);
+  const rx = (tileSpec.w * Math.abs(cos) + tileSpec.h * Math.abs(sin)) * 0.5;
+  const ry = (tileSpec.w * Math.abs(sin) + tileSpec.h * Math.abs(cos)) * 0.5;
+  const sx0 = Math.max(0, Math.min(simGrid - 1, Math.floor((cx - rx) / simSectorPx)));
+  const sy0 = Math.max(0, Math.min(simGrid - 1, Math.floor((cy - ry) / simSectorPx)));
+  const sx1 = Math.max(0, Math.min(simGrid - 1, Math.floor((cx + rx) / simSectorPx)));
+  const sy1 = Math.max(0, Math.min(simGrid - 1, Math.floor((cy + ry) / simSectorPx)));
+  for (let sy = sy0; sy <= sy1; sy++) {
+    for (let sx = sx0; sx <= sx1; sx++) {
+      ensureSec(sx, sy).t.push(tid);
+    }
+  }
+}
+
+export function virtualWallToDocData(seg, levelId) {
+  const data = {
+    c: seg.c.slice(0, 4),
+    move: seg.move ?? 20,
+    sight: seg.sight ?? 20,
+    light: seg.light ?? 20,
+    sound: seg.sound ?? 20,
+    dir: seg.dir || 0,
+    door: seg.door || 0,
+    ds: seg.ds || 0,
+    doorSound: seg.doorSound || "",
+    levels: [levelId]
+  };
+  if (seg.threshold && (seg.threshold.light || seg.threshold.sight || seg.threshold.sound)) {
+    data.threshold = {
+      light: seg.threshold.light ?? null,
+      sight: seg.threshold.sight ?? null,
+      sound: seg.threshold.sound ?? null,
+      attenuation: Boolean(seg.threshold.attenuation)
+    };
+  }
+  if (seg.animation?.type && seg.animation?.texture) {
+    data.animation = { ...seg.animation };
+  }
+  return data;
+}
+
+export function virtualLightToDocData(item, levelId) {
+  const config = {
+    dim: item.dim || 0,
+    bright: item.bright || 0,
+    angle: item.angle ?? 360,
+    color: item.color || null,
+    alpha: item.alpha ?? 0.5,
+    attenuation: item.attenuation ?? 0.5,
+    luminosity: item.luminosity ?? 0.5,
+    darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
+    animation: { type: item.anim || null, speed: item.speed ?? 3, intensity: item.intensity ?? 3 }
+  };
+  if (Number.isFinite(item.coloration)) config.coloration = item.coloration;
+  return {
+    x: item.x,
+    y: item.y,
+    elevation: item.elevation,
+    rotation: item.rotation || 0,
+    hidden: Boolean(item.hidden),
+    walls: item.walls !== false,
+    levels: [levelId],
+    config
+  };
+}
+
+export function virtualSoundToDocData(item, levelId) {
+  return {
+    x: item.x,
+    y: item.y,
+    elevation: item.elevation,
+    radius: item.radius || 20,
+    path: item.path || "",
+    volume: item.volume ?? 0.6,
+    walls: item.walls !== false,
+    easing: item.easing !== false,
+    hidden: Boolean(item.hidden),
+    darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
+    levels: [levelId]
+  };
+}
+
+export function virtualTileToDocData(item, levelId) {
+  const ax = item.anchorX ?? 0.5;
+  const ay = item.anchorY ?? 0.5;
+  const docX = item.anchorX === undefined ? (item.x + item.w * 0.5) : item.x;
+  const docY = item.anchorY === undefined ? (item.y + item.h * 0.5) : item.y;
+  return {
+    x: docX,
+    y: docY,
+    width: item.w,
+    height: item.h,
+    rotation: item.rot || 0,
+    elevation: item.elevation,
+    sort: item.sort || 0,
+    alpha: item.alpha ?? 1,
+    hidden: Boolean(item.hidden),
+    levels: [levelId],
+    texture: {
+      src: item.src,
+      tint: item.tint || "#ffffff",
+      alphaThreshold: item.alphaThreshold ?? 0.75,
+      anchorX: ax,
+      anchorY: ay,
+      scaleX: item.scaleX ?? 1,
+      scaleY: item.scaleY ?? 1,
+      fit: item.fit ?? "fill"
+    },
+    occlusion: {
+      modes: resolveOccModesArray(item.occlusionMode),
+      alpha: item.occludedAlpha ?? 0.2
+    },
+    restrictions: {
+      light: Boolean(item.restrictsLight),
+      weather: Boolean(item.restrictsWeather)
+    }
+  };
+}
+
+/**
+ * Pure transformation: merges virtual edits (`wallEdits`, `lightEdits`, `soundEdits`, `tileEdits`)
+ * and optional newly-drawn native spatial data into a clean level manifest spec with recalculated sector keys.
+ */
+export function mergeEditsIntoLevelSpec(spec, {
+  levelId = "",
+  baseElevation = 0,
+  wallEdits = null,
+  lightEdits = null,
+  soundEdits = null,
+  tileEdits = null,
+  doorStates = null,
+  nativeSpatial = null
+} = {}) {
+  const worldPx = spec.worldPx || 100000;
+  const simGrid = spec.simGrid || Math.max(4, Math.min(40, Math.ceil(worldPx / 2500)));
+  const simSectorPx = spec.simSectorPx || Math.ceil(worldPx / simGrid);
+  const wEdits = toPlainEditRecord(wallEdits);
+  const lEdits = toPlainEditRecord(lightEdits);
+  const sEdits = toPlainEditRecord(soundEdits);
+  const tEdits = toPlainEditRecord(tileEdits);
+  const dStates = toPlainEditRecord(doorStates);
+
+  const newSectors = {};
+  const ensureSec = (sx, sy) => {
+    const cx = Math.max(0, Math.min(simGrid - 1, sx));
+    const cy = Math.max(0, Math.min(simGrid - 1, sy));
+    const k = `${cx}_${cy}`;
+    return (newSectors[k] ??= { w: [], d: [], l: [], t: [], o: [], s: [] });
+  };
+
+  let walls = 0;
+  let lights = 0;
+  let sounds = 0;
+
+  const oldSectors = spec.sectors || {};
+  for (const [sk, sec] of Object.entries(oldSectors)) {
+    if (!sec) continue;
+    if (sec.o?.length) {
+      const target = (newSectors[sk] ??= { w: [], d: [], l: [], t: [], o: [], s: [] });
+      target.o.push(...sec.o);
+    }
+    if (sec.w?.length) {
+      for (let wi = 0; wi < sec.w.length; wi++) {
+        const seg = resolveWallItem(sk, "w", wi, sec.w[wi], wEdits, dStates, levelId);
+        if (!seg) continue;
+        const cx = (seg.c[0] + seg.c[2]) * 0.5;
+        const cy = (seg.c[1] + seg.c[3]) * 0.5;
+        const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
+        const enc = encodeWallToSector(seg);
+        dst[enc.kind].push(enc.tuple);
+        walls++;
+      }
+    }
+    if (sec.d?.length) {
+      for (let di = 0; di < sec.d.length; di++) {
+        const seg = resolveWallItem(sk, "d", di, sec.d[di], wEdits, dStates, levelId);
+        if (!seg) continue;
+        const cx = (seg.c[0] + seg.c[2]) * 0.5;
+        const cy = (seg.c[1] + seg.c[3]) * 0.5;
+        const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
+        const enc = encodeWallToSector(seg);
+        dst[enc.kind].push(enc.tuple);
+        walls++;
+      }
+    }
+    if (sec.l?.length) {
+      for (let li = 0; li < sec.l.length; li++) {
+        const item = resolveLightItem(sk, li, sec.l[li], lEdits, baseElevation + 6);
+        if (!item) continue;
+        const dst = ensureSec(Math.floor(item.x / simSectorPx), Math.floor(item.y / simSectorPx));
+        dst.l.push(encodeLightTuple(item));
+        lights++;
+      }
+    }
+    if (sec.s?.length) {
+      for (let si = 0; si < sec.s.length; si++) {
+        const item = resolveSoundItem(sk, si, sec.s[si], sEdits, baseElevation + 5);
+        if (!item) continue;
+        const dst = ensureSec(Math.floor(item.x / simSectorPx), Math.floor(item.y / simSectorPx));
+        dst.s.push(encodeSoundTuple(item));
+        sounds++;
+      }
+    }
+  }
+
+  const newTiles = [];
+  const oldTiles = Array.isArray(spec.tiles) ? spec.tiles : [];
+  for (let tid = 0; tid < oldTiles.length; tid++) {
+    const resolved = resolveTileItem(tid, oldTiles[tid], tEdits, baseElevation);
+    if (!resolved) continue;
+    const nextTid = newTiles.length;
+    newTiles.push(resolved);
+    indexTileIntoSectors(resolved, nextTid, ensureSec, simGrid, simSectorPx);
+  }
+
+  // Optionally absorb newly drawn native Foundry documents into the same sector grid
+  if (nativeSpatial) {
+    for (const sec of Object.values(nativeSpatial.sectors || {})) {
+      if (!sec) continue;
+      for (const w of sec.w || []) {
+        const cx = (w[0] + w[2]) * 0.5;
+        const cy = (w[1] + w[3]) * 0.5;
+        ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx)).w.push(w);
+        walls++;
+      }
+      for (const d of sec.d || []) {
+        const cx = (d[0] + d[2]) * 0.5;
+        const cy = (d[1] + d[3]) * 0.5;
+        ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx)).d.push(d);
+        walls++;
+      }
+      for (const l of sec.l || []) {
+        ensureSec(Math.floor(l[0] / simSectorPx), Math.floor(l[1] / simSectorPx)).l.push(l);
+        lights++;
+      }
+      for (const s of sec.s || []) {
+        ensureSec(Math.floor(s[0] / simSectorPx), Math.floor(s[1] / simSectorPx)).s.push(s);
+        sounds++;
+      }
+    }
+    for (const tileSpec of nativeSpatial.tiles || []) {
+      const nextTid = newTiles.length;
+      newTiles.push(tileSpec);
+      indexTileIntoSectors(tileSpec, nextTid, ensureSec, simGrid, simSectorPx);
+    }
+  }
+
+  // Strip completely empty sectors to keep manifest JSON lean
+  for (const [sk, sec] of Object.entries(newSectors)) {
+    if (!sec.w.length && !sec.d.length && !sec.l.length && !sec.t.length && !sec.o.length && !sec.s.length) {
+      delete newSectors[sk];
+    }
+  }
+
+  const nextSpec = {
+    ...spec,
+    worldPx,
+    simGrid,
+    simSectorPx,
+    tiles: newTiles,
+    sectors: newSectors
+  };
+  return {
+    spec: nextSpec,
+    counts: { walls, lights, sounds, tiles: newTiles.length }
+  };
+}
+
+/**
+ * Pure extractor: resolves all virtual Walls, AmbientLights, AmbientSounds, and Tiles
+ * of a Boundless level spec (applying all pending `*Edits` and live `doorStates`) into native Foundry v14 doc payloads.
+ */
+export function extractNativeDocsFromLevelSpec(spec, {
+  levelId = "",
+  targetLevelId = levelId,
+  baseElevation = 0,
+  wallEdits = null,
+  lightEdits = null,
+  soundEdits = null,
+  tileEdits = null,
+  doorStates = null
+} = {}) {
+  const wEdits = toPlainEditRecord(wallEdits);
+  const lEdits = toPlainEditRecord(lightEdits);
+  const sEdits = toPlainEditRecord(soundEdits);
+  const tEdits = toPlainEditRecord(tileEdits);
+  const dStates = toPlainEditRecord(doorStates);
+
+  const walls = [];
+  const lights = [];
+  const sounds = [];
+  const tiles = [];
+
+  for (const [sk, sec] of Object.entries(spec?.sectors || {})) {
+    if (!sec) continue;
+    if (sec.w?.length) {
+      for (let wi = 0; wi < sec.w.length; wi++) {
+        const seg = resolveWallItem(sk, "w", wi, sec.w[wi], wEdits, dStates, levelId);
+        if (seg) walls.push(virtualWallToDocData(seg, targetLevelId));
+      }
+    }
+    if (sec.d?.length) {
+      for (let di = 0; di < sec.d.length; di++) {
+        const seg = resolveWallItem(sk, "d", di, sec.d[di], wEdits, dStates, levelId);
+        if (seg) walls.push(virtualWallToDocData(seg, targetLevelId));
+      }
+    }
+    if (sec.l?.length) {
+      for (let li = 0; li < sec.l.length; li++) {
+        const item = resolveLightItem(sk, li, sec.l[li], lEdits, baseElevation + 6);
+        if (item) lights.push(virtualLightToDocData(item, targetLevelId));
+      }
+    }
+    if (sec.s?.length) {
+      for (let si = 0; si < sec.s.length; si++) {
+        const item = resolveSoundItem(sk, si, sec.s[si], sEdits, baseElevation + 5);
+        if (item) sounds.push(virtualSoundToDocData(item, targetLevelId));
+      }
+    }
+  }
+
+  const rawTiles = Array.isArray(spec?.tiles) ? spec.tiles : [];
+  for (let tid = 0; tid < rawTiles.length; tid++) {
+    const item = resolveTileItem(tid, rawTiles[tid], tEdits, baseElevation);
+    if (item && item.src) tiles.push(virtualTileToDocData(item, targetLevelId));
+  }
+
+  return { walls, lights, sounds, tiles };
+}
+
+function getSceneManifestInfo(scene) {
+  const cfg = scene?.flags?.[MODULE_ID] || {};
+  return {
+    cfg,
+    sceneManifestUrl: cfg.manifestUrl || "",
+    sceneLevelId: cfg.levelId || null
+  };
+}
+
+function isWritableDataPath(url) {
+  const clean = String(url || "").replace(/^\/+/, "");
+  if (!clean) return false;
+  if (/^https?:\/\//i.test(clean)) return false;
+  if (clean.startsWith("modules/") || clean.startsWith("systems/")) return false;
+  return true;
+}
+
+function getDirAndFilename(url, fallbackDir) {
+  const clean = String(url || "").split("?")[0].replace(/^\/+/, "");
+  const slash = clean.lastIndexOf("/");
+  if (slash <= 0 || !isWritableDataPath(clean)) {
+    return { dir: fallbackDir, filename: "pyramid_manifest.json", redirected: true };
+  }
+  return {
+    dir: clean.slice(0, slash),
+    filename: clean.slice(slash + 1) || "pyramid_manifest.json",
+    redirected: false
+  };
+}
+
+async function fetchManifestJson(url, signal = null) {
+  const sep = url.includes("?") ? "&" : "?";
+  const res = await fetch(`${url}${sep}t=${Date.now()}`, signal ? { signal } : undefined);
+  if (!res.ok) throw new Error(`Failed to fetch manifest (${res.status}): ${url}`);
+  return res.json();
+}
+
+function buildLevelEditClearPatch(prevFlags, levelIds) {
+  const patch = {};
+  for (const mapKey of ["wallEdits", "lightEdits", "soundEdits", "tileEdits"]) {
+    if (prevFlags?.[mapKey] && typeof prevFlags[mapKey] === "object") {
+      for (const lid of levelIds) {
+        if (lid in prevFlags[mapKey]) {
+          patch[`flags.${MODULE_ID}.${mapKey}.-=${lid}`] = null;
+        }
+      }
+    }
+  }
+  return patch;
+}
+
+async function createEmbeddedBatched(scene, docName, items, { signal = null, onBatch = null } = {}) {
+  let created = 0;
+  for (let i = 0; i < items.length; i += DOC_CREATE_BATCH_SIZE) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const chunk = items.slice(i, i + DOC_CREATE_BATCH_SIZE);
+    await scene.createEmbeddedDocuments(docName, chunk);
+    created += chunk.length;
+    onBatch?.(created, items.length);
+  }
+  return created;
+}
+
+/**
+ * Stitch a Boundless WebP tile pyramid back into a single raster WebP image capped at `maxDim` px
+ * so unbaked scenes restore their native `level.background.src` / `level.foreground.src` safely within WebGL limits.
+ */
+async function stitchPyramidToWebp({
+  pyramidBaseUrl,
+  maxZoomZ = 0,
+  worldPx = 4096,
+  tilePx = TILE_PX,
+  bounds = null,
+  sparseTiles = null,
+  maxDim = UNBAKE_MAX_IMAGE_PX,
+  quality = 0.88,
+  signal = null
+}) {
+  const b = bounds || { x: 0, y: 0, w: worldPx, h: worldPx };
+  const safeMaxZ = Math.max(0, Number(maxZoomZ) || 0);
+  let chosenZ = 0;
+  for (let z = safeMaxZ; z >= 0; z--) {
+    const scaleZ = (tilePx * (1 << z)) / worldPx;
+    const estW = Math.round(b.w * scaleZ);
+    const estH = Math.round(b.h * scaleZ);
+    if (Math.max(estW, estH) <= maxDim) {
+      chosenZ = z;
+      break;
+    }
+  }
+  const scaleZ = (tilePx * (1 << chosenZ)) / worldPx;
+  const outW = Math.max(1, Math.min(maxDim, Math.round(b.w * scaleZ)));
+  const outH = Math.max(1, Math.min(maxDim, Math.round(b.h * scaleZ)));
+  const tileWorld = worldPx / (1 << chosenZ);
+  const maxIdx = (1 << chosenZ) - 1;
+  const x0 = Math.max(0, Math.min(maxIdx, Math.floor(b.x / tileWorld)));
+  const y0 = Math.max(0, Math.min(maxIdx, Math.floor(b.y / tileWorld)));
+  const x1 = Math.max(0, Math.min(maxIdx, Math.floor((b.x + b.w - 0.001) / tileWorld)));
+  const y1 = Math.max(0, Math.min(maxIdx, Math.floor((b.y + b.h - 0.001) / tileWorld)));
+
+  const sparseSet = (() => {
+    if (!sparseTiles) return null;
+    const set = new Set();
+    if (Array.isArray(sparseTiles)) {
+      for (const entry of sparseTiles) set.add(String(entry));
+    } else if (typeof sparseTiles === "object") {
+      const list = sparseTiles[String(chosenZ)] || sparseTiles[chosenZ];
+      if (Array.isArray(list)) {
+        for (const xy of list) set.add(`${chosenZ}/${xy}`);
+      }
+    }
+    return set.size ? set : null;
+  })();
+
+  const work = createWorkCanvas(outW, outH);
+  work.ctx.clearRect(0, 0, outW, outH);
+  let drawn = 0;
+
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      if (sparseSet && !sparseSet.has(`${chosenZ}/${tx}_${ty}`)) continue;
+      const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
+      let img = null;
+      try {
+        img = await loadImageSource(url, signal);
+        const dx = (tx * tileWorld - b.x) * scaleZ;
+        const dy = (ty * tileWorld - b.y) * scaleZ;
+        const dw = tileWorld * scaleZ;
+        const dh = tileWorld * scaleZ;
+        work.ctx.drawImage(img.source, dx, dy, dw, dh);
+        drawn++;
+      } catch (err) {
+        if (err?.name === "AbortError") throw err;
+      } finally {
+        img?.close?.();
+      }
+    }
+  }
+  if (!drawn) return null;
+  return canvasToWebpBlob(work, quality);
+}
+
+/**
+ * Check whether a scene is eligible for Bake Edits / Unbake (Boundless enabled, not chunked/superGrid).
+ */
+export function isSceneBoundlessEditable(scene) {
+  if (!scene) return false;
+  const cfg = scene.flags?.[MODULE_ID];
+  const anyLevel = scene.levels?.some?.(l => l.flags?.[MODULE_ID]?.enabled);
+  return Boolean(cfg?.enabled || anyLevel);
+}
+
+/**
+ * Bake accumulated virtual edits (`wallEdits`, `lightEdits`, `soundEdits`, `tileEdits`)
+ * and optionally newly created native documents back into clean Boundless manifest JSON(s),
+ * clearing the scene edit delta flags afterwards.
+ */
+export async function bakeSceneEditsToManifest(controller, scene, {
+  absorbNative = true,
+  onProgress = null,
+  signal = null
+} = {}) {
+  if (!scene) throw new Error("No scene provided.");
+  if (!game.user?.isGM) throw new Error("Only a GM can bake edits into a Boundless manifest.");
+
+  const report = (pct, text) => {
+    try { onProgress?.({ pct: Math.max(0, Math.min(100, Math.round(pct))), text }); } catch {}
+  };
+
+  report(5, game.i18n.localize("BOUNDLESS.Baker.StepPreparing"));
+  const { cfg, sceneManifestUrl, sceneLevelId } = getSceneManifestInfo(scene);
+  const allLevels = Array.from(scene.levels || []);
+  const prevFlags = scene.flags?.[MODULE_ID] || {};
+  const fallbackDir = buildDefaultBakeDir(scene);
+
+  const editedLevelIds = [];
+  const nativeTileIdsToDelete = [];
+  const nativeWallIdsToDelete = [];
+  const nativeLightIdsToDelete = [];
+  const nativeSoundIdsToDelete = [];
+  let totalWalls = 0;
+  let totalLights = 0;
+  let totalSounds = 0;
+  let totalTiles = 0;
+
+  const collectNativeForLevel = (level, simGrid) => {
+    if (!absorbNative) return null;
+    const spatial = controller.collectLevelSpatialData(scene, level, { simGrid });
+    nativeTileIdsToDelete.push(...spatial.tileIdsToDelete);
+    nativeWallIdsToDelete.push(...spatial.wallIdsToDelete);
+    nativeLightIdsToDelete.push(...spatial.lightIdsToDelete);
+    nativeSoundIdsToDelete.push(...spatial.soundIdsToDelete);
+    return spatial;
+  };
+
+  const scenePatch = {};
+  const processedByLevelManifest = new Set();
+
+  // 1. Handle per-level manifests and inline manifests first
+  for (let i = 0; i < allLevels.length; i++) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const lvl = allLevels[i];
+    const lcfg = lvl.flags?.[MODULE_ID];
+    if (!lcfg?.enabled) continue;
+    const lid = lvl.id;
+    const baseElev = getLevelBaseElevation(lvl);
+
+    if (lcfg.inlineManifest) {
+      if (lcfg.inlineManifest.chunks?.baseUrl || lcfg.inlineManifest.superGrid) {
+        throw new Error("Chunked and superGrid manifests cannot be edited in place.");
+      }
+      report(20 + Math.round((i / Math.max(1, allLevels.length)) * 30), game.i18n.format("BOUNDLESS.BakeEdits.StepLevel", { level: lvl.name || lid }));
+      const nativeSpatial = collectNativeForLevel(lvl, lcfg.inlineManifest.simGrid || null);
+      const merged = mergeEditsIntoLevelSpec(lcfg.inlineManifest, {
+        levelId: lid,
+        baseElevation: baseElev,
+        wallEdits: prevFlags.wallEdits?.[lid],
+        lightEdits: prevFlags.lightEdits?.[lid],
+        soundEdits: prevFlags.soundEdits?.[lid],
+        tileEdits: prevFlags.tileEdits?.[lid],
+        nativeSpatial
+      });
+      await lvl.update({ [`flags.${MODULE_ID}.inlineManifest`]: merged.spec });
+      totalWalls += merged.counts.walls;
+      totalLights += merged.counts.lights;
+      totalSounds += merged.counts.sounds;
+      totalTiles += merged.counts.tiles;
+      editedLevelIds.push(lid);
+      processedByLevelManifest.add(lid);
+    } else if (lcfg.manifestUrl) {
+      report(20 + Math.round((i / Math.max(1, allLevels.length)) * 30), game.i18n.format("BOUNDLESS.BakeEdits.StepLevel", { level: lvl.name || lid }));
+      const rawManifest = await fetchManifestJson(lcfg.manifestUrl, signal);
+      if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
+        throw new Error("Chunked and superGrid manifests cannot be edited in place.");
+      }
+      const targetSpec = rawManifest.levels?.[lid] || rawManifest;
+      const nativeSpatial = collectNativeForLevel(lvl, targetSpec.simGrid || null);
+      const merged = mergeEditsIntoLevelSpec(targetSpec, {
+        levelId: lid,
+        baseElevation: baseElev,
+        wallEdits: prevFlags.wallEdits?.[lid],
+        lightEdits: prevFlags.lightEdits?.[lid],
+        soundEdits: prevFlags.soundEdits?.[lid],
+        tileEdits: prevFlags.tileEdits?.[lid],
+        nativeSpatial
+      });
+      const updatedManifest = rawManifest.levels?.[lid]
+        ? { ...rawManifest, levels: { ...rawManifest.levels, [lid]: merged.spec } }
+        : merged.spec;
+      const { dir, filename, redirected } = getDirAndFilename(lcfg.manifestUrl, `${fallbackDir}/lvl_${slugifyPathPart(lvl.name, lid.slice(0, 6))}`);
+      await ensureDirectoryRecursive(dir);
+      const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
+      await uploadFileSilent(dir, file);
+      const finalUrl = `${dir}/${filename}`;
+      controller.manifestCache?.delete?.(lcfg.manifestUrl);
+      controller.manifestCache?.delete?.(finalUrl);
+      if (redirected) {
+        await lvl.update({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+      }
+      totalWalls += merged.counts.walls;
+      totalLights += merged.counts.lights;
+      totalSounds += merged.counts.sounds;
+      totalTiles += merged.counts.tiles;
+      editedLevelIds.push(lid);
+      processedByLevelManifest.add(lid);
+    }
+  }
+
+  // 2. Handle scene-level manifestUrl
+  if (cfg.enabled && sceneManifestUrl) {
+    report(55, game.i18n.localize("BOUNDLESS.Baker.StepManifest"));
+    const rawManifest = await fetchManifestJson(sceneManifestUrl, signal);
+    if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
+      throw new Error("Chunked and superGrid manifests cannot be edited in place.");
+    }
+    let updatedManifest;
+    if (rawManifest.levels && typeof rawManifest.levels === "object") {
+      const nextLevels = { ...rawManifest.levels };
+      for (const lvl of allLevels) {
+        const lid = lvl.id;
+        if (processedByLevelManifest.has(lid) || !nextLevels[lid]) continue;
+        if (lvl.flags?.[MODULE_ID]?.enabled === false) continue;
+        const spec = nextLevels[lid];
+        if (spec.chunks?.baseUrl || spec.superGrid) continue;
+        const nativeSpatial = collectNativeForLevel(lvl, spec.simGrid || null);
+        const merged = mergeEditsIntoLevelSpec(spec, {
+          levelId: lid,
+          baseElevation: getLevelBaseElevation(lvl),
+          wallEdits: prevFlags.wallEdits?.[lid],
+          lightEdits: prevFlags.lightEdits?.[lid],
+          soundEdits: prevFlags.soundEdits?.[lid],
+          tileEdits: prevFlags.tileEdits?.[lid],
+          nativeSpatial
+        });
+        nextLevels[lid] = merged.spec;
+        totalWalls += merged.counts.walls;
+        totalLights += merged.counts.lights;
+        totalSounds += merged.counts.sounds;
+        totalTiles += merged.counts.tiles;
+        editedLevelIds.push(lid);
+      }
+      updatedManifest = { ...rawManifest, levels: nextLevels };
+    } else {
+      const targetLvl = (sceneLevelId && scene.levels.get(sceneLevelId))
+        || allLevels[0];
+      if (targetLvl && !processedByLevelManifest.has(targetLvl.id)) {
+        const lid = targetLvl.id;
+        const nativeSpatial = collectNativeForLevel(targetLvl, rawManifest.simGrid || null);
+        const merged = mergeEditsIntoLevelSpec(rawManifest, {
+          levelId: lid,
+          baseElevation: getLevelBaseElevation(targetLvl),
+          wallEdits: prevFlags.wallEdits?.[lid],
+          lightEdits: prevFlags.lightEdits?.[lid],
+          soundEdits: prevFlags.soundEdits?.[lid],
+          tileEdits: prevFlags.tileEdits?.[lid],
+          nativeSpatial
+        });
+        updatedManifest = merged.spec;
+        totalWalls += merged.counts.walls;
+        totalLights += merged.counts.lights;
+        totalSounds += merged.counts.sounds;
+        totalTiles += merged.counts.tiles;
+        editedLevelIds.push(lid);
+      } else {
+        updatedManifest = rawManifest;
+      }
+    }
+
+    const { dir, filename, redirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
+    await ensureDirectoryRecursive(dir);
+    const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
+    await uploadFileSilent(dir, file);
+    const finalUrl = `${dir}/${filename}`;
+    controller.manifestCache?.delete?.(sceneManifestUrl);
+    controller.manifestCache?.delete?.(finalUrl);
+    if (redirected) {
+      scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+    }
+  }
+
+  if (!editedLevelIds.length) {
+    throw new Error("No Boundless manifest found on this scene.");
+  }
+
+  // 3. Remove absorbed native documents and clear edit flags
+  report(85, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
+  if (absorbNative) {
+    const deleteIds = async (docName, ids) => {
+      const unique = Array.from(new Set(ids));
+      if (unique.length) await scene.deleteEmbeddedDocuments(docName, unique);
+    };
+    await deleteIds("Tile", nativeTileIdsToDelete);
+    await deleteIds("Wall", nativeWallIdsToDelete);
+    await deleteIds("AmbientLight", nativeLightIdsToDelete);
+    await deleteIds("AmbientSound", nativeSoundIdsToDelete);
+  }
+
+  Object.assign(scenePatch, buildLevelEditClearPatch(prevFlags, editedLevelIds));
+  if (Object.keys(scenePatch).length) {
+    await scene.update(scenePatch);
+  }
+
+  await controller.lightBatch?.clearPolyCacheDB?.(scene.id);
+  if (canvas.scene?.id === scene.id) {
+    await controller.mount(scene);
+  }
+
+  report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));
+  return {
+    scene,
+    levelsBaked: editedLevelIds.length,
+    walls: totalWalls,
+    lights: totalLights,
+    sounds: totalSounds,
+    tiles: totalTiles
+  };
+}
+
+/**
+ * Unbake a Boundless scene back into a standard native Foundry v14 scene:
+ * restores virtual walls, doors, lights, ambient sounds, and tiles as native embedded documents,
+ * stitches pyramid tiles back into `level.background.src` / `level.foreground.src` when missing,
+ * and removes Boundless flags.
+ */
+export async function unbakeSceneFromBoundless(controller, scene, {
+  createCopy = true,
+  activateCopy = true,
+  restoreImages = true,
+  maxImageDim = UNBAKE_MAX_IMAGE_PX,
+  onProgress = null,
+  signal = null
+} = {}) {
+  if (!scene) throw new Error("No scene provided.");
+  if (!game.user?.isGM) throw new Error("Only a GM can unbake a Boundless scene.");
+
+  const report = (pct, text) => {
+    try { onProgress?.({ pct: Math.max(0, Math.min(100, Math.round(pct))), text }); } catch {}
+  };
+
+  report(5, game.i18n.localize("BOUNDLESS.Baker.StepPreparing"));
+  const { cfg, sceneManifestUrl, sceneLevelId } = getSceneManifestInfo(scene);
+  const srcLevels = Array.from(scene.levels || []);
+  const prevFlags = scene.flags?.[MODULE_ID] || {};
+
+  // 1. Load manifests and resolve per-level specs before cloning so unsupported formats fail cleanly
+  let sceneManifest = null;
+  if (cfg.enabled && sceneManifestUrl) {
+    sceneManifest = await fetchManifestJson(sceneManifestUrl, signal);
+    if (sceneManifest.chunks?.baseUrl || sceneManifest.superGrid) {
+      throw new Error("Chunked and superGrid scenes are too large to unbake into native Foundry documents.");
+    }
+  }
+
+  const levelSpecEntries = [];
+  for (let i = 0; i < srcLevels.length; i++) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const lvl = srcLevels[i];
+    const lcfg = lvl.flags?.[MODULE_ID];
+    let spec = null;
+    if (lcfg?.enabled && lcfg.inlineManifest) {
+      spec = lcfg.inlineManifest;
+    } else if (lcfg?.enabled && lcfg.manifestUrl) {
+      const lm = await fetchManifestJson(lcfg.manifestUrl, signal);
+      spec = lm.levels?.[lvl.id] || lm;
+    } else if (cfg.enabled && sceneManifest && lcfg?.enabled !== false) {
+      if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
+        spec = sceneManifest.levels[lvl.id] || null;
+      } else if ((!sceneLevelId && i === 0) || sceneLevelId === lvl.id) {
+        spec = sceneManifest;
+      }
+    }
+    if (!spec) continue;
+    if (spec.chunks?.baseUrl || spec.superGrid) {
+      throw new Error("Chunked and superGrid scenes are too large to unbake into native Foundry documents.");
+    }
+    levelSpecEntries.push({ srcLevel: lvl, idx: i, spec });
+  }
+
+  if (!levelSpecEntries.length) {
+    throw new Error("No Boundless level data found on this scene.");
+  }
+
+  // 2. Optionally clone scene first so original Boundless scene stays untouched
+  let targetScene = scene;
+  let createdClone = false;
+  const levelIdMap = new Map();
+
+  try {
+    if (createCopy) {
+      const cloneName = `${scene.name} (Native)`;
+      targetScene = await scene.clone({ name: cloneName }, { save: true });
+      createdClone = true;
+      const dstLevels = Array.from(targetScene.levels || []);
+      for (let i = 0; i < srcLevels.length; i++) {
+        const dst = targetScene.levels.get(srcLevels[i].id) || dstLevels[i];
+        if (dst) levelIdMap.set(srcLevels[i].id, dst.id);
+      }
+    } else {
+      for (const l of srcLevels) levelIdMap.set(l.id, l.id);
+    }
+
+    const outDir = `${buildDefaultBakeDir(targetScene)}_unbaked`;
+    const allWalls = [];
+    const allLights = [];
+    const allSounds = [];
+    const allTiles = [];
+
+    // 3. Extract native documents and optionally stitch pyramid textures back into background/foreground
+    for (let i = 0; i < levelSpecEntries.length; i++) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const { srcLevel, spec } = levelSpecEntries[i];
+      const srcLid = srcLevel.id;
+      const dstLid = levelIdMap.get(srcLid) || srcLid;
+      const dstLevel = targetScene.levels.get(dstLid);
+      if (!dstLevel) continue;
+
+      report(15 + Math.round((i / levelSpecEntries.length) * 40), game.i18n.format("BOUNDLESS.Unbake.StepLevel", { level: dstLevel.name || dstLid }));
+
+      const extracted = extractNativeDocsFromLevelSpec(spec, {
+        levelId: srcLid,
+        targetLevelId: dstLid,
+        baseElevation: getLevelBaseElevation(dstLevel),
+        wallEdits: prevFlags.wallEdits?.[srcLid],
+        lightEdits: prevFlags.lightEdits?.[srcLid],
+        soundEdits: prevFlags.soundEdits?.[srcLid],
+        tileEdits: prevFlags.tileEdits?.[srcLid],
+        doorStates: prevFlags.doorStates
+      });
+      allWalls.push(...extracted.walls);
+      allLights.push(...extracted.lights);
+      allSounds.push(...extracted.sounds);
+      allTiles.push(...extracted.tiles);
+
+      if (restoreImages) {
+        const lvlPatch = {};
+        const lvlSlug = slugifyPathPart(dstLevel.name, dstLid.slice(0, 6));
+        if (!dstLevel.background?.src && spec.pyramidBaseUrl) {
+          const blob = await stitchPyramidToWebp({
+            pyramidBaseUrl: spec.pyramidBaseUrl,
+            maxZoomZ: spec.maxZoomZ ?? 0,
+            worldPx: spec.worldPx || targetScene.width || 4096,
+            tilePx: spec.tilePx || TILE_PX,
+            bounds: spec.bounds || null,
+            maxDim: maxImageDim,
+            signal
+          });
+          if (blob) {
+            await ensureDirectoryRecursive(outDir);
+            const fname = `bg_${i}_${lvlSlug}.webp`;
+            const res = await uploadFileSilent(outDir, new File([blob], fname, { type: "image/webp" }));
+            lvlPatch["background.src"] = res.path;
+          }
+        }
+        if (!dstLevel.foreground?.src && spec.foregroundPyramidBaseUrl) {
+          const fgBlob = await stitchPyramidToWebp({
+            pyramidBaseUrl: spec.foregroundPyramidBaseUrl,
+            maxZoomZ: spec.foregroundMaxZoomZ ?? spec.maxZoomZ ?? 0,
+            worldPx: spec.worldPx || targetScene.width || 4096,
+            tilePx: spec.tilePx || TILE_PX,
+            bounds: spec.bounds || null,
+            sparseTiles: spec.foregroundTiles || null,
+            maxDim: maxImageDim,
+            signal
+          });
+          if (fgBlob) {
+            await ensureDirectoryRecursive(outDir);
+            const fname = `fg_${i}_${lvlSlug}.webp`;
+            const res = await uploadFileSilent(outDir, new File([fgBlob], fname, { type: "image/webp" }));
+            lvlPatch["foreground.src"] = res.path;
+          }
+        }
+        if (Object.keys(lvlPatch).length) {
+          await dstLevel.update(lvlPatch);
+        }
+      }
+    }
+
+    // 4. Create native embedded documents in safe chunks
+    const totalDocs = allWalls.length + allLights.length + allSounds.length + allTiles.length;
+    let createdDocs = 0;
+    const onDocs = (batchDelta) => {
+      createdDocs += batchDelta;
+      const pct = 58 + Math.round((createdDocs / Math.max(1, totalDocs)) * 32);
+      report(pct, game.i18n.format("BOUNDLESS.Unbake.StepDocuments", { done: createdDocs, total: totalDocs }));
+    };
+
+    const runBatched = async (docName, list) => {
+      if (!list.length) return;
+      let prev = 0;
+      await createEmbeddedBatched(targetScene, docName, list, {
+        signal,
+        onBatch: (done) => {
+          onDocs(done - prev);
+          prev = done;
+        }
+      });
+    };
+
+    await runBatched("Tile", allTiles);
+    await runBatched("Wall", allWalls);
+    await runBatched("AmbientLight", allLights);
+    await runBatched("AmbientSound", allSounds);
+
+    // 5. Clear Boundless flags from levels & scene
+    report(93, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
+    for (const lvl of targetScene.levels || []) {
+      if (lvl.flags?.[MODULE_ID]) {
+        await lvl.update({ [`flags.-=${MODULE_ID}`]: null });
+      }
+    }
+    if (targetScene.flags?.[MODULE_ID]) {
+      await targetScene.update({ [`flags.-=${MODULE_ID}`]: null });
+    }
+
+    report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));
+
+    if (createCopy && activateCopy) {
+      await targetScene.view();
+    } else if (canvas.scene?.id === targetScene.id) {
+      controller.unmount({ clearTextures: true });
+      await canvas.draw();
+    }
+
+    return {
+      scene: targetScene,
+      levelsUnbaked: levelSpecEntries.length,
+      walls: allWalls.length,
+      lights: allLights.length,
+      sounds: allSounds.length,
+      tiles: allTiles.length
+    };
+  } catch (err) {
+    if (createdClone && targetScene?.id) {
+      try { await targetScene.delete(); } catch {}
+    }
+    throw err;
   }
 }

@@ -99,6 +99,15 @@
     "DoorLocked": "This door is locked.",
     "FogBrushTool": "Boundless Fog Brush",
     "FogBrushHint": "Fog Brush: Left-click to reveal, Shift + Left-click to hide, Alt + Wheel to resize, Esc to exit.",
+    "Settings": {
+      "VramProfile": "VRAM Cache Budget",
+      "VramProfileHint": "Texture cache limit for Boundless on this device. Auto adjusts based on your hardware.",
+      "VramAuto": "Auto (System)",
+      "VramLow": "Low (512 MB, laptops and integrated GPU)",
+      "VramBalanced": "Balanced (1024 MB)",
+      "VramHigh": "High (1536 MB)",
+      "VramUltra": "Ultra (2048 MB, 8+ GB VRAM)"
+    },
     "Optimize": {
       "ContextMenu": "Optimize with Boundless",
       "DialogTitle": "Optimize with Boundless",
@@ -110,6 +119,35 @@
       "Done": "Scene \"{scene}\" optimized with Boundless.",
       "Cancelled": "Scene optimization cancelled.",
       "Failed": "Scene optimization failed. {error}"
+    },
+    "BakeEdits": {
+      "ContextMenu": "Bake Edits into Boundless Manifest",
+      "DialogTitle": "Bake Edits into Boundless Manifest",
+      "DialogBody": "All virtual wall, light, sound, and tile edits on scene \"{scene}\" will be merged into a clean manifest file and temporary scene flags cleared.",
+      "AbsorbNative": "Absorb newly drawn native objects",
+      "AbsorbNativeHint": "Move newly added native walls, lights, sounds, and tiles into the manifest and remove their duplicates from the scene.",
+      "StartButton": "Bake Edits",
+      "ProgressTitle": "Updating Manifest",
+      "StepLevel": "Merging level \"{level}\"...",
+      "Done": "Edits on \"{scene}\" baked into manifest ({walls} walls, {lights} lights, {sounds} sounds, {tiles} tiles).",
+      "Cancelled": "Manifest update cancelled.",
+      "Failed": "Failed to bake edits into manifest. {error}"
+    },
+    "Unbake": {
+      "ContextMenu": "Unbake Scene from Boundless",
+      "DialogTitle": "Unbake Scene from Boundless",
+      "DialogBody": "Virtual walls, doors, lights, sounds, and tiles on scene \"{scene}\" will be restored as standard native Foundry documents.",
+      "CreateCopy": "Create an unbaked copy of the scene",
+      "CreateCopyHint": "Keeps the original Boundless scene untouched and opens the native copy automatically once finished.",
+      "RestoreImages": "Restore background and foreground images",
+      "RestoreImagesHint": "Stitches pyramid tiles back into a single WebP image whenever the original background was cleared.",
+      "StartButton": "Unbake",
+      "ProgressTitle": "Unbaking Scene",
+      "StepLevel": "Preparing level \"{level}\"...",
+      "StepDocuments": "Creating documents ({done} / {total})...",
+      "Done": "Scene \"{scene}\" unbaked ({walls} walls, {lights} lights, {sounds} sounds, {tiles} tiles).",
+      "Cancelled": "Scene unbake cancelled.",
+      "Failed": "Failed to unbake scene. {error}"
     },
     "Baker": {
       "CancelButton": "Cancel",

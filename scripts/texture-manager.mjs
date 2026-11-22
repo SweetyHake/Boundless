@@ -1,8 +1,39 @@
 import { TileWorkerPool, isWorkerDecodableUrl } from "./tile-worker-pool.mjs";
 import { isTextureUsable } from "./utils.mjs";
 
-export const MAX_VRAM_TEXTURES = 1024; // High entry cap so small 256px prop textures across multi-level scenes don't evict pyramid/roof textures
-export const MAX_VRAM_BYTES = 1536 * 1024 * 1024; // ~1.5 GB VRAM budget (mipmapped RGBA estimate) for high-PPI multi-level LRU cache
+export const MAX_VRAM_TEXTURES = 1024; // Default high entry cap so small 256px prop textures across multi-level scenes don't evict pyramid/roof textures
+export const MAX_VRAM_BYTES = 1536 * 1024 * 1024; // ~1.5 GB default VRAM budget (mipmapped RGBA estimate)
+
+export const VRAM_PROFILES = Object.freeze({
+  low: Object.freeze({ maxBytes: 512 * 1024 * 1024, maxTextures: 384 }),
+  balanced: Object.freeze({ maxBytes: 1024 * 1024 * 1024, maxTextures: 768 }),
+  high: Object.freeze({ maxBytes: MAX_VRAM_BYTES, maxTextures: MAX_VRAM_TEXTURES }),
+  ultra: Object.freeze({ maxBytes: 2048 * 1024 * 1024, maxTextures: 1536 })
+});
+
+/**
+ * Resolve a concrete VRAM texture cache budget for the requested profile (`auto` | `low` | `balanced` | `high` | `ultra`).
+ * Note: Chromium caps `navigator.deviceMemory` at 8 GB even on 32/64 GB machines, so <= 4 GB maps to `low`,
+ * low-core systems map to `balanced`, and 8+ GB multi-core desktops map to `high` (1.5 GB).
+ */
+export function resolveVramBudget(profile = "auto", hw = null) {
+  const key = typeof profile === "string" ? profile.toLowerCase() : "auto";
+  if (key !== "auto" && key in VRAM_PROFILES) {
+    const p = VRAM_PROFILES[key];
+    return { profile: key, effectiveProfile: key, maxBytes: p.maxBytes, maxTextures: p.maxTextures };
+  }
+  const nav = hw || (typeof globalThis !== "undefined" ? globalThis.navigator : null);
+  const devMem = Number(nav?.deviceMemory);
+  const cores = Number(nav?.hardwareConcurrency);
+  let effective = "high";
+  if (Number.isFinite(devMem) && devMem > 0 && devMem <= 4) {
+    effective = "low";
+  } else if (Number.isFinite(cores) && cores > 0 && cores <= 4) {
+    effective = "balanced";
+  }
+  const p = VRAM_PROFILES[effective];
+  return { profile: "auto", effectiveProfile: effective, maxBytes: p.maxBytes, maxTextures: p.maxTextures };
+}
 
 /**
  * VRAM-budgeted LRU texture cache backed by off-main-thread `TileWorkerPool` decoding.
@@ -19,6 +50,23 @@ export class LRUTextureManager {
   workerOwned = new Map();  // src -> { tex: PIXI.Texture, bitmap: ImageBitmap }
   workerPool = new TileWorkerPool();
   _gen = 0;
+  vramProfile = "auto";
+  effectiveProfile = "high";
+  maxVramBytes = MAX_VRAM_BYTES;
+  maxVramTextures = MAX_VRAM_TEXTURES;
+
+  constructor({ profile = "auto", hw = null } = {}) {
+    this.setVramProfile(profile, hw);
+  }
+
+  setVramProfile(profile = "auto", hw = null) {
+    const resolved = resolveVramBudget(profile, hw);
+    this.vramProfile = resolved.profile;
+    this.effectiveProfile = resolved.effectiveProfile;
+    this.maxVramBytes = resolved.maxBytes;
+    this.maxVramTextures = resolved.maxTextures;
+    return resolved;
+  }
 
   _estimateBytes(tex) {
     const bt = tex?.baseTexture;
@@ -182,7 +230,7 @@ export class LRUTextureManager {
   }
 
   needsPrune() {
-    return this.lru.size > MAX_VRAM_TEXTURES || this.totalBytes > MAX_VRAM_BYTES;
+    return this.lru.size > this.maxVramTextures || this.totalBytes > this.maxVramBytes;
   }
 
   prune(inUseSet, maxEvict = Infinity) {
@@ -216,6 +264,10 @@ export class LRUTextureManager {
     return {
       lruSize: this.lru.size,
       vramMB: +(this.totalBytes / (1024 * 1024)).toFixed(1),
+      vramBudgetMB: Math.round(this.maxVramBytes / (1024 * 1024)),
+      maxVramTextures: this.maxVramTextures,
+      vramProfile: this.vramProfile,
+      effectiveProfile: this.effectiveProfile,
       pinnedSize: this.pinned.size,
       missingCount: this.missingSrcs.size,
       workerOwned: this.workerOwned.size,

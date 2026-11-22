@@ -8,6 +8,61 @@ import {
   hasSpecOverlays,
   isPointUnderRoofSpec
 } from "./utils.mjs";
+import {
+  loadLevelPolysFromDB,
+  saveLevelPolysToDB,
+  clearPolyCacheDB as clearPolyCacheStorage
+} from "./poly-cache-db.mjs";
+
+/**
+ * Fast deterministic FNV-1a fingerprint of a level's wall/door geometry so persisted
+ * IndexedDB shadow polygons auto-invalidate whenever the manifest walls change.
+ */
+export function hashLevelWallGeometry(sectors) {
+  if (!sectors || typeof sectors !== "object") return "0";
+  let h = 2166136261 >>> 0;
+  let count = 0;
+  const keys = Object.keys(sectors).sort();
+  for (let ki = 0; ki < keys.length; ki++) {
+    const sec = sectors[keys[ki]];
+    if (!sec) continue;
+    const wList = sec.w;
+    if (wList?.length) {
+      for (let i = 0; i < wList.length; i++) {
+        const w = wList[i];
+        count++;
+        h = Math.imul(h ^ (w[0] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (w[1] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (w[2] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (w[3] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ ((w[6] ?? 20) | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ ((w[8] ?? 0) | 0), 16777619) >>> 0;
+        const th = w[9]?.threshold;
+        if (th?.light) h = Math.imul(h ^ Math.round(th.light * 10), 16777619) >>> 0;
+      }
+    }
+    const dList = sec.d;
+    if (dList?.length) {
+      for (let i = 0; i < dList.length; i++) {
+        const d = dList[i];
+        count++;
+        h = Math.imul(h ^ (d[0] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (d[1] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (d[2] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ (d[3] | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ ((d[4] ?? 1) | 0), 16777619) >>> 0;
+        h = Math.imul(h ^ ((d[5] ?? 0) | 0), 16777619) >>> 0;
+        const ex = d[6];
+        if (ex) {
+          h = Math.imul(h ^ ((ex.light ?? 20) | 0), 16777619) >>> 0;
+          h = Math.imul(h ^ ((ex.dir ?? 0) | 0), 16777619) >>> 0;
+          if (ex.threshold?.light) h = Math.imul(h ^ Math.round(ex.threshold.light * 10), 16777619) >>> 0;
+        }
+      }
+    }
+  }
+  return `${count}:${h.toString(36)}`;
+}
 
 export const LIGHT_PAD_WORLD_PX = 900; // > max 40ft (800px) light radius so lights never pop on viewport edge
 export const FOUNDRY_DEFAULT_ATTENUATION = 0.277992; // Exact Foundry v14 computedAttenuation for data.attenuation = 0.5
@@ -423,16 +478,78 @@ export class MegaLightBatch {
   _getLevelCacheSigFn = null;
 
   // Cross-level polygon cache: persists across same-scene level switches (cleared on scene change via clearPolyCache)
+  // and hydrated/persisted across full reloads via IndexedDB (`poly-cache-db.mjs`).
   _polyCache = new Map(); // lightId -> { sig: string, offsets: Float32Array | null, hasNearbyWall: boolean }
   _polyCacheSceneId = null;
+  _hydratedPolyLevels = new Set();
   lastPolyCacheHits = 0;
   lastPolyCacheMisses = 0;
+  lastPolyCacheHydrated = 0;
 
   clearPolyCache() {
     this._polyCache.clear();
     this._polyCacheSceneId = null;
+    this._hydratedPolyLevels.clear();
     this.lastPolyCacheHits = 0;
     this.lastPolyCacheMisses = 0;
+    this.lastPolyCacheHydrated = 0;
+  }
+
+  async hydratePolyCacheFromDB(worldId, sceneId, levelIds) {
+    if (!sceneId || !Array.isArray(levelIds) || !levelIds.length) return 0;
+    if (this._polyCacheSceneId && this._polyCacheSceneId !== sceneId) {
+      this._polyCache.clear();
+      this._hydratedPolyLevels.clear();
+    }
+    this._polyCacheSceneId = sceneId;
+
+    const missingLevels = levelIds.filter(lid => lid && !this._hydratedPolyLevels.has(lid));
+    if (!missingLevels.length) {
+      this.lastPolyCacheHydrated = 0;
+      return 0;
+    }
+
+    const loaded = await loadLevelPolysFromDB(worldId, sceneId, missingLevels);
+    // Abort hydration if another scene mounted while awaiting IndexedDB
+    if (this._polyCacheSceneId !== sceneId) return 0;
+
+    for (const lid of missingLevels) this._hydratedPolyLevels.add(lid);
+    let added = 0;
+    for (const [lightId, entry] of loaded) {
+      if (!this._polyCache.has(lightId)) {
+        this._polyCache.set(lightId, entry);
+        added++;
+      }
+    }
+    this.lastPolyCacheHydrated = added;
+    return added;
+  }
+
+  async persistPolyCacheToDB(worldId, sceneId, levelIds = null) {
+    if (!sceneId || this._polyCacheSceneId !== sceneId || !this._polyCache.size) return false;
+    const filterSet = Array.isArray(levelIds) && levelIds.length ? new Set(levelIds) : null;
+    const byLevel = new Map();
+    for (const [lightId, entry] of this._polyCache) {
+      const sep = lightId.indexOf("::");
+      if (sep <= 0) continue;
+      const lid = lightId.slice(0, sep);
+      if (filterSet && !filterSet.has(lid)) continue;
+      let list = byLevel.get(lid);
+      if (!list) {
+        list = [];
+        byLevel.set(lid, list);
+      }
+      list.push([lightId, entry.sig, entry.offsets, Boolean(entry.hasNearbyWall)]);
+    }
+    if (!byLevel.size) return false;
+    return saveLevelPolysToDB(worldId, sceneId, byLevel);
+  }
+
+  async clearPolyCacheDB(sceneId = null) {
+    if (!sceneId || sceneId === this._polyCacheSceneId) {
+      this.clearPolyCache();
+    }
+    return clearPolyCacheStorage(sceneId);
   }
 
   _buildNativeEdgesSig(nativeEdges) {
@@ -632,6 +749,7 @@ export class MegaLightBatch {
     const curSceneId = canvas.scene?.id || null;
     if (this._polyCacheSceneId && curSceneId && this._polyCacheSceneId !== curSceneId) {
       this._polyCache.clear();
+      this._hydratedPolyLevels.clear();
     }
     this._polyCacheSceneId = curSceneId;
     this.lastPolyCacheHits = 0;
@@ -679,7 +797,8 @@ export class MegaLightBatch {
       const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
       const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
       const extraLevelSig = this._getLevelCacheSigFn ? String(this._getLevelCacheSigFn(levelId) ?? "") : "";
-      const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}`;
+      const wallGeomHash = spec._superGridBase ? "sg" : hashLevelWallGeometry(sectors);
+      const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}|wg:${wallGeomHash}`;
 
       // Fast instanced light baking for unmodified superGrid worlds (e.g. 6000x6000 = 6x6 provinces -> 22,860 shadowed lights in ~120ms)
       if (spec._superGridBase && spec.superGrid && !hasEditsOnLevel) {

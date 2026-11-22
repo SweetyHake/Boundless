@@ -180,3 +180,68 @@ export function isPointUnderRoofSpec(px, py, ov) {
   const ly = dx * s + dy * c;
   return Math.abs(lx) <= ov.w * 0.5 && Math.abs(ly) <= ov.h * 0.5;
 }
+
+/**
+ * Compute world-space viewport bounds with optional velocity-biased lookahead padding.
+ * Shifts tile prefetch margin forward along the pan vector while trimming excess trailing margin
+ * so VRAM usage stays roughly constant and fast pans don't flash low-LOD tiles.
+ */
+export function computePredictiveViewportRect(
+  pivotX,
+  pivotY,
+  screenW,
+  screenH,
+  scale,
+  maxW,
+  maxH,
+  {
+    padFraction = 0.25,
+    velX = 0,
+    velY = 0,
+    lookaheadSec = 0.35,
+    maxLeadFraction = 0.65,
+    minTrailFraction = 0.1
+  } = {}
+) {
+  const s = scale || 1;
+  const wWorld = screenW / s;
+  const hWorld = screenH / s;
+  const basePadX = wWorld * padFraction;
+  const basePadY = hWorld * padFraction;
+
+  let padLeft = basePadX;
+  let padRight = basePadX;
+  let padTop = basePadY;
+  let padBottom = basePadY;
+
+  if (padFraction > 0 && (velX || velY)) {
+    const minTrailX = wWorld * Math.min(minTrailFraction, padFraction);
+    const minTrailY = hWorld * Math.min(minTrailFraction, padFraction);
+    const leadX = Math.max(-wWorld * maxLeadFraction, Math.min(wWorld * maxLeadFraction, velX * lookaheadSec));
+    const leadY = Math.max(-hWorld * maxLeadFraction, Math.min(hWorld * maxLeadFraction, velY * lookaheadSec));
+
+    if (leadX > 0) {
+      padRight = basePadX + leadX;
+      padLeft = Math.max(minTrailX, basePadX - leadX * 0.45);
+    } else if (leadX < 0) {
+      padLeft = basePadX - leadX;
+      padRight = Math.max(minTrailX, basePadX + leadX * 0.45);
+    }
+
+    if (leadY > 0) {
+      padBottom = basePadY + leadY;
+      padTop = Math.max(minTrailY, basePadY - leadY * 0.45);
+    } else if (leadY < 0) {
+      padTop = basePadY - leadY;
+      padBottom = Math.max(minTrailY, basePadY + leadY * 0.45);
+    }
+  }
+
+  return {
+    scale: s,
+    x0: Math.max(0, pivotX - wWorld * 0.5 - padLeft),
+    y0: Math.max(0, pivotY - hWorld * 0.5 - padTop),
+    x1: Math.min(maxW, pivotX + wWorld * 0.5 + padRight),
+    y1: Math.min(maxH, pivotY + hWorld * 0.5 + padBottom)
+  };
+}
