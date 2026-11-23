@@ -3,7 +3,8 @@ import {
   PERF_CONFIG,
   perfStats,
   isAgPerfCoreActive,
-  wrapFoundryMethod
+  wrapFoundryMethod,
+  wrapTargetMethod
 } from "./perf-patcher.mjs";
 
 /**
@@ -608,6 +609,20 @@ function patchMiscCpuGuards() {
   const okSources = ["PointVisionSource", "PointLightSource", "PointDarknessSource"].map((cls) =>
     Boolean(wrapFoundryMethod(cls, "initialize", sourceInitWrapper))
   );
+
+  // Track dynamic CanvasEdges mutations (e.g. Showstopper animated doors, Boundless Sim-Bubble)
+  // so sourceInitWrapper NEVER skips sweep recalculation when edges move without an updateWall hook!
+  const CanvasEdgesProto = globalThis.foundry?.canvas?.geometry?.edges?.CanvasEdges?.prototype;
+  if (CanvasEdgesProto) {
+    for (const m of ["set", "delete", "clear", "refresh", "initialize"]) {
+      if (typeof CanvasEdgesProto[m] !== "function") continue;
+      wrapTargetMethod(CanvasEdgesProto, m, `CanvasEdges.prototype.${m}`, function (wrapped, ...args) {
+        _edgeVersion++;
+        _losCache.clear();
+        return wrapped(...args);
+      });
+    }
+  }
 
   const okEnrich = wrapFoundryMethod("TextEditor", "enrichHTML", function (wrapped, content, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfEnrichCache || options?.rollData || typeof content !== "string") {
