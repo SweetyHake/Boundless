@@ -79,6 +79,23 @@ export function restoreAllStandardCulling() {
     const icon = note.controlIcon ?? note.controls;
     if (icon && !icon.destroyed) icon.renderable = true;
   }
+  for (const door of c.controls?.doors?.children ?? []) {
+    if (door && !door.destroyed) door.renderable = true;
+  }
+  for (const wall of c.walls?.placeables ?? []) {
+    if (wall && !wall.destroyed) wall.renderable = true;
+  }
+  for (const ls of c.effects?.lightSources ?? []) {
+    if (ls.background && !ls.background.destroyed) ls.background.renderable = true;
+    if (ls.illumination && !ls.illumination.destroyed) ls.illumination.renderable = true;
+    if (ls.coloration && !ls.coloration.destroyed) ls.coloration.renderable = true;
+  }
+  for (const ds of c.effects?.darknessSources ?? []) {
+    if (ds.background && !ds.background.destroyed) ds.background.renderable = true;
+    if (ds.illumination && !ds.illumination.destroyed) ds.illumination.renderable = true;
+    if (ds.coloration && !ds.coloration.destroyed) ds.coloration.renderable = true;
+    if (ds.darkness && !ds.darkness.destroyed) ds.darkness.renderable = true;
+  }
 }
 
 export function updateStandardSceneCulling() {
@@ -175,8 +192,80 @@ export function updateStandardSceneCulling() {
     }
   }
 
+  // DoorControl icons: engage when scene has >= 12 doors
+  let culledDoors = 0;
+  const doors = c.controls?.doors?.children ?? [];
+  if (doors.length >= 12) {
+    for (let i = 0; i < doors.length; i++) {
+      const d = doors[i];
+      if (!d || d.destroyed) continue;
+      const inView = d.x >= vp.minX && d.x <= vp.maxX && d.y >= vp.minY && d.y <= vp.maxY;
+      d.renderable = inView;
+      if (!inView) culledDoors++;
+    }
+  }
+
+  // WallsLayer frustum culling: engage when scene has >= 100 walls
+  const walls = c.walls?.placeables ?? [];
+  if (walls.length >= 100) {
+    for (let i = 0; i < walls.length; i++) {
+      const w = walls[i];
+      if (!w || w.destroyed) continue;
+      if (w.controlled || w.hover || w.isPreview) {
+        w.renderable = true;
+        continue;
+      }
+      const coords = w.document?.c;
+      if (!coords || coords.length < 4) continue;
+      const minX = coords[0] < coords[2] ? coords[0] : coords[2];
+      const maxX = coords[0] > coords[2] ? coords[0] : coords[2];
+      const minY = coords[1] < coords[3] ? coords[1] : coords[3];
+      const maxY = coords[1] > coords[3] ? coords[1] : coords[3];
+      w.renderable = rectsIntersect(minX, minY, maxX, maxY, vp);
+    }
+  }
+
+  // Offscreen PointLightSource / PointDarknessSource mesh culling (skips offscreen light shader passes!)
+  let culledLightMeshes = 0;
+  const lightSources = c.effects?.lightSources;
+  const globalLs = c.environment?.globalLightSource;
+  if (lightSources && lightSources.size >= 16) {
+    for (const ls of lightSources) {
+      if (!ls || ls === globalLs || ls.isPreview) continue;
+      const r = ls.radius ?? ls.data?.radius;
+      if (!Number.isFinite(r) || r <= 0) continue;
+      const lx = ls.x ?? ls.data?.x;
+      const ly = ls.y ?? ls.data?.y;
+      if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
+      const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
+      if (ls.background && !ls.background.destroyed) ls.background.renderable = inView;
+      if (ls.illumination && !ls.illumination.destroyed) ls.illumination.renderable = inView;
+      if (ls.coloration && !ls.coloration.destroyed) ls.coloration.renderable = inView;
+      if (!inView) culledLightMeshes++;
+    }
+  }
+  const darkSources = c.effects?.darknessSources;
+  if (darkSources && darkSources.size >= 8) {
+    for (const ds of darkSources) {
+      if (!ds || ds.isPreview) continue;
+      const r = ds.radius ?? ds.data?.radius;
+      if (!Number.isFinite(r) || r <= 0) continue;
+      const lx = ds.x ?? ds.data?.x;
+      const ly = ds.y ?? ds.data?.y;
+      if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
+      const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
+      if (ds.background && !ds.background.destroyed) ds.background.renderable = inView;
+      if (ds.illumination && !ds.illumination.destroyed) ds.illumination.renderable = inView;
+      if (ds.coloration && !ds.coloration.destroyed) ds.coloration.renderable = inView;
+      if (ds.darkness && !ds.darkness.destroyed) ds.darkness.renderable = inView;
+      if (!inView) culledLightMeshes++;
+    }
+  }
+
   perfStats.autoCulledTiles = culledTiles;
   perfStats.autoCulledLights = culledLights;
+  perfStats.autoCulledLightMeshes = culledLightMeshes;
+  perfStats.autoCulledDoors = culledDoors;
   perfStats.autoCulledSounds = culledSounds;
 }
 
@@ -426,7 +515,7 @@ export function installAutoPerfEngine(controller) {
     });
   }
 
-  for (const h of ["createAmbientLight", "deleteAmbientLight", "createAmbientSound", "deleteAmbientSound", "createNote", "deleteNote"]) {
+  for (const h of ["createAmbientLight", "deleteAmbientLight", "createAmbientSound", "deleteAmbientSound", "createNote", "deleteNote", "lightingRefresh"]) {
     Hooks.on(h, () => {
       if (isStandardSceneActive()) scheduleStandardCulling();
     });

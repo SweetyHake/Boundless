@@ -1,6 +1,6 @@
 import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, resetPerfStats } from "./perf-patcher.mjs";
-import { applyLightingRenderScale, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
+import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
 import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
 
 /**
@@ -46,6 +46,7 @@ async function setPerfMode(enabled) {
     restoreAllStandardCulling();
   }
   applyLightingRenderScale();
+  applyDisableUiBlur();
   // Refresh wall sprites/graphics and note icons so toggle takes effect immediately
   const walls = globalThis.canvas?.walls?.placeables;
   if (walls?.length) {
@@ -355,6 +356,36 @@ export async function benchmarkCurrentScene(opts = {}) {
       });
       pushRow("9. TextEditor.enrichHTML (40x)", off, on, {}, { absToleranceMs: 0.5 });
     }
+
+    // M10: Zoomed-in Offscreen Light Culling + Light Animation (when >= 16 light sources)
+    if ((canvas.effects?.lightSources?.size ?? 0) >= 16) {
+      canvas.tokens.activate();
+      canvas.pan({ x: (scene.width || 4000) * 0.25, y: (scene.height || 4000) * 0.25, scale: 1.6 });
+      await sleep(120);
+      const { off, on } = await runABBA(async (warmup) => {
+        const iters = warmup ? 4 : 24;
+        return measureGlRender(() => {
+          for (const ls of canvas.effects.lightSources) ls.animate?.(16.6);
+          renderer.render(stage);
+        }, iters);
+      });
+      pushRow(`10. Zoomed Lights+Anim (${canvas.effects.lightSources.size} lights)`, off, on, {}, { absToleranceMs: 0.35 });
+    }
+
+    // M11: Mouse Hover Sweep over Tiles (detects gl.readPixels HoverFade stalls on dense maps)
+    if ((canvas.tiles?.placeables?.length ?? 0) >= 12) {
+      canvas.tokens.activate();
+      const { off, on } = await runABBA(async (warmup) => {
+        const n = warmup ? 4 : 40;
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) {
+          const fakeEv = { global: { x: 200 + (i * 19) % 600, y: 200 + (i * 23) % 400 } };
+          try { canvas.primary._onMouseMove(fakeEv); } catch {}
+        }
+        return { ms: performance.now() - t0 };
+      });
+      pushRow(`11. Hover Sweep (${canvas.tiles.placeables.length} tiles)`, off, on, {}, { absToleranceMs: 0.3 });
+    }
   } finally {
     await game.settings.set("core", "tokenDragPreview", savedDragPreview);
     await setPerfMode(savedPerfEnabled);
@@ -374,13 +405,153 @@ export async function benchmarkCurrentScene(opts = {}) {
 }
 
 /**
+ * Benchmark global non-scene gameplay mechanics (D&D 5e attack/damage/skill rolls,
+ * Roll.validate, ChatMessage rendering, and Character Sheet open/re-render) with ABBA.
+ * Zero DB mutations: all rolls use `{ create: false }` / dry-run evaluation.
+ */
+export async function benchmarkGameplayMechanics() {
+  const savedPerfEnabled = PERF_CONFIG.perfEnabled;
+  const rows = [];
+  const pushRow = (mechanic, offRes, onRes, thresholds = {}) => {
+    const cls = classifyMetric(offRes.ms, onRes.ms, thresholds);
+    rows.push({
+      scene: "Global Gameplay",
+      mechanic,
+      offMs: cls.offMs,
+      onMs: cls.onMs,
+      gainPct: cls.gainPct,
+      offFps: null,
+      onFps: null,
+      offDraws: null,
+      onDraws: null,
+      status: cls.status
+    });
+  };
+
+  try {
+    // G1: Roll.validate (200x repeated D&D formulas)
+    {
+      const formulas = ["1d20 + 7", "2d6 + 4", "8d6", "1d8 + 3 + 1d4", "1d20kh + 5", "4d10 + 10"];
+      const { off, on } = await runABBA(async (warmup) => {
+        const n = warmup ? 12 : 180;
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) Roll.validate(formulas[i % formulas.length]);
+        return { ms: performance.now() - t0 };
+      });
+      pushRow("G1. Roll.validate (180x)", off, on, { absToleranceMs: 0.25 });
+    }
+
+    // G2: Attack / Damage / Skill Rolls (D&D 5e dry-run, 0 DB writes) + Roll#render
+    const pc = game.actors?.find?.((a) => a.type === "character" && a.items?.size > 10)
+      || game.actors?.find?.((a) => a.type === "character");
+    const weapon = pc?.items?.find?.((i) => i.type === "weapon" && i.system?.activities?.size > 0);
+    const atkAct = weapon?.system?.activities?.find?.((a) => a.type === "attack");
+    {
+      const { off, on } = await runABBA(async (warmup) => {
+        const n = warmup ? 2 : 10;
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) {
+          if (atkAct?.rollAttack) {
+            try {
+              const rolls = await atkAct.rollAttack({}, { configure: false }, { create: false });
+              if (Array.isArray(rolls)) {
+                for (const r of rolls) await r.render();
+              }
+            } catch {
+              const r = await (new Roll("1d20 + 7")).evaluate();
+              await r.render();
+            }
+          } else {
+            const r = await (new Roll("1d20 + 7")).evaluate();
+            await r.render();
+          }
+          if (atkAct?.rollDamage) {
+            try {
+              const dmg = await atkAct.rollDamage({}, { configure: false }, { create: false });
+              if (Array.isArray(dmg)) {
+                for (const r of dmg) await r.render();
+              }
+            } catch {
+              const r = await (new Roll("2d6 + 4")).evaluate();
+              await r.render();
+            }
+          } else {
+            const r = await (new Roll("2d6 + 4")).evaluate();
+            await r.render();
+          }
+        }
+        return { ms: performance.now() - t0 };
+      });
+      pushRow("G2. Attack+Damage Rolls (10x)", off, on, { absToleranceMs: 2.5, warnPct: 8, failPct: 15 });
+    }
+
+    // G3: ChatMessage.renderHTML (recent chat cards)
+    const msgs = game.messages?.contents?.slice(-8) ?? [];
+    if (msgs.length >= 2) {
+      const { off, on } = await runABBA(async (warmup) => {
+        const list = warmup ? msgs.slice(0, 2) : msgs;
+        const t0 = performance.now();
+        for (const m of list) await m.renderHTML();
+        return { ms: performance.now() - t0 };
+      });
+      pushRow(`G3. Chat Cards Render (${msgs.length}x)`, off, on, { absToleranceMs: 1.5, warnPct: 8, failPct: 15 });
+    }
+
+    // G4: Character Sheet Open & Re-render (AppV2)
+    if (pc?.sheet) {
+      const { off, on } = await runABBA(async (warmup) => {
+        const t0 = performance.now();
+        await pc.sheet.render({ force: true });
+        if (!warmup) await pc.sheet.render();
+        await pc.sheet.close({ animate: false });
+        return { ms: performance.now() - t0 };
+      });
+      pushRow(`G4. Actor Sheet Open+Render (${pc.items.size} items)`, off, on, { absToleranceMs: 8, warnPct: 8, failPct: 15 });
+    }
+  } finally {
+    await setPerfMode(savedPerfEnabled);
+  }
+
+  return rows;
+}
+
+function selectDiverseScenes(maxCount = 5) {
+  const list = game.scenes?.contents ?? [];
+  if (list.length <= maxCount) return list.map((s) => s.id);
+  const picked = new Set();
+  const pickBest = (scoreFn) => {
+    let best = null;
+    let bestScore = -1;
+    for (const s of list) {
+      if (picked.has(s.id)) continue;
+      const sc = scoreFn(s);
+      if (sc > bestScore) { bestScore = sc; best = s; }
+    }
+    if (best && bestScore > 0) picked.add(best.id);
+  };
+  // 1. Most walls + lights (standard dungeon/castle)
+  pickBest((s) => (!s.flags?.[MODULE_ID]?.enabled ? (s.walls.size + s.lights.size * 3) : -1));
+  // 2. Most tokens + notes (combat / D&D adventure map)
+  pickBest((s) => (!s.flags?.[MODULE_ID]?.enabled ? (s.tokens.size * 10 + s.notes.size * 5) : -1));
+  // 3. Most tiles (tile-heavy standard scene)
+  pickBest((s) => (!s.flags?.[MODULE_ID]?.enabled ? s.tiles.size : -1));
+  // 4. Medium cave/encounter standard scene
+  pickBest((s) => (!s.flags?.[MODULE_ID]?.enabled ? (s.walls.size + s.tokens.size * 5 + s.lights.size * 2) : -1));
+  // 5. Boundless mega-scene with tokens
+  pickBest((s) => (s.flags?.[MODULE_ID]?.enabled ? (100 + s.tokens.size) : -1));
+  return Array.from(picked);
+}
+
+/**
  * Run the full A/B benchmark across one or multiple scenes and print a clean console report.
  */
 export async function runPerfBenchmark(opts = {}) {
   const origSceneId = globalThis.canvas?.scene?.id;
-  const sceneIds = Array.isArray(opts.sceneIds) && opts.sceneIds.length
-    ? opts.sceneIds
-    : [origSceneId].filter(Boolean);
+  const sceneIds = opts.allMaps
+    ? selectDiverseScenes(opts.maxMaps || 5)
+    : (Array.isArray(opts.sceneIds) && opts.sceneIds.length
+      ? opts.sceneIds
+      : [origSceneId].filter(Boolean));
 
   const allRows = [];
   try {
@@ -393,6 +564,10 @@ export async function runPerfBenchmark(opts = {}) {
       }
       const res = await benchmarkCurrentScene(opts);
       allRows.push(...res.rows);
+    }
+    if (opts.includeGameplay !== false) {
+      const gpRows = await benchmarkGameplayMechanics();
+      allRows.push(...gpRows);
     }
   } finally {
     if (origSceneId && canvas.scene?.id !== origSceneId) {

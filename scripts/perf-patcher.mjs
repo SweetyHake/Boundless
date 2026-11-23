@@ -87,7 +87,11 @@ export const perfStats = {
   // Auto-optimizer (standard scenes)
   autoCulledTiles: 0,
   autoCulledLights: 0,
+  autoCulledLightMeshes: 0,
+  autoCulledDoors: 0,
   autoCulledSounds: 0,
+  lightAnimSkipped: 0,
+  rollValidateHits: 0,
   vramTexturesDisposed: 0,
   vramBytesFreed: 0,
   standardLevelsPrewarmed: 0

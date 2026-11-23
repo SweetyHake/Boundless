@@ -899,6 +899,7 @@ export function resolveLightingScalePreset(mode, perfMode = 2) {
 
 export function applyLightingRenderScale() {
   if (isPrimePerfActive()) return;
+  if (!globalThis.canvas?.ready) return;
   const effects = globalThis.canvas?.effects;
   const baseRes = globalThis.canvas?.app?.renderer?.resolution || 1;
   if (!effects) return;
@@ -909,11 +910,16 @@ export function applyLightingRenderScale() {
 
   const applyOne = (layer, mult) => {
     const filter = layer?.filter;
-    if (!filter) return;
+    if (!filter || filter.destroyed) return;
+    // Do not override filters whose resolution is locked by Boundless mega-map engine
+    if (globalThis.Boundless?._patchedFilters?.has?.(filter)) return;
     const targetRes = Math.max(0.25, Math.min(baseRes, Math.round(baseRes * mult * 1000) / 1000));
-    if (Math.abs((filter.resolution || baseRes) - targetRes) > 0.01) {
-      filter.resolution = targetRes;
-    }
+    try {
+      const cur = filter.resolution;
+      if (Math.abs((cur || baseRes) - targetRes) > 0.01) {
+        filter.resolution = targetRes;
+      }
+    } catch {}
   };
   applyOne(effects.illumination, preset.illumination);
   applyOne(effects.coloration, preset.coloration);
@@ -922,8 +928,9 @@ export function applyLightingRenderScale() {
 
 export function applyDisableUiBlur() {
   if (typeof document === "undefined" || !document.body) return;
-  const active = Boolean(PERF_CONFIG.perfEnabled && PERF_CONFIG.perfDisableUiBlur);
-  document.body.classList.toggle("boundless-no-blur", active);
+  const blurOff = Boolean(PERF_CONFIG.perfEnabled && PERF_CONFIG.perfDisableUiBlur);
+  document.body.classList.toggle("boundless-no-blur", blurOff);
+  document.body.classList.toggle("boundless-ui-perf", Boolean(PERF_CONFIG.perfEnabled));
 }
 
 // ---------------------------------------------------------------------------

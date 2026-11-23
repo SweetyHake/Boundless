@@ -328,3 +328,21 @@ body.boundless-no-blur *::after {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
+
+/* Zero-config UI layout/paint isolation for long chat logs, directories, and big item lists */
+body.boundless-ui-perf .chat-log .chat-message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 110px;
+  contain: layout style;
+}
+
+body.boundless-ui-perf .directory .directory-list .directory-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
+  contain: layout style;
+}
+
+body.boundless-ui-perf .dnd5e2 .items-list .item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 38px;
+}

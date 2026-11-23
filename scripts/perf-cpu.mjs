@@ -32,6 +32,7 @@ const _losCache = new Map();
 const _cellVisCache = new Map();
 const _cellExploredCache = new Map();
 const _enrichCache = new Map();
+const _rollValidateCache = new Map();
 const _fogGuardSnap = new Map();
 const _fieldSigs = new WeakMap();
 let _measureCaches = new WeakMap();
@@ -620,12 +621,13 @@ function patchMiscCpuGuards() {
     const hit = _enrichCache.get(key);
     if (hit !== undefined) {
       perfStats.enrichHits++;
+      if (_enrichCache.size > 1) { _enrichCache.delete(key); _enrichCache.set(key, hit); }
       return Promise.resolve(hit);
     }
     perfStats.enrichMisses++;
     const res = wrapped(content, options);
     const store = (val) => {
-      if (_enrichCache.size >= 300) _enrichCache.delete(_enrichCache.keys().next().value);
+      if (_enrichCache.size >= 800) _enrichCache.delete(_enrichCache.keys().next().value);
       _enrichCache.set(key, val);
     };
     if (res?.then) res.then(store, () => {});
@@ -633,7 +635,37 @@ function patchMiscCpuGuards() {
     return res;
   }, { staticOnly: true });
 
-  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, Boolean(okEnrich)];
+  // Cache deterministic Roll.validate(formula) grammar parsing (called heavily on actor sheets & attack activities)
+  const okRollVal = wrapFoundryMethod("Roll", "validate", function (wrapped, formula) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfEnrichCache || typeof formula !== "string" || formula.length > 200) {
+      return wrapped(formula);
+    }
+    const hit = _rollValidateCache.get(formula);
+    if (hit !== undefined) {
+      perfStats.rollValidateHits++;
+      return hit;
+    }
+    const res = wrapped(formula);
+    if (_rollValidateCache.size >= 512) _rollValidateCache.delete(_rollValidateCache.keys().next().value);
+    _rollValidateCache.set(formula, res);
+    return res;
+  }, { staticOnly: true });
+
+  // Skip per-frame uniform/shader animation CPU work for offscreen-culled light sources
+  const okLightAnim = wrapFoundryMethod("PointLightSource", "animate", function (wrapped, dt) {
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
+      const bgOn = this.background?.renderable !== false && this.background;
+      const ilOn = this.illumination?.renderable !== false && this.illumination;
+      const coOn = this.coloration?.renderable !== false && this.coloration;
+      if ((this.background || this.illumination || this.coloration) && !bgOn && !ilOn && !coOn) {
+        perfStats.lightAnimSkipped++;
+        return;
+      }
+    }
+    return wrapped(dt);
+  });
+
+  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim)];
 }
 
 // ---------------------------------------------------------------------------
