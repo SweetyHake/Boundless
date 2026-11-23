@@ -325,6 +325,34 @@ const ROTATE_ANIM_TYPES = new Set(["sunburst", "revolving", "vortex", "dome", "r
 const CHROMA_ANIM_TYPES = new Set(["chroma", "rainbow"]);
 
 /**
+ * Average coloration fill factor of Foundry's procedural animated coloration shaders.
+ * Pattern shaders like `energy` (`voronoi3d` raised to `c.x^3`) leave ~85-90% of the disk black,
+ * so drawing them at full 1.0 solid fill in `MegaLightBatch` causes a jarring brightness drop
+ * whenever a door opens and nearby lights promote to native `PointLightSource`.
+ */
+const PATTERN_ANIM_COLOR_GAIN = {
+  energy: 0.16,
+  grid: 0.22,
+  forcegrid: 0.22,
+  starlight: 0.24,
+  smokepatch: 0.35,
+  fog: 0.38,
+  witchwave: 0.42,
+  bewitchingwave: 0.42,
+  fairy: 0.40,
+  ghost: 0.42,
+  emanation: 0.40,
+  hexa: 0.38,
+  dome: 0.45
+};
+
+export function getAnimColorationGain(anim) {
+  if (!anim) return 1.0;
+  const key = String(anim).trim().toLowerCase();
+  return PATTERN_ANIM_COLOR_GAIN[key] ?? 1.0;
+}
+
+/**
  * Encode animation mode and per-light phase offset into the single `aParams.w` float:
  *  - `< -1.5`      : macro orbital glow
  *  - `-1.5 .. <0`  : static light (no animation)
@@ -1251,23 +1279,24 @@ export class MegaLightBatch {
                 const lx = bl.lx + offX;
                 const ly = bl.ly + offY;
                 const ph = encodeLightAnimPhase(bl.anim, bl.basePhase + phaseShift, bl.canRotateCone);
+                const effAlpha = bl.alpha * getAnimColorationGain(bl.anim);
                 const vStart = vertCursor;
 
                 if (bl.offsets) {
                   const nPts = bl.offsets.length >> 1;
-                  const centerIdx = pushVertex(lx, ly, 0, 0, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const centerIdx = pushVertex(lx, ly, 0, 0, bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   const ringStart = vertCursor;
                   for (let i = 0; i < nPts; i++) {
-                    pushVertex(lx, ly, bl.offsets[i * 2], bl.offsets[i * 2 + 1], bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                    pushVertex(lx, ly, bl.offsets[i * 2], bl.offsets[i * 2 + 1], bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   }
                   for (let i = 0; i < nPts; i++) {
                     indicesArr.push(centerIdx, ringStart + i, ringStart + ((i + 1) % nPts));
                   }
                 } else {
-                  const v0 = pushVertex(lx, ly, -1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
-                  const v1 = pushVertex(lx, ly, 1, -1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
-                  const v2 = pushVertex(lx, ly, 1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
-                  const v3 = pushVertex(lx, ly, -1, 1, bl.dimPx, bl.ratio, bl.alpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v0 = pushVertex(lx, ly, -1, -1, bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v1 = pushVertex(lx, ly, 1, -1, bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v2 = pushVertex(lx, ly, 1, 1, bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
+                  const v3 = pushVertex(lx, ly, -1, 1, bl.dimPx, bl.ratio, effAlpha, ph, bl.r, bl.g, bl.b, bl.shaderAtt, bl.luminosity, bl.speed, bl.intensity);
                   indicesArr.push(v0, v1, v2, v0, v2, v3);
                 }
 
@@ -1425,22 +1454,23 @@ export class MegaLightBatch {
 
           const canRotateCone = angle < 360 && !(useWalls && hasNearbyWall);
           const phase = encodeLightAnimPhase(anim, basePhase, canRotateCone);
+          const effAlpha = aVal * getAnimColorationGain(anim);
 
           if (offsets && offsets.length >= 6) {
             const nPts = offsets.length >> 1;
-            const centerIdx = pushVertex(lx, ly, 0, 0, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const centerIdx = pushVertex(lx, ly, 0, 0, dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
             const ringStart = vertCursor;
             for (let i = 0; i < nPts; i++) {
-              pushVertex(lx, ly, offsets[i * 2], offsets[i * 2 + 1], dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+              pushVertex(lx, ly, offsets[i * 2], offsets[i * 2 + 1], dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
             }
             for (let i = 0; i < nPts; i++) {
               indicesArr.push(centerIdx, ringStart + i, ringStart + ((i + 1) % nPts));
             }
           } else {
-            const v0 = pushVertex(lx, ly, -1, -1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
-            const v1 = pushVertex(lx, ly, 1, -1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
-            const v2 = pushVertex(lx, ly, 1, 1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
-            const v3 = pushVertex(lx, ly, -1, 1, dimPx, ratio, aVal, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v0 = pushVertex(lx, ly, -1, -1, dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v1 = pushVertex(lx, ly, 1, -1, dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v2 = pushVertex(lx, ly, 1, 1, dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
+            const v3 = pushVertex(lx, ly, -1, 1, dimPx, ratio, effAlpha, phase, r, g, b, shaderAtt, style.luminosity, style.speed, style.intensity);
             indicesArr.push(v0, v1, v2, v0, v2, v3);
           }
 
@@ -2077,12 +2107,13 @@ export class MegaLightBatch {
           }
           const canRotateCone = angle < 360 && !(useWalls && hasNearbyWall);
           const phase = encodeLightAnimPhase(resolved.anim, basePhase, canRotateCone);
+          const effAlpha = aVal * getAnimColorationGain(resolved.anim);
 
           const vStart = job.vertCursor;
           const pushV = (ox, oy) => {
             job.centersArr.push(lx, ly);
             job.offsetsArr.push(ox, oy);
-            job.paramsArr.push(dimPx, ratio, aVal, phase);
+            job.paramsArr.push(dimPx, ratio, effAlpha, phase);
             job.colorsArr.push(r, g, b);
             job.stylesArr.push(shaderAtt, style.luminosity, style.speed, style.intensity);
             return job.vertCursor++;
