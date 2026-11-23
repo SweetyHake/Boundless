@@ -215,8 +215,8 @@ export class VirtualWallEditor {
 
   applyDoorStateToMounted(dKey, ds, { playSound = true } = {}) {
     const entry = this.mountedByDoorKey.get(dKey);
-    if (!entry?.wall || entry.wall.destroyed) return;
-    if (entry.doc.ds === ds) return;
+    if (!entry?.wall || entry.wall.destroyed) return false;
+    if (entry.doc.ds === ds) return false;
     entry.doc.updateSource({ ds });
     entry.sig = this._wallSig({
       levelId: entry.levelId,
@@ -234,8 +234,9 @@ export class VirtualWallEditor {
     entry.wall._onUpdate({ ds }, { sound: playSound }, game.user?.id);
     if (!this.active) entry.wall.visible = false;
     const dc = entry.wall.doorControl;
-    if (dc && !dc.destroyed) dc.visible = dc.isVisible;
+    if (dc && !dc.destroyed) dc.visible = (this._showDoorControls !== false) && dc.isVisible;
     this._syncOpenWallSheet(entry, { ds }, { syncDoorControl: true });
+    return true;
   }
 
   _syncPreviewDoorControl(previewWall) {
@@ -895,8 +896,10 @@ export class VirtualWallEditor {
     this._clearMountedWalls();
     this._removePatches();
     if (this.macroGfx) {
-      this.macroGfx.parent?.removeChild(this.macroGfx);
-      this.macroGfx.destroy();
+      try { this.macroGfx.parent?.removeChild(this.macroGfx); } catch {}
+      if (!this.macroGfx.destroyed) {
+        try { this.macroGfx.destroy(); } catch {}
+      }
       this.macroGfx = null;
     }
   }

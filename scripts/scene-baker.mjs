@@ -811,8 +811,11 @@ function resolveOccModesArray(modeSpec) {
 
 function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelId) {
   const wKey = `${sk}:${kind}:${idx}`;
-  const dKey = `${levelId}:${sk}:${kind === "w" ? "w:" : ""}${idx}`;
-  const liveDs = (doorStatesObj && dKey in doorStatesObj) ? doorStatesObj[dKey] : undefined;
+  const dKey = `${levelId}::${sk}_${kind === "w" ? "w" : ""}${idx}`;
+  const legacyDKey = `${levelId}:${sk}:${kind === "w" ? "w:" : ""}${idx}`;
+  const liveDs = (doorStatesObj && dKey in doorStatesObj)
+    ? doorStatesObj[dKey]
+    : ((doorStatesObj && legacyDKey in doorStatesObj) ? doorStatesObj[legacyDKey] : undefined);
 
   if (wallEditsObj && Object.prototype.hasOwnProperty.call(wallEditsObj, wKey)) {
     const ov = wallEditsObj[wKey];
@@ -1416,12 +1419,23 @@ async function fetchManifestJson(url, signal = null) {
 
 function buildLevelEditClearPatch(prevFlags, levelIds) {
   const patch = {};
+  const levelIdSet = new Set(levelIds);
   for (const mapKey of ["wallEdits", "lightEdits", "soundEdits", "tileEdits"]) {
     if (prevFlags?.[mapKey] && typeof prevFlags[mapKey] === "object") {
       for (const lid of levelIds) {
         if (lid in prevFlags[mapKey]) {
           patch[`flags.${MODULE_ID}.${mapKey}.-=${lid}`] = null;
         }
+      }
+    }
+  }
+  // Clear doorStates for edited levels since sector indices may shift after merging edits
+  if (prevFlags?.doorStates && typeof prevFlags.doorStates === "object") {
+    for (const dKey of Object.keys(prevFlags.doorStates)) {
+      const sep = dKey.indexOf("::");
+      const lid = sep > 0 ? dKey.slice(0, sep) : dKey.split(":")[0];
+      if (lid && levelIdSet.has(lid)) {
+        patch[`flags.${MODULE_ID}.doorStates.-=${dKey}`] = null;
       }
     }
   }
@@ -1600,10 +1614,12 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         lightEdits: prevFlags.lightEdits?.[lid],
         soundEdits: prevFlags.soundEdits?.[lid],
         tileEdits: prevFlags.tileEdits?.[lid],
+        doorStates: prevFlags.doorStates,
         nativeSpatial
       });
       attachBakedPolysIfPossible(merged.spec, scene, lvl);
-      await lvl.update({ [`flags.${MODULE_ID}.inlineManifest`]: merged.spec });
+      // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
+      await lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: merged.spec });
       totalWalls += merged.counts.walls;
       totalLights += merged.counts.lights;
       totalSounds += merged.counts.sounds;
@@ -1625,6 +1641,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         lightEdits: prevFlags.lightEdits?.[lid],
         soundEdits: prevFlags.soundEdits?.[lid],
         tileEdits: prevFlags.tileEdits?.[lid],
+        doorStates: prevFlags.doorStates,
         nativeSpatial
       });
       attachBakedPolysIfPossible(merged.spec, scene, lvl);
@@ -1678,6 +1695,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           lightEdits: prevFlags.lightEdits?.[lid],
           soundEdits: prevFlags.soundEdits?.[lid],
           tileEdits: prevFlags.tileEdits?.[lid],
+          doorStates: prevFlags.doorStates,
           nativeSpatial
         });
         attachBakedPolysIfPossible(merged.spec, scene, lvl);
@@ -1703,6 +1721,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           lightEdits: prevFlags.lightEdits?.[lid],
           soundEdits: prevFlags.soundEdits?.[lid],
           tileEdits: prevFlags.tileEdits?.[lid],
+          doorStates: prevFlags.doorStates,
           nativeSpatial
         });
         attachBakedPolysIfPossible(merged.spec, scene, targetLvl);
@@ -1734,17 +1753,41 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     throw new Error("No Boundless manifest found on this scene.");
   }
 
-  // 3. Remove absorbed native documents and clear edit flags
+  // 3. Remove or prune absorbed native documents (preserving unbaked levels on multi-level scenes)
   report(85, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
   if (absorbNative) {
-    const deleteIds = async (docName, ids) => {
-      const unique = Array.from(new Set(ids));
-      if (unique.length) await scene.deleteEmbeddedDocuments(docName, unique);
+    const editedLevelIdSet = new Set(editedLevelIds);
+    const unbakedLevelIds = allLevels.map(l => l.id).filter(lid => !editedLevelIdSet.has(lid));
+    const isPartial = unbakedLevelIds.length > 0;
+    const pruneOrDelete = async (docName, rawIds) => {
+      const unique = Array.from(new Set(rawIds));
+      if (!unique.length) return;
+      if (!isPartial) {
+        await scene.deleteEmbeddedDocuments(docName, unique);
+        return;
+      }
+      const collection = scene.getEmbeddedCollection?.(docName);
+      const toDelete = [];
+      const toUpdate = [];
+      for (const id of unique) {
+        const doc = collection?.get?.(id);
+        if (!doc) continue;
+        const docLevels = doc.levels ? Array.from(doc.levels) : [];
+        if (!docLevels.length) {
+          toUpdate.push({ _id: id, levels: unbakedLevelIds });
+          continue;
+        }
+        const remaining = docLevels.filter(lid => !editedLevelIdSet.has(lid));
+        if (remaining.length === 0) toDelete.push(id);
+        else if (remaining.length < docLevels.length) toUpdate.push({ _id: id, levels: remaining });
+      }
+      if (toUpdate.length) await scene.updateEmbeddedDocuments(docName, toUpdate);
+      if (toDelete.length) await scene.deleteEmbeddedDocuments(docName, toDelete);
     };
-    await deleteIds("Tile", nativeTileIdsToDelete);
-    await deleteIds("Wall", nativeWallIdsToDelete);
-    await deleteIds("AmbientLight", nativeLightIdsToDelete);
-    await deleteIds("AmbientSound", nativeSoundIdsToDelete);
+    await pruneOrDelete("Tile", nativeTileIdsToDelete);
+    await pruneOrDelete("Wall", nativeWallIdsToDelete);
+    await pruneOrDelete("AmbientLight", nativeLightIdsToDelete);
+    await pruneOrDelete("AmbientSound", nativeSoundIdsToDelete);
   }
 
   Object.assign(scenePatch, buildLevelEditClearPatch(prevFlags, editedLevelIds));

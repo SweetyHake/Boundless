@@ -1,6 +1,7 @@
 import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, resetPerfStats } from "./perf-patcher.mjs";
 import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
+import { resetCpuCaches } from "./perf-cpu.mjs";
 import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
 
 /**
@@ -86,6 +87,7 @@ function captureCanvasRgba(w = 256, h = 144) {
     _snapCanvas.width = w;
     _snapCanvas.height = h;
   }
+  if (!_snapCtx) return null;
   // Render synchronously right before drawImage (WebGL default preserveDrawingBuffer is false!)
   renderer.render(stage);
   renderer.batch.flush();
@@ -127,6 +129,7 @@ async function checkVisualParity(label, { maxMeanDiff = 4.5, maxMismatchPct = 3.
 
 async function setPerfMode(enabled) {
   PERF_CONFIG.perfEnabled = Boolean(enabled);
+  resetCpuCaches();
   if (!enabled) {
     clearTokenUiBitmapCaches();
     restoreAllStandardCulling();
@@ -227,19 +230,24 @@ function classifyMetric(offMs, onMs, { absToleranceMs = 0.25, warnPct = 5, failP
 function measureGlRender(renderFn, iters = 30) {
   const renderer = canvas.app.renderer;
   const gl = renderer.gl;
-  const origDE = gl.drawElements.bind(gl);
-  const origDA = gl.drawArrays.bind(gl);
+  const origDE = gl.drawElements;
+  const origDA = gl.drawArrays;
+  const hasOwnDE = Object.prototype.hasOwnProperty.call(gl, "drawElements");
+  const hasOwnDA = Object.prototype.hasOwnProperty.call(gl, "drawArrays");
 
   // Warmup
   for (let i = 0; i < 4; i++) { renderFn(); renderer.batch.flush(); gl.finish(); }
 
   let draws = 0;
-  gl.drawElements = (...a) => { draws++; return origDE(...a); };
-  gl.drawArrays = (...a) => { draws++; return origDA(...a); };
-  renderFn();
-  renderer.batch.flush();
-  gl.drawElements = origDE;
-  gl.drawArrays = origDA;
+  try {
+    gl.drawElements = function (...a) { draws++; return origDE.apply(this, a); };
+    gl.drawArrays = function (...a) { draws++; return origDA.apply(this, a); };
+    renderFn();
+    renderer.batch.flush();
+  } finally {
+    if (hasOwnDE) gl.drawElements = origDE; else delete gl.drawElements;
+    if (hasOwnDA) gl.drawArrays = origDA; else delete gl.drawArrays;
+  }
 
   const times = [];
   for (let i = 0; i < iters; i++) {
@@ -260,30 +268,33 @@ async function runRealMouseDrag(tok, steps = 28) {
   const sx = rect.left + (tok.center.x * wt.a + wt.tx);
   const sy = rect.top + (tok.center.y * wt.d + wt.ty);
 
-  view.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-  await nextFrame();
-  view.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, buttons: 1, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-  await nextFrame();
-
   const dts = [];
-  let prev = performance.now();
-  for (let i = 1; i <= steps; i++) {
-    const cx = sx + Math.cos(i * 0.22) * 240 + i * 4;
-    const cy = sy + Math.sin(i * 0.22) * 240;
-    view.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, button: 0, buttons: 1, clientX: cx, clientY: cy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+  try {
+    view.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
     await nextFrame();
-    const now = performance.now();
-    dts.push(now - prev);
-    prev = now;
-  }
+    view.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, buttons: 1, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+    await nextFrame();
 
-  window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-  view.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-  await nextFrame();
+    let prev = performance.now();
+    for (let i = 1; i <= steps; i++) {
+      const cx = sx + Math.cos(i * 0.22) * 240 + i * 4;
+      const cy = sy + Math.sin(i * 0.22) * 240;
+      view.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, button: 0, buttons: 1, clientX: cx, clientY: cy, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      await nextFrame();
+      const now = performance.now();
+      dts.push(now - prev);
+      prev = now;
+    }
+  } finally {
+    try { tok.mouseInteractionManager?.cancel?.(); } catch {}
+    try { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true })); } catch {}
+    try { view.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
+    await nextFrame();
+  }
 
   const avgMs = avg(dts);
   const p95Ms = percentile(dts, 0.95);
-  const worstMs = Math.max(...dts);
+  const worstMs = dts.length ? Math.max(...dts) : 0;
   return { ms: avgMs, p95Ms, worstMs, fps: +(1000 / Math.max(0.1, avgMs)).toFixed(1) };
 }
 
@@ -297,6 +308,8 @@ export async function benchmarkCurrentScene(opts = {}) {
   }
 
   const savedPerfEnabled = PERF_CONFIG.perfEnabled;
+  const savedIdleFpsLimit = PERF_CONFIG.perfIdleFpsLimit;
+  PERF_CONFIG.perfIdleFpsLimit = false;
   const savedLayer = canvas.activeLayer;
   const savedCamera = {
     x: canvas.stage.pivot.x,
@@ -543,22 +556,25 @@ export async function benchmarkCurrentScene(opts = {}) {
           let prevSig = "";
           let changed = 0;
           const t0 = performance.now();
-          for (let i = 0; i < steps; i++) {
-            const ang = (i / steps) * (Math.PI * 0.5);
-            const ex = activeLs.x + 25 + Math.cos(ang) * 45;
-            const ey = activeLs.y - 20 + Math.sin(ang) * 45;
-            edges.set("bl-bench-door.0", new EdgeCls(
-              { x: activeLs.x + 25, y: activeLs.y - 20 },
-              { x: ex, y: ey },
-              { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
-            ));
+          try {
+            for (let i = 0; i < steps; i++) {
+              const ang = (i / steps) * (Math.PI * 0.5);
+              const ex = activeLs.x + 25 + Math.cos(ang) * 45;
+              const ey = activeLs.y - 20 + Math.sin(ang) * 45;
+              edges.set("bl-bench-door.0", new EdgeCls(
+                { x: activeLs.x + 25, y: activeLs.y - 20 },
+                { x: ex, y: ey },
+                { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
+              ));
+              activeLs.initialize();
+              const pts = activeLs.shape?.points;
+              const sig = pts ? `${pts.length}:${Math.round(pts[0] || 0)}:${Math.round(pts[pts.length - 1] || 0)}` : "";
+              if (sig && sig !== prevSig) { changed++; prevSig = sig; }
+            }
+          } finally {
+            edges.delete("bl-bench-door.0");
             activeLs.initialize();
-            const pts = activeLs.shape?.points;
-            const sig = pts ? `${pts.length}:${Math.round(pts[0] || 0)}:${Math.round(pts[pts.length - 1] || 0)}` : "";
-            if (sig && sig !== prevSig) { changed++; prevSig = sig; }
           }
-          edges.delete("bl-bench-door.0");
-          activeLs.initialize();
           if (isOn && !warmup) onShapesChanged = Math.max(onShapesChanged, changed);
           return { ms: performance.now() - t0 };
         };
@@ -587,17 +603,20 @@ export async function benchmarkCurrentScene(opts = {}) {
           const runMultiSweep = async (warmup) => {
             const steps = warmup ? 2 : 6;
             const t0 = performance.now();
-            for (let i = 0; i < steps; i++) {
-              const ang = (i / steps) * (Math.PI * 0.5);
-              edges.set("bl-bench-door.0", new EdgeCls(
-                { x: activeLs.x + 25, y: activeLs.y - 20 },
-                { x: activeLs.x + 25 + Math.cos(ang) * 45, y: activeLs.y - 20 + Math.sin(ang) * 45 },
-                { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
-              ));
+            try {
+              for (let i = 0; i < steps; i++) {
+                const ang = (i / steps) * (Math.PI * 0.5);
+                edges.set("bl-bench-door.0", new EdgeCls(
+                  { x: activeLs.x + 25, y: activeLs.y - 20 },
+                  { x: activeLs.x + 25 + Math.cos(ang) * 45, y: activeLs.y - 20 + Math.sin(ang) * 45 },
+                  { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
+                ));
+                for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
+              }
+            } finally {
+              edges.delete("bl-bench-door.0");
               for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
             }
-            edges.delete("bl-bench-door.0");
-            for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
             return { ms: (performance.now() - t0) / steps };
           };
           const { off: mOff, on: mOn } = await runABBA(async (warmup) => runMultiSweep(warmup));
@@ -634,6 +653,7 @@ export async function benchmarkCurrentScene(opts = {}) {
         pushRow(`14. Idle Combat Token UI (${tokens.length} tokens)`, off, on, {}, { absToleranceMs: 0.12 });
       } finally {
         for (const s of savedVis) {
+          try { s.t.drawBars?.(); } catch {}
           if (s.t.nameplate && s.np !== undefined) s.t.nameplate.visible = s.np;
           if (s.t.bars && s.bars !== undefined) s.t.bars.visible = s.bars;
           if (s.t.bars?.bar1 && s.b1 !== undefined) s.t.bars.bar1.visible = s.b1;
@@ -641,8 +661,9 @@ export async function benchmarkCurrentScene(opts = {}) {
       }
     }
   } finally {
-    await game.settings.set("core", "tokenDragPreview", savedDragPreview);
-    await setPerfMode(savedPerfEnabled);
+    PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
+    try { await game.settings.set("core", "tokenDragPreview", savedDragPreview); } catch {}
+    try { await setPerfMode(savedPerfEnabled); } catch {}
     try { savedLayer?.activate?.(); } catch {}
     try { canvas.pan(savedCamera); } catch {}
   }
@@ -753,17 +774,23 @@ export async function benchmarkGameplayMechanics() {
 
     // G4: Character Sheet Open & Re-render (AppV2)
     if (pc?.sheet) {
+      const wasOpen = Boolean(pc.sheet.rendered);
       const { off, on } = await runABBA(async (warmup) => {
         const t0 = performance.now();
-        await pc.sheet.render({ force: true });
-        if (!warmup) await pc.sheet.render();
-        await pc.sheet.close({ animate: false });
+        try {
+          await pc.sheet.render({ force: true });
+          if (!warmup) await pc.sheet.render();
+        } finally {
+          if (!wasOpen) {
+            try { await pc.sheet.close({ animate: false }); } catch {}
+          }
+        }
         return { ms: performance.now() - t0 };
       });
       pushRow(`G4. Actor Sheet Open+Render (${pc.items.size} items)`, off, on, { absToleranceMs: 8, warnPct: 8, failPct: 15 });
     }
   } finally {
-    await setPerfMode(savedPerfEnabled);
+    try { await setPerfMode(savedPerfEnabled); } catch {}
   }
 
   return rows;
@@ -825,7 +852,7 @@ export async function runPerfBenchmark(opts = {}) {
     }
   } finally {
     if (origSceneId && canvas.scene?.id !== origSceneId) {
-      await game.scenes.get(origSceneId)?.view();
+      try { await game.scenes.get(origSceneId)?.view(); } catch {}
     }
   }
 

@@ -1,4 +1,4 @@
-import { MODULE_ID } from "./utils.mjs";
+import { MODULE_ID, getEffectiveScale } from "./utils.mjs";
 
 const CHUNK_STREAM_MIN_SCALE = 0.022; // Below ~0.022x (true continental orbit), macro pyramid + soft Gaussian macroLights handle rendering with 0 chunk fetches
 const CHUNK_VP_PAD_PX = 14000;        // Prefetch neighboring chunks 140 cells outside screen edge
@@ -41,7 +41,8 @@ export class ChunkStreamer {
         cfg,
         populated: new Set(Array.isArray(cfg.populated) ? cfg.populated : []),
         loaded: new Map(),  // ck -> { key, sectorKeys, overlayIds, lastUsedMs }
-        pending: new Map(), // ck -> Promise
+        pending: new Map(), // ck -> { promise, abort }
+        failed: new Map(),  // ck -> retryAfterMs (Infinity for 404/410)
         lastKey: ""
       });
     }
@@ -50,11 +51,15 @@ export class ChunkStreamer {
   unmount() {
     this._gen++;
     for (const [, st] of this.states) {
+      for (const [, req] of st.pending) {
+        try { req?.abort?.abort?.(); } catch {}
+      }
       for (const [ck] of st.loaded) {
         this._evictChunk(st, ck, false);
       }
       st.loaded.clear();
       st.pending.clear();
+      st.failed?.clear?.();
     }
     this.states.clear();
   }
@@ -109,7 +114,7 @@ export class ChunkStreamer {
     }
 
     // 2. Load chunks visible in viewport when zoomed below orbital scale
-    if (vp && vp.scale >= CHUNK_STREAM_MIN_SCALE) {
+    if (vp && getEffectiveScale(vp.scale) >= CHUNK_STREAM_MIN_SCALE) {
       addBox(
         vp.x0 - CHUNK_VP_PAD_PX,
         vp.y0 - CHUNK_VP_PAD_PX,
@@ -121,9 +126,17 @@ export class ChunkStreamer {
     return needed;
   }
 
+  _canFetchChunk(st, ck, now = performance.now()) {
+    if (st.loaded.has(ck) || st.pending.has(ck)) return false;
+    const retryAfter = st.failed?.get(ck);
+    if (retryAfter !== undefined && now < retryAfter) return false;
+    return true;
+  }
+
   /** Preload destination chunk silently while camera is flying to a distant POI. */
   prewarmPoint(worldX, worldY) {
     if (this.states.size === 0 || !Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
+    const now = performance.now();
     for (const [, st] of this.states) {
       const { cfg, populated, layer } = st;
       const cw = cfg.chunkWorldPx;
@@ -133,7 +146,7 @@ export class ChunkStreamer {
       const cy = Math.floor(worldY / cw);
       if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
       const ck = `${cx}_${cy}`;
-      if ((populated.size === 0 || populated.has(ck)) && !st.loaded.has(ck) && !st.pending.has(ck)) {
+      if ((populated.size === 0 || populated.has(ck)) && this._canFetchChunk(st, ck, now)) {
         this._fetchChunk(st, ck);
       }
     }
@@ -152,7 +165,7 @@ export class ChunkStreamer {
           const rec = st.loaded.get(ck);
           if (rec) {
             rec.lastUsedMs = now;
-          } else if (!st.pending.has(ck)) {
+          } else if (this._canFetchChunk(st, ck, now)) {
             this._fetchChunk(st, ck);
           }
         }
@@ -184,21 +197,30 @@ export class ChunkStreamer {
   _fetchChunk(st, ck) {
     const gen = this._gen;
     const url = `${st.cfg.baseUrl}/${ck}.json`;
-    const p = fetch(url)
+    const abort = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const p = fetch(url, abort ? { signal: abort.signal } : undefined)
       .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        if (!r.ok) {
+          const err = new Error(`HTTP ${r.status}`);
+          err.status = r.status;
+          throw err;
+        }
         return r.json();
       })
       .then(data => {
         st.pending.delete(ck);
+        st.failed?.delete?.(ck);
         if (gen !== this._gen || !this.states.has(st.layer.level.id)) return;
         this._mountChunkData(st, ck, data);
       })
       .catch(err => {
         st.pending.delete(ck);
+        if (err?.name === "AbortError" || gen !== this._gen) return;
+        const perm = err?.status === 404 || err?.status === 410;
+        st.failed?.set?.(ck, perm ? Infinity : (performance.now() + 15000));
         console.warn(`${MODULE_ID} | Failed to load chunk ${url}:`, err);
       });
-    st.pending.set(ck, p);
+    st.pending.set(ck, { promise: p, abort });
     return p;
   }
 

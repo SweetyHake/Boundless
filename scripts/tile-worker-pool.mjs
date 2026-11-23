@@ -372,7 +372,7 @@ export class TileWorkerPool {
   getStats() {
     return {
       supported: this._supported,
-      workers: this._workers.length,
+      workers: this._workers.filter(Boolean).length,
       queued: this._queue.length,
       inFlight: this._active.size,
       workerDecoded: this.stats.workerDecoded,
@@ -388,7 +388,7 @@ export class TileWorkerPool {
   destroy() {
     this.cancelAll();
     for (const w of this._workers) {
-      try { w.terminate?.(); } catch {}
+      try { w?.terminate?.(); } catch {}
     }
     this._workers = [];
     this._workerLoad = [];

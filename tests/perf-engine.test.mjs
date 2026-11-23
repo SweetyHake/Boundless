@@ -206,3 +206,22 @@ test("computeVisualDiff measures identical and divergent RGBA frames accurately"
   assert.equal(d.maxDelta, 60);
   assert.equal(d.meanAbsDiff, 5);
 });
+
+test("buildMeasureCacheKey distinguishes climb vs crawl actions and rejects function options", () => {
+  const kClimb = buildMeasureCacheKey([{ x: 0, y: 0, action: "climb" }, { x: 100, y: 0, action: "climb" }], {});
+  const kCrawl = buildMeasureCacheKey([{ x: 0, y: 0, action: "crawl" }, { x: 100, y: 0, action: "crawl" }], {});
+  assert.ok(kClimb && kCrawl);
+  assert.notEqual(kClimb, kCrawl);
+  assert.equal(buildMeasureCacheKey([{ x: 0, y: 0 }, { x: 100, y: 0 }], { cost: () => 2 }), null);
+});
+
+test("rewriteShaderNoiseGlsl leaves GLSL 300 es shaders untouched", () => {
+  const frag300 = `#version 300 es
+precision highp float;
+float noise(in vec2 uv) {
+  return mix(0.0, 1.0, uv.x);
+}`;
+  const res = rewriteShaderNoiseGlsl(frag300);
+  assert.equal(res.modified, false);
+  assert.equal(res.src, frag300);
+});

@@ -1,5 +1,6 @@
 import { TokenImpostorLayer } from "./token-impostors.mjs";
 import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation } from "./utils.mjs";
+import { invalidateTokenLayerCache } from "./perf-gpu.mjs";
 
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
 const MOUNT_ENTER_SCALE = 0.11;     // Start streaming native NPC placeables when descending past 0.11x (11px/token)
@@ -105,15 +106,23 @@ export function installLazyTokenLayerPatch() {
     const origDraw = TokenCls.prototype.draw;
     TokenCls.prototype.draw = function (...args) {
       coreDrawingCounts.set(this, (coreDrawingCounts.get(this) || 0) + 1);
-      const p = Promise.resolve(origDraw.apply(this, args)).finally(() => {
+      const cleanup = (promiseRef) => {
         const rem = (coreDrawingCounts.get(this) || 1) - 1;
         if (rem <= 0) {
           coreDrawingCounts.delete(this);
-          if (coreDrawPromises.get(this) === p) coreDrawPromises.delete(this);
+          if (!promiseRef || coreDrawPromises.get(this) === promiseRef) coreDrawPromises.delete(this);
         } else {
           coreDrawingCounts.set(this, rem);
         }
-      });
+      };
+      let rawRes;
+      try {
+        rawRes = origDraw.apply(this, args);
+      } catch (err) {
+        cleanup(null);
+        throw err;
+      }
+      const p = Promise.resolve(rawRes).finally(() => cleanup(p));
       coreDrawPromises.set(this, p);
       return p;
     };
@@ -623,6 +632,9 @@ export class TokenStreamer {
       }
     }
 
+    if (anyRenderableToggled || lodChanged) {
+      invalidateTokenLayerCache();
+    }
     if (anyRenderableToggled) {
       // Flush impostor state synchronously in the same frame so Native <-> Impostor handoff has zero 1-frame blink
       this.impostors.refreshVisibility(true);
@@ -1066,6 +1078,7 @@ export class TokenStreamer {
     }
 
     if (evicted > 0) {
+      invalidateTokenLayerCache();
       this.impostors.markVisibilityDirty();
     }
 

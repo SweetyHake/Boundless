@@ -478,6 +478,7 @@ class MegaWorld1000 {
     if (!next && this.active && canvas?.ready) {
       this.syncZoomLimits({ animate: false });
       this.updatePyramid();
+      this.scheduleViewportLightSync();
       this._saveCameraNow();
     }
   }
@@ -963,6 +964,7 @@ class MegaWorld1000 {
 
   _scheduleIdleLevelPrewarm(scene, sceneCfg, sceneManifest, mountGen) {
     this._cancelIdleLevelPrewarm();
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleLevelPrewarm) return;
     const allLevels = Array.from(scene?.levels || []);
     if (allLevels.length <= 1) return;
 
@@ -985,7 +987,7 @@ class MegaWorld1000 {
         if (!busy) return true;
         await new Promise(r => setTimeout(r, 350));
       }
-      return !isStale();
+      return false;
     };
 
     this._idleLevelPrewarmTimer = setTimeout(async () => {
@@ -998,7 +1000,7 @@ class MegaWorld1000 {
         || scene.firstLevel?.id
         || allLevels[0]?.id;
       const adjacentLevels = allLevels
-        .filter(lvl => !this.levelLayers.has(lvl.id) && lvl.flags?.[MODULE_ID]?.enabled !== false)
+        .filter(lvl => !this.levelLayers.has(lvl.id) && !this._prewarmedLevels.has(lvl.id) && lvl.flags?.[MODULE_ID]?.enabled !== false)
         .sort((a, b) => Math.abs(getLevelBaseElevation(a) - curElev) - Math.abs(getLevelBaseElevation(b) - curElev));
 
       const pxPerFt = (canvas.dimensions?.size || 100) / (canvas.dimensions?.distance || 5);
@@ -1049,15 +1051,21 @@ class MegaWorld1000 {
           if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
             urls.push(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`);
           }
+          let completedTex = true;
           for (const url of urls) {
-            if (isStale() || this.isActivelyMoving()) break;
-            if (this.texMgr.totalBytes >= this.texMgr.maxVramBytes * 0.75) break;
+            if (isStale()) return;
+            if (this.isActivelyMoving() || this.texMgr.totalBytes >= this.texMgr.maxVramBytes * 0.75) {
+              completedTex = false;
+              break;
+            }
             if (!this.texMgr.getSync(url)) {
               await this.texMgr.load(url, { mipmap: true, priority: 2 }).catch(() => {});
             }
           }
+          if (completedTex) this._prewarmedLevels.add(lvl.id);
+        } else {
+          this._prewarmedLevels.add(lvl.id);
         }
-        this._prewarmedLevels.add(lvl.id);
       }
     }, 1800);
   }
@@ -1088,14 +1096,14 @@ class MegaWorld1000 {
   _syncInterfaceVoidFilter(forceEnable = false) {
     const ifVoid = canvas.interface?.filters?.find(f => f?.constructor?.name === "VoidFilter");
     if (!ifVoid) return;
-    if (this._origIfVoidEnabled === null) this._origIfVoidEnabled = ifVoid.enabled;
+    if (this._origIfVoidEnabled === null) this._origIfVoidEnabled = Boolean(ifVoid.enabled);
     const needVoid = Boolean(
       forceEnable
       || (canvas.tokens?.placeables?.length || 0) > 0
       || (canvas.tokens?.objects?.children?.length || 0) > 0
       || (canvas.scene?.tokens?.size || 0) > 0
     );
-    ifVoid.enabled = needVoid ? this._origIfVoidEnabled : false;
+    ifVoid.enabled = needVoid ? (this._origIfVoidEnabled || true) : false;
   }
 
   _hasMultiElevationDepth() {
@@ -2593,15 +2601,39 @@ class MegaWorld1000 {
           }
         }
       }
+      // Also track light-restricting virtual & native tiles with occlusion so CanvasDepthMask refreshes on fade
+      for (const [vtKey, vt] of this.activeVirtualTiles) {
+        const m = vt?.mesh;
+        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        sig += `vt:${vtKey}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
+      }
+      for (const nt of canvas.tiles?.placeables ?? []) {
+        const m = nt?.mesh;
+        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        sig += `nt:${nt.id}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
+      }
       if (sig !== this._lastRoofOccSig) {
         this._lastRoofOccSig = sig;
         this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
       }
-    } else if (this._lastRoofOccSig) {
-      this._lastRoofOccSig = "";
-      this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+    } else {
+      let tileSig = "";
+      for (const [vtKey, vt] of this.activeVirtualTiles) {
+        const m = vt?.mesh;
+        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        tileSig += `vt:${vtKey}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
+      }
+      for (const nt of canvas.tiles?.placeables ?? []) {
+        const m = nt?.mesh;
+        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        tileSig += `nt:${nt.id}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
+      }
+      if (tileSig !== this._lastRoofOccSig) {
+        this._lastRoofOccSig = tileSig;
+        this._depthDirty = true;
+        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+      }
     }
 
     // Reconcile localized z=6 interior reveal tiles on z=5
@@ -3834,13 +3866,30 @@ class MegaWorld1000 {
     }
     if (this.visibleLevelLayers.length) {
       const now = performance.now();
-      if (rangedChanged || (now - (this._lastLightRefreshAudioMs || 0)) >= 120) {
+      const elapsed = now - (this._lastLightRefreshAudioMs || 0);
+      if (rangedChanged || elapsed >= 120) {
+        if (this._lightRefreshAudioTimer) {
+          clearTimeout(this._lightRefreshAudioTimer);
+          this._lightRefreshAudioTimer = null;
+        }
         this._lastLightRefreshAudioMs = now;
         this.audioStreamer.update(
           this.visibleLevelLayers,
           this.getViewportWorldRect(0.28),
           (lid, sk, idx, raw, lvl) => this.resolveVirtualSound(lid, sk, idx, raw, lvl)
         );
+      } else if (!this._lightRefreshAudioTimer) {
+        const delay = Math.max(16, Math.ceil(120 - elapsed));
+        this._lightRefreshAudioTimer = setTimeout(() => {
+          this._lightRefreshAudioTimer = null;
+          if (!this.active || !this.visibleLevelLayers.length) return;
+          this._lastLightRefreshAudioMs = performance.now();
+          this.audioStreamer.update(
+            this.visibleLevelLayers,
+            this.getViewportWorldRect(0.28),
+            (lid, sk, idx, raw, lvl) => this.resolveVirtualSound(lid, sk, idx, raw, lvl)
+          );
+        }, delay);
       }
     }
   }
@@ -3953,13 +4002,15 @@ class MegaWorld1000 {
         }
       }
 
-      // 1c. Viewport animated lights (at close/room zoom >= 0.22): promote visible animated lights
-      //     (especially pattern shaders like `energy`, `witchwave`, `fairy`, `torch`) to native PointLightSource
-      //     so closing a door never makes room animations vanish! Debounced on pan settle to keep 144 FPS panning.
+      // 1c. Viewport animated lights (at close/room zoom >= 0.22 in 100-PPI equivalent scale): promote visible
+      //     animated lights (especially pattern shaders like `energy`, `witchwave`, `fairy`, `torch`) to native
+      //     PointLightSource so closing a door never makes room animations vanish!
       const MAX_VIEWPORT_ANIM_LIGHTS = 18;
-      const lightAnimEnabled = (() => { try { return game.settings.get("core", "lightAnimation") !== false; } catch { return true; } })();
-      const effScale = canvas.stage?.scale?.x || 1;
-      if (lightAnimEnabled && effScale >= 0.22 && neededDynLights.size < MAX_VIEWPORT_ANIM_LIGHTS + 8) {
+      const MAX_TOTAL_DYN_LIGHTS = 28;
+      const lightAnimEnabled = canvas.effects?.animateLightSources !== false;
+      const effScale = getEffectiveScale(canvas.stage?.scale?.x || 1);
+      const vpAnimBudget = Math.min(MAX_VIEWPORT_ANIM_LIGHTS, Math.max(0, MAX_TOTAL_DYN_LIGHTS - neededDynLights.size));
+      if (lightAnimEnabled && effScale >= 0.22 && vpAnimBudget > 0) {
         const vp = this.getViewportWorldRect(0.2);
         if (vp && Number.isFinite(vp.x0) && Number.isFinite(vp.x1)) {
           const cx = (vp.x0 + vp.x1) * 0.5;
@@ -3969,6 +4020,7 @@ class MegaWorld1000 {
             const layer = this.visibleLevelLayers[li];
             const levelId = layer?.level?.id;
             if (!levelId || !layer?.spec?.sectors) continue;
+            const viewPrio = layer.level.isView ? 0 : 1;
             const { simGrid, simSectorPx, spec } = layer;
             const sx0 = Math.max(0, Math.floor((vp.x0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
             const sy0 = Math.max(0, Math.floor((vp.y0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
@@ -3990,15 +4042,14 @@ class MegaWorld1000 {
                   const dy = meta.ly - cy;
                   const animType = String(meta.raw[6]).toLowerCase();
                   const isPattern = animType !== "torch" && animType !== "flame" && animType !== "pulse";
-                  vpCandidates.push({ lid, prio: isPattern ? 0 : 1, distSq: dx * dx + dy * dy });
+                  vpCandidates.push({ lid, viewPrio, prio: isPattern ? 0 : 1, distSq: dx * dx + dy * dy });
                 }
               }
             }
           }
           if (vpCandidates.length > 0) {
-            vpCandidates.sort((a, b) => (a.prio - b.prio) || (a.distSq - b.distSq));
-            const budget = Math.max(0, MAX_VIEWPORT_ANIM_LIGHTS);
-            const take = Math.min(budget, vpCandidates.length);
+            vpCandidates.sort((a, b) => (a.viewPrio - b.viewPrio) || (a.prio - b.prio) || (a.distSq - b.distSq));
+            const take = Math.min(vpAnimBudget, vpCandidates.length);
             for (let i = 0; i < take; i++) neededDynLights.add(vpCandidates[i].lid);
           }
         }
@@ -4353,36 +4404,70 @@ class MegaWorld1000 {
     }
 
     // Drive native Wall._onUpdate (DoorControl icon, DoorMesh animation, native door sound)
-    this.wallEditor.applyDoorStateToMounted(dKey, ds, { playSound });
+    const mountedUpdated = Boolean(this.wallEditor.applyDoorStateToMounted(dKey, ds, { playSound }));
 
     if (deferRebakeMs > 0) {
-      const timerId = setTimeout(() => {
+      let deferRetries = 0;
+      const runCloseRebake = () => {
         this.closingDoorTimers.delete(dKey);
         if (!this.active) return;
         const nowOpen = this.getCurrentDoorState(dKey, defaultDs) === 1;
         if (nowOpen !== (defaultDs === 1)) return;
+        // Wait if Showstopper / DoorMesh CanvasAnimation is still in progress (e.g. tab was backgrounded)
+        const anims = foundry.canvas?.animation?.CanvasAnimation?.animations ?? globalThis.CanvasAnimation?.animations;
+        const wallId = mountedWall?.id;
+        let stillAnimating = false;
+        if (anims && wallId && deferRetries < 20) {
+          const prefix = `Door.${wallId}.`;
+          for (const k in anims) {
+            if (k.startsWith(prefix)) { stillAnimating = true; break; }
+          }
+        }
+        if (stillAnimating) {
+          deferRetries++;
+          this.closingDoorTimers.set(dKey, setTimeout(runCloseRebake, 100));
+          return;
+        }
         this.openDoors.delete(dKey);
         this.updateSimAndLightBubbles(false);
-        canvas.perception?.update({ refreshLighting: true, refreshVision: true });
-      }, deferRebakeMs + 60);
-      this.closingDoorTimers.set(dKey, timerId);
+        for (const [, ls] of this.dynamicLights) {
+          if (ls.data?.level !== levelId) continue;
+          const r = (ls.radius || ls.data?.dim || 600) + 150;
+          if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize();
+        }
+        canvas.perception?.update({ refreshLightSources: true, refreshLighting: true, refreshVision: true });
+      };
+      this.closingDoorTimers.set(dKey, setTimeout(runCloseRebake, deferRebakeMs + 60));
     }
 
     if (isOpen !== wasOpen) {
       const hasAnimatedDoorLighting = Boolean(
-        mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
+        mountedUpdated && mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
         && globalThis.showstopper?.doorLighting?.isEnabled?.()
       );
       this.updateSimAndLightBubbles(false);
       if (!hasAnimatedDoorLighting) {
-        for (const [, ls] of this.dynamicLights) {
-          if (ls.data?.level !== levelId) continue;
+        let needDarknessRebuild = false;
+        for (const ls of canvas.effects?.lightSources ?? []) {
+          if (!ls?.active || ls.data?.walls === false) continue;
+          const lsLvl = ls.level?.id ?? ls.data?.level;
+          if (lsLvl && lsLvl !== levelId) continue;
           const r = (ls.radius || ls.data?.dim || 600) + 150;
-          if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize(ls.data);
+          if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize();
+        }
+        for (const dsSrc of canvas.effects?.darknessSources ?? []) {
+          if (!dsSrc?.active || dsSrc.data?.walls === false) continue;
+          const dsLvl = dsSrc.level?.id ?? dsSrc.data?.level;
+          if (dsLvl && dsLvl !== levelId) continue;
+          const r = (dsSrc.radius || 600) + 150;
+          if (Math.hypot(dsSrc.x - dx, dsSrc.y - dy) <= r) {
+            needDarknessRebuild = true;
+            break;
+          }
         }
         canvas.perception.update({
           initializeVision: true,
-          initializeLighting: (canvas.lighting?.placeables?.length ?? 0) > 0,
+          initializeLighting: needDarknessRebuild,
           initializeSounds: true,
           refreshLightSources: true,
           refreshLighting: true,
@@ -4429,7 +4514,18 @@ class MegaWorld1000 {
       // Only the single active GM persists player door requests and broadcasts authoritative state
       if (game.users.activeGM?.id !== game.user?.id) return;
       const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
-      if (info.doorType === 2 || curDs === 2 || targetDs === 2) return;
+      if (info.doorType === 2 || curDs === 2 || targetDs === 2) {
+        // Send authoritative state back so rejected player rolls back optimistic local toggle
+        game.socket?.emit(SOCKET_NAME, {
+          type: "doorState",
+          sceneId: canvas.scene.id,
+          dKey: info.dKey,
+          ds: curDs,
+          playSound: false,
+          senderId: game.user.id
+        });
+        return;
+      }
       this._applyDoorStateLocal(info, targetDs, { playSound: true });
       game.socket?.emit(SOCKET_NAME, {
         type: "doorState",
@@ -5934,6 +6030,11 @@ class MegaWorld1000 {
     this.soundEdits.clear();
     this.tileEdits.clear();
     this._lightRebuildScheduled = false;
+    if (this._vpLightSyncTimer) { clearTimeout(this._vpLightSyncTimer); this._vpLightSyncTimer = null; }
+    if (this._lightRefreshAudioTimer) { clearTimeout(this._lightRefreshAudioTimer); this._lightRefreshAudioTimer = null; }
+    this._lastLightRefreshAudioMs = 0;
+    if (_sightBubbleTimer) { clearTimeout(_sightBubbleTimer); _sightBubbleTimer = null; }
+    _hadVisionSources = false;
 
     if (this.tickerFn && canvas?.app?.ticker) {
       canvas.app.ticker.remove(this.tickerFn);
@@ -6316,6 +6417,8 @@ Hooks.on("lightingRefresh", (effects) => {
 
 let _sightRefreshQueued = false;
 let _lastSightBubbleMs = 0;
+let _sightBubbleTimer = null;
+let _hadVisionSources = false;
 Hooks.on("sightRefresh", () => {
   if (!controller.active) return;
   if (_sightRefreshQueued) return;
@@ -6326,11 +6429,25 @@ Hooks.on("sightRefresh", () => {
     controller.fogManager.revealFromActiveVision();
     controller.wallEditor.refreshDoorVisibility();
     const hasVision = (canvas.effects?.visionSources?.size ?? 0) > 0;
-    if (hasVision) {
+    if (hasVision !== _hadVisionSources) {
+      _hadVisionSources = hasVision;
+      if (_sightBubbleTimer) { clearTimeout(_sightBubbleTimer); _sightBubbleTimer = null; }
+      _lastSightBubbleMs = performance.now();
+      controller.updateSimAndLightBubbles(false);
+    } else if (hasVision) {
       const now = performance.now();
-      if (now - _lastSightBubbleMs >= 100) {
+      const elapsed = now - _lastSightBubbleMs;
+      if (elapsed >= 100) {
+        if (_sightBubbleTimer) { clearTimeout(_sightBubbleTimer); _sightBubbleTimer = null; }
         _lastSightBubbleMs = now;
         controller.updateSimAndLightBubbles(false);
+      } else if (!_sightBubbleTimer) {
+        _sightBubbleTimer = setTimeout(() => {
+          _sightBubbleTimer = null;
+          if (!controller.active) return;
+          _lastSightBubbleMs = performance.now();
+          controller.updateSimAndLightBubbles(false);
+        }, Math.max(16, Math.ceil(100 - elapsed)));
       }
     }
     controller.tokenStreamer.onVisibilityChanged();
@@ -6343,7 +6460,7 @@ Hooks.on("updateToken", (doc, changes) => {
   controller.charPins.onTokenUpdated(doc, changes);
   const posChanged = "x" in changes || "y" in changes || "level" in changes;
   const elevChanged = "elevation" in changes;
-  const lightChanged = "light" in changes;
+  const lightChanged = "light" in changes || "sight" in changes;
   if (posChanged || elevChanged || lightChanged) {
     if ((posChanged || elevChanged) && controller._hasMultiElevationDepth()) controller._depthDirty = true;
     if (posChanged || lightChanged) controller.updateSimAndLightBubbles(false);
@@ -6357,7 +6474,7 @@ Hooks.on("updateToken", (doc, changes) => {
 Hooks.on("drawToken", (tok) => {
   if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenDrawn(tok);
-  controller._syncInterfaceVoidFilter(true);
+  if (!tok.isPreview) controller._syncInterfaceVoidFilter(true);
 });
 
 Hooks.on("refreshToken", (tok, flags) => {

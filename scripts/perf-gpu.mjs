@@ -286,6 +286,8 @@ function patchWallSprites() {
     sp.tint = wc;
 
     this.line.hitArea = makeLineHitPolygon(c[0], c[1], c[2], c[3], Math.max(6, lw * 2));
+    if (this.doorControl) this.doorControl.reposition();
+    globalThis.foundry?.canvas?.interaction?.MouseInteractionManager?.emulateMoveEvent?.();
 
     if (this.directionIcon) {
       this.directionIcon.position.set((c[0] + c[2]) * 0.5, (c[1] + c[3]) * 0.5);
@@ -417,6 +419,10 @@ function patchControlIcons() {
   const okClear = wrapFoundryMethod("ControlIcon", "_clear", function (wrapped) {
     if (this._blBgSprite) this._blBgSprite.visible = false;
     if (this._blBorderSprite) this._blBorderSprite.visible = false;
+    if (this._blShadowSp) this._blShadowSp.visible = false;
+    if (this._blExtrudeSp) this._blExtrudeSp.visible = false;
+    if (this._blFillSp) this._blFillSp.visible = false;
+    if (this._blStrokeSp) this._blStrokeSp.visible = false;
     return wrapped();
   }, { type: "WRAPPER" });
 
@@ -604,7 +610,7 @@ function getStageViewportWorldRect(padWorld = 240) {
 }
 
 function renderChildSafe(child, renderer) {
-  if (!child || !child.visible || !child.renderable || child.worldAlpha <= 0) return;
+  if (!child || child.destroyed || !child.visible || !child.renderable || child.worldAlpha <= 0) return;
   child.render(renderer);
 }
 
@@ -627,6 +633,10 @@ function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
 
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].border, renderer);
+  // Render voidMesh (ERASE cutout) & detectionFilterMesh strictly BEFORE UI overlays (bars, effects, nameplates)
+  // so voidMesh never erases token bars, status icons, or tooltips.
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].voidMesh, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].detectionFilterMesh, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].effects, renderer);
   for (let i = 0; i < n; i++) {
@@ -645,6 +655,8 @@ function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
       if (
         c === t.turnMarker ||
         c === t.border ||
+        c === t.voidMesh ||
+        c === t.detectionFilterMesh ||
         c === t.bars ||
         c === t.effects ||
         c === t.targetArrows ||
@@ -660,9 +672,14 @@ function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
 }
 
 function tryRenderStaticTokenLayerCache(renderer, visibleTokens, complexTokens) {
-  // Only engage static RT cache for >= 8 visible tokens when rendering directly to screen (no nested filter RT)
-  if (visibleTokens.length < 8) return false;
+  // Only engage static RT cache for >= 8 visible tokens when rendering directly to screen (no nested VoidFilter RT)
+  // and no animated turnMarkers are active.
+  if (visibleTokens.length < 8) {
+    if (_tokLayerCache.rt) destroyTokenLayerCache();
+    return false;
+  }
   if (renderer.renderTexture?.current) return false;
+  if (globalThis.canvas?.tokens?.turnMarkers?.size > 0) return false;
   if (globalThis.canvas?.tokens?.preview?.children?.length > 0) {
     invalidateTokenLayerCache();
     return false;
@@ -757,6 +774,7 @@ function attachTokenUiBatcher() {
     const kids = this.children;
     const count = kids.length;
     if (count < 4) return wrapped(renderer);
+    if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
     visibleTokens.length = 0;
@@ -764,7 +782,7 @@ function attachTokenUiBatcher() {
 
     for (let i = 0; i < count; i++) {
       const tok = kids[i];
-      if (!tok || !tok.visible || !tok.renderable || tok.worldAlpha <= 0) continue;
+      if (!tok || tok.destroyed || !tok.visible || !tok.renderable || tok.worldAlpha <= 0) continue;
 
       if (vp && !tok.controlled && !tok.hover && !tok.isPreview) {
         const tx = tok.x ?? tok.document?.x ?? 0;
@@ -777,7 +795,14 @@ function attachTokenUiBatcher() {
         }
       }
 
-      if (tok._mask || (tok.filters && tok.filters.length) || !tok.bars) {
+      // Preserve vision-5e custom render(renderer) children-swapping for non-precise detections
+      if (
+        tok._mask ||
+        (tok.filters && tok.filters.length) ||
+        !tok.bars ||
+        tok.detectionFilter != null ||
+        (tok._detectionLevel !== undefined && tok._detectionLevel < 2)
+      ) {
         complexTokens.push(tok);
       } else {
         visibleTokens.push(tok);
@@ -803,28 +828,39 @@ function attachLightingLayerBatcher() {
   objects._blLightBatcherAttached = true;
 
   const visLights = [];
+  const complexLights = [];
 
   wrapTargetMethod(objects, "render", "LightingLayer.objects.render", function (wrapped, renderer) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfWallSprites) return wrapped(renderer);
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfWallSprites || isPrimePerfActive()) return wrapped(renderer);
     if (!this.visible || this.worldAlpha <= 0 || !this.renderable) return;
+    if (this._mask || (this.filters && this.filters.length) || this.cullable) return wrapped(renderer);
     const kids = this.children;
     const count = kids.length;
     if (count < 32) return wrapped(renderer);
+    if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
+    const distPx = globalThis.canvas?.dimensions?.distancePixels || 20;
     visLights.length = 0;
+    complexLights.length = 0;
     for (let i = 0; i < count; i++) {
       const al = kids[i];
-      if (!al || !al.visible || !al.renderable || al.worldAlpha <= 0) continue;
+      if (!al || al.destroyed || !al.visible || !al.renderable || al.worldAlpha <= 0) continue;
       if (vp && !al.controlled && !al.hover && !al.isPreview) {
         const lx = al.document?.x ?? al.x ?? 0;
         const ly = al.document?.y ?? al.y ?? 0;
-        const r = Math.max(80, al.lightSource?.radius ?? 100);
+        const cfgR = Math.max(al.document?.config?.dim || 0, al.document?.config?.bright || 0) * distPx;
+        const r = Math.max(80, al.radius || al.lightSource?.radius || cfgR || 100);
         if (lx + r < vp.minX || lx - r > vp.maxX || ly + r < vp.minY || ly - r > vp.maxY) continue;
       }
-      visLights.push(al);
+      if (al._mask || (al.filters && al.filters.length)) {
+        complexLights.push(al);
+      } else {
+        visLights.push(al);
+      }
     }
 
+    for (let i = 0; i < complexLights.length; i++) complexLights[i].render(renderer);
     const n = visLights.length;
     if (n === 0) return;
     // Pass 1: field Graphics (radius rings)
@@ -891,7 +927,8 @@ function patchTokenUiCaching() {
       this.effects &&
       !this.effects.destroyed &&
       !this.isPreview &&
-      this.effects.children?.length > 1
+      !this.effects.overlay &&
+      this.effects.children?.length >= 4
     ) {
       this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
       this.effects.cacheAsBitmap = true;
@@ -904,7 +941,7 @@ function patchTokenUiCaching() {
 }
 
 export function clearTokenUiBitmapCaches() {
-  invalidateTokenLayerCache();
+  destroyTokenLayerCache();
   const placeables = globalThis.canvas?.tokens?.placeables;
   if (!placeables) return;
   for (const tok of placeables) {
@@ -990,6 +1027,8 @@ function getNoiseLutTexture() {
 export function rewriteShaderNoiseGlsl(src) {
   if (typeof src !== "string" || !src.length) return { src, modified: false };
   if (src.includes("uBoundlessNoise")) return { src, modified: false };
+  // Skip WebGL2 GLSL 300 es custom shaders (texture2D / uniform ordering rules differ)
+  if (/^\s*#version\s+300\s+es\b/m.test(src)) return { src, modified: false };
 
   let out = src;
   let modified = false;
@@ -1160,8 +1199,8 @@ export function installGpuPerfEngine() {
 
   Hooks.on("canvasReady", () => {
     invalidateTokenLayerCache();
-    attachLightingLayerBatcher();
     if (!isPrimePerfActive()) {
+      attachLightingLayerBatcher();
       patchDnd5eMapLocationIcons();
       attachTokenUiBatcher();
       applyLightingRenderScale();
@@ -1183,7 +1222,7 @@ export function refreshGpuPerfSettings() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiCache) {
     clearTokenUiBitmapCaches();
   }
-  // Re-render walls and notes if currently active so toggle takes effect immediately
+  // Re-render walls, notes, doors, and sound icons so toggle takes effect immediately
   const walls = globalThis.canvas?.walls?.placeables;
   if (walls?.length) {
     for (const w of walls) {
@@ -1195,6 +1234,22 @@ export function refreshGpuPerfSettings() {
     for (const n of notes) {
       if (n.controlIcon && !n.controlIcon.destroyed) {
         try { n.controlIcon._refresh?.(); } catch {}
+      }
+    }
+  }
+  const doors = globalThis.canvas?.controls?.doors?.children;
+  if (doors?.length) {
+    for (const d of doors) {
+      if (d && !d.destroyed && typeof d.draw === "function") {
+        try { d.draw(); } catch {}
+      }
+    }
+  }
+  const sounds = globalThis.canvas?.sounds?.placeables;
+  if (sounds?.length) {
+    for (const s of sounds) {
+      if (s.controlIcon && !s.controlIcon.destroyed) {
+        try { s.controlIcon._refresh?.(); } catch {}
       }
     }
   }

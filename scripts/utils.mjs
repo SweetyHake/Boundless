@@ -22,10 +22,16 @@ export function isTextureUsable(tex) {
  * In Foundry v14, unset `level.elevation.bottom` resolves to `-Infinity` and `top` to `Infinity` (ExtendedNumberField).
  * Always fall back to finite `base` -> finite `bottom` -> `0` when a finite default elevation is required.
  */
+function toFiniteNumber(val) {
+  if (val === null || val === undefined || val === "") return NaN;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 export function getLevelBaseElevation(level) {
-  const base = Number(level?.elevation?.base);
+  const base = toFiniteNumber(level?.elevation?.base);
   if (Number.isFinite(base)) return base;
-  const bottom = Number(level?.elevation?.bottom);
+  const bottom = toFiniteNumber(level?.elevation?.bottom);
   if (Number.isFinite(bottom)) return bottom;
   return 0;
 }
@@ -45,7 +51,7 @@ export function getLevelBottomElevation(level) {
  * Always fall back to `base/bottom + 20` when `top` is non-finite so roof occlusion, indoor lights, and Showstopper stay consistent.
  */
 export function getLevelRoofElevation(level) {
-  const top = Number(level?.elevation?.top);
+  const top = toFiniteNumber(level?.elevation?.top);
   if (Number.isFinite(top)) return top;
   return getLevelBaseElevation(level) + 20;
 }
@@ -140,9 +146,12 @@ export function getVirtualTileBounds(tSpec) {
 /** Convert Foundry v14 wall threshold (in scene distance units) into pixel-scaled Edge threshold (including darkness). */
 export function buildEdgeThresholdPx(threshold, pxPerFt) {
   if (!threshold || typeof threshold !== "object") return undefined;
-  const light = Number.isFinite(Number(threshold.light)) ? Number(threshold.light) * pxPerFt : null;
-  const sight = Number.isFinite(Number(threshold.sight)) ? Number(threshold.sight) * pxPerFt : null;
-  const sound = Number.isFinite(Number(threshold.sound)) ? Number(threshold.sound) * pxPerFt : null;
+  const lNum = toFiniteNumber(threshold.light);
+  const sNum = toFiniteNumber(threshold.sight);
+  const sndNum = toFiniteNumber(threshold.sound);
+  const light = Number.isFinite(lNum) ? lNum * pxPerFt : null;
+  const sight = Number.isFinite(sNum) ? sNum * pxPerFt : null;
+  const sound = Number.isFinite(sndNum) ? sndNum * pxPerFt : null;
   if (light === null && sight === null && sound === null) return undefined;
   return {
     light,

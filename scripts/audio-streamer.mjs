@@ -100,27 +100,37 @@ export class MegaAudioStreamer {
       }
     }
 
-    const key = Array.from(needed.entries())
-      .map(([k, { item }]) => `${k}:${item.x},${item.y},${item.radius},${item.volume},${item.path},${item.walls ? 1 : 0},${item.easing ? 1 : 0},${item.elevation}`)
-      .sort()
-      .join("|");
+    const entrySigs = new Map();
+    const keyParts = [];
+    for (const [k, { item }] of needed) {
+      const s = `${item.x},${item.y},${item.radius},${item.volume},${item.path},${item.walls ? 1 : 0},${item.easing ? 1 : 0},${item.elevation}`;
+      entrySigs.set(k, s);
+      keyParts.push(`${k}:${s}`);
+    }
+    const key = keyParts.sort().join("|");
     if (key === this.lastKey) return;
     this.lastKey = key;
 
     let changed = false;
+    if (!this._sourceSigs) this._sourceSigs = new Map();
 
     for (const [k, src] of this.activeSources) {
       if (!needed.has(k)) {
         try { src.destroy(); } catch {}
         this.activeSources.delete(k);
+        this._sourceSigs.delete(k);
         changed = true;
       }
     }
 
     for (const [k, { layer, item }] of needed) {
       const existing = this.activeSources.get(k);
+      const itemSig = entrySigs.get(k);
       const radiusPx = (item.radius || 20) * pxPerFt;
       if (existing) {
+        if (this._sourceSigs.get(k) === itemSig && existing.attached) {
+          continue;
+        }
         try {
           existing.initialize({
             x: item.x, y: item.y,
@@ -133,11 +143,13 @@ export class MegaAudioStreamer {
             easing: Boolean(item.easing)
           });
           if (existing.shape && !existing.attached) existing.add();
+          this._sourceSigs.set(k, itemSig);
           changed = true;
         } catch (err) {
           console.warn("boundless | Failed to update streamed sound:", item.path, err);
           try { existing.destroy(); } catch {}
           this.activeSources.delete(k);
+          this._sourceSigs.delete(k);
           changed = true;
         }
         continue;
@@ -157,6 +169,7 @@ export class MegaAudioStreamer {
         if (src.shape) {
           src.add();
           this.activeSources.set(k, src);
+          this._sourceSigs.set(k, itemSig);
           changed = true;
         } else {
           try { src.destroy(); } catch {}
@@ -177,6 +190,7 @@ export class MegaAudioStreamer {
       try { src.destroy(); } catch {}
     }
     this.activeSources.clear();
+    this._sourceSigs?.clear?.();
     this.lastKey = "";
     if (hadAny && canvas?.ready) {
       canvas.perception?.update({ refreshSounds: true });

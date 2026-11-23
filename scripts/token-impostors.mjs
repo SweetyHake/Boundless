@@ -1149,8 +1149,9 @@ export class TokenImpostorLayer {
     const isMountedOnLayer = Boolean(obj && !obj.destroyed && obj.parent === canvas.tokens?.objects);
     const hiddenByShowstopper = Boolean(
       obj && !obj.destroyed &&
-      Number.isFinite(Number(obj._ssOcclusionAlpha)) &&
-      Number(obj._ssOcclusionAlpha) <= 0.05
+      typeof obj._ssOcclusionAlpha === "number" &&
+      Number.isFinite(obj._ssOcclusionAlpha) &&
+      obj._ssOcclusionAlpha <= 0.05
     );
     if (isMountedOnLayer && !this.streamer?.isTokenDrawing?.(obj)) {
       if (obj.visible === false || hiddenByShowstopper) {

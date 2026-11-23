@@ -156,6 +156,11 @@ export function wrapFoundryMethod(className, method, wrapperFn, opts = {}) {
   const fullPath = isProto ? `${path}.prototype.${method}` : `${path}.${method}`;
   const original = targetObj[method];
 
+  const existing = activePatches.get(fullPath);
+  if (existing?.active) {
+    return { original, fullPath, viaLibWrapper: existing.via === "libWrapper" };
+  }
+
   const hasLibWrapper = Boolean(globalThis.libWrapper?.register && globalThis.game?.modules?.get?.("lib-wrapper")?.active);
   if (hasLibWrapper) {
     try {

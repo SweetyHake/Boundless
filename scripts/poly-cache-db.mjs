@@ -4,6 +4,7 @@ const STORE_NAME = "levels";
 const MAX_LEVEL_RECORDS = 64;
 
 let _dbPromise = null;
+let _openDb = null;
 
 function getIndexedDB() {
   try {
@@ -22,7 +23,18 @@ export function isPolyCacheDBSupported() {
 }
 
 export function resetPolyCacheDBConnection() {
+  if (_openDb) {
+    try { _openDb.close(); } catch {}
+    _openDb = null;
+  }
   _dbPromise = null;
+}
+
+function handleDbTxError(err) {
+  const name = err?.name || "";
+  if (name === "InvalidStateError" || name === "NotFoundError" || name === "AbortError") {
+    resetPolyCacheDBConnection();
+  }
 }
 
 function openPolyCacheDB() {
@@ -31,34 +43,54 @@ function openPolyCacheDB() {
   if (_dbPromise) return _dbPromise;
 
   _dbPromise = new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return false;
+      settled = true;
+      resolve(val);
+      return true;
+    };
     try {
       const req = idb.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: "key" });
-          store.createIndex("updatedAt", "updatedAt", { unique: false });
-        }
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            const store = db.createObjectStore(STORE_NAME, { keyPath: "key" });
+            store.createIndex("updatedAt", "updatedAt", { unique: false });
+          }
+        } catch {}
       };
       req.onsuccess = () => {
         const db = req.result;
-        db.onversionchange = () => {
+        if (!finish(db)) {
           try { db.close(); } catch {}
+          return;
+        }
+        _openDb = db;
+        const drop = () => {
+          if (_openDb === db) _openDb = null;
           _dbPromise = null;
         };
-        resolve(db);
+        db.onversionchange = () => {
+          try { db.close(); } catch {}
+          drop();
+        };
+        db.onclose = drop;
+        db.onabort = drop;
       };
-      req.onerror = () => {
+      req.onerror = (ev) => {
+        try { ev?.preventDefault?.(); } catch {}
         _dbPromise = null;
-        resolve(null);
+        finish(null);
       };
       req.onblocked = () => {
         _dbPromise = null;
-        resolve(null);
+        finish(null);
       };
     } catch {
       _dbPromise = null;
-      resolve(null);
+      finish(null);
     }
   });
   return _dbPromise;
@@ -75,42 +107,65 @@ export async function loadLevelPolysFromDB(worldId, sceneId, levelIds) {
   if (!db) return out;
 
   return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve(out);
+    };
     try {
       const tx = db.transaction(STORE_NAME, "readonly");
       const store = tx.objectStore(STORE_NAME);
       let pending = levelIds.length;
       const doneOne = () => {
-        if (--pending <= 0) resolve(out);
+        if (--pending <= 0) finish();
       };
       for (const levelId of levelIds) {
         const key = makePolyCacheRecordKey(worldId, sceneId, levelId);
         const req = store.get(key);
         req.onsuccess = () => {
-          const rec = req.result;
-          if (rec && Array.isArray(rec.entries)) {
-            for (const row of rec.entries) {
-              if (!Array.isArray(row) || row.length < 4) continue;
-              const [lightId, sig, rawOffsets, hasNearbyWall] = row;
-              if (typeof lightId !== "string" || typeof sig !== "string") continue;
-              let offsets = null;
-              if (rawOffsets instanceof Float32Array) {
-                offsets = rawOffsets;
-              } else if (ArrayBuffer.isView(rawOffsets)) {
-                offsets = new Float32Array(rawOffsets.buffer, rawOffsets.byteOffset, Math.floor(rawOffsets.byteLength / 4));
-              } else if (Array.isArray(rawOffsets)) {
-                offsets = Float32Array.from(rawOffsets);
+          try {
+            const rec = req.result;
+            if (rec && Array.isArray(rec.entries)) {
+              for (const row of rec.entries) {
+                if (!Array.isArray(row) || row.length < 4) continue;
+                const [lightId, sig, rawOffsets, hasNearbyWall] = row;
+                if (typeof lightId !== "string" || typeof sig !== "string") continue;
+                let offsets = null;
+                if (rawOffsets instanceof Float32Array) {
+                  offsets = rawOffsets;
+                } else if (ArrayBuffer.isView(rawOffsets)) {
+                  const len = Math.floor(rawOffsets.byteLength / 4);
+                  if (len > 0) {
+                    if ((rawOffsets.byteOffset & 3) === 0) {
+                      offsets = new Float32Array(rawOffsets.buffer, rawOffsets.byteOffset, len);
+                    } else {
+                      const copy = rawOffsets.buffer.slice(rawOffsets.byteOffset, rawOffsets.byteOffset + len * 4);
+                      offsets = new Float32Array(copy);
+                    }
+                  }
+                } else if (Array.isArray(rawOffsets)) {
+                  offsets = Float32Array.from(rawOffsets);
+                }
+                out.set(lightId, { sig, offsets, hasNearbyWall: Boolean(hasNearbyWall) });
               }
-              out.set(lightId, { sig, offsets, hasNearbyWall: Boolean(hasNearbyWall) });
             }
+          } catch {}
+          finally {
+            doneOne();
           }
+        };
+        req.onerror = (ev) => {
+          try { ev?.preventDefault?.(); } catch {}
           doneOne();
         };
-        req.onerror = doneOne;
       }
-      tx.onerror = () => resolve(out);
-      tx.onabort = () => resolve(out);
-    } catch {
-      resolve(out);
+      tx.oncomplete = finish;
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} finish(); };
+      tx.onabort = finish;
+    } catch (err) {
+      handleDbTxError(err);
+      finish();
     }
   });
 }
@@ -131,7 +186,7 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
       const store = tx.objectStore(STORE_NAME);
       for (const [levelId, entries] of entriesByLevel) {
         if (!levelId || !Array.isArray(entries) || !entries.length) continue;
-        store.put({
+        const putReq = store.put({
           key: makePolyCacheRecordKey(worldId, sceneId, levelId),
           worldId: worldId || "world",
           sceneId,
@@ -139,11 +194,13 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
           updatedAt: now,
           entries
         });
+        putReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
       tx.oncomplete = () => resolve(true);
-      tx.onerror = () => resolve(false);
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(false); };
       tx.onabort = () => resolve(false);
-    } catch {
+    } catch (err) {
+      handleDbTxError(err);
       resolve(false);
     }
   });
@@ -161,23 +218,30 @@ function _pruneOldRecords(db, maxRecords) {
       const store = tx.objectStore(STORE_NAME);
       const countReq = store.count();
       countReq.onsuccess = () => {
-        const excess = (countReq.result || 0) - maxRecords;
-        if (excess <= 0) return;
-        const idx = store.index("updatedAt");
-        let deleted = 0;
-        const cursorReq = idx.openCursor();
-        cursorReq.onsuccess = () => {
-          const cursor = cursorReq.result;
-          if (!cursor || deleted >= excess) return;
-          cursor.delete();
-          deleted++;
-          cursor.continue();
-        };
+        try {
+          const excess = (countReq.result || 0) - maxRecords;
+          if (excess <= 0) return;
+          const idx = store.index("updatedAt");
+          let deleted = 0;
+          const cursorReq = idx.openCursor();
+          cursorReq.onsuccess = () => {
+            try {
+              const cursor = cursorReq.result;
+              if (!cursor || deleted >= excess) return;
+              cursor.delete();
+              deleted++;
+              cursor.continue();
+            } catch {}
+          };
+          cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
+        } catch {}
       };
+      countReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(); };
       tx.onabort = () => resolve();
-    } catch {
+    } catch (err) {
+      handleDbTxError(err);
       resolve();
     }
   });
@@ -199,16 +263,20 @@ export async function clearPolyCacheDB(sceneId = null) {
       } else {
         const cursorReq = store.openCursor();
         cursorReq.onsuccess = () => {
-          const cursor = cursorReq.result;
-          if (!cursor) return;
-          if (cursor.value?.sceneId === sceneId) cursor.delete();
-          cursor.continue();
+          try {
+            const cursor = cursorReq.result;
+            if (!cursor) return;
+            if (cursor.value?.sceneId === sceneId) cursor.delete();
+            cursor.continue();
+          } catch {}
         };
+        cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
       tx.oncomplete = () => resolve(true);
-      tx.onerror = () => resolve(false);
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(false); };
       tx.onabort = () => resolve(false);
-    } catch {
+    } catch (err) {
+      handleDbTxError(err);
       resolve(false);
     }
   });

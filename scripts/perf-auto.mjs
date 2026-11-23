@@ -86,15 +86,16 @@ export function restoreAllStandardCulling() {
     if (wall && !wall.destroyed) wall.renderable = true;
   }
   for (const ls of c.effects?.lightSources ?? []) {
-    if (ls.background && !ls.background.destroyed) ls.background.renderable = true;
-    if (ls.illumination && !ls.illumination.destroyed) ls.illumination.renderable = true;
-    if (ls.coloration && !ls.coloration.destroyed) ls.coloration.renderable = true;
+    const bg = ls.layers?.background?.mesh;
+    const il = ls.layers?.illumination?.mesh;
+    const co = ls.layers?.coloration?.mesh;
+    if (bg && !bg.destroyed) bg.renderable = true;
+    if (il && !il.destroyed) il.renderable = true;
+    if (co && !co.destroyed) co.renderable = true;
   }
   for (const ds of c.effects?.darknessSources ?? []) {
-    if (ds.background && !ds.background.destroyed) ds.background.renderable = true;
-    if (ds.illumination && !ds.illumination.destroyed) ds.illumination.renderable = true;
-    if (ds.coloration && !ds.coloration.destroyed) ds.coloration.renderable = true;
-    if (ds.darkness && !ds.darkness.destroyed) ds.darkness.renderable = true;
+    const dk = ds.layers?.darkness?.mesh;
+    if (dk && !dk.destroyed) dk.renderable = true;
   }
 }
 
@@ -104,6 +105,7 @@ export function updateStandardSceneCulling() {
     return;
   }
   if (!isStandardSceneActive()) return;
+  syncDecorativeTileShaders(true);
 
   const c = globalThis.canvas;
   const vp = computeExpandedViewport(c.stage, c.app?.renderer?.screen, 0.45, 420);
@@ -115,12 +117,13 @@ export function updateStandardSceneCulling() {
 
   // Tiles: only engage when scene has >= 12 tiles
   const tiles = c.tiles?.placeables ?? [];
+  const tilesHi = Boolean(c.tiles?.highlightObjects);
   if (tiles.length >= 12) {
     for (let i = 0; i < tiles.length; i++) {
       const t = tiles[i];
       const mesh = t.mesh;
       if (!mesh || mesh.destroyed) continue;
-      if (t.controlled || t.hover || t.isPreview) {
+      if (tilesHi || t.controlled || t.hover || t.isPreview) {
         mesh.renderable = true;
         continue;
       }
@@ -135,60 +138,84 @@ export function updateStandardSceneCulling() {
       mesh.renderable = inView;
       if (!inView) culledTiles++;
     }
+  } else {
+    for (let i = 0; i < tiles.length; i++) {
+      if (tiles[i].mesh && !tiles[i].mesh.destroyed) tiles[i].mesh.renderable = true;
+    }
   }
 
-  // Light control icons: only engage when scene has >= 20 lights
+  // Light control icons: only engage when scene has >= 20 lights (use full radius for v14 ShapeControls border)
   const lights = c.lighting?.placeables ?? [];
+  const lightsHi = Boolean(c.lighting?.highlightObjects);
   if (lights.length >= 20) {
     for (let i = 0; i < lights.length; i++) {
       const al = lights[i];
       const icon = al.controls ?? al.controlIcon;
       if (!icon || icon.destroyed) continue;
-      if (al.controlled || al.hover || al.isPreview) {
+      if (lightsHi || al.controlled || al.hover || al.isPreview) {
         icon.renderable = true;
         continue;
       }
       const x = al.document?.x ?? 0;
       const y = al.document?.y ?? 0;
-      const inView = x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY;
+      const r = al.radius || 0;
+      const inView = (x + r >= vp.minX) && (x - r <= vp.maxX) && (y + r >= vp.minY) && (y - r <= vp.maxY);
       icon.renderable = inView;
       if (!inView) culledLights++;
     }
+  } else {
+    for (let i = 0; i < lights.length; i++) {
+      const icon = lights[i].controls ?? lights[i].controlIcon;
+      if (icon && !icon.destroyed) icon.renderable = true;
+    }
   }
 
-  // Sound control icons: only engage when scene has >= 20 sounds
+  // Sound control icons: only engage when scene has >= 20 sounds (use full radius for v14 ShapeControls border)
   const sounds = c.sounds?.placeables ?? [];
+  const soundsHi = Boolean(c.sounds?.highlightObjects);
   if (sounds.length >= 20) {
     for (let i = 0; i < sounds.length; i++) {
       const as = sounds[i];
       const icon = as.controls ?? as.controlIcon;
       if (!icon || icon.destroyed) continue;
-      if (as.controlled || as.hover || as.isPreview) {
+      if (soundsHi || as.controlled || as.hover || as.isPreview) {
         icon.renderable = true;
         continue;
       }
       const x = as.document?.x ?? 0;
       const y = as.document?.y ?? 0;
-      const inView = x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY;
+      const r = as.radius || 0;
+      const inView = (x + r >= vp.minX) && (x - r <= vp.maxX) && (y + r >= vp.minY) && (y - r <= vp.maxY);
       icon.renderable = inView;
       if (!inView) culledSounds++;
+    }
+  } else {
+    for (let i = 0; i < sounds.length; i++) {
+      const icon = sounds[i].controls ?? sounds[i].controlIcon;
+      if (icon && !icon.destroyed) icon.renderable = true;
     }
   }
 
   // Note control icons: engage when scene has >= 8 notes
   const notes = c.notes?.placeables ?? [];
+  const notesHi = Boolean(c.notes?.highlightObjects);
   if (notes.length >= 8) {
     for (let i = 0; i < notes.length; i++) {
       const n = notes[i];
       const icon = n.controlIcon ?? n.controls;
       if (!icon || icon.destroyed) continue;
-      if (n.controlled || n.hover || n.isPreview) {
+      if (notesHi || n.controlled || n.hover || n.isPreview) {
         icon.renderable = true;
         continue;
       }
       const x = n.document?.x ?? 0;
       const y = n.document?.y ?? 0;
       icon.renderable = (x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY);
+    }
+  } else {
+    for (let i = 0; i < notes.length; i++) {
+      const icon = notes[i].controlIcon ?? notes[i].controls;
+      if (icon && !icon.destroyed) icon.renderable = true;
     }
   }
 
@@ -203,15 +230,20 @@ export function updateStandardSceneCulling() {
       d.renderable = inView;
       if (!inView) culledDoors++;
     }
+  } else {
+    for (let i = 0; i < doors.length; i++) {
+      if (doors[i] && !doors[i].destroyed) doors[i].renderable = true;
+    }
   }
 
   // WallsLayer frustum culling: engage when scene has >= 100 walls
   const walls = c.walls?.placeables ?? [];
+  const wallsHi = Boolean(c.walls?.highlightObjects);
   if (walls.length >= 100) {
     for (let i = 0; i < walls.length; i++) {
       const w = walls[i];
       if (!w || w.destroyed) continue;
-      if (w.controlled || w.hover || w.isPreview) {
+      if (wallsHi || w.controlled || w.hover || w.isPreview) {
         w.renderable = true;
         continue;
       }
@@ -223,41 +255,59 @@ export function updateStandardSceneCulling() {
       const maxY = coords[1] > coords[3] ? coords[1] : coords[3];
       w.renderable = rectsIntersect(minX, minY, maxX, maxY, vp);
     }
+  } else {
+    for (let i = 0; i < walls.length; i++) {
+      if (walls[i] && !walls[i].destroyed) walls[i].renderable = true;
+    }
   }
 
   // Offscreen PointLightSource / PointDarknessSource mesh culling (skips offscreen light shader passes!)
   let culledLightMeshes = 0;
   const lightSources = c.effects?.lightSources;
   const globalLs = c.environment?.globalLightSource;
-  if (lightSources && lightSources.size >= 16) {
+  if (lightSources) {
+    const cullLs = lightSources.size >= 16;
     for (const ls of lightSources) {
       if (!ls || ls === globalLs || ls.isPreview) continue;
+      const bg = ls.layers?.background?.mesh;
+      const il = ls.layers?.illumination?.mesh;
+      const co = ls.layers?.coloration?.mesh;
+      if (!cullLs) {
+        if (bg && !bg.destroyed) bg.renderable = true;
+        if (il && !il.destroyed) il.renderable = true;
+        if (co && !co.destroyed) co.renderable = true;
+        continue;
+      }
       const r = ls.radius ?? ls.data?.radius;
       if (!Number.isFinite(r) || r <= 0) continue;
       const lx = ls.x ?? ls.data?.x;
       const ly = ls.y ?? ls.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
       const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
-      if (ls.background && !ls.background.destroyed) ls.background.renderable = inView;
-      if (ls.illumination && !ls.illumination.destroyed) ls.illumination.renderable = inView;
-      if (ls.coloration && !ls.coloration.destroyed) ls.coloration.renderable = inView;
+      if (bg && !bg.destroyed) bg.renderable = inView;
+      if (il && !il.destroyed) il.renderable = inView;
+      if (co && !co.destroyed) co.renderable = inView;
       if (!inView) culledLightMeshes++;
     }
   }
   const darkSources = c.effects?.darknessSources;
-  if (darkSources && darkSources.size >= 8) {
+  if (darkSources) {
+    const cullDs = darkSources.size >= 8;
     for (const ds of darkSources) {
       if (!ds || ds.isPreview) continue;
+      const dk = ds.layers?.darkness?.mesh;
+      if (!dk || dk.destroyed) continue;
+      if (!cullDs) {
+        dk.renderable = true;
+        continue;
+      }
       const r = ds.radius ?? ds.data?.radius;
       if (!Number.isFinite(r) || r <= 0) continue;
       const lx = ds.x ?? ds.data?.x;
       const ly = ds.y ?? ds.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
       const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
-      if (ds.background && !ds.background.destroyed) ds.background.renderable = inView;
-      if (ds.illumination && !ds.illumination.destroyed) ds.illumination.renderable = inView;
-      if (ds.coloration && !ds.coloration.destroyed) ds.coloration.renderable = inView;
-      if (ds.darkness && !ds.darkness.destroyed) ds.darkness.renderable = inView;
+      dk.renderable = inView;
       if (!inView) culledLightMeshes++;
     }
   }
@@ -282,7 +332,22 @@ export function syncDecorativeTileShaders(enable) {
     const t = tiles[i];
     const m = t.mesh;
     if (!m || m.destroyed || m._boundlessMesh) continue;
-    const isDecorative = !m.occlusionMode && !m.restrictsLight && !m.restrictsWeather && !t.isVideo && !t.document?.roof;
+    const doc = t.document;
+    // Check both document & mesh fields: PIXI "batch" shader ignores unoccludedAlpha (Tile opacity < 1),
+    // occlusion modes, and light/weather depth restrictions.
+    const docAlpha = doc?.alpha ?? 1;
+    const unoccAlpha = m.unoccludedAlpha ?? 1;
+    const hasDocOcc = Boolean(doc?.occlusion?.modes?.size || doc?.occlusion?.mode);
+    const hasDocRestrict = Boolean(doc?.restrictions?.light || doc?.restrictions?.weather);
+    const isDecorative =
+      docAlpha >= 0.999 &&
+      unoccAlpha >= 0.999 &&
+      !hasDocOcc &&
+      !hasDocRestrict &&
+      !m.occlusionMode &&
+      !m.restrictsLight &&
+      !m.restrictsWeather &&
+      !t.isVideo;
     if (allow && isDecorative) {
       if (m.pluginName !== "batch") {
         m.pluginName = "batch";
@@ -329,32 +394,48 @@ export function collectSceneActiveAssetUrls(scene) {
   };
   if (!scene) return used;
 
-  add(scene.background?.src);
-  add(scene.foreground?.src ?? scene.foreground);
+  // Read _source first on v14 Scene documents to avoid triggering deprecated scene.background/foreground getters
+  const srcBg = scene._source ? scene._source.background?.src : scene.background?.src;
+  const srcFg = scene._source ? (scene._source.foreground?.src ?? scene._source.foreground) : (scene.foreground?.src ?? scene.foreground);
+  add(srcBg);
+  add(srcFg);
 
   if (scene.levels) {
     for (const lvl of scene.levels) {
       add(lvl.background?.src);
       add(lvl.foreground?.src ?? lvl.foreground);
+      add(lvl.fog?.src);
     }
   }
   for (const t of scene.tiles ?? []) add(t.texture?.src);
   for (const tok of scene.tokens ?? []) {
     add(tok.texture?.src);
     add(tok.ring?.subject?.texture);
+    add(tok.turnMarker?.src);
   }
   for (const d of scene.drawings ?? []) add(d.texture);
+  for (const tpl of scene.templates ?? []) add(tpl.texture);
+  for (const n of scene.notes ?? []) add(n.texture?.src);
+  add(globalThis.CONFIG?.Combat?.settings?.turnMarker?.src);
   return used;
 }
 
 export function disposeStaleSceneVramTextures() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfVramCleanup) return { disposed: 0, bytes: 0 };
+  // Boundless scenes manage their own byte-budgeted LRUTextureManager; never evict their streamed assets here
+  if (!isStandardSceneActive()) return { disposed: 0, bytes: 0 };
   const renderer = globalThis.canvas?.app?.renderer;
   const scene = globalThis.canvas?.scene;
   const managed = renderer?.texture?.managedTextures;
   if (!scene || !Array.isArray(managed) || managed.length === 0) return { disposed: 0, bytes: 0 };
 
   const activeUrls = collectSceneActiveAssetUrls(scene);
+  const protectedBts = new Set();
+  const ringBt = globalThis.CONFIG?.Token?.ring?.ringClass?.baseTexture;
+  if (ringBt) protectedBts.add(ringBt);
+  const ringSheetBt = globalThis.CONFIG?.Token?.ring?.spritesheet?.baseTexture;
+  if (ringSheetBt) protectedBts.add(ringSheetBt);
+
   let disposed = 0;
   let bytes = 0;
 
@@ -363,18 +444,18 @@ export function disposeStaleSceneVramTextures() {
   for (let i = 0; i < list.length; i++) {
     const bt = list[i];
     if (!bt || bt.destroyed || bt.isRenderTexture) continue;
-    if (bt._boundlessManaged) continue;
+    if (bt._boundlessManaged || protectedBts.has(bt)) continue;
     // Only target large textures (>= 1024x1024, >= ~4 MB uncompressed RGBA)
     const w = bt.realWidth || bt.width || 0;
     const h = bt.realHeight || bt.height || 0;
     if (w * h < 1024 * 1024) continue;
 
-    // Must be an image-backed URL texture so PIXI can seamlessly re-upload if ever needed again
-    const rawUrl = bt.resource?.url || (Array.isArray(bt.textureCacheIds) ? bt.textureCacheIds[0] : "");
+    // Require a real URL-backed resource so CanvasResource / dynamic spritesheets are never evicted
+    const rawUrl = bt.resource?.url;
     if (!rawUrl || typeof rawUrl !== "string") continue;
     if (/\.(webm|mp4|m4v|ogg|ogv)$/i.test(rawUrl)) continue;
-    // Never evict global Foundry/module spritesheets (token rings, UI atlases, weather masks)
-    if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
+    // Never evict global Foundry or module spritesheets (token rings, VFX, weather, UI atlases)
+    if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|more-dynamic-token-rings\/|cs-rings\/|showstopper\/|fxmaster\/|jb2a|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
 
     const norm = normalizeAssetKey(rawUrl);
     if (!norm || activeUrls.has(norm)) continue;
@@ -509,7 +590,7 @@ export function installAutoPerfEngine(controller) {
     scheduleStandardCulling();
   });
 
-  for (const h of ["drawTile", "createTile", "updateTile", "deleteTile"]) {
+  for (const h of ["drawTile", "refreshTile", "createTile", "updateTile", "deleteTile"]) {
     Hooks.on(h, () => {
       if (!isStandardSceneActive()) return;
       syncDecorativeTileShaders(true);
@@ -517,7 +598,13 @@ export function installAutoPerfEngine(controller) {
     });
   }
 
-  for (const h of ["createAmbientLight", "deleteAmbientLight", "createAmbientSound", "deleteAmbientSound", "createNote", "deleteNote", "lightingRefresh"]) {
+  for (const h of [
+    "createAmbientLight", "updateAmbientLight", "deleteAmbientLight",
+    "createAmbientSound", "updateAmbientSound", "deleteAmbientSound",
+    "createNote", "updateNote", "deleteNote",
+    "createWall", "updateWall", "deleteWall",
+    "highlightObjects", "lightingRefresh"
+  ]) {
     Hooks.on(h, () => {
       if (isStandardSceneActive()) scheduleStandardCulling();
     });

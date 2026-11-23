@@ -60,7 +60,7 @@ export function rectInRange(b, s) {
 export function buildMeasureCacheKey(waypoints, options) {
   let opts = "";
   for (const [k, v] of Object.entries(options ?? {})) {
-    if (v !== null && typeof v === "object") return null;
+    if (typeof v === "function" || (v !== null && typeof v === "object")) return null;
     opts += `${k}=${String(v)};`;
   }
   let h1 = waypoints.length | 0;
@@ -68,22 +68,44 @@ export function buildMeasureCacheKey(waypoints, options) {
   for (let i = 0; i < waypoints.length; i++) {
     const w = waypoints[i];
     if (!Number.isFinite(w?.x) || !Number.isFinite(w?.y)) return null;
-    h1 = (Math.imul(h1, 33) ^ (w.x | 0)) | 0;
-    h2 = (Math.imul(h2, 31) ^ (w.y | 0)) | 0;
+    const qx = Math.round(w.x * 16) | 0;
+    const qy = Math.round(w.y * 16) | 0;
+    h1 = (Math.imul(h1, 33) ^ qx) | 0;
+    h2 = (Math.imul(h2, 31) ^ qy) | 0;
     h2 = (h2 ^ Math.round((w.elevation ?? 0) * 8)) | 0;
-    if (w.action) h1 = (h1 ^ Math.imul(w.action.length, w.action.charCodeAt(0))) | 0;
-    h1 = (h1 + (w.checkpoint ? 1 : 0) + (w.explicit ? 2 : 0) + (w.snapped ? 4 : 0)) | 0;
+    if (w.action) {
+      for (let c = 0; c < w.action.length; c++) {
+        h1 = (Math.imul(h1, 31) ^ w.action.charCodeAt(c)) | 0;
+      }
+    }
+    if (w.level) {
+      for (let c = 0; c < w.level.length; c++) {
+        h2 = (Math.imul(h2, 31) ^ w.level.charCodeAt(c)) | 0;
+      }
+    }
+    if (w.width != null) h1 = (Math.imul(h1, 17) ^ Math.round(w.width * 16)) | 0;
+    if (w.height != null) h2 = (Math.imul(h2, 17) ^ Math.round(w.height * 16)) | 0;
+    if (w.depth != null) h1 = (Math.imul(h1, 13) ^ Math.round(w.depth * 16)) | 0;
+    if (w.shape != null) h2 = (Math.imul(h2, 13) ^ (w.shape | 0)) | 0;
+    h1 = (h1 + (w.checkpoint ? 1 : 0) + (w.explicit ? 2 : 0) + (w.snapped ? 4 : 0) + (w.intermediate ? 8 : 0)) | 0;
   }
   const first = waypoints[0];
   const last = waypoints[waypoints.length - 1];
-  return `${h1},${h2},${first.x | 0},${first.y | 0},${last.x | 0},${last.y | 0}|${opts}`;
+  return `${h1},${h2},${Math.round(first.x * 16)},${Math.round(first.y * 16)},${Math.round(last.x * 16)},${Math.round(last.y * 16)}|${opts}`;
 }
 
-function makeTickerThrottle(getMs, statKeys, opts = {}) {
-  const st = { last: 0, timerId: null, original: null, lastSelf: null, lastArgs: null, dirty: false };
+function makeTickerThrottle(methodName, getMs, statKeys, opts = {}) {
+  const st = { last: 0, timerId: null, lastSelf: null, lastArgs: null, dirty: false, inTrailing: false };
   const wrapper = function (wrapped, ...args) {
     const ms = getMs();
-    if (!ms || !st.original) return wrapped(...args);
+    if (!ms) return wrapped(...args);
+    if (st.inTrailing) {
+      st.last = performance.now();
+      st.dirty = false;
+      const result = wrapped(...args);
+      opts.onRun?.();
+      return result;
+    }
     const now = performance.now();
     const elapsed = now - st.last;
     if ((elapsed >= ms) || opts.force?.()) {
@@ -112,30 +134,48 @@ function makeTickerThrottle(getMs, statKeys, opts = {}) {
         const args2 = st.lastArgs;
         st.lastSelf = null;
         st.lastArgs = null;
-        if (!self || !globalThis.canvas?.ready) return;
-        st.last = performance.now();
+        if (!self || !globalThis.canvas?.ready || typeof self[methodName] !== "function") return;
         st.dirty = false;
         perfStats[statKeys.trail]++;
+        st.inTrailing = true;
         try {
-          st.original.call(self, ...(args2 ?? []));
-          opts.onRun?.();
+          self[methodName](...(args2 ?? []));
         } catch (err) {
           console.error(`${MODULE_ID} | throttle trailing error:`, err);
+        } finally {
+          st.inTrailing = false;
         }
       }, delay);
     }
   };
   return {
     wrapper,
+    flush: (targetSelf) => {
+      if (st.timerId !== null) { clearTimeout(st.timerId); st.timerId = null; }
+      const self = targetSelf || st.lastSelf;
+      const args2 = st.lastArgs;
+      st.lastSelf = null;
+      st.lastArgs = null;
+      st.dirty = false;
+      if (self && typeof self[methodName] === "function") {
+        st.inTrailing = true;
+        try {
+          self[methodName](...(args2 ?? []));
+          return true;
+        } finally {
+          st.inTrailing = false;
+        }
+      }
+      return false;
+    },
     reset: () => {
       if (st.timerId !== null) { clearTimeout(st.timerId); st.timerId = null; }
       st.last = 0;
       st.dirty = false;
+      st.inTrailing = false;
       st.lastSelf = null;
       st.lastArgs = null;
     },
-    setOriginal: (fn) => { st.original = fn; },
-    getOriginal: () => st.original,
     isDirty: () => st.dirty
   };
 }
@@ -149,7 +189,7 @@ function patchRenderFlags() {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && changes && typeof changes === "object") {
       let allPresent = true;
       for (const k in changes) {
-        if (changes[k] && !this.has(k)) {
+        if (changes[k] && (!this.has(k) || (this.flags?.[k]?.reset?.length > 0))) {
           allPresent = false;
           break;
         }
@@ -174,10 +214,11 @@ function collectVisionRanges() {
   let sawUnboundedLightPerception = false;
   for (const vs of canvas.effects?.visionSources ?? []) {
     if (!vs.active) continue;
-    let maxR = vs.data?.radius ?? 0;
+    let maxR = Math.max(vs.data?.radius ?? 0, vs.data?.externalRadius ?? 0);
     const modes = vs.object?.document?.detectionModes;
     if (modes) {
       for (const [id, m] of Object.entries(modes)) {
+        if (m?.enabled === false) continue;
         const range = m?.range ?? 0;
         if (range === Infinity) {
           if (id === "lightPerception") { sawUnboundedLightPerception = true; continue; }
@@ -228,7 +269,7 @@ function pruneOutOfSight() {
     }
   }
   for (const n of canvas.notes?.placeables ?? []) {
-    if (n.visible || n.document?.global || n.controlled) continue;
+    if (n.visible || n.isPreview || n.document?.global || n.controlled) continue;
     if (!n.bounds) continue;
     if (anyIn(n.bounds, sources)) continue;
     if (lights.length && anyIn(n.bounds, lights)) continue;
@@ -243,6 +284,7 @@ function pruneOutOfSight() {
 function sourceLosSig(vs) {
   const d = vs.data ?? {};
   return `${(vs.x ?? d.x ?? 0).toFixed(1)},${(vs.y ?? d.y ?? 0).toFixed(1)},${d.elevation ?? 0}`
+    + `,${vs.level?.id ?? ""},${d.walls !== false ? 1 : 0},${vs.updateId ?? 0}`
     + `,${vs.radius ?? d.radius ?? 0},${d.angle ?? 360},${d.rotation ?? 0},${d.externalRadius ?? ""}`;
 }
 
@@ -269,6 +311,9 @@ function patchVisibilityAndLos() {
     const hit = _losCache.get(key);
     if (hit !== undefined) {
       perfStats.losHits++;
+      if (this.angle || (visionSource.data?.angle ?? 360) >= 360) {
+        test.los?.set?.(visionSource, hit);
+      }
       return hit;
     }
     perfStats.losMisses++;
@@ -286,7 +331,8 @@ function patchVisibilityAndLos() {
     if (arr.length !== 1) return wrapped(points, options);
     const p = arr[0];
     if (!Number.isFinite(p?.x) || !Number.isFinite(p?.y)) return wrapped(points, options);
-    const key = `${p.x.toFixed(1)},${p.y.toFixed(1)},${(p.elevation ?? 0).toFixed(1)}|t${options.tolerance ?? 2}|v${_perceptionVer}`;
+    const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
+    const key = `${p.x.toFixed(1)},${p.y.toFixed(1)},${elev.toFixed(1)}|${globalThis.canvas?.level?.id ?? ""}|t${options.tolerance ?? 2}|v${_perceptionVer}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;
@@ -354,10 +400,14 @@ function fogSnapshot() {
 }
 
 const _fogThrottle = makeTickerThrottle(
+  "commit",
   () => (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfFogOcclusionThrottle) ? 50 : 0,
   { run: "fogCommitted", skip: "fogSkipped", trail: "fogTrailing" },
   {
     force: () => {
+      // Shared Fog v14 toggles shared containers visible ONLY during synchronous commit()
+      const vis = globalThis.canvas?.visibility?.vision;
+      if (vis?.sight?.shared?.visible || vis?.light?.mask?.shared?.visible) return true;
       if (fogVisionMovedFar()) {
         perfStats.fogGuardCommitted++;
         return true;
@@ -369,36 +419,43 @@ const _fogThrottle = makeTickerThrottle(
 );
 
 const _occMaskThrottle = makeTickerThrottle(
+  "_updateOcclusionMask",
   () => (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfFogOcclusionThrottle) ? 33 : 0,
   { run: "occlusionRun", skip: "occlusionSkipped", trail: "occlusionTrailing" }
 );
 
 const _occObjThrottle = makeTickerThrottle(
+  "_updateOccludedObjects",
   () => (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfFogOcclusionThrottle) ? 33 : 0,
   { run: "occObjRun", skip: "occObjSkipped", trail: "occObjTrailing" }
 );
 
 function patchFogAndOcclusion() {
   const regFog = wrapFoundryMethod("FogManager", "commit", _fogThrottle.wrapper);
-  if (regFog) _fogThrottle.setOriginal(regFog.original);
 
   const regSave = wrapFoundryMethod("FogManager", "save", function (wrapped, ...args) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfFogOcclusionThrottle && _fogThrottle.isDirty()) {
       try {
-        _fogThrottle.getOriginal()?.call(this);
-        fogSnapshot();
-        perfStats.fogSaveFlushed++;
+        if (_fogThrottle.flush(this)) perfStats.fogSaveFlushed++;
       } catch {}
-      _fogThrottle.reset();
     }
     return wrapped(...args);
   });
 
   const regOcc1 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOcclusionMask", _occMaskThrottle.wrapper);
-  if (regOcc1) _occMaskThrottle.setOriginal(regOcc1.original);
-
   const regOcc2 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOccludedObjects", _occObjThrottle.wrapper);
-  if (regOcc2) _occObjThrottle.setOriginal(regOcc2.original);
+
+  // Track v14 surfaceExposure changes (roofs/levels) so sourceInitWrapper never skips light/vision recompute
+  const regOccSurf = wrapFoundryMethod("CanvasOcclusionMask", "_updateOccludedSurfaces", function (wrapped, ...args) {
+    const prevSize = this.occludedSurfaces?.size ?? -1;
+    const res = wrapped(...args);
+    const nextSize = this.occludedSurfaces?.size ?? -1;
+    const pf = globalThis.canvas?.perception?.renderFlags;
+    if (nextSize !== prevSize || pf?.has?.("initializeLightSources") || pf?.has?.("initializeVision")) {
+      _geometryVersion++;
+    }
+    return res;
+  });
 
   const regPerc = wrapFoundryMethod("PerceptionManager", "update", function (wrapped, flags) {
     if (
@@ -424,7 +481,7 @@ function patchFogAndOcclusion() {
     finally { _visGuardToken = null; }
   });
 
-  return [Boolean(regFog), Boolean(regSave), Boolean(regOcc1), Boolean(regOcc2), Boolean(regPerc), Boolean(regVis)];
+  return [Boolean(regFog), Boolean(regSave), Boolean(regOcc1), Boolean(regOcc2), Boolean(regOccSurf), Boolean(regPerc), Boolean(regVis)];
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +494,14 @@ function getDragWindowMs() {
   return Math.min(50, Math.max(6, _dragRecalcMs * 2));
 }
 
+function clearDragPending() {
+  if (_dragQ.timerId !== null) {
+    clearTimeout(_dragQ.timerId);
+    _dragQ.timerId = null;
+  }
+  _dragQ.pending = null;
+}
+
 function flushDragDestination(forceSync = false) {
   if (_dragQ.timerId !== null && forceSync) {
     clearTimeout(_dragQ.timerId);
@@ -446,9 +511,11 @@ function flushDragDestination(forceSync = false) {
   if (!pending) return;
   _dragQ.pending = null;
   _dragQ.last = performance.now();
-  perfStats.dragDestFlushed++;
   const { token, point, snap } = pending;
-  if (token.destroyed || !globalThis.canvas?.ready) return;
+  if (!token || token.destroyed || !globalThis.canvas?.ready) return;
+  if (token.layer?._draggedToken && token.layer._draggedToken !== token) return;
+  if (!token.mouseInteractionManager?.interactionData?.contexts) return;
+  perfStats.dragDestFlushed++;
   const t0 = performance.now();
   try { token._updateDragDestination(point, { snap }); }
   catch (err) { console.error(`${MODULE_ID} | drag flush error:`, err); }
@@ -465,11 +532,7 @@ function patchDragAndMovement() {
     const elapsed = now - _dragQ.last;
     if (elapsed >= ms) {
       _dragQ.last = now;
-      _dragQ.pending = null;
-      if (_dragQ.timerId !== null) {
-        clearTimeout(_dragQ.timerId);
-        _dragQ.timerId = null;
-      }
+      clearDragPending();
       perfStats.dragDestRun++;
       const t0 = performance.now();
       const res = wrapped(event);
@@ -489,8 +552,20 @@ function patchDragAndMovement() {
     }
   });
 
-  const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
+  // Flush BEFORE drop / waypoint commits so the final mouse cell is always persisted accurately
+  const okDrop = wrapFoundryMethod("Token", "_onDragLeftDrop", function (wrapped, ...args) {
     flushDragDestination(true);
+    return wrapped(...args);
+  });
+
+  const okWaypoint = wrapFoundryMethod("Token", "_addDragWaypoint", function (wrapped, ...args) {
+    flushDragDestination(true);
+    return wrapped(...args);
+  });
+
+  // On cancel / finalize, simply cancel any stale pending timer without running extra recalc
+  const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
+    clearDragPending();
     return wrapped(...args);
   });
 
@@ -531,18 +606,56 @@ function patchDragAndMovement() {
     return wrapped();
   });
 
-  return [Boolean(okMove), Boolean(okFinal), Boolean(okMeasure), Boolean(okPos)];
+  return [Boolean(okMove), Boolean(okDrop), Boolean(okWaypoint), Boolean(okFinal), Boolean(okMeasure), Boolean(okPos)];
 }
 
 // ---------------------------------------------------------------------------
 // 5. Text Style Guard, Detection Filter Guard, Light Field Guard, Identical Sweep Skip, EnrichHTML Cache
 // ---------------------------------------------------------------------------
 
+function safeValuesEqual(a, b, depth = 0) {
+  if (Object.is(a, b)) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" || depth > 3) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!safeValuesEqual(a[i], b[i], depth + 1)) return false;
+    return true;
+  }
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) {
+    const k = ka[i];
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!safeValuesEqual(a[k], b[k], depth + 1)) return false;
+  }
+  return true;
+}
+
+function isCompatibleSourceGeom(g) {
+  return Boolean(
+    g &&
+    !g.destroyed &&
+    g.buffers?.length > 0 &&
+    g.attributes?.aVertexPosition?.size === 2 &&
+    g.attributes?.aDepthValue &&
+    typeof g.getIndex === "function" &&
+    g.getIndex()
+  );
+}
+
+const _attachedVisionMeshes = new Set();
+const _enrichAllowedKeys = new Set([
+  "secrets", "documents", "links", "embeds", "rolls", "custom", "relativeTo", "_embedDepth", "async"
+]);
+
 function patchMiscCpuGuards() {
   const okNp = wrapFoundryMethod("Token", "_refreshNameplate", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
-    const key = `${this.document?.name}|${this.w}`;
-    if (this.__blNpKey === key) {
+    const docName = this.document?.name ?? "";
+    const key = `${docName}|${this.w}|${this.h}`;
+    if (this.__blNpKey === key && this.nameplate?.text === docName) {
       perfStats.textSkipped++;
       return;
     }
@@ -552,8 +665,9 @@ function patchMiscCpuGuards() {
 
   const okTt = wrapFoundryMethod("Token", "_refreshTooltip", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
-    const key = `${this._getTooltipText?.()}|${this.w}|${canvas.dimensions?.uiScale}`;
-    if (this.__blTtKey === key) {
+    const text = this._getTooltipText?.() ?? "";
+    const key = `${text}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}`;
+    if (this.__blTtKey === key && this.tooltip?.text === text) {
       perfStats.textSkipped++;
       return;
     }
@@ -574,7 +688,13 @@ function patchMiscCpuGuards() {
     const s = canvas.dimensions?.uiScale;
     for (const al of this.placeables ?? []) {
       const ls = al.lightSource;
-      const sig = ls ? `${ls.active ? 1 : 0}:${ls.updateId ?? 0}|${s}` : `none|${s}`;
+      // Never cache virtual Boundless lights or lights without an initialized lightSource
+      if (!ls || al.document?._mmVirtualLight) {
+        _fieldSigs.delete(al);
+        al.renderFlags?.set?.({ refreshField: true });
+        continue;
+      }
+      const sig = `${ls.active ? 1 : 0}:${ls.updateId ?? 0}|${s}`;
       if (_fieldSigs.get(al) === sig) {
         perfStats.lightFieldsSkipped++;
         continue;
@@ -603,32 +723,30 @@ function patchMiscCpuGuards() {
   };
 
   const sourceInitWrapper = function (wrapped, data = {}, options = {}) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(data, options);
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) {
+      this.__blSweepV = null;
+      return wrapped(data, options);
+    }
     let dataSame = true;
     if (data) {
       for (const k in data) {
-        const a = this.data?.[k];
-        const b = data[k];
-        if (a !== b) {
-          if (typeof a === "object" && typeof b === "object" && a !== null && b !== null) {
-            if (JSON.stringify(a) !== JSON.stringify(b)) { dataSame = false; break; }
-          } else {
-            dataSame = false;
-            break;
-          }
+        if (!safeValuesEqual(this.data?.[k], data[k])) {
+          dataSame = false;
+          break;
         }
       }
     }
     const stateSig = quickStateSig(this);
     const curV = `${_geometryVersion}|${_edgeVersion}|${stateSig}`;
-    if (!options?.reset && this.shape && dataSame && this.__blSweepV === curV) {
+    const hasValidGeom = !this.attached || this.data?.disabled || isCompatibleSourceGeom(this._geometry) || Boolean(this._geometry && !this._geometry.destroyed);
+    if (!options?.reset && this.shape && hasValidGeom && dataSame && this.__blSweepV === curV) {
       perfStats.sweepSkipped++;
       return this;
     }
     if (this.requiresEdges === true && (!dataSame || options?.reset)) _edgeVersion++;
     perfStats.sweepRun++;
     const result = wrapped(data, options);
-    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${stateSig}`;
+    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${quickStateSig(this)}`;
     return result;
   };
 
@@ -649,7 +767,8 @@ function patchMiscCpuGuards() {
       this.__blGeomKey = null;
       return wrapped();
     }
-    const shape = this.shape;
+    // PointDarknessSource builds its mesh from _visualShape (padded by darknessSourcePaddingMultiplier)
+    const shape = this._visualShape ?? this.shape;
     const pts = shape?.points;
     const origin = shape?.origin;
     const radius = shape?.config?.radius ?? 0;
@@ -661,10 +780,22 @@ function patchMiscCpuGuards() {
     const offset = this._flags?.renderSoftEdges
       ? (this.constructor?.EDGE_OFFSET ?? 0) * (gridSize / 100)
       : 0;
+    if (offset > 0) {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
+
+    const existingGeom = this._geometry;
+    const geomUsable = isCompatibleSourceGeom(existingGeom);
+    // If an existing non-destroyed geometry has an incompatible layout (e.g. interleaved), delegate safely
+    if (existingGeom && !existingGeom.destroyed && !geomUsable) {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
 
     // 1. Exact shape cache check — skip PolygonMesher completely when polygon did not change
     const gKey = `${origin.x}|${origin.y}|${radius}|${offset}|${pts.length}`;
-    if (this._geometry && this.__blGeomKey === gKey && this.__blGeomPts?.length === pts.length) {
+    if (geomUsable && this.__blGeomKey === gKey && this.__blGeomPts?.length === pts.length) {
       const prev = this.__blGeomPts;
       let same = true;
       for (let i = 0; i < pts.length; i++) {
@@ -690,6 +821,7 @@ function patchMiscCpuGuards() {
       const y = origin.y;
       const invR = 1 / radius;
       const outerN = pts.length >> 1;
+      if (outerN > 65530) { this.__blGeomKey = null; return wrapped(); }
 
       let vBuf, dBuf, idxBuf;
       if (offset === 0) {
@@ -714,18 +846,24 @@ function patchMiscCpuGuards() {
           path[k] = new Clipper.IntPoint(Math.round((pts[i] - x) * scale), Math.round((pts[i + 1] - y) * scale));
         }
         let paths = new Clipper.Paths();
-        _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
-        _sharedOffsetter.Execute(paths, Math.round(offset * scale));
-        _sharedOffsetter.Clear();
+        try {
+          _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
+          _sharedOffsetter.Execute(paths, Math.round(offset * scale));
+        } finally {
+          _sharedOffsetter.Clear();
+        }
 
         let innerDepth = 1.0;
         // Narrow-slit fallback: if full offset collapsed a thin light beam (e.g. door barely ajar),
         // try a 35% inset so the slit keeps a smooth gradient instead of turning fully transparent.
         if (!paths.length) {
           paths = new Clipper.Paths();
-          _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
-          _sharedOffsetter.Execute(paths, Math.round(offset * 0.35 * scale));
-          _sharedOffsetter.Clear();
+          try {
+            _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
+            _sharedOffsetter.Execute(paths, Math.round(offset * 0.35 * scale));
+          } finally {
+            _sharedOffsetter.Clear();
+          }
           innerDepth = 0.55;
         }
 
@@ -788,6 +926,7 @@ function patchMiscCpuGuards() {
           outerIdx = pixiEarcut(flat, null, stride);
           totalIdxLen = outerIdx.length;
         }
+        if (!totalIdxLen) { this.__blGeomKey = null; return wrapped(); }
 
         vBuf = new Float32Array(totalVerts * 2);
         dBuf = new Float32Array(totalVerts);
@@ -815,10 +954,10 @@ function patchMiscCpuGuards() {
         }
       }
 
-      if (this._geometry) {
-        this._geometry.getBuffer("aVertexPosition").update(vBuf);
-        this._geometry.getBuffer("aDepthValue").update(dBuf);
-        this._geometry.getIndex().update(idxBuf);
+      if (geomUsable) {
+        existingGeom.getBuffer("aVertexPosition").update(vBuf);
+        existingGeom.getBuffer("aDepthValue").update(dBuf);
+        existingGeom.getIndex().update(idxBuf);
       } else {
         this._geometry = new PIXI.Geometry()
           .addAttribute("aVertexPosition", vBuf, 2)
@@ -878,6 +1017,12 @@ function patchMiscCpuGuards() {
       return wrapped(content, options);
     }
     const o = options ?? {};
+    // Never cache immediate inline rolls [[1d20]] (non-deferred) or @Embed or custom enricher options
+    if (o.rolls !== false && /\[\[(?!\/)/.test(content)) return wrapped(content, options);
+    if (o.embeds !== false && content.includes("@Embed[")) return wrapped(content, options);
+    for (const k in o) {
+      if (!_enrichAllowedKeys.has(k)) return wrapped(content, options);
+    }
     const b = (v, def) => ((v ?? def) ? 1 : 0);
     const key = `${content}|s${b(o.secrets, false)}|d${b(o.documents, true)}`
       + `|l${b(o.links, true)}|e${b(o.embeds, true)}|r${b(o.rolls, true)}`
@@ -899,29 +1044,33 @@ function patchMiscCpuGuards() {
     return res;
   }, { staticOnly: true });
 
-  // Cache deterministic Roll.validate(formula) grammar parsing (called heavily on actor sheets & attack activities)
+  // Cache deterministic Roll.validate(formula) grammar parsing (keyed by subclass name for D20Roll/DamageRoll)
   const okRollVal = wrapFoundryMethod("Roll", "validate", function (wrapped, formula) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfEnrichCache || typeof formula !== "string" || formula.length > 200) {
       return wrapped(formula);
     }
-    const hit = _rollValidateCache.get(formula);
+    const key = `${this?.name ?? "Roll"}|${formula}`;
+    const hit = _rollValidateCache.get(key);
     if (hit !== undefined) {
       perfStats.rollValidateHits++;
       return hit;
     }
     const res = wrapped(formula);
     if (_rollValidateCache.size >= 512) _rollValidateCache.delete(_rollValidateCache.keys().next().value);
-    _rollValidateCache.set(formula, res);
+    _rollValidateCache.set(key, res);
     return res;
   }, { staticOnly: true });
 
   // Skip per-frame uniform/shader animation CPU work for offscreen-culled light sources
   const okLightAnim = wrapFoundryMethod("PointLightSource", "animate", function (wrapped, dt) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
-      const bgOn = this.background?.renderable !== false && this.background;
-      const ilOn = this.illumination?.renderable !== false && this.illumination;
-      const coOn = this.coloration?.renderable !== false && this.coloration;
-      if ((this.background || this.illumination || this.coloration) && !bgOn && !ilOn && !coOn) {
+      const bg = this.layers?.background?.mesh;
+      const il = this.layers?.illumination?.mesh;
+      const co = this.layers?.coloration?.mesh;
+      const bgOn = bg && bg.renderable !== false;
+      const ilOn = il && il.renderable !== false;
+      const coOn = co && co.renderable !== false;
+      if ((bg || il || co) && !bgOn && !ilOn && !coOn) {
         perfStats.lightAnimSkipped++;
         return;
       }
@@ -931,21 +1080,52 @@ function patchMiscCpuGuards() {
 
   // Safe partial lighting rebuild: when only vision sources moved on a light-heavy standard scene (>= 16 lights),
   // rebuild only the vision branch instead of clearing & re-adding all 50-150 static light meshes every step.
+  const sourceHasLayerReset = (s) => {
+    const layers = s.layers;
+    if (!layers) return false;
+    for (const k in layers) if (layers[k]?.reset) return true;
+    return false;
+  };
+
   const computeLightsOnlySig = (effects) => {
     const ls = effects.lightSources;
     const ds = effects.darknessSources;
     if (!ls || ls.size < 16) return null;
-    let sig = `${ls.size}|${ds?.size ?? 0}|${canvas.environment?.darknessLevel ?? ""}|${canvas.environment?.globalLightSource?.active ? 1 : 0}`;
+    const gls = canvas.environment?.globalLightSource;
+    if (gls && sourceHasLayerReset(gls)) return null;
+    let hasActiveVision = 0;
+    if (ds?.size) {
+      for (const vs of effects.visionSources ?? []) {
+        if (vs.active && vs.radius > 0) { hasActiveVision = 1; break; }
+      }
+    }
+    let sig = `${ls.size}|${ds?.size ?? 0}|${canvas.environment?.darknessLevel ?? ""}|${gls?.active ? 1 : 0}:${gls?.updateId ?? 0}|v${hasActiveVision}`;
     const lv = canvas.visibility?.lightingVisibility;
     if (lv) sig += `|${lv.background},${lv.illumination},${lv.coloration},${lv.darkness}`;
-    for (const s of ls) sig += `;${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
-    if (ds) for (const s of ds) sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
+    for (const s of ls) {
+      if (sourceHasLayerReset(s)) return null;
+      const d = s.data;
+      sig += `;${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.color ?? ""}:${d?.alpha ?? ""}:${d?.luminosity ?? ""}:${d?.attenuation ?? ""}`;
+    }
+    if (ds) {
+      for (const s of ds) {
+        if (sourceHasLayerReset(s)) return null;
+        sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
+      }
+    }
     return sig;
   };
+
+  const okClearFx = wrapFoundryMethod("EffectsCanvasGroup", "clearEffects", function (wrapped) {
+    _lastLightSig = null;
+    _attachedVisionMeshes.clear();
+    return wrapped();
+  });
 
   const okPartialLight = wrapFoundryMethod("EffectsCanvasGroup", "refreshLighting", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || globalThis.Boundless?.active) {
       _lastLightSig = null;
+      _attachedVisionMeshes.clear();
       return wrapped();
     }
     const sig = computeLightsOnlySig(this);
@@ -967,16 +1147,27 @@ function patchMiscCpuGuards() {
         }
         background.vision.removeChildren();
         background.visionPreferred.removeChildren();
+        // Remove all vision meshes attached during the previous rebuild so deselected/deleted tokens never stick
+        for (const prevMesh of _attachedVisionMeshes) {
+          if (prevMesh && !prevMesh.destroyed && prevMesh.parent) {
+            prevMesh.parent.removeChild(prevMesh);
+          }
+        }
+        _attachedVisionMeshes.clear();
         for (const vs of this.visionSources) {
-          const meshes = vs.drawMeshes?.() ?? {};
-          if (meshes.illumination?.parent) meshes.illumination.parent.removeChild(meshes.illumination);
-          if (meshes.coloration?.parent) meshes.coloration.parent.removeChild(meshes.coloration);
           if (!vs.active || (vs.radius <= 0)) continue;
+          const meshes = vs.drawMeshes?.() ?? {};
           if (meshes.background) {
             (vs.preferred ? background.visionPreferred : background.vision).addChild(meshes.background);
           }
-          if (meshes.illumination) illumination.lights.addChild(meshes.illumination);
-          if (meshes.coloration) coloration.addChild(meshes.coloration);
+          if (meshes.illumination) {
+            illumination.lights.addChild(meshes.illumination);
+            _attachedVisionMeshes.add(meshes.illumination);
+          }
+          if (meshes.coloration) {
+            coloration.addChild(meshes.coloration);
+            _attachedVisionMeshes.add(meshes.coloration);
+          }
         }
         if (background.vision.filter) background.vision.filter.enabled = background.vision.children.length > 0;
         if (background.visionPreferred.filter) background.visionPreferred.filter.enabled = background.visionPreferred.children.length > 0;
@@ -992,62 +1183,101 @@ function patchMiscCpuGuards() {
         return;
       } catch {
         _lastLightSig = null;
+        _attachedVisionMeshes.clear();
       }
     }
+    _attachedVisionMeshes.clear();
     const res = wrapped();
+    // Record vision meshes attached by the full core refresh so the next partial rebuild cleans them up
+    for (const vs of this.visionSources ?? []) {
+      const il = vs.layers?.illumination?.mesh;
+      const co = vs.layers?.coloration?.mesh;
+      if (il && il.parent) _attachedVisionMeshes.add(il);
+      if (co && co.parent) _attachedVisionMeshes.add(co);
+    }
     _lastLightSig = sig;
     return res;
   });
 
-  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, ...okGeoms, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim), Boolean(okPartialLight)];
+  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, ...okGeoms, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim), Boolean(okClearFx), Boolean(okPartialLight)];
 }
 
 // ---------------------------------------------------------------------------
 // 6. Optional Idle FPS Limiter (battery/laptop saver)
 // ---------------------------------------------------------------------------
 
-const _idle = { attached: false, last: 0, throttled: false, savedMax: undefined };
+const _idle = { listenersAttached: false, ticker: null, tickerFn: null, last: 0, throttled: false, savedMax: undefined };
 
 function restoreIdleFps() {
   if (!_idle.throttled) return;
   _idle.throttled = false;
   try {
-    canvas.app.ticker.maxFPS = _idle.savedMax ?? (game.settings.get("core", "maxFPS") || 0);
+    const settingMax = game.settings.get("core", "maxFPS") || 0;
+    const ticker = globalThis.canvas?.app?.ticker;
+    if (ticker) ticker.maxFPS = settingMax;
   } catch {}
   _idle.savedMax = undefined;
 }
 
 function attachIdleFpsLimiter() {
-  if (_idle.attached || !globalThis.canvas?.app?.ticker) return;
-  _idle.attached = true;
-  _idle.last = performance.now();
-  const bump = () => {
+  const ticker = globalThis.canvas?.app?.ticker;
+  if (!ticker) return;
+  if (!_idle.listenersAttached) {
+    _idle.listenersAttached = true;
     _idle.last = performance.now();
-    restoreIdleFps();
-  };
-  window.addEventListener("pointermove", bump, { passive: true });
-  window.addEventListener("pointerdown", bump, { passive: true });
-  window.addEventListener("wheel", bump, { passive: true });
-  window.addEventListener("keydown", bump);
-  Hooks.on("sightRefresh", bump);
-
-  canvas.app.ticker.add(() => {
+    const bump = () => {
+      _idle.last = performance.now();
+      restoreIdleFps();
+    };
+    window.addEventListener("pointermove", bump, { passive: true });
+    window.addEventListener("pointerdown", bump, { passive: true });
+    window.addEventListener("wheel", bump, { passive: true });
+    window.addEventListener("keydown", bump);
+    Hooks.on("sightRefresh", bump);
+  }
+  if (_idle.ticker === ticker) return;
+  if (_idle.ticker && _idle.tickerFn) {
+    try { _idle.ticker.remove(_idle.tickerFn); } catch {}
+  }
+  _idle.ticker = ticker;
+  _idle.tickerFn = () => {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) {
       restoreIdleFps();
       return;
     }
     if (!_idle.throttled && (performance.now() - _idle.last >= 6000)) {
+      const curMax = ticker.maxFPS || 0;
+      if (curMax > 0 && curMax <= 20) return;
       _idle.throttled = true;
-      _idle.savedMax = canvas.app.ticker.maxFPS;
+      _idle.savedMax = curMax;
       perfStats.idleThrottles++;
-      canvas.app.ticker.maxFPS = 20;
+      ticker.maxFPS = 20;
     }
-  });
+  };
+  ticker.add(_idle.tickerFn);
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle Installer
 // ---------------------------------------------------------------------------
+
+let _fogExploredTarget = null;
+const _onFogExplored = () => {
+  _exploredVer++;
+  _cellExploredCache.clear();
+};
+
+function bindFogExploredListener() {
+  if (_fogExploredTarget && _fogExploredTarget !== globalThis.canvas?.fog) {
+    try { _fogExploredTarget.removeEventListener("explored", _onFogExplored); } catch {}
+    _fogExploredTarget = null;
+  }
+  const fog = globalThis.canvas?.fog;
+  if (fog && typeof fog.addEventListener === "function" && _fogExploredTarget !== fog) {
+    fog.addEventListener("explored", _onFogExplored);
+    _fogExploredTarget = fog;
+  }
+}
 
 export function invalidateCpuGeometry() {
   _geometryVersion++;
@@ -1059,12 +1289,13 @@ export function resetCpuCaches() {
   _exploredVer++;
   _cellVisCache.clear();
   _cellExploredCache.clear();
+  _enrichCache.clear();
   _measureCaches = new WeakMap();
   _fogGuardSnap.clear();
   _lastLightSig = null;
+  _attachedVisionMeshes.clear();
   _dragQ.last = 0;
-  _dragQ.pending = null;
-  if (_dragQ.timerId !== null) { clearTimeout(_dragQ.timerId); _dragQ.timerId = null; }
+  clearDragPending();
   _fogThrottle.reset();
   _occMaskThrottle.reset();
   _occObjThrottle.reset();
@@ -1089,21 +1320,34 @@ export function installCpuPerfEngine() {
   Hooks.on("initializeVisionMode", () => { _lastLightSig = null; });
   Hooks.on("canvasReady", () => {
     resetCpuCaches();
+    bindFogExploredListener();
     attachIdleFpsLimiter();
+  });
+  Hooks.on("canvasTearDown", () => {
+    if (_fogExploredTarget) {
+      try { _fogExploredTarget.removeEventListener("explored", _onFogExplored); } catch {}
+      _fogExploredTarget = null;
+    }
+    resetCpuCaches();
+    restoreIdleFps();
   });
 
   for (const h of ["createWall", "updateWall", "deleteWall", "createRegion", "updateRegion", "deleteRegion", "createLevel", "updateLevel", "deleteLevel", "updateScene"]) {
     Hooks.on(h, () => { _geometryVersion++; });
   }
-  for (const h of ["createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "updateToken"]) {
+  for (const h of ["createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "updateToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
+  }
+  for (const h of ["updateActor", "deleteActor", "updateItem", "deleteItem", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry"]) {
+    Hooks.on(h, () => { _enrichCache.clear(); });
   }
 
   const lightAddsEdges = (cfg) => Boolean(cfg?.negative || ((cfg?.priority ?? 0) > 0));
-  Hooks.on("createLight", (l) => { if (lightAddsEdges(l?.config)) _edgeVersion++; });
-  Hooks.on("updateLight", (_l, ch) => { if (ch && "config" in ch) _edgeVersion++; });
-  Hooks.on("deleteLight", (l) => { if (lightAddsEdges(l?.config)) _edgeVersion++; });
+  const posOrCfgChanged = (ch) => Boolean(ch && ("config" in ch || "x" in ch || "y" in ch || "hidden" in ch || "elevation" in ch || "rotation" in ch || "level" in ch));
+  Hooks.on("createAmbientLight", (l) => { if (lightAddsEdges(l?.config)) _edgeVersion++; });
+  Hooks.on("updateAmbientLight", (l, ch) => { if (ch && ("config" in ch || (lightAddsEdges(l?.config) && posOrCfgChanged(ch)))) _edgeVersion++; });
+  Hooks.on("deleteAmbientLight", (l) => { if (lightAddsEdges(l?.config)) _edgeVersion++; });
   Hooks.on("createToken", (t) => { if (t?.light && lightAddsEdges(t.light)) _edgeVersion++; });
-  Hooks.on("updateToken", (_t, ch) => { if (ch && "light" in ch) _edgeVersion++; });
+  Hooks.on("updateToken", (t, ch) => { if (ch && ("light" in ch || (t?.light && lightAddsEdges(t.light) && posOrCfgChanged(ch)))) _edgeVersion++; });
   Hooks.on("deleteToken", (t) => { if (t?.light && lightAddsEdges(t.light)) _edgeVersion++; });
 }

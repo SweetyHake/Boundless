@@ -1048,6 +1048,7 @@ export class PoiManager {
     };
 
     root.on("pointerover", () => {
+      if (!this.container || root.destroyed) return;
       entry.hovered = true;
       drawMedal(true);
       drawPill(true);
@@ -1807,9 +1808,10 @@ export class PoiManager {
 
     const ticker = canvas.app?.ticker;
     const view = canvas.app?.view || canvas.app?.canvas;
-    const temporarilyRelaxedMin = Boolean(canvas.dimensions?.scale && activeMinScale > flightMinScale);
+    const relaxedScaleObj = canvas.dimensions?.scale || null;
+    const temporarilyRelaxedMin = Boolean(relaxedScaleObj && activeMinScale > flightMinScale);
     if (temporarilyRelaxedMin) {
-      canvas.dimensions.scale.min = flightMinScale;
+      relaxedScaleObj.min = flightMinScale;
     }
 
     this.controller?.setCameraFlying?.(true);
@@ -1859,8 +1861,8 @@ export class PoiManager {
         view?.removeEventListener("wheel", onUserWheel, true);
         view?.removeEventListener("pointerdown", onUserPointerDown, true);
         window.removeEventListener("keydown", onUserKeyDown, true);
-        if (temporarilyRelaxedMin && canvas?.dimensions?.scale) {
-          canvas.dimensions.scale.min = activeMinScale;
+        if (temporarilyRelaxedMin && canvas?.scene?.id === originSceneId && canvas?.dimensions?.scale === relaxedScaleObj) {
+          relaxedScaleObj.min = activeMinScale;
         }
         this.controller?.setCameraFlying?.(false);
       };

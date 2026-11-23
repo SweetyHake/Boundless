@@ -1319,13 +1319,17 @@ export class VirtualLayerEditors {
     this.deactivateTiles();
     this._removePatches();
     if (this.lightMacroGfx) {
-      this.lightMacroGfx.parent?.removeChild(this.lightMacroGfx);
-      this.lightMacroGfx.destroy();
+      try { this.lightMacroGfx.parent?.removeChild(this.lightMacroGfx); } catch {}
+      if (!this.lightMacroGfx.destroyed) {
+        try { this.lightMacroGfx.destroy(); } catch {}
+      }
       this.lightMacroGfx = null;
     }
     if (this.soundMacroGfx) {
-      this.soundMacroGfx.parent?.removeChild(this.soundMacroGfx);
-      this.soundMacroGfx.destroy();
+      try { this.soundMacroGfx.parent?.removeChild(this.soundMacroGfx); } catch {}
+      if (!this.soundMacroGfx.destroyed) {
+        try { this.soundMacroGfx.destroy(); } catch {}
+      }
       this.soundMacroGfx = null;
     }
   }

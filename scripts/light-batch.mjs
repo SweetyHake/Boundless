@@ -348,6 +348,7 @@ const PATTERN_ANIM_COLOR_GAIN = {
 
 export function getAnimColorationGain(anim) {
   if (!anim) return 1.0;
+  if (globalThis.canvas?.effects?.animateLightSources === false) return 1.0;
   const key = String(anim).trim().toLowerCase();
   return PATTERN_ANIM_COLOR_GAIN[key] ?? 1.0;
 }
@@ -1598,8 +1599,10 @@ export class MegaLightBatch {
     let cursor = 0;
     const schedule = (fn) => {
       if (typeof globalThis.requestAnimationFrame === "function") {
+        this._deferredBakeIsTimer = false;
         this._deferredBakeRaf = globalThis.requestAnimationFrame(fn);
       } else {
+        this._deferredBakeIsTimer = true;
         this._deferredBakeRaf = setTimeout(fn, 0);
       }
     };
@@ -2365,7 +2368,7 @@ export class MegaLightBatch {
     batch.illumMesh?.destroy({ children: false });
     batch.colorMesh?.parent?.removeChild(batch.colorMesh);
     batch.colorMesh?.destroy({ children: false });
-    batch.geometry?.destroy();
+    this._destroyGeometry(batch.geometry);
     if (this._lastVp) this._updateMacroCrossfade(this._lastVp.scale);
     this._onBatchChanged?.();
   }
@@ -2597,17 +2600,24 @@ export class MegaLightBatch {
 
   syncDarknessLevel(darkness) {
     const next = Number.isFinite(darkness) ? darkness : 0;
-    const changed = Math.abs(next - this._currentDarkness) > 0.0001;
+    const prev = this._currentDarkness;
+    const changed = Math.abs(next - prev) > 0.0001;
     this._currentDarkness = next;
     if (!changed || !this._hasDarknessRangedLights) return false;
     if (!this.weightArray && this.chunkBatches.size === 0) return false;
+    let thresholdCrossed = false;
     for (const meta of this.lightMetaById.values()) {
       if (meta.darkMin > 0 || meta.darkMax < 1) {
-        this._applyMetaEffectiveWeight(meta);
+        const wasActive = prev >= meta.darkMin && prev <= meta.darkMax;
+        const isActive = next >= meta.darkMin && next <= meta.darkMax;
+        if (wasActive !== isActive) {
+          thresholdCrossed = true;
+          this._applyMetaEffectiveWeight(meta);
+        }
       }
     }
-    this.flushWeights();
-    return true;
+    if (thresholdCrossed) this.flushWeights();
+    return thresholdCrossed;
   }
 
   setLightWeight(lightId, weight) {
@@ -2731,15 +2741,26 @@ export class MegaLightBatch {
     }
   }
 
+  _destroyGeometry(geom) {
+    if (!geom) return;
+    if (Array.isArray(geom.buffers)) {
+      for (const b of geom.buffers) {
+        try { b?.destroy?.(); } catch {}
+      }
+    }
+    try { geom.destroy(); } catch {}
+  }
+
   destroy() {
     this._chunkBakeGen++;
     this._deferredBakeGen++;
     if (this._deferredBakeRaf !== null) {
       try {
-        if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(this._deferredBakeRaf);
-        clearTimeout(this._deferredBakeRaf);
+        if (this._deferredBakeIsTimer) clearTimeout(this._deferredBakeRaf);
+        else if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(this._deferredBakeRaf);
       } catch {}
       this._deferredBakeRaf = null;
+      this._deferredBakeIsTimer = false;
     }
     this._chunkBakeQueue = [];
     if (this._chunkBakeRaf !== null) {
@@ -2764,7 +2785,7 @@ export class MegaLightBatch {
       this.macroBatch.illumMesh?.destroy({ children: false });
       this.macroBatch.colorMesh?.parent?.removeChild(this.macroBatch.colorMesh);
       this.macroBatch.colorMesh?.destroy({ children: false });
-      this.macroBatch.geometry?.destroy();
+      this._destroyGeometry(this.macroBatch.geometry);
       this.macroBatch = null;
     }
 
@@ -2773,7 +2794,7 @@ export class MegaLightBatch {
       batch.illumMesh?.destroy({ children: false });
       batch.colorMesh?.parent?.removeChild(batch.colorMesh);
       batch.colorMesh?.destroy({ children: false });
-      batch.geometry?.destroy();
+      this._destroyGeometry(batch.geometry);
     }
     this.chunkBatches.clear();
 
@@ -2788,7 +2809,7 @@ export class MegaLightBatch {
       this.colorMesh = null;
     }
     if (this.geometry) {
-      this.geometry.destroy();
+      this._destroyGeometry(this.geometry);
       this.geometry = null;
     }
     this.illumShader = null;

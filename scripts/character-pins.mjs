@@ -471,6 +471,7 @@ export class CharacterPinManager {
     };
 
     root.on("pointerover", () => {
+      if (!this.container || root.destroyed) return;
       entry.hovered = true;
       drawFrame(true);
       namePill.visible = true;
@@ -480,6 +481,7 @@ export class CharacterPinManager {
     });
 
     root.on("pointerout", () => {
+      if (!this.container || root.destroyed) return;
       entry.hovered = false;
       drawFrame(false);
       namePill.visible = isSelf;

@@ -104,6 +104,7 @@ export class LRUTextureManager {
 
   _configureBaseTexture(tex, mipmap) {
     if (!tex?.baseTexture) return;
+    tex.baseTexture._boundlessManaged = true;
     tex.baseTexture.mipmap = mipmap ? PIXI.MIPMAP_MODES.ON : PIXI.MIPMAP_MODES.OFF;
     tex.baseTexture.scaleMode = PIXI.SCALE_MODES.LINEAR;
     tex.baseTexture.wrapMode = PIXI.WRAP_MODES.CLAMP;
@@ -150,6 +151,7 @@ export class LRUTextureManager {
             alphaMode: PIXI.ALPHA_MODES.PMA,
             resolution: 1
           });
+          base._boundlessManaged = true;
           const tex = new PIXI.Texture(base);
           const prevOwned = this.workerOwned.get(src);
           if (prevOwned) {
