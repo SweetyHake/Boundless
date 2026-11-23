@@ -3821,19 +3821,23 @@ class MegaWorld1000 {
     this._optimizeEffectsLayers(effects);
     this.tokenStreamer.onVisibilityChanged();
     if (rangedChanged) {
+      this._depthDirty = true;
+      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
       queueMicrotask(() => {
         if (this.active) this.updateSimAndLightBubbles(false);
       });
     }
     if (this.visibleLevelLayers.length) {
-      this.audioStreamer.update(
-        this.visibleLevelLayers,
-        this.getViewportWorldRect(0.28),
-        (lid, sk, idx, raw, lvl) => this.resolveVirtualSound(lid, sk, idx, raw, lvl)
-      );
+      const now = performance.now();
+      if (rangedChanged || (now - (this._lastLightRefreshAudioMs || 0)) >= 120) {
+        this._lastLightRefreshAudioMs = now;
+        this.audioStreamer.update(
+          this.visibleLevelLayers,
+          this.getViewportWorldRect(0.28),
+          (lid, sk, idx, raw, lvl) => this.resolveVirtualSound(lid, sk, idx, raw, lvl)
+        );
+      }
     }
-    this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
   }
 
   scheduleViewportLightSync() {
@@ -4360,19 +4364,33 @@ class MegaWorld1000 {
     }
 
     if (isOpen !== wasOpen) {
+      const hasAnimatedDoorLighting = Boolean(
+        mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
+        && globalThis.showstopper?.doorLighting?.isEnabled?.()
+      );
       this.updateSimAndLightBubbles(false);
-      for (const [, ls] of this.dynamicLights) {
-        if (ls.data?.level !== levelId) continue;
-        const r = (ls.radius || ls.data?.dim || 600) + 150;
-        if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize(ls.data);
+      if (!hasAnimatedDoorLighting) {
+        for (const [, ls] of this.dynamicLights) {
+          if (ls.data?.level !== levelId) continue;
+          const r = (ls.radius || ls.data?.dim || 600) + 150;
+          if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize(ls.data);
+        }
+        canvas.perception.update({
+          initializeVision: true,
+          initializeLighting: (canvas.lighting?.placeables?.length ?? 0) > 0,
+          initializeSounds: true,
+          refreshLightSources: true,
+          refreshLighting: true,
+          refreshVision: true
+        });
+      } else {
+        canvas.perception.update({
+          initializeVision: true,
+          initializeSounds: true,
+          refreshLighting: true,
+          refreshVision: true
+        });
       }
-      canvas.perception.update({
-        initializeVision: true,
-        initializeLighting: true,
-        initializeSounds: true,
-        refreshLighting: true,
-        refreshVision: true
-      });
     }
     return true;
   }
@@ -6289,10 +6307,10 @@ Hooks.on("controlToken", () => {
 Hooks.on("lightingRefresh", (effects) => {
   if (!controller.active) return;
   controller.onLightingRefresh(effects);
-  controller.tokenStreamer.onVisibilityChanged();
 });
 
 let _sightRefreshQueued = false;
+let _lastSightBubbleMs = 0;
 Hooks.on("sightRefresh", () => {
   if (!controller.active) return;
   if (_sightRefreshQueued) return;
@@ -6302,7 +6320,14 @@ Hooks.on("sightRefresh", () => {
     if (!controller.active) return;
     controller.fogManager.revealFromActiveVision();
     controller.wallEditor.refreshDoorVisibility();
-    controller.updateSimAndLightBubbles(false);
+    const hasVision = (canvas.effects?.visionSources?.size ?? 0) > 0;
+    if (hasVision) {
+      const now = performance.now();
+      if (now - _lastSightBubbleMs >= 100) {
+        _lastSightBubbleMs = now;
+        controller.updateSimAndLightBubbles(false);
+      }
+    }
     controller.tokenStreamer.onVisibilityChanged();
   });
 });

@@ -76,6 +76,8 @@ export const perfStats = {
   textSkipped: 0,
   sweepSkipped: 0,
   sweepRun: 0,
+  geomCacheHits: 0,
+  geomFastBuilds: 0,
   detFilterSkipped: 0,
   enrichHits: 0,
   enrichMisses: 0,

@@ -578,6 +578,31 @@ export async function benchmarkCurrentScene(opts = {}) {
           status: onShapesChanged < 2 ? "REGRESSION" : cls.status,
           ...extra
         });
+
+        // M13b: Multi-Light Door Sweep (all scene lights near door + unaffected lights, mirroring Showstopper)
+        const activeLights = Array.from(canvas.effects?.lightSources ?? []).filter(
+          (s) => s?.active && Number.isFinite(s.radius) && s.radius > 0 && s.data?.walls !== false
+        );
+        if (activeLights.length >= 4) {
+          const runMultiSweep = async (warmup) => {
+            const steps = warmup ? 2 : 6;
+            const t0 = performance.now();
+            for (let i = 0; i < steps; i++) {
+              const ang = (i / steps) * (Math.PI * 0.5);
+              edges.set("bl-bench-door.0", new EdgeCls(
+                { x: activeLs.x + 25, y: activeLs.y - 20 },
+                { x: activeLs.x + 25 + Math.cos(ang) * 45, y: activeLs.y - 20 + Math.sin(ang) * 45 },
+                { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
+              ));
+              for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
+            }
+            edges.delete("bl-bench-door.0");
+            for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
+            return { ms: (performance.now() - t0) / steps };
+          };
+          const { off: mOff, on: mOn } = await runABBA(async (warmup) => runMultiSweep(warmup));
+          pushRow(`13b. Multi-Light Door Frame (${activeLights.length} lights)`, mOff, mOn, {}, { absToleranceMs: 0.5 });
+        }
       }
     }
 

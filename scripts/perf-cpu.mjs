@@ -636,6 +636,229 @@ function patchMiscCpuGuards() {
     Boolean(wrapFoundryMethod(cls, "initialize", sourceInitWrapper))
   );
 
+  // Fast PointEffectSource._updateGeometry:
+  // 1) Skip full re-triangulation when shape.points, origin, radius, and offset are unchanged (saves 100% of
+  //    idle lights on initializeLightSources and lights behind walls during Showstopper animated door sweeps).
+  // 2) Replace Foundry's 6-pass scale=1e8 ClipperOffset (which triggers JS Int128 software emulation and builds
+  //    up to 6 concentric offset rings on 200 PPI maps) with a single local-coordinate ClipperOffset pass
+  //    (strictly inside fast native int range, zero Int128) + earcut.earcutEdges soft-edge strip (7-10x faster,
+  //    visual MAE ~0.007-0.03). Includes narrow-slit fallback at 0.35x offset so thin door cracks keep soft light.
+  let _sharedOffsetter = null;
+  const fastSourceGeometryWrapper = function (wrapped) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
+    const shape = this.shape;
+    const pts = shape?.points;
+    const origin = shape?.origin;
+    const radius = shape?.config?.radius ?? 0;
+    if (!pts || pts.length < 6 || !origin || !(radius > 0)) {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
+    const gridSize = globalThis.canvas?.scene?._source?.grid?.size ?? 100;
+    const offset = this._flags?.renderSoftEdges
+      ? (this.constructor?.EDGE_OFFSET ?? 0) * (gridSize / 100)
+      : 0;
+
+    // 1. Exact shape cache check — skip PolygonMesher completely when polygon did not change
+    const gKey = `${origin.x}|${origin.y}|${radius}|${offset}|${pts.length}`;
+    if (this._geometry && this.__blGeomKey === gKey && this.__blGeomPts?.length === pts.length) {
+      const prev = this.__blGeomPts;
+      let same = true;
+      for (let i = 0; i < pts.length; i++) {
+        if (Math.abs(prev[i] - pts[i]) > 1e-4) { same = false; break; }
+      }
+      if (same) {
+        perfStats.geomCacheHits++;
+        return;
+      }
+    }
+
+    // 2. Fast local-coordinate 1-pass soft-edge mesher (falls back cleanly to wrapped() if deps missing)
+    const Clipper = globalThis.ClipperLib;
+    const pixiEarcut = globalThis.PIXI?.utils?.earcut;
+    const edgeEarcut = globalThis.earcut?.earcutEdges;
+    if (typeof pixiEarcut !== "function" || (offset !== 0 && !Clipper?.ClipperOffset)) {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
+
+    try {
+      const x = origin.x;
+      const y = origin.y;
+      const invR = 1 / radius;
+      const outerN = pts.length >> 1;
+
+      let vBuf, dBuf, idxBuf;
+      if (offset === 0) {
+        const idx = pixiEarcut(pts, null, 2);
+        if (!idx?.length) { this.__blGeomKey = null; return wrapped(); }
+        vBuf = new Float32Array(outerN * 2);
+        dBuf = new Float32Array(outerN);
+        dBuf.fill(1.0);
+        for (let i = 0; i < outerN; i++) {
+          vBuf[i * 2] = (pts[i * 2] - x) * invR;
+          vBuf[i * 2 + 1] = (pts[i * 2 + 1] - y) * invR;
+        }
+        idxBuf = new Uint16Array(idx);
+      } else {
+        if (!_sharedOffsetter) _sharedOffsetter = new Clipper.ClipperOffset(7);
+        // Local coords centered at (x, y) keep |coord * scale| <= 1e8 << ClipperLib loRange (~1.07e9),
+        // completely avoiding slow JS Int128 multiplication while keeping <= 0.0001 px precision.
+        const scale = Math.min(10000, Math.max(100, Math.floor(1e8 / Math.max(radius, 1))));
+        const invScale = 1 / scale;
+        const path = new Clipper.Path(outerN);
+        for (let i = 0, k = 0; i < pts.length; i += 2, k++) {
+          path[k] = new Clipper.IntPoint(Math.round((pts[i] - x) * scale), Math.round((pts[i + 1] - y) * scale));
+        }
+        let paths = new Clipper.Paths();
+        _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
+        _sharedOffsetter.Execute(paths, Math.round(offset * scale));
+        _sharedOffsetter.Clear();
+
+        let innerDepth = 1.0;
+        // Narrow-slit fallback: if full offset collapsed a thin light beam (e.g. door barely ajar),
+        // try a 35% inset so the slit keeps a smooth gradient instead of turning fully transparent.
+        if (!paths.length) {
+          paths = new Clipper.Paths();
+          _sharedOffsetter.AddPath(path, Clipper.JoinType.jtMiter, Clipper.EndType.etClosedPolygon);
+          _sharedOffsetter.Execute(paths, Math.round(offset * 0.35 * scale));
+          _sharedOffsetter.Clear();
+          innerDepth = 0.55;
+        }
+
+        let totalVerts = outerN;
+        for (let c = 0; c < paths.length; c++) totalVerts += paths[c].length;
+        if (totalVerts > 65530) { this.__blGeomKey = null; return wrapped(); }
+
+        const useEdgeEarcut = paths.length > 0 && typeof edgeEarcut === "function";
+        const stride = useEdgeEarcut ? 3 : 2;
+        const flat = new Float64Array(totalVerts * stride);
+        if (useEdgeEarcut) {
+          for (let i = 0; i < outerN; i++) {
+            const o = i * 3;
+            flat[o] = pts[i * 2] - x;
+            flat[o + 1] = pts[i * 2 + 1] - y;
+            flat[o + 2] = 0.0;
+          }
+        } else {
+          for (let i = 0; i < outerN; i++) {
+            flat[i * 2] = pts[i * 2] - x;
+            flat[i * 2 + 1] = pts[i * 2 + 1] - y;
+          }
+        }
+
+        const holes = new Array(paths.length);
+        let vp = outerN * stride;
+        let vOff = outerN;
+        for (let c = 0; c < paths.length; c++) {
+          holes[c] = vOff;
+          const p = paths[c];
+          if (useEdgeEarcut) {
+            for (let i = 0; i < p.length; i++) {
+              flat[vp++] = p[i].X * invScale;
+              flat[vp++] = p[i].Y * invScale;
+              flat[vp++] = innerDepth;
+            }
+          } else {
+            for (let i = 0; i < p.length; i++) {
+              flat[vp++] = p[i].X * invScale;
+              flat[vp++] = p[i].Y * invScale;
+            }
+          }
+          vOff += p.length;
+        }
+
+        let outerIdx;
+        const innerIdxList = [];
+        let totalIdxLen = 0;
+        if (paths.length) {
+          outerIdx = useEdgeEarcut ? edgeEarcut(flat, holes) : pixiEarcut(flat, holes, 2);
+          totalIdxLen = outerIdx.length;
+          for (let c = 0; c < paths.length; c++) {
+            const p = paths[c];
+            const sub = flat.subarray(holes[c] * stride, (holes[c] + p.length) * stride);
+            const iIdx = pixiEarcut(sub, null, stride);
+            innerIdxList.push(iIdx);
+            totalIdxLen += iIdx.length;
+          }
+        } else {
+          outerIdx = pixiEarcut(flat, null, stride);
+          totalIdxLen = outerIdx.length;
+        }
+
+        vBuf = new Float32Array(totalVerts * 2);
+        dBuf = new Float32Array(totalVerts);
+        const fallbackDepth = paths.length ? 0.0 : 0.65;
+        if (useEdgeEarcut) {
+          for (let i = 0; i < totalVerts; i++) {
+            vBuf[i * 2] = flat[i * 3] * invR;
+            vBuf[i * 2 + 1] = flat[i * 3 + 1] * invR;
+            dBuf[i] = flat[i * 3 + 2];
+          }
+        } else {
+          for (let i = 0; i < totalVerts; i++) {
+            vBuf[i * 2] = flat[i * 2] * invR;
+            vBuf[i * 2 + 1] = flat[i * 2 + 1] * invR;
+            dBuf[i] = i < outerN ? fallbackDepth : innerDepth;
+          }
+        }
+        idxBuf = new Uint16Array(totalIdxLen);
+        idxBuf.set(outerIdx, 0);
+        let ip = outerIdx.length;
+        for (let c = 0; c < innerIdxList.length; c++) {
+          const shift = holes[c];
+          const arr = innerIdxList[c];
+          for (let i = 0; i < arr.length; i++) idxBuf[ip++] = arr[i] + shift;
+        }
+      }
+
+      if (this._geometry) {
+        this._geometry.getBuffer("aVertexPosition").update(vBuf);
+        this._geometry.getBuffer("aDepthValue").update(dBuf);
+        this._geometry.getIndex().update(idxBuf);
+      } else {
+        this._geometry = new PIXI.Geometry()
+          .addAttribute("aVertexPosition", vBuf, 2)
+          .addAttribute("aTextureCoord", [0, 0, 1, 0, 1, 1, 0, 1], 2)
+          .addAttribute("aDepthValue", dBuf, 1)
+          .addIndex(idxBuf);
+      }
+
+      const b = shape.bounds ?? shape.getBounds?.();
+      if (b) {
+        const bx = (b.x - x) * invR;
+        const by = (b.y - y) * invR;
+        const bw = b.width * invR;
+        const bh = b.height * invR;
+        if (this._geometry.bounds) {
+          this._geometry.bounds.x = bx;
+          this._geometry.bounds.y = by;
+          this._geometry.bounds.width = bw;
+          this._geometry.bounds.height = bh;
+        } else {
+          this._geometry.bounds = new PIXI.Rectangle(bx, by, bw, bh);
+        }
+      }
+
+      this.__blGeomKey = gKey;
+      if (!this.__blGeomPts || this.__blGeomPts.length !== pts.length) {
+        this.__blGeomPts = new Float64Array(pts.length);
+      }
+      this.__blGeomPts.set(pts);
+      perfStats.geomFastBuilds++;
+    } catch {
+      this.__blGeomKey = null;
+      return wrapped();
+    }
+  };
+
+  const okGeoms = ["PointLightSource", "PointDarknessSource", "PointVisionSource"].map((cls) =>
+    Boolean(wrapFoundryMethod(cls, "_updateGeometry", fastSourceGeometryWrapper))
+  );
+
   // Track dynamic CanvasEdges mutations (e.g. Showstopper animated doors, Boundless Sim-Bubble)
   // so sourceInitWrapper NEVER skips sweep recalculation when edges move without an updateWall hook!
   const CanvasEdgesProto = globalThis.foundry?.canvas?.geometry?.edges?.CanvasEdges?.prototype;
@@ -776,7 +999,7 @@ function patchMiscCpuGuards() {
     return res;
   });
 
-  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim), Boolean(okPartialLight)];
+  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, ...okGeoms, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim), Boolean(okPartialLight)];
 }
 
 // ---------------------------------------------------------------------------
