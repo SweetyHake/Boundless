@@ -1,5 +1,18 @@
 import { MODULE_ID, getLevelBaseElevation } from "./utils.mjs";
-import { extractLightStyle } from "./light-batch.mjs";
+import { extractLightStyle, computeLevelBakedPolys } from "./light-batch.mjs";
+
+function attachBakedPolysIfPossible(spec, scene, level) {
+  if (!spec || !scene) return;
+  try {
+    const gridSize = Number(scene.grid?.size || canvas?.dimensions?.size || 100);
+    const gridDist = Number(scene.grid?.distance || canvas?.dimensions?.distance || 5);
+    const pxPerFt = gridDist > 0 ? (gridSize / gridDist) : 20;
+    const bp = computeLevelBakedPolys(spec, pxPerFt, { level });
+    if (bp) spec.bakedPolys = bp;
+  } catch (err) {
+    console.warn(`${MODULE_ID} | Could not precompute bakedPolys for level ${level?.id}:`, err);
+  }
+}
 
 const TILE_PX = 1024;
 const UPLOAD_CONCURRENCY = 4;
@@ -564,6 +577,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
         spec.foregroundMaxZoomZ = fgPlan.maxZoomZ;
         if (fgSparseTiles) spec.foregroundTiles = fgSparseTiles;
       }
+      attachBakedPolysIfPossible(spec, targetScene, level);
       levelSpecs[level.id] = spec;
     }
 
@@ -1294,6 +1308,7 @@ export function mergeEditsIntoLevelSpec(spec, {
     tiles: newTiles,
     sectors: newSectors
   };
+  delete nextSpec.bakedPolys;
   return {
     spec: nextSpec,
     counts: { walls, lights, sounds, tiles: newTiles.length }
@@ -1587,6 +1602,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         tileEdits: prevFlags.tileEdits?.[lid],
         nativeSpatial
       });
+      attachBakedPolysIfPossible(merged.spec, scene, lvl);
       await lvl.update({ [`flags.${MODULE_ID}.inlineManifest`]: merged.spec });
       totalWalls += merged.counts.walls;
       totalLights += merged.counts.lights;
@@ -1611,6 +1627,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         tileEdits: prevFlags.tileEdits?.[lid],
         nativeSpatial
       });
+      attachBakedPolysIfPossible(merged.spec, scene, lvl);
       const updatedManifest = rawManifest.levels?.[lid]
         ? { ...rawManifest, levels: { ...rawManifest.levels, [lid]: merged.spec } }
         : merged.spec;
@@ -1663,6 +1680,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           tileEdits: prevFlags.tileEdits?.[lid],
           nativeSpatial
         });
+        attachBakedPolysIfPossible(merged.spec, scene, lvl);
         nextLevels[lid] = merged.spec;
         totalWalls += merged.counts.walls;
         totalLights += merged.counts.lights;
@@ -1687,6 +1705,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           tileEdits: prevFlags.tileEdits?.[lid],
           nativeSpatial
         });
+        attachBakedPolysIfPossible(merged.spec, scene, targetLvl);
         updatedManifest = merged.spec;
         totalWalls += merged.counts.walls;
         totalLights += merged.counts.lights;

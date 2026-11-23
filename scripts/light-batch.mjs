@@ -64,6 +64,241 @@ export function hashLevelWallGeometry(sectors) {
   return `${count}:${h.toString(36)}`;
 }
 
+/**
+ * Yield back to the browser event loop (preferring idle callback when available)
+ * so background polygon prewarming never drops a frame.
+ */
+function yieldIdleSlice(timeoutMs = 50) {
+  return new Promise((resolve) => {
+    if (typeof globalThis.requestIdleCallback === "function") {
+      globalThis.requestIdleCallback(() => resolve(), { timeout: timeoutMs });
+    } else if (typeof globalThis.requestAnimationFrame === "function") {
+      globalThis.requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+
+function buildFallbackOuterBounds(worldPx, EdgeCls) {
+  const w = Math.max(1000, Number(worldPx) || 100000);
+  return [
+    new EdgeCls({ x: 0, y: 0 }, { x: w, y: 0 }, { id: "ob_top", type: "outerBounds" }),
+    new EdgeCls({ x: w, y: 0 }, { x: w, y: w }, { id: "ob_right", type: "outerBounds" }),
+    new EdgeCls({ x: w, y: w }, { x: 0, y: w }, { id: "ob_bottom", type: "outerBounds" }),
+    new EdgeCls({ x: 0, y: w }, { x: 0, y: 0 }, { id: "ob_left", type: "outerBounds" })
+  ];
+}
+
+function buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn = null) {
+  const sectorEdges = new Map();
+  for (const [sk, sec] of Object.entries(sectors || {})) {
+    const arr = [];
+    if (sec?.w) {
+      for (let wi = 0; wi < sec.w.length; wi++) {
+        const seg = resolveWallFn
+          ? resolveWallFn(levelId, "w", sk, wi, sec.w[wi])
+          : {
+              c: sec.w[wi].slice(0, 4),
+              move: sec.w[wi][4], sight: sec.w[wi][5], light: sec.w[wi][6], sound: sec.w[wi][7],
+              dir: sec.w[wi][8] || 0, door: 0, ds: 0,
+              threshold: sec.w[wi][9]?.threshold || null
+            };
+        if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
+        const [x1, y1, x2, y2] = seg.c;
+        const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
+        arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+          id: `bw_${levelId}_${sk}_${wi}`, type: "wall",
+          move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+          ...(threshold ? { threshold } : {})
+        }));
+      }
+    }
+    if (sec?.d) {
+      for (let di = 0; di < sec.d.length; di++) {
+        const rawD = sec.d[di];
+        const ex = rawD[6] && typeof rawD[6] === "object" ? rawD[6] : null;
+        const seg = resolveWallFn
+          ? resolveWallFn(levelId, "d", sk, di, rawD)
+          : {
+              c: rawD.slice(0, 4),
+              move: ex?.move ?? 20, sight: ex?.sight ?? 20, light: ex?.light ?? 20, sound: ex?.sound ?? 20,
+              dir: ex?.dir || 0, door: rawD[4] || 1, ds: rawD[5] || 0,
+              threshold: ex?.threshold || null
+            };
+        if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
+        const [x1, y1, x2, y2] = seg.c;
+        const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
+        arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+          id: `bd_${levelId}_${sk}_${di}`, type: "wall",
+          move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+          ...(threshold ? { threshold } : {})
+        }));
+      }
+    }
+    if (arr.length) sectorEdges.set(sk, arr);
+  }
+  return sectorEdges;
+}
+
+function createLocalFakeLevel(level, worldPx, levelId, EdgeCls) {
+  const emptyRect = new PIXI.Rectangle(-1e9, -1e9, 1, 1);
+  let outerBounds = [];
+  let innerBounds = [];
+  if (level?.edges?.getEdges) {
+    outerBounds = Array.from(
+      level.edges.getEdges(emptyRect, { includeOuterBounds: true, includeInnerBounds: false })
+    ).filter(e => e.type === "outerBounds").map(e => e.clone());
+    innerBounds = Array.from(
+      level.edges.getEdges(emptyRect, { includeOuterBounds: false, includeInnerBounds: true })
+    ).filter(e => e.type === "innerBounds").map(e => e.clone());
+  }
+  if (!outerBounds.length) {
+    outerBounds = buildFallbackOuterBounds(worldPx, EdgeCls);
+  }
+
+  const localEdgeStore = {
+    _list: [],
+    getEdges(bbox, { includeInnerBounds = false, includeOuterBounds = true, collisionTest, collisionTestBounds = false } = {}) {
+      const out = new Set();
+      for (const e of this._list) {
+        if (bbox && (Math.max(e.a.x, e.b.x) < bbox.x || Math.min(e.a.x, e.b.x) > bbox.right ||
+            Math.max(e.a.y, e.b.y) < bbox.y || Math.min(e.a.y, e.b.y) > bbox.bottom)) continue;
+        if (!collisionTest || collisionTest(e)) out.add(e);
+      }
+      const boundsTest = collisionTestBounds ? collisionTest : null;
+      if (includeInnerBounds) {
+        for (const inner of innerBounds) {
+          if (!boundsTest || boundsTest(inner)) out.add(inner);
+        }
+      }
+      if (includeOuterBounds) {
+        for (const outer of outerBounds) {
+          if (!boundsTest || boundsTest(outer)) out.add(outer);
+        }
+      }
+      if (out.size > 1 && EdgeCls.identifyEdgeIntersections) {
+        EdgeCls.identifyEdgeIntersections(out, levelId);
+      }
+      return out;
+    }
+  };
+  const fakeLevel = level
+    ? Object.create(level, { edges: { value: localEdgeStore, enumerable: true } })
+    : { id: levelId, edges: localEdgeStore };
+  return { localEdgeStore, fakeLevel };
+}
+
+function computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, localEdges, fakeLevel, CSP) {
+  let hasNearbyWall = false;
+  if (useWalls) {
+    for (const e of localEdges) {
+      if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+          Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+        hasNearbyWall = true;
+        break;
+      }
+    }
+  }
+  let offsets = null;
+  if ((useWalls && hasNearbyWall) || angle < 360) {
+    const poly = new CSP();
+    poly.initialize({ x: lx, y: ly }, {
+      type: "light",
+      level: fakeLevel,
+      edgeTypes: { wall: useWalls },
+      radius: dimPx,
+      angle,
+      rotation,
+      density: 32,
+      hasLimitedRadius: true,
+      useThreshold: true
+    });
+    poly.compute();
+    const pts = poly.points;
+    const nPts = pts.length >> 1;
+    if (nPts >= 3) {
+      offsets = new Float32Array(nPts * 2);
+      const invR = 1 / dimPx;
+      for (let i = 0; i < nPts; i++) {
+        let ox = (pts[i * 2] - lx) * invR;
+        let oy = (pts[i * 2 + 1] - ly) * invR;
+        const len = Math.hypot(ox, oy);
+        if (len > 1.001) {
+          ox /= len;
+          oy /= len;
+        }
+        offsets[i * 2] = ox;
+        offsets[i * 2 + 1] = oy;
+      }
+    }
+  }
+  return { offsets, hasNearbyWall };
+}
+
+/**
+ * Precompute compact wall-shadowed light polygons for a level manifest spec (`spec.bakedPolys`)
+ * so every first-time player loads the scene with zero `ClockwiseSweepPolygon` raycasts.
+ */
+export function computeLevelBakedPolys(spec, pxPerFt, { level = null, maxLights = 2500 } = {}) {
+  const sectors = spec?.sectors;
+  const EdgeCls = globalThis.foundry?.canvas?.geometry?.edges?.Edge;
+  const CSP = globalThis.foundry?.canvas?.geometry?.ClockwiseSweepPolygon;
+  if (!sectors || !EdgeCls || !CSP || !Number.isFinite(pxPerFt) || pxPerFt <= 0) return null;
+
+  let totalLights = 0;
+  for (const sec of Object.values(sectors)) {
+    totalLights += sec?.l?.length || 0;
+    if (totalLights > maxLights) return null;
+  }
+  if (totalLights === 0) return null;
+
+  const levelId = level?.id || "baked";
+  const sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, null);
+  const { localEdgeStore, fakeLevel } = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
+  const polys = {};
+
+  for (const [sk, sec] of Object.entries(sectors)) {
+    if (!sec?.l?.length) continue;
+    const [sx, sy] = sk.split("_").map(Number);
+    const localEdges = [];
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
+        if (arr) for (const e of arr) localEdges.push(e);
+      }
+    }
+    localEdgeStore._list = localEdges;
+
+    for (let li = 0; li < sec.l.length; li++) {
+      const raw = sec.l[li];
+      const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
+      if (extra?.hidden) continue;
+      const lx = raw[0], ly = raw[1];
+      const dimPx = Math.max(raw[2] || 0, raw[3] || 0) * pxPerFt;
+      const angle = extra?.angle ?? 360;
+      const rotation = extra?.rotation ?? 0;
+      const useWalls = extra?.walls !== false;
+      if (dimPx <= 0 || angle <= 0) continue;
+
+      const { offsets } = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, localEdges, fakeLevel, CSP);
+      if (offsets && offsets.length >= 6) {
+        const compact = new Array(offsets.length);
+        for (let i = 0; i < offsets.length; i++) {
+          compact[i] = Math.round(offsets[i] * 1000) / 1000;
+        }
+        polys[`${sk}_${li}`] = compact;
+      }
+    }
+  }
+
+  return {
+    wg: hashLevelWallGeometry(sectors),
+    pxPerFt: Math.round(pxPerFt * 1000) / 1000,
+    polys
+  };
+}
+
 export const LIGHT_PAD_WORLD_PX = 900; // > max 40ft (800px) light radius so lights never pop on viewport edge
 export const FOUNDRY_DEFAULT_ATTENUATION = 0.277992; // Exact Foundry v14 computedAttenuation for data.attenuation = 0.5
 export function computeShaderAttenuation(att = 0.5) {
@@ -482,17 +717,22 @@ export class MegaLightBatch {
   _polyCache = new Map(); // lightId -> { sig: string, offsets: Float32Array | null, hasNearbyWall: boolean }
   _polyCacheSceneId = null;
   _hydratedPolyLevels = new Set();
+  _deferredBakeGen = 0;
+  _deferredBakeRaf = null;
   lastPolyCacheHits = 0;
   lastPolyCacheMisses = 0;
   lastPolyCacheHydrated = 0;
+  lastPolyCacheBakedHits = 0;
 
   clearPolyCache() {
     this._polyCache.clear();
     this._polyCacheSceneId = null;
     this._hydratedPolyLevels.clear();
+    this._deferredBakeGen++;
     this.lastPolyCacheHits = 0;
     this.lastPolyCacheMisses = 0;
     this.lastPolyCacheHydrated = 0;
+    this.lastPolyCacheBakedHits = 0;
   }
 
   async hydratePolyCacheFromDB(worldId, sceneId, levelIds) {
@@ -754,6 +994,12 @@ export class MegaLightBatch {
     this._polyCacheSceneId = curSceneId;
     this.lastPolyCacheHits = 0;
     this.lastPolyCacheMisses = 0;
+    this.lastPolyCacheBakedHits = 0;
+    const deferredJobs = [];
+    const timeSliceThreshold = Number.isFinite(opts.timeSliceThreshold) ? opts.timeSliceThreshold : 0;
+    const syncBudgetMs = Number.isFinite(opts.syncBudgetMs) ? opts.syncBudgetMs : 14;
+    const syncBakeStartMs = performance.now();
+    let syncComputedCount = 0;
 
     const EdgeCls = foundry.canvas.geometry.edges.Edge;
     const CSP = foundry.canvas.geometry.ClockwiseSweepPolygon;
@@ -1056,98 +1302,44 @@ export class MegaLightBatch {
       }
 
       // Pre-build static light-blocking Edge arrays per sector for this level
-      const sectorEdges = new Map();
-      for (const [sk, sec] of Object.entries(sectors)) {
-        const arr = [];
-        if (sec.w) {
-          for (let wi = 0; wi < sec.w.length; wi++) {
-            const seg = resolveWallFn
-              ? resolveWallFn(levelId, "w", sk, wi, sec.w[wi])
-              : {
-                  c: sec.w[wi].slice(0, 4),
-                  move: sec.w[wi][4], sight: sec.w[wi][5], light: sec.w[wi][6], sound: sec.w[wi][7],
-                  dir: sec.w[wi][8] || 0, door: 0, ds: 0
-                };
-            if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
-            const [x1, y1, x2, y2] = seg.c;
-            const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-            arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-              id: `bw_${levelId}_${sk}_${wi}`, type: "wall",
-              move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
-              ...(threshold ? { threshold } : {})
-            }));
-          }
-        }
-        if (sec.d) {
-          for (let di = 0; di < sec.d.length; di++) {
-            const seg = resolveWallFn
-              ? resolveWallFn(levelId, "d", sk, di, sec.d[di])
-              : {
-                  c: sec.d[di].slice(0, 4),
-                  move: 20, sight: 20, light: 20, sound: 20,
-                  dir: 0, door: sec.d[di][4] || 1, ds: sec.d[di][5] || 0
-                };
-            if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
-            const [x1, y1, x2, y2] = seg.c;
-            const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-            arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-              id: `bd_${levelId}_${sk}_${di}`, type: "wall",
-              move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
-              ...(threshold ? { threshold } : {})
-            }));
-          }
-        }
-        if (arr.length) sectorEdges.set(sk, arr);
-      }
+      const bp = spec.bakedPolys;
+      const hasOpenDoors = Boolean(extraLevelSig && extraLevelSig.includes("|od:") && !extraLevelSig.endsWith("|od:"));
+      const canUseSpecBakedPolys = Boolean(
+        bp && typeof bp === "object" && bp.polys && typeof bp.polys === "object" &&
+        bp.wg === wallGeomHash &&
+        (!bp.pxPerFt || Math.abs(bp.pxPerFt - pxPerFt) < 0.01) &&
+        !hasEditsOnLevel &&
+        !hasOpenDoors
+      );
 
-      const outerBounds = Array.from(
-        level.edges.getEdges(emptyRect, { includeOuterBounds: true, includeInnerBounds: false })
-      ).filter(e => e.type === "outerBounds").map(e => e.clone());
-      const innerBounds = Array.from(
-        level.edges.getEdges(emptyRect, { includeOuterBounds: false, includeInnerBounds: true })
-      ).filter(e => e.type === "innerBounds").map(e => e.clone());
-
-      const localEdgeStore = {
-        _list: [],
-        getEdges(bbox, { includeInnerBounds = false, includeOuterBounds = true, collisionTest, collisionTestBounds = false } = {}) {
-          const out = new Set();
-          for (const e of this._list) {
-            if (bbox && (Math.max(e.a.x, e.b.x) < bbox.x || Math.min(e.a.x, e.b.x) > bbox.right ||
-                Math.max(e.a.y, e.b.y) < bbox.y || Math.min(e.a.y, e.b.y) > bbox.bottom)) continue;
-            if (!collisionTest || collisionTest(e)) out.add(e);
-          }
-          const boundsTest = collisionTestBounds ? collisionTest : null;
-          if (includeInnerBounds) {
-            for (const inner of innerBounds) {
-              if (!boundsTest || boundsTest(inner)) out.add(inner);
-            }
-          }
-          if (includeOuterBounds) {
-            for (const outer of outerBounds) {
-              if (!boundsTest || boundsTest(outer)) out.add(outer);
-            }
-          }
-          if (out.size > 1 && EdgeCls.identifyEdgeIntersections) {
-            EdgeCls.identifyEdgeIntersections(out, levelId);
-          }
-          return out;
-        }
+      let sectorEdges = null;
+      let localEdgeStore = null;
+      let fakeLevel = null;
+      const ensureLevelEdgeContext = () => {
+        if (sectorEdges) return;
+        sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn);
+        const built = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
+        localEdgeStore = built.localEdgeStore;
+        fakeLevel = built.fakeLevel;
       };
-      const fakeLevel = Object.create(level, {
-        edges: { value: localEdgeStore, enumerable: true }
-      });
 
       for (const [sk, sec] of Object.entries(sectors)) {
         if (!sec?.l?.length) continue;
         const [sx, sy] = sk.split("_").map(Number);
-        const localEdges = nativeEdges.length ? nativeEdges.slice() : [];
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
-            if (arr) for (const e of arr) localEdges.push(e);
+        let localEdges = null;
+        const ensureLocalEdges = () => {
+          if (localEdges) return localEdges;
+          ensureLevelEdgeContext();
+          localEdges = nativeEdges.length ? nativeEdges.slice() : [];
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
+              if (arr) for (const e of arr) localEdges.push(e);
+            }
           }
-        }
-        localEdgeStore._list = localEdges;
+          localEdgeStore._list = localEdges;
+          return localEdges;
+        };
 
         const idxStart = indicesArr.length;
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -1205,49 +1397,29 @@ export class MegaLightBatch {
             hasNearbyWall = cachedPoly.hasNearbyWall;
             offsets = cachedPoly.offsets;
             this.lastPolyCacheHits++;
+          } else if (canUseSpecBakedPolys) {
+            const pre = bp.polys[`${sk}_${li}`];
+            if (Array.isArray(pre) && pre.length >= 6) {
+              offsets = Float32Array.from(pre);
+              hasNearbyWall = useWalls;
+            }
+            this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
+            this.lastPolyCacheHits++;
+            this.lastPolyCacheBakedHits++;
+          } else if (timeSliceThreshold > 0 && syncComputedCount >= timeSliceThreshold && (performance.now() - syncBakeStartMs) >= syncBudgetMs) {
+            // Defer remaining heavy ClockwiseSweepPolygon computations to non-blocking rAF slices
+            this.lastPolyCacheMisses++;
+            deferredJobs.push({
+              lightId, polySig, lx, ly, dimPx, angle, rotation, useWalls,
+              ensureLocalEdges, getFakeLevel: () => { ensureLevelEdgeContext(); return fakeLevel; }
+            });
           } else {
             this.lastPolyCacheMisses++;
-            if (useWalls) {
-              for (const e of localEdges) {
-                if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
-                    Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
-                  hasNearbyWall = true;
-                  break;
-                }
-              }
-            }
-            if ((useWalls && hasNearbyWall) || angle < 360) {
-              const poly = new CSP();
-              poly.initialize({ x: lx, y: ly }, {
-                type: "light",
-                level: fakeLevel,
-                edgeTypes: { wall: useWalls },
-                radius: dimPx,
-                angle,
-                rotation,
-                density: 32,
-                hasLimitedRadius: true,
-                useThreshold: true
-              });
-              poly.compute();
-              const pts = poly.points;
-              const nPts = pts.length >> 1;
-              if (nPts >= 3) {
-                offsets = new Float32Array(nPts * 2);
-                const invR = 1 / dimPx;
-                for (let i = 0; i < nPts; i++) {
-                  let ox = (pts[i * 2] - lx) * invR;
-                  let oy = (pts[i * 2 + 1] - ly) * invR;
-                  const len = Math.hypot(ox, oy);
-                  if (len > 1.001) {
-                    ox /= len;
-                    oy /= len;
-                  }
-                  offsets[i * 2] = ox;
-                  offsets[i * 2 + 1] = oy;
-                }
-              }
-            }
+            syncComputedCount++;
+            const edges = ensureLocalEdges();
+            const computed = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, edges, fakeLevel, CSP);
+            offsets = computed.offsets;
+            hasNearbyWall = computed.hasNearbyWall;
             this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
           }
 
@@ -1380,6 +1552,190 @@ export class MegaLightBatch {
     this.colorMesh.visible = hasVis;
 
     this.syncDepthElevations(false);
+
+    if (deferredJobs.length > 0) {
+      this._startDeferredPolyBake(
+        deferredJobs,
+        CSP,
+        opts.onDeferredPolysReady || null,
+        Number(opts.deferredBudgetMs) || 8
+      );
+    }
+  }
+
+  _startDeferredPolyBake(jobs, CSP, onReady, budgetMs = 8) {
+    const gen = ++this._deferredBakeGen;
+    let cursor = 0;
+    const schedule = (fn) => {
+      if (typeof globalThis.requestAnimationFrame === "function") {
+        this._deferredBakeRaf = globalThis.requestAnimationFrame(fn);
+      } else {
+        this._deferredBakeRaf = setTimeout(fn, 0);
+      }
+    };
+
+    const step = () => {
+      this._deferredBakeRaf = null;
+      if (this._deferredBakeGen !== gen) return;
+      const t0 = performance.now();
+      while (cursor < jobs.length) {
+        const job = jobs[cursor++];
+        const edges = job.ensureLocalEdges();
+        const fakeLevel = job.getFakeLevel();
+        const { offsets, hasNearbyWall } = computeSingleLightPoly(
+          job.lx, job.ly, job.dimPx, job.angle, job.rotation, job.useWalls,
+          edges, fakeLevel, CSP
+        );
+        this._polyCache.set(job.lightId, { sig: job.polySig, offsets, hasNearbyWall });
+        if ((performance.now() - t0) >= budgetMs) break;
+      }
+      if (cursor < jobs.length) {
+        schedule(step);
+      } else if (this._deferredBakeGen === gen) {
+        onReady?.();
+      }
+    };
+    schedule(step);
+  }
+
+  /**
+   * Background time-sliced light polygon prewarmer for adjacent (currently unviewed) levels.
+   * Runs inside small idle slices (`<= budgetMs`) so 120 FPS never drops, populates `_polyCache`,
+   * and persists finished level polygons into IndexedDB.
+   */
+  async prewarmLevelPolysTimeSliced(layerEntry, pxPerFt, resolveWallFn = null, resolveLightFn = null, {
+    worldId = "world",
+    sceneId = null,
+    budgetMs = 5,
+    shouldAbort = null,
+    hasLevelEditsFn = null,
+    getLevelCacheSigFn = null
+  } = {}) {
+    const { level, spec } = layerEntry || {};
+    if (!level || !spec?.sectors || spec.chunks?.baseUrl || spec._superGridBase) {
+      return { computed: 0, skipped: 0, aborted: false };
+    }
+    const EdgeCls = globalThis.foundry?.canvas?.geometry?.edges?.Edge;
+    const CSP = globalThis.foundry?.canvas?.geometry?.ClockwiseSweepPolygon;
+    if (!EdgeCls || !CSP) return { computed: 0, skipped: 0, aborted: false };
+
+    const curSceneId = sceneId || canvas?.scene?.id || null;
+    if (this._polyCacheSceneId && curSceneId && this._polyCacheSceneId !== curSceneId) {
+      return { computed: 0, skipped: 0, aborted: true };
+    }
+    if (curSceneId) this._polyCacheSceneId = curSceneId;
+
+    const levelId = level.id;
+    const sectors = spec.sectors;
+    const defaultLightElev = getLevelBaseElevation(level) + 6;
+    const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
+    const hasEditsOnLevel = Boolean(hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
+    const extraLevelSig = getLevelCacheSigFn ? String(getLevelCacheSigFn(levelId) ?? "") : "";
+    const wallGeomHash = hashLevelWallGeometry(sectors);
+    const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}|wg:${wallGeomHash}`;
+
+    const bp = spec.bakedPolys;
+    const hasOpenDoors = Boolean(extraLevelSig && extraLevelSig.includes("|od:") && !extraLevelSig.endsWith("|od:"));
+    const canUseSpecBakedPolys = Boolean(
+      bp && typeof bp === "object" && bp.polys && typeof bp.polys === "object" &&
+      bp.wg === wallGeomHash &&
+      (!bp.pxPerFt || Math.abs(bp.pxPerFt - pxPerFt) < 0.01) &&
+      !hasEditsOnLevel &&
+      !hasOpenDoors
+    );
+
+    let sectorEdges = null;
+    let localEdgeStore = null;
+    let fakeLevel = null;
+    const ensureEdgeCtx = () => {
+      if (sectorEdges) return;
+      sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn);
+      const built = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
+      localEdgeStore = built.localEdgeStore;
+      fakeLevel = built.fakeLevel;
+    };
+
+    let computed = 0;
+    let skipped = 0;
+    let sliceStart = performance.now();
+
+    for (const [sk, sec] of Object.entries(sectors)) {
+      if (shouldAbort?.() || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
+        return { computed, skipped, aborted: true };
+      }
+      if (!sec?.l?.length) continue;
+      const [sx, sy] = sk.split("_").map(Number);
+      let localEdges = null;
+      const ensureLocalEdges = () => {
+        if (localEdges) return localEdges;
+        ensureEdgeCtx();
+        localEdges = nativeEdges.length ? nativeEdges.slice() : [];
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
+            if (arr) for (const e of arr) localEdges.push(e);
+          }
+        }
+        localEdgeStore._list = localEdges;
+        return localEdges;
+      };
+
+      for (let li = 0; li < sec.l.length; li++) {
+        if (shouldAbort?.() || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
+          return { computed, skipped, aborted: true };
+        }
+        const raw = sec.l[li];
+        const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
+        const resolved = resolveLightFn
+          ? resolveLightFn(levelId, sk, li, raw, level)
+          : {
+              x: raw[0], y: raw[1], dim: raw[2], bright: raw[3],
+              hidden: Boolean(extra?.hidden),
+              walls: extra?.walls !== false,
+              angle: extra?.angle ?? 360,
+              rotation: extra?.rotation ?? 0,
+              elevation: Number.isFinite(raw[7]) ? raw[7] : defaultLightElev
+            };
+        if (!resolved || resolved.hidden) continue;
+        const lx = resolved.x, ly = resolved.y;
+        const dimPx = Math.max(resolved.dim || 0, resolved.bright || 0) * pxPerFt;
+        const angle = resolved.angle ?? 360;
+        const rotation = resolved.rotation ?? 0;
+        const useWalls = resolved.walls !== false;
+        if (dimPx <= 0 || angle <= 0) continue;
+
+        const lightId = `${levelId}::${sk}_${li}`;
+        const polySig = `${lx},${ly},${dimPx},${angle},${rotation},${useWalls ? 1 : 0}|${levelCacheSig}`;
+        const existing = this._polyCache.get(lightId);
+        if (existing && existing.sig === polySig) {
+          skipped++;
+          continue;
+        }
+        if (canUseSpecBakedPolys) {
+          const pre = bp.polys[`${sk}_${li}`];
+          const offsets = (Array.isArray(pre) && pre.length >= 6) ? Float32Array.from(pre) : null;
+          this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall: Boolean(offsets && useWalls) });
+          skipped++;
+          continue;
+        }
+
+        const edges = ensureLocalEdges();
+        const { offsets, hasNearbyWall } = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, edges, fakeLevel, CSP);
+        this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
+        computed++;
+
+        if ((performance.now() - sliceStart) >= budgetMs) {
+          await yieldIdleSlice();
+          sliceStart = performance.now();
+        }
+      }
+    }
+
+    if (computed > 0 && curSceneId && !shouldAbort?.()) {
+      this._hydratedPolyLevels.add(levelId);
+      await this.persistPolyCacheToDB(worldId, curSceneId, [levelId]).catch(() => {});
+    }
+    return { computed, skipped, aborted: false };
   }
 
   /**
@@ -2346,6 +2702,14 @@ export class MegaLightBatch {
 
   destroy() {
     this._chunkBakeGen++;
+    this._deferredBakeGen++;
+    if (this._deferredBakeRaf !== null) {
+      try {
+        if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(this._deferredBakeRaf);
+        clearTimeout(this._deferredBakeRaf);
+      } catch {}
+      this._deferredBakeRaf = null;
+    }
     this._chunkBakeQueue = [];
     if (this._chunkBakeRaf !== null) {
       try {

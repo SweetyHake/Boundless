@@ -366,6 +366,9 @@ class MegaWorld1000 {
   _lastShowstopperMs = 0;
   _vtIdleCleanupNeeded = false;
   _prewarmGen = 0;
+  _idleLevelPrewarmTimer = null;
+  _idleLevelPrewarmGen = 0;
+  _prewarmedLevels = new Set();
 
   applyVramProfile(profile = null) {
     let chosen = profile;
@@ -877,6 +880,29 @@ class MegaWorld1000 {
     };
   }
 
+  async _resolveSingleLevelLayer(level, sceneManifest, defaultLevelId) {
+    if (!level) return null;
+    const lCfg = level.flags?.[MODULE_ID] || {};
+    if (lCfg.enabled === false) return null;
+
+    let rawSpec = null;
+    if (lCfg.inlineManifest) {
+      rawSpec = lCfg.inlineManifest;
+    } else if (lCfg.manifestUrl) {
+      try {
+        rawSpec = await this._fetchManifest(lCfg.manifestUrl);
+      } catch (err) {
+        console.warn(`${MODULE_ID} | Could not load level manifest ${lCfg.manifestUrl}:`, err);
+      }
+    } else if (sceneManifest?.levels && sceneManifest.levels[level.id]) {
+      rawSpec = sceneManifest.levels[level.id];
+    } else if (sceneManifest && !sceneManifest.levels && level.id === defaultLevelId) {
+      rawSpec = sceneManifest;
+    }
+
+    return rawSpec ? this._normalizeLevelSpec(rawSpec, level, lCfg) : null;
+  }
+
   /**
    * Resolve which visible Foundry v14 Levels have Boundless layers attached.
    * Supports:
@@ -905,28 +931,8 @@ class MegaWorld1000 {
 
     const layers = [];
     for (const level of visibleLevels) {
-      const lCfg = level.flags?.[MODULE_ID] || {};
-      if (lCfg.enabled === false) continue;
-
-      let rawSpec = null;
-      if (lCfg.inlineManifest) {
-        rawSpec = lCfg.inlineManifest;
-      } else if (lCfg.manifestUrl) {
-        try {
-          rawSpec = await this._fetchManifest(lCfg.manifestUrl);
-        } catch (err) {
-          console.warn(`${MODULE_ID} | Could not load level manifest ${lCfg.manifestUrl}:`, err);
-        }
-      } else if (sceneManifest?.levels && sceneManifest.levels[level.id]) {
-        rawSpec = sceneManifest.levels[level.id];
-      } else if (sceneManifest && !sceneManifest.levels && level.id === defaultLevelId) {
-        rawSpec = sceneManifest;
-      }
-
-      if (rawSpec) {
-        const entry = this._normalizeLevelSpec(rawSpec, level, lCfg);
-        if (entry) layers.push(entry);
-      }
+      const entry = await this._resolveSingleLevelLayer(level, sceneManifest, defaultLevelId);
+      if (entry) layers.push(entry);
     }
 
     layers.sort((a, b) => {
@@ -935,6 +941,115 @@ class MegaWorld1000 {
       return ea < eb ? -1 : (ea > eb ? 1 : (a.level.index ?? 0) - (b.level.index ?? 0));
     });
     return { layers, sceneManifest };
+  }
+
+  _cancelIdleLevelPrewarm() {
+    this._idleLevelPrewarmGen++;
+    if (this._idleLevelPrewarmTimer !== null) {
+      clearTimeout(this._idleLevelPrewarmTimer);
+      this._idleLevelPrewarmTimer = null;
+    }
+  }
+
+  _scheduleIdleLevelPrewarm(scene, sceneCfg, sceneManifest, mountGen) {
+    this._cancelIdleLevelPrewarm();
+    const allLevels = Array.from(scene?.levels || []);
+    if (allLevels.length <= 1) return;
+
+    const prewarmGen = ++this._idleLevelPrewarmGen;
+    const isStale = () =>
+      !this.active ||
+      this._mountGen !== mountGen ||
+      this._idleLevelPrewarmGen !== prewarmGen ||
+      canvas.scene?.id !== scene.id;
+
+    const waitUntilQuiet = async () => {
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (isStale()) return false;
+        const texStats = this.texMgr.getStats();
+        const busy = this.isActivelyMoving()
+          || this.pendingTileMounts.length > 0
+          || this.pendingOverlayMounts.length > 0
+          || this.pendingVirtualTileMounts.length > 0
+          || texStats.inFlight > 0;
+        if (!busy) return true;
+        await new Promise(r => setTimeout(r, 350));
+      }
+      return !isStale();
+    };
+
+    this._idleLevelPrewarmTimer = setTimeout(async () => {
+      this._idleLevelPrewarmTimer = null;
+      if (!(await waitUntilQuiet())) return;
+
+      const curElev = getLevelBaseElevation(canvas.level);
+      const defaultLevelId = sceneCfg.levelId
+        || (typeof scene.initialLevel === "string" ? scene.initialLevel : scene.initialLevel?.id)
+        || scene.firstLevel?.id
+        || allLevels[0]?.id;
+      const adjacentLevels = allLevels
+        .filter(lvl => !this.levelLayers.has(lvl.id) && lvl.flags?.[MODULE_ID]?.enabled !== false)
+        .sort((a, b) => Math.abs(getLevelBaseElevation(a) - curElev) - Math.abs(getLevelBaseElevation(b) - curElev));
+
+      const pxPerFt = (canvas.dimensions?.size || 100) / (canvas.dimensions?.distance || 5);
+      const worldId = game.world?.id || "world";
+      const buildOpts = this._getLightBatchBuildOpts();
+
+      for (const lvl of adjacentLevels) {
+        if (!(await waitUntilQuiet())) return;
+
+        // 1. Pre-fetch & cache level manifest JSON in RAM
+        const layer = await this._resolveSingleLevelLayer(lvl, sceneManifest, defaultLevelId);
+        if (isStale() || !layer) continue;
+
+        // 2. Hydrate from IndexedDB or silently time-slice bake shadow polygons (<= 5 ms/slice)
+        await this.lightBatch.hydratePolyCacheFromDB(worldId, scene.id, [lvl.id]);
+        if (isStale()) return;
+        await this.lightBatch.prewarmLevelPolysTimeSliced(
+          layer,
+          pxPerFt,
+          (lid, kind, sk, idx, raw) => this.resolveVirtualWall(lid, kind, sk, idx, raw),
+          (lid, sk, idx, raw, lObj) => this.resolveVirtualLight(lid, sk, idx, raw, lObj),
+          {
+            worldId,
+            sceneId: scene.id,
+            budgetMs: 5,
+            shouldAbort: isStale,
+            hasLevelEditsFn: buildOpts.hasLevelEditsFn,
+            getLevelCacheSigFn: buildOpts.getLevelCacheSigFn
+          }
+        );
+        if (isStale()) return;
+
+        // 3. Gently pre-decode base z=0/z=1 textures at lowest worker priority (2) when VRAM has headroom
+        if (this.texMgr.effectiveProfile !== "low" && this.texMgr.totalBytes < this.texMgr.maxVramBytes * 0.72) {
+          const urls = [];
+          if (layer.hasPyramid) {
+            const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+            urls.push(`${mBase}/0/0_0.webp`);
+            if (layer.maxZoomZ >= 1) {
+              const z1TileSz = this._getPyramidTileSize(layer, 1);
+              const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
+              const maxY1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.h || layer.worldPx) - 0.001) / z1TileSz));
+              for (let y = 0; y <= maxY1; y++) {
+                for (let x = 0; x <= maxX1; x++) urls.push(`${mBase}/1/${x}_${y}.webp`);
+              }
+            }
+          }
+          if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
+            urls.push(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`);
+          }
+          for (const url of urls) {
+            if (isStale() || this.isActivelyMoving()) break;
+            if (this.texMgr.totalBytes >= this.texMgr.maxVramBytes * 0.75) break;
+            if (!this.texMgr.getSync(url)) {
+              await this.texMgr.load(url, { mipmap: true, priority: 2 }).catch(() => {});
+            }
+          }
+        }
+        this._prewarmedLevels.add(lvl.id);
+      }
+    }, 1800);
   }
 
   _capFilterResolution(filter, maxRes = 1.0) {
@@ -1062,6 +1177,7 @@ class MegaWorld1000 {
   clearSceneCache() {
     this.texMgr.clear(true);
     this.lightBatch.clearPolyCache();
+    this._prewarmedLevels.clear();
     this._cachedSceneId = null;
   }
 
@@ -1201,9 +1317,19 @@ class MegaWorld1000 {
       pxPerFt,
       (lid, kind, sk, idx, raw) => this.resolveVirtualWall(lid, kind, sk, idx, raw),
       (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
-      this._getLightBatchBuildOpts()
+      {
+        ...this._getLightBatchBuildOpts(),
+        timeSliceThreshold: 80,
+        syncBudgetMs: 14,
+        deferredBudgetMs: 8,
+        onDeferredPolysReady: () => {
+          if (!this.active || this._mountGen !== mountGen || canvas.scene?.id !== scene.id) return;
+          this.scheduleLightBatchRebuild();
+          this.lightBatch.persistPolyCacheToDB(worldId, scene.id, visibleLevelIds).catch(() => {});
+        }
+      }
     );
-    if (this.lightBatch.lastPolyCacheMisses > 0) {
+    if (this.lightBatch.lastPolyCacheMisses > 0 && this.lightBatch._deferredBakeRaf === null) {
       this.lightBatch.persistPolyCacheToDB(worldId, scene.id, visibleLevelIds).catch(() => {});
     }
     this.lightBatch.attachTo(canvas.effects);
@@ -1301,6 +1427,7 @@ class MegaWorld1000 {
     );
     this._emit("mount", { scene });
     Hooks.callAll("boundlessMount", this);
+    this._scheduleIdleLevelPrewarm(scene, cfg || {}, sceneManifest, mountGen);
   }
 
   /**
@@ -5661,6 +5788,7 @@ class MegaWorld1000 {
     this._mounting = false;
     this._mountGen++;
     this._prewarmGen++;
+    this._cancelIdleLevelPrewarm();
     this.manifest = null;
     if (this._camSaveTimer !== null) {
       clearTimeout(this._camSaveTimer);
