@@ -17,6 +17,7 @@ import {
   collectSceneActiveAssetUrls
 } from "../scripts/perf-auto.mjs";
 import { wrapTargetMethod } from "../scripts/perf-patcher.mjs";
+import { computeVisualDiff } from "../scripts/perf-benchmark.mjs";
 
 test("generateNoiseLutPixels produces valid non-constant 128x128 RGBA data", () => {
   const size = 64;
@@ -191,4 +192,17 @@ test("collectSceneActiveAssetUrls supports v14 object foreground on scene and le
   assert.ok(used.has("maps/roof.webp"));
   assert.ok(used.has("maps/lvl2_bg.webp"));
   assert.ok(used.has("maps/lvl2_fg.webp"));
+});
+
+test("computeVisualDiff measures identical and divergent RGBA frames accurately", () => {
+  const a = new Uint8ClampedArray([100, 120, 140, 255, 50, 60, 70, 255, 200, 200, 200, 255, 10, 20, 30, 255]);
+  const same = new Uint8ClampedArray(a);
+  assert.deepEqual(computeVisualDiff(a, same, 20), { meanAbsDiff: 0, mismatchPct: 0, maxDelta: 0 });
+
+  const b = new Uint8ClampedArray(a);
+  b[0] = 160; // delta 60 on 1 of 4 pixels -> 25% mismatch
+  const d = computeVisualDiff(a, b, 20);
+  assert.equal(d.mismatchPct, 25);
+  assert.equal(d.maxDelta, 60);
+  assert.equal(d.meanAbsDiff, 5);
 });

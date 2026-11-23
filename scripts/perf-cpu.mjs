@@ -584,19 +584,44 @@ function patchMiscCpuGuards() {
     }
   });
 
+  const quickStateSig = (src) => {
+    const b = src.blinded;
+    const s = src.suppression;
+    if (!b && !s) return "";
+    let out = "";
+    if (b && typeof b === "object") {
+      for (const k in b) if (b[k]) out += `b:${k}|`;
+    } else if (b) {
+      out += `b:${b}|`;
+    }
+    if (s && typeof s === "object") {
+      for (const k in s) if (s[k]) out += `s:${k}|`;
+    } else if (s) {
+      out += `s:${s}|`;
+    }
+    return out;
+  };
+
   const sourceInitWrapper = function (wrapped, data = {}, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(data, options);
     let dataSame = true;
-    if (data && !foundry.utils.isEmpty(data)) {
-      for (const k of Object.keys(data)) {
-        if (JSON.stringify(this.data?.[k]) !== JSON.stringify(data[k])) {
-          dataSame = false;
-          break;
+    if (data) {
+      for (const k in data) {
+        const a = this.data?.[k];
+        const b = data[k];
+        if (a !== b) {
+          if (typeof a === "object" && typeof b === "object" && a !== null && b !== null) {
+            if (JSON.stringify(a) !== JSON.stringify(b)) { dataSame = false; break; }
+          } else {
+            dataSame = false;
+            break;
+          }
         }
       }
     }
-    const stateSig = `${JSON.stringify(this.blinded ?? "")}|${JSON.stringify(this.suppression ?? "")}`;
-    if (!options?.reset && this.shape && dataSame && this.__blSweepV === `${_geometryVersion}|${_edgeVersion}|${stateSig}`) {
+    const stateSig = quickStateSig(this);
+    const curV = `${_geometryVersion}|${_edgeVersion}|${stateSig}`;
+    if (!options?.reset && this.shape && dataSame && this.__blSweepV === curV) {
       perfStats.sweepSkipped++;
       return this;
     }

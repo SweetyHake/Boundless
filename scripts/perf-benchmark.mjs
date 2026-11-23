@@ -39,6 +39,92 @@ function avg(arr) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
+/**
+ * Pure pixel-level visual parity metric between two equal-length RGBA buffers.
+ * Returns mean absolute RGB difference (0..255), percentage of pixels exceeding
+ * `pixelThreshold`, and max single-pixel RGB delta.
+ */
+export function computeVisualDiff(rgbaA, rgbaB, pixelThreshold = 20) {
+  if (!rgbaA || !rgbaB || rgbaA.length !== rgbaB.length || rgbaA.length === 0) {
+    return { meanAbsDiff: 255, mismatchPct: 100, maxDelta: 255 };
+  }
+  const pixelCount = rgbaA.length >> 2;
+  let sumDiff = 0;
+  let mismatched = 0;
+  let maxDelta = 0;
+  for (let i = 0; i < rgbaA.length; i += 4) {
+    const dr = Math.abs(rgbaA[i] - rgbaB[i]);
+    const dg = Math.abs(rgbaA[i + 1] - rgbaB[i + 1]);
+    const db = Math.abs(rgbaA[i + 2] - rgbaB[i + 2]);
+    const m = dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db);
+    sumDiff += (dr + dg + db) / 3;
+    if (m > pixelThreshold) mismatched++;
+    if (m > maxDelta) maxDelta = m;
+  }
+  return {
+    meanAbsDiff: +(sumDiff / pixelCount).toFixed(2),
+    mismatchPct: +((mismatched / pixelCount) * 100).toFixed(2),
+    maxDelta
+  };
+}
+
+let _snapCanvas = null;
+let _snapCtx = null;
+
+function captureCanvasRgba(w = 256, h = 144) {
+  const renderer = globalThis.canvas?.app?.renderer;
+  const stage = globalThis.canvas?.app?.stage;
+  const view = globalThis.canvas?.app?.view;
+  if (!renderer || !stage || !view || typeof document === "undefined") return null;
+
+  if (!_snapCanvas) {
+    _snapCanvas = document.createElement("canvas");
+    _snapCanvas.width = w;
+    _snapCanvas.height = h;
+    _snapCtx = _snapCanvas.getContext("2d", { willReadFrequently: true });
+  } else if (_snapCanvas.width !== w || _snapCanvas.height !== h) {
+    _snapCanvas.width = w;
+    _snapCanvas.height = h;
+  }
+  // Render synchronously right before drawImage (WebGL default preserveDrawingBuffer is false!)
+  renderer.render(stage);
+  renderer.batch.flush();
+  renderer.gl?.finish?.();
+  _snapCtx.clearRect(0, 0, w, h);
+  _snapCtx.drawImage(view, 0, 0, w, h);
+  return _snapCtx.getImageData(0, 0, w, h).data;
+}
+
+async function checkVisualParity(label, { maxMeanDiff = 4.5, maxMismatchPct = 3.0 } = {}) {
+  const ticker = globalThis.canvas?.app?.ticker;
+  const wasStarted = Boolean(ticker?.started);
+  // Pause ticker briefly so animated lights & weather stay at the exact same timestamp for OFF vs ON!
+  if (wasStarted) ticker.stop();
+  try {
+    await setPerfMode(false);
+    // Apply pending render flags (e.g. wall sprite -> graphics swap) without advancing animation time
+    globalThis.canvas?.app?.renderer?.render?.(globalThis.canvas.app.stage);
+    globalThis.canvas?.perception?.applyRenderFlags?.();
+    const offPx = captureCanvasRgba(256, 144);
+
+    await setPerfMode(true);
+    globalThis.canvas?.app?.renderer?.render?.(globalThis.canvas.app.stage);
+    globalThis.canvas?.perception?.applyRenderFlags?.();
+    const onPx = captureCanvasRgba(256, 144);
+
+    const diff = computeVisualDiff(offPx, onPx, 20);
+    let status = "PASS";
+    if (diff.meanAbsDiff > maxMeanDiff || diff.mismatchPct > maxMismatchPct) {
+      status = "REGRESSION";
+    } else if (diff.meanAbsDiff > maxMeanDiff * 0.7 || diff.mismatchPct > maxMismatchPct * 0.7) {
+      status = "WARN";
+    }
+    return { label, ...diff, status };
+  } finally {
+    if (wasStarted) ticker.start();
+  }
+}
+
 async function setPerfMode(enabled) {
   PERF_CONFIG.perfEnabled = Boolean(enabled);
   if (!enabled) {
@@ -68,8 +154,18 @@ async function setPerfMode(enabled) {
     updateStandardSceneCulling();
   }
   resetPerfStats();
-  await nextFrame();
-  await nextFrame();
+  if (globalThis.canvas?.app?.ticker?.started) {
+    await nextFrame();
+    await nextFrame();
+  } else {
+    // When ticker is paused (e.g. visual parity freeze-frame), apply placeable render flags manually
+    for (const w of globalThis.canvas?.walls?.placeables ?? []) {
+      w.applyRenderFlags?.();
+    }
+    for (const t of globalThis.canvas?.tokens?.placeables ?? []) {
+      t.applyRenderFlags?.();
+    }
+  }
 }
 
 /**
@@ -230,6 +326,41 @@ export async function benchmarkCurrentScene(opts = {}) {
   try {
     const renderer = canvas.app.renderer;
     const stage = canvas.app.stage;
+
+    // V0: Visual Parity checks (OFF vs ON pixel-diff at frozen animation timestamp!)
+    const pushVisualRow = (v) => {
+      rows.push({
+        scene: scene.name,
+        mechanic: v.label,
+        offMs: 0,
+        onMs: 0,
+        gainPct: 0,
+        offFps: null,
+        onFps: null,
+        offDraws: null,
+        onDraws: null,
+        meanAbsDiff: v.meanAbsDiff,
+        mismatchPct: v.mismatchPct,
+        maxDelta: v.maxDelta,
+        status: v.status
+      });
+    };
+
+    canvas.tokens.activate();
+    await nextFrame();
+    pushVisualRow(await checkVisualParity("V1. Visual Parity (Gameplay)"));
+
+    if ((canvas.walls?.placeables?.length ?? 0) >= 10) {
+      canvas.walls.activate();
+      await nextFrame();
+      pushVisualRow(await checkVisualParity("V2. Visual Parity (Walls Layer)", { maxMeanDiff: 5.0, maxMismatchPct: 4.5 }));
+    }
+
+    if ((canvas.notes?.placeables?.length ?? 0) >= 4) {
+      canvas.notes.activate();
+      await nextFrame();
+      pushVisualRow(await checkVisualParity("V3. Visual Parity (Notes/Pins)", { maxMeanDiff: 4.5, maxMismatchPct: 3.0 }));
+    }
 
     // M1: Full-frame gameplay render (TokenLayer active, pan/zoom view)
     canvas.tokens.activate();
@@ -681,9 +812,9 @@ export async function runPerfBenchmark(opts = {}) {
     console.table(allRows.map((r) => ({
       Scene: r.scene,
       Mechanic: r.mechanic,
-      "OFF ms": r.offMs,
-      "ON ms": r.onMs,
-      "Gain %": `${r.gainPct >= 0 ? "+" : ""}${r.gainPct}%`,
+      "OFF ms": r.meanAbsDiff != null ? `MAE ${r.meanAbsDiff}` : r.offMs,
+      "ON ms": r.mismatchPct != null ? `diff ${r.mismatchPct}%` : r.onMs,
+      "Gain %": r.meanAbsDiff != null ? `maxΔ ${r.maxDelta}` : `${r.gainPct >= 0 ? "+" : ""}${r.gainPct}%`,
       "Draws OFF->ON": r.offDraws != null ? `${r.offDraws} -> ${r.onDraws}` : "",
       Status: r.status
     })));
