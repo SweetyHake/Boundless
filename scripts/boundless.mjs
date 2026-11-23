@@ -980,12 +980,13 @@ class MegaWorld1000 {
         if (isStale()) return false;
         const texStats = this.texMgr.getStats();
         const busy = this.isActivelyMoving()
+          || (performance.now() - (this._lastPanMs || 0)) < 1200
           || this.pendingTileMounts.length > 0
           || this.pendingOverlayMounts.length > 0
           || this.pendingVirtualTileMounts.length > 0
           || texStats.inFlight > 0;
         if (!busy) return true;
-        await new Promise(r => setTimeout(r, 350));
+        await new Promise(r => setTimeout(r, 400));
       }
       return false;
     };
@@ -1014,7 +1015,7 @@ class MegaWorld1000 {
         const layer = await this._resolveSingleLevelLayer(lvl, sceneManifest, defaultLevelId);
         if (isStale() || !layer) continue;
 
-        // 2. Hydrate from IndexedDB or silently time-slice bake shadow polygons (<= 5 ms/slice)
+        // 2. Hydrate from IndexedDB or silently time-slice bake shadow polygons (<= 4 ms/slice)
         await this.lightBatch.hydratePolyCacheFromDB(worldId, scene.id, [lvl.id]);
         if (isStale()) return;
         await this.lightBatch.prewarmLevelPolysTimeSliced(
@@ -1025,28 +1026,21 @@ class MegaWorld1000 {
           {
             worldId,
             sceneId: scene.id,
-            budgetMs: 5,
-            shouldAbort: isStale,
+            budgetMs: 4,
+            shouldAbort: () => isStale() || this.isActivelyMoving(),
             hasLevelEditsFn: buildOpts.hasLevelEditsFn,
             getLevelCacheSigFn: buildOpts.getLevelCacheSigFn
           }
         );
         if (isStale()) return;
+        if (this.isActivelyMoving()) continue;
 
-        // 3. Gently pre-decode base z=0/z=1 textures at lowest worker priority (2) when VRAM has headroom
+        // 3. Gently pre-decode only the base z=0 tile per adjacent level with pauses so GPU uploads never stutter zoom
         if (this.texMgr.effectiveProfile !== "low" && this.texMgr.totalBytes < this.texMgr.maxVramBytes * 0.72) {
           const urls = [];
           if (layer.hasPyramid) {
             const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
             urls.push(`${mBase}/0/0_0.webp`);
-            if (layer.maxZoomZ >= 1) {
-              const z1TileSz = this._getPyramidTileSize(layer, 1);
-              const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
-              const maxY1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.h || layer.worldPx) - 0.001) / z1TileSz));
-              for (let y = 0; y <= maxY1; y++) {
-                for (let x = 0; x <= maxX1; x++) urls.push(`${mBase}/1/${x}_${y}.webp`);
-              }
-            }
           }
           if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
             urls.push(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`);
@@ -1060,6 +1054,7 @@ class MegaWorld1000 {
             }
             if (!this.texMgr.getSync(url)) {
               await this.texMgr.load(url, { mipmap: true, priority: 2 }).catch(() => {});
+              await new Promise(r => setTimeout(r, 120));
             }
           }
           if (completedTex) this._prewarmedLevels.add(lvl.id);
@@ -1067,7 +1062,7 @@ class MegaWorld1000 {
           this._prewarmedLevels.add(lvl.id);
         }
       }
-    }, 1800);
+    }, 3000);
   }
 
   _capFilterResolution(filter, maxRes = 1.0) {
@@ -1306,7 +1301,7 @@ class MegaWorld1000 {
       this._origDepthAutoRender = canvas.masks.depth.autoRender;
       canvas.masks.depth.autoRender = false;
       this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+      canvas.masks.depth.renderDirty = true;
     }
 
     // Prevent PIXI TextureGCSystem from silently evicting _glTextures out from under our byte-budgeted LRUTextureManager every 60s
@@ -2025,8 +2020,10 @@ class MegaWorld1000 {
       this.wallEditor.syncViewport(false, vp);
       this.layerEditors.syncViewport(false, vp);
     }
-    this._depthDirty = true;
-    if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+    if (this.lightBatch.useDepthTexture || this.activeOverlays.size > 0 || this._hasMultiElevationDepth()) {
+      this._depthDirty = true;
+      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+    }
 
     let anyTilesOrOverlaysChanged = false;
     let maxTargetZ = 0;
@@ -3278,7 +3275,7 @@ class MegaWorld1000 {
     const curScale = canvas.stage?.scale?.x ?? 1;
     let wantMacroRoofMask = false;
     for (const layer of this.visibleLevelLayers) {
-      if (!layer.spec?.overlays) continue;
+      if (!hasSpecOverlays(layer.spec?.overlays)) continue;
       const topElev = getLevelRoofElevation(layer.level);
       const hideRoofsForUpperView = !layer.level.isView && viewedBottom >= topElev;
       if (hideRoofsForUpperView) continue;
@@ -3331,7 +3328,7 @@ class MegaWorld1000 {
 
   syncOverlayMeshes(layer, targetZ, vp) {
     const overlays = layer.spec?.overlays;
-    if (!overlays) return false;
+    if (!hasSpecOverlays(overlays)) return false;
 
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const { simGrid, simSectorPx, spec, level } = layer;
@@ -3894,14 +3891,14 @@ class MegaWorld1000 {
     }
   }
 
-  scheduleViewportLightSync() {
+  scheduleViewportLightSync(delayMs = 320) {
     if (this._vpLightSyncTimer) clearTimeout(this._vpLightSyncTimer);
     this._vpLightSyncTimer = setTimeout(() => {
       this._vpLightSyncTimer = null;
       if (this.active && !this._mounting) {
         this.updateSimAndLightBubbles(false);
       }
-    }, 180);
+    }, delayMs);
   }
 
   // Multi-Level Physics Sim-Bubble & Dynamic Lights: strictly driven by tokens (on their own level!), active visionSources, and open doors
@@ -4002,17 +3999,25 @@ class MegaWorld1000 {
         }
       }
 
-      // 1c. Viewport animated lights (at close/room zoom >= 0.22 in 100-PPI equivalent scale): promote visible
-      //     animated lights (especially pattern shaders like `energy`, `witchwave`, `fairy`, `torch`) to native
-      //     PointLightSource so closing a door never makes room animations vanish!
+      // 1c. Viewport animated lights with zoom hysteresis (enter >= 0.28, exit < 0.18 in 100-PPI equivalent scale)
+      //     and sticky selection so zooming/panning never churns or flickers lights.
       const MAX_VIEWPORT_ANIM_LIGHTS = 18;
       const MAX_TOTAL_DYN_LIGHTS = 28;
       const lightAnimEnabled = canvas.effects?.animateLightSources !== false;
       const effScale = getEffectiveScale(canvas.stage?.scale?.x || 1);
+      if (!lightAnimEnabled) {
+        this._vpAnimLightsActive = false;
+      } else if (this._vpAnimLightsActive) {
+        if (effScale < 0.18) this._vpAnimLightsActive = false;
+      } else if (effScale >= 0.28) {
+        this._vpAnimLightsActive = true;
+      }
+      const vpAnimOnlyIds = new Set();
       const vpAnimBudget = Math.min(MAX_VIEWPORT_ANIM_LIGHTS, Math.max(0, MAX_TOTAL_DYN_LIGHTS - neededDynLights.size));
-      if (lightAnimEnabled && effScale >= 0.22 && vpAnimBudget > 0) {
+      if (this._vpAnimLightsActive && vpAnimBudget > 0) {
         const vp = this.getViewportWorldRect(0.2);
-        if (vp && Number.isFinite(vp.x0) && Number.isFinite(vp.x1)) {
+        const vpSticky = this.getViewportWorldRect(0.55);
+        if (vp && vpSticky && Number.isFinite(vp.x0) && Number.isFinite(vp.x1)) {
           const cx = (vp.x0 + vp.x1) * 0.5;
           const cy = (vp.y0 + vp.y1) * 0.5;
           const vpCandidates = [];
@@ -4022,10 +4027,10 @@ class MegaWorld1000 {
             if (!levelId || !layer?.spec?.sectors) continue;
             const viewPrio = layer.level.isView ? 0 : 1;
             const { simGrid, simSectorPx, spec } = layer;
-            const sx0 = Math.max(0, Math.floor((vp.x0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sy0 = Math.max(0, Math.floor((vp.y0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sx1 = Math.min(simGrid - 1, Math.floor((vp.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
-            const sy1 = Math.min(simGrid - 1, Math.floor((vp.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sx0 = Math.max(0, Math.floor((vpSticky.x0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy0 = Math.max(0, Math.floor((vpSticky.y0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sx1 = Math.min(simGrid - 1, Math.floor((vpSticky.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy1 = Math.min(simGrid - 1, Math.floor((vpSticky.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             for (let sy = sy0; sy <= sy1; sy++) {
               for (let sx = sx0; sx <= sx1; sx++) {
                 const sk = `${sx}_${sy}`;
@@ -4037,20 +4042,37 @@ class MegaWorld1000 {
                   const meta = this.lightBatch.lightMetaById.get(lid);
                   if (!meta || !meta.raw?.[6] || !isMetaEligibleDyn(meta)) continue;
                   const r = meta.dimPx || 0;
-                  if (meta.lx + r < vp.x0 || meta.lx - r > vp.x1 || meta.ly + r < vp.y0 || meta.ly - r > vp.y1) continue;
+                  const alreadyDyn = this.dynamicLights.has(lid);
+                  const box = alreadyDyn ? vpSticky : vp;
+                  if (meta.lx + r < box.x0 || meta.lx - r > box.x1 || meta.ly + r < box.y0 || meta.ly - r > box.y1) continue;
                   const dx = meta.lx - cx;
                   const dy = meta.ly - cy;
                   const animType = String(meta.raw[6]).toLowerCase();
                   const isPattern = animType !== "torch" && animType !== "flame" && animType !== "pulse";
-                  vpCandidates.push({ lid, viewPrio, prio: isPattern ? 0 : 1, distSq: dx * dx + dy * dy });
+                  vpCandidates.push({
+                    lid,
+                    stickyPrio: alreadyDyn ? 0 : 1,
+                    viewPrio,
+                    prio: isPattern ? 0 : 1,
+                    distSq: dx * dx + dy * dy
+                  });
                 }
               }
             }
           }
           if (vpCandidates.length > 0) {
-            vpCandidates.sort((a, b) => (a.viewPrio - b.viewPrio) || (a.prio - b.prio) || (a.distSq - b.distSq));
+            vpCandidates.sort((a, b) =>
+              (a.stickyPrio - b.stickyPrio) ||
+              (a.viewPrio - b.viewPrio) ||
+              (a.prio - b.prio) ||
+              (a.distSq - b.distSq)
+            );
             const take = Math.min(vpAnimBudget, vpCandidates.length);
-            for (let i = 0; i < take; i++) neededDynLights.add(vpCandidates[i].lid);
+            for (let i = 0; i < take; i++) {
+              const lid = vpCandidates[i].lid;
+              neededDynLights.add(lid);
+              vpAnimOnlyIds.add(lid);
+            }
           }
         }
       }
@@ -4191,10 +4213,11 @@ class MegaWorld1000 {
 
       const dynKey = Array.from(neededDynLights).sort().join("|");
       let lightsChanged = false;
+      let moreVpAnimPending = false;
+      const MAX_NEW_VP_PROMOTES_PER_TICK = force ? Infinity : 4;
+      let newVpPromotes = 0;
 
       if (force || dynKey !== this.lastDynLightKey || edgesChanged) {
-        this.lastDynLightKey = dynKey;
-
         for (const [lid, ls] of this.dynamicLights) {
           if (!neededDynLights.has(lid)) {
             this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
@@ -4211,6 +4234,11 @@ class MegaWorld1000 {
               const ls = this.dynamicLights.get(lid);
               ls.initialize(ls.data);
             }
+            continue;
+          }
+          // Spread viewport-only promotions across tiny slices (<= 4 lights/tick) to eliminate zoom stutter spikes
+          if (vpAnimOnlyIds.has(lid) && newVpPromotes >= MAX_NEW_VP_PROMOTES_PER_TICK) {
+            moreVpAnimPending = true;
             continue;
           }
           const meta = this.lightBatch.lightMetaById.get(lid);
@@ -4235,7 +4263,10 @@ class MegaWorld1000 {
           this.lightBatch.setLightWeight(lid, 0.0);
           this._emit("dynamicLightMount", { id: lid, light: ls, meta });
           lightsChanged = true;
+          if (vpAnimOnlyIds.has(lid)) newVpPromotes++;
         }
+
+        this.lastDynLightKey = moreVpAnimPending ? "" : dynKey;
       }
 
       this.lightBatch.flushWeights();
@@ -4243,13 +4274,23 @@ class MegaWorld1000 {
       if (edgesChanged || lightsChanged) {
         canvas.perception.update({
           initializeVision: edgesChanged,
-          initializeLighting: lightsChanged || edgesChanged,
+          initializeLighting: edgesChanged,
           initializeSounds: edgesChanged,
+          refreshLightSources: lightsChanged && !edgesChanged,
           refreshLighting: true,
-          refreshVision: true
+          refreshVision: edgesChanged
         });
+        // Flush perception synchronously so MegaLightBatch weight changes and native PointLightSource meshes
+        // swap atomically within the exact same frame (eliminates 1-frame dark flicker during handoff!).
+        if (!this._mounting && typeof canvas.perception.applyRenderFlags === "function") {
+          canvas.perception.applyRenderFlags();
+        }
       } else {
         this.lightBatch.attachTo(canvas.effects);
+      }
+
+      if (moreVpAnimPending && !this._mounting) {
+        this.scheduleViewportLightSync(45);
       }
     } finally {
       this._updatingBubbles = false;
@@ -6030,6 +6071,7 @@ class MegaWorld1000 {
     this.soundEdits.clear();
     this.tileEdits.clear();
     this._lightRebuildScheduled = false;
+    this._vpAnimLightsActive = false;
     if (this._vpLightSyncTimer) { clearTimeout(this._vpLightSyncTimer); this._vpLightSyncTimer = null; }
     if (this._lightRefreshAudioTimer) { clearTimeout(this._lightRefreshAudioTimer); this._lightRefreshAudioTimer = null; }
     this._lastLightRefreshAudioMs = 0;
