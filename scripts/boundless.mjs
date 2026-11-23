@@ -3836,6 +3836,16 @@ class MegaWorld1000 {
     if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
   }
 
+  scheduleViewportLightSync() {
+    if (this._vpLightSyncTimer) clearTimeout(this._vpLightSyncTimer);
+    this._vpLightSyncTimer = setTimeout(() => {
+      this._vpLightSyncTimer = null;
+      if (this.active && !this._mounting) {
+        this.updateSimAndLightBubbles(false);
+      }
+    }, 180);
+  }
+
   // Multi-Level Physics Sim-Bubble & Dynamic Lights: strictly driven by tokens (on their own level!), active visionSources, and open doors
   updateSimAndLightBubbles(force = false) {
     if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready || this._updatingBubbles) return;
@@ -3931,6 +3941,57 @@ class MegaWorld1000 {
           const sorted = Array.from(visionCandidates.entries()).sort((a, b) => a[1] - b[1]);
           const take = Math.min(MAX_VISION_DYN_LIGHTS, sorted.length);
           for (let i = 0; i < take; i++) neededDynLights.add(sorted[i][0]);
+        }
+      }
+
+      // 1c. Viewport animated lights (at close/room zoom >= 0.22): promote visible animated lights
+      //     (especially pattern shaders like `energy`, `witchwave`, `fairy`, `torch`) to native PointLightSource
+      //     so closing a door never makes room animations vanish! Debounced on pan settle to keep 144 FPS panning.
+      const MAX_VIEWPORT_ANIM_LIGHTS = 18;
+      const lightAnimEnabled = (() => { try { return game.settings.get("core", "lightAnimation") !== false; } catch { return true; } })();
+      const effScale = canvas.stage?.scale?.x || 1;
+      if (lightAnimEnabled && effScale >= 0.22 && neededDynLights.size < MAX_VIEWPORT_ANIM_LIGHTS + 8) {
+        const vp = this.getViewportWorldRect(0.2);
+        if (vp && Number.isFinite(vp.x0) && Number.isFinite(vp.x1)) {
+          const cx = (vp.x0 + vp.x1) * 0.5;
+          const cy = (vp.y0 + vp.y1) * 0.5;
+          const vpCandidates = [];
+          for (let li = 0; li < this.visibleLevelLayers.length; li++) {
+            const layer = this.visibleLevelLayers[li];
+            const levelId = layer?.level?.id;
+            if (!levelId || !layer?.spec?.sectors) continue;
+            const { simGrid, simSectorPx, spec } = layer;
+            const sx0 = Math.max(0, Math.floor((vp.x0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy0 = Math.max(0, Math.floor((vp.y0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sx1 = Math.min(simGrid - 1, Math.floor((vp.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const sy1 = Math.min(simGrid - 1, Math.floor((vp.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            for (let sy = sy0; sy <= sy1; sy++) {
+              for (let sx = sx0; sx <= sx1; sx++) {
+                const sk = `${sx}_${sy}`;
+                const sec = spec.sectors[sk];
+                if (!sec?.l?.length) continue;
+                for (let idx = 0; idx < sec.l.length; idx++) {
+                  const lid = `${levelId}::${sk}_${idx}`;
+                  if (neededDynLights.has(lid)) continue;
+                  const meta = this.lightBatch.lightMetaById.get(lid);
+                  if (!meta || !meta.raw?.[6] || !isMetaEligibleDyn(meta)) continue;
+                  const r = meta.dimPx || 0;
+                  if (meta.lx + r < vp.x0 || meta.lx - r > vp.x1 || meta.ly + r < vp.y0 || meta.ly - r > vp.y1) continue;
+                  const dx = meta.lx - cx;
+                  const dy = meta.ly - cy;
+                  const animType = String(meta.raw[6]).toLowerCase();
+                  const isPattern = animType !== "torch" && animType !== "flame" && animType !== "pulse";
+                  vpCandidates.push({ lid, prio: isPattern ? 0 : 1, distSq: dx * dx + dy * dy });
+                }
+              }
+            }
+          }
+          if (vpCandidates.length > 0) {
+            vpCandidates.sort((a, b) => (a.prio - b.prio) || (a.distSq - b.distSq));
+            const budget = Math.max(0, MAX_VIEWPORT_ANIM_LIGHTS);
+            const take = Math.min(budget, vpCandidates.length);
+            for (let i = 0; i < take; i++) neededDynLights.add(vpCandidates[i].lid);
+          }
         }
       }
 
@@ -5803,6 +5864,10 @@ class MegaWorld1000 {
     this._mountGen++;
     this._prewarmGen++;
     this._cancelIdleLevelPrewarm();
+    if (this._vpLightSyncTimer) {
+      clearTimeout(this._vpLightSyncTimer);
+      this._vpLightSyncTimer = null;
+    }
     this.manifest = null;
     if (this._camSaveTimer !== null) {
       clearTimeout(this._camSaveTimer);
@@ -6204,6 +6269,7 @@ Hooks.on("canvasPan", () => {
   controller._updateCameraVelocity(now);
   controller.scheduleCameraSave();
   controller.updatePyramid();
+  controller.scheduleViewportLightSync();
 });
 
 let _controlTokenQueued = false;
