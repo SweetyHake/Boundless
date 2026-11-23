@@ -238,7 +238,7 @@ function installHoverFadeHitTestPatch() {
 
   const origOnMouseMove = PCG.prototype._onMouseMove;
   PCG.prototype._onMouseMove = function (...args) {
-    if (!controller?.active) return origOnMouseMove.apply(this, args);
+    if (!controller?.active && !PERF_CONFIG.perfEnabled) return origOnMouseMove.apply(this, args);
     _inHoverFadeHitTest = true;
     try {
       return origOnMouseMove.apply(this, args);
@@ -249,10 +249,15 @@ function installHoverFadeHitTestPatch() {
 
   const origContainsCanvasPoint = PSM.prototype.containsCanvasPoint;
   PSM.prototype.containsCanvasPoint = function (...args) {
-    if (_inHoverFadeHitTest && controller?.active && this._boundlessMesh) {
-      if (!this.hoverFade && !this.occlusionMode) return false;
-      if (this._boundlessTile && !this.hoverFade) return false;
-      if (controller.isActivelyMoving()) return false;
+    if (_inHoverFadeHitTest) {
+      if (controller?.active && this._boundlessMesh) {
+        if (!this.hoverFade && !this.occlusionMode) return false;
+        if (this._boundlessTile && !this.hoverFade) return false;
+        if (controller.isActivelyMoving()) return false;
+      } else if (PERF_CONFIG.perfEnabled) {
+        // On any standard scene, skip synchronous gl.readPixels() alpha-map stall for non-hoverFade, non-occludable meshes
+        if (!this.hoverFade && !this.occlusionMode) return false;
+      }
     }
     return origContainsCanvasPoint.apply(this, args);
   };

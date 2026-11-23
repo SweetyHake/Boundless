@@ -1,7 +1,7 @@
 import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, resetPerfStats } from "./perf-patcher.mjs";
 import { applyLightingRenderScale, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
-import { restoreAllStandardCulling, updateStandardSceneCulling } from "./perf-auto.mjs";
+import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
 
 /**
  * Boundless A/B Regression Benchmark Suite for Foundry VTT v14.
@@ -46,13 +46,23 @@ async function setPerfMode(enabled) {
     restoreAllStandardCulling();
   }
   applyLightingRenderScale();
-  // Refresh wall sprites/graphics so toggle takes effect immediately
+  // Refresh wall sprites/graphics and note icons so toggle takes effect immediately
   const walls = globalThis.canvas?.walls?.placeables;
   if (walls?.length) {
     for (let i = 0; i < walls.length; i++) {
       walls[i].renderFlags?.set?.({ refreshLine: true, refreshEndpoints: true });
     }
   }
+  const notes = globalThis.canvas?.notes?.placeables;
+  if (notes?.length) {
+    for (let i = 0; i < notes.length; i++) {
+      const icon = notes[i].controlIcon;
+      if (icon && !icon.destroyed) {
+        try { icon._refresh?.(); } catch {}
+      }
+    }
+  }
+  syncDecorativeTileShaders(enabled);
   if (enabled) {
     updateStandardSceneCulling();
   }

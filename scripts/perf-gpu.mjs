@@ -34,13 +34,13 @@ function getUiAtlas() {
 
   const canvasEl = document.createElement("canvas");
   canvasEl.width = 256;
-  canvasEl.height = 128;
+  canvasEl.height = 256;
   const ctx = canvasEl.getContext("2d");
   if (!ctx) return null;
 
   // (A) Wall Line texture at (2, 2, 12, 36):
   // Outer black border (top/bottom 12px each), inner white core (12px) so sprite.tint tints only the core!
-  ctx.clearRect(0, 0, 256, 128);
+  ctx.clearRect(0, 0, 256, 256);
   ctx.fillStyle = "rgba(0,0,0,1)";
   ctx.fillRect(0, 2, 16, 36);
   ctx.fillStyle = "rgba(255,255,255,1)";
@@ -75,7 +75,7 @@ function getUiAtlas() {
     ctx.closePath();
   };
 
-  // (C) ControlIcon Background rounded square at (104, 4, 60, 60): pure white (tintable)
+  // (C) ControlIcon / DoorControl Background rounded square at (104, 4, 60, 60): pure white (tintable)
   roundedRectPath(104, 4, 60, 60, 8);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
@@ -90,6 +90,41 @@ function getUiAtlas() {
   ctx.strokeStyle = "rgba(255,255,255,1)";
   ctx.stroke();
 
+  // (E) Plain tintable rounded border (for DoorControl orange border) at (0, 80, 64, 64)
+  roundedRectPath(4, 84, 56, 56, 7);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(255,255,255,1)";
+  ctx.stroke();
+
+  // (F) Soft blurred drop-shadow circle at (64, 80, 64, 64) (replaces PIXI.BlurFilter on D&D 5e MapLocation pins!)
+  ctx.save();
+  const sg = ctx.createRadialGradient(96, 112, 16, 96, 112, 31);
+  sg.addColorStop(0, "rgba(255,255,255,0.68)");
+  sg.addColorStop(0.68, "rgba(255,255,255,0.52)");
+  sg.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = sg;
+  ctx.beginPath();
+  ctx.arc(96, 112, 31, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // (G) Clean anti-aliased white circle at (128, 80, 64, 64) (for MapLocation extrude & bg fill)
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(160, 112, 30, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,1)";
+  ctx.fill();
+  ctx.restore();
+
+  // (H) Clean anti-aliased white circle outline at (192, 80, 64, 64) (for MapLocation border stroke)
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(224, 112, 29, 0, Math.PI * 2);
+  ctx.lineWidth = 3.2;
+  ctx.strokeStyle = "rgba(255,255,255,1)";
+  ctx.stroke();
+  ctx.restore();
+
   const base = PIXI.BaseTexture.from(canvasEl, {
     scaleMode: PIXI.SCALE_MODES.LINEAR,
     mipmap: PIXI.MIPMAP_MODES.OFF
@@ -100,7 +135,11 @@ function getUiAtlas() {
     wallLine: new PIXI.Texture(base, new PIXI.Rectangle(4, 2, 8, 36)),
     wallDot: new PIXI.Texture(base, new PIXI.Rectangle(32, 0, 64, 64)),
     iconBg: new PIXI.Texture(base, new PIXI.Rectangle(104, 4, 60, 60)),
-    iconBorder: new PIXI.Texture(base, new PIXI.Rectangle(176, 4, 64, 64))
+    iconBorder: new PIXI.Texture(base, new PIXI.Rectangle(176, 4, 64, 64)),
+    plainBorder: new PIXI.Texture(base, new PIXI.Rectangle(0, 80, 64, 64)),
+    softShadowCircle: new PIXI.Texture(base, new PIXI.Rectangle(64, 80, 64, 64)),
+    solidCircle: new PIXI.Texture(base, new PIXI.Rectangle(128, 80, 64, 64)),
+    circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(192, 80, 64, 64))
   };
   return _uiAtlas;
 }
@@ -316,6 +355,161 @@ function patchControlIcons() {
   }, { type: "WRAPPER" });
 
   return [Boolean(okRefresh), Boolean(okClear)];
+}
+
+// ---------------------------------------------------------------------------
+// 3b. DoorControl Batched Sprites (replaces 2 PIXI.Graphics per door)
+// ---------------------------------------------------------------------------
+
+function patchDoorControls() {
+  const okDraw = wrapFoundryMethod("DoorControl", "draw", async function (wrapped, ...args) {
+    const res = await wrapped(...args);
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfControlIconCache || isPrimePerfActive()) {
+      if (this._blDoorBg) this._blDoorBg.visible = false;
+      if (this._blDoorBorder) this._blDoorBorder.visible = false;
+      return res;
+    }
+    const atlas = getUiAtlas();
+    if (!atlas || !this.bg || !this.border || this.destroyed) return res;
+
+    const s = globalThis.canvas?.dimensions?.uiScale || 1;
+    const x = -2 * s;
+    const y = -2 * s;
+    const sz = 44 * s;
+
+    this.bg.clear();
+    let bgSp = this._blDoorBg;
+    if (!bgSp || bgSp.destroyed) {
+      bgSp = new PIXI.Sprite(atlas.iconBg);
+      bgSp.eventMode = "none";
+      this._blDoorBg = bgSp;
+      this.bg.addChild(bgSp);
+    }
+    bgSp.visible = true;
+    bgSp.position.set(x, y);
+    bgSp.width = sz;
+    bgSp.height = sz;
+    bgSp.tint = 0x000000;
+
+    this.border.clear();
+    let bdSp = this._blDoorBorder;
+    if (!bdSp || bdSp.destroyed) {
+      bdSp = new PIXI.Sprite(atlas.plainBorder);
+      bdSp.eventMode = "none";
+      this._blDoorBorder = bdSp;
+      this.border.addChild(bdSp);
+    }
+    bdSp.visible = true;
+    bdSp.position.set(x, y);
+    bdSp.width = sz;
+    bdSp.height = sz;
+    bdSp.tint = 0xFF5500;
+    bdSp.alpha = 0.85;
+
+    perfStats.controlIconsBatched++;
+    return res;
+  }, { type: "WRAPPER" });
+
+  return Boolean(okDraw);
+}
+
+// ---------------------------------------------------------------------------
+// 3c. D&D 5e MapLocationControlIcon -> Batched Atlas Sprites (0 BlurFilter FBOs!)
+// ---------------------------------------------------------------------------
+
+let _mapLocPatched = false;
+function patchDnd5eMapLocationIcons() {
+  if (_mapLocPatched) return true;
+  const MapLoc = globalThis.dnd5e?.canvas?.MapLocationControlIcon;
+  if (!MapLoc?.prototype?._refresh) return false;
+  _mapLocPatched = true;
+
+  wrapTargetMethod(MapLoc.prototype, "_refresh", "dnd5e.MapLocationControlIcon.prototype._refresh", function (wrapped) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfControlIconCache || isPrimePerfActive()) {
+      if (this._blShadowSp) this._blShadowSp.visible = false;
+      if (this._blExtrudeSp) this._blExtrudeSp.visible = false;
+      if (this._blFillSp) this._blFillSp.visible = false;
+      if (this._blStrokeSp) this._blStrokeSp.visible = false;
+      if (this.shadow && this._blOrigShadowFilters !== undefined) {
+        this.shadow.filters = this._blOrigShadowFilters;
+      }
+      return wrapped();
+    }
+    const atlas = getUiAtlas();
+    if (!atlas || !this.shadow || !this.extrude || !this.bg) return wrapped();
+
+    // Let dnd5e compute radius, circle, hitArea, cursor, text, border visibility
+    wrapped();
+
+    const r = this.radius || (this.size || 40) / 2;
+    const style = this.style || {};
+
+    // Remove the expensive per-note PIXI.BlurFilter FBO pass!
+    if (this._blOrigShadowFilters === undefined) {
+      this._blOrigShadowFilters = this.shadow.filters;
+    }
+    this.shadow.filters = null;
+    this.shadow.clear();
+    let shSp = this._blShadowSp;
+    if (!shSp || shSp.destroyed) {
+      shSp = new PIXI.Sprite(atlas.softShadowCircle);
+      shSp.anchor.set(0.5);
+      shSp.eventMode = "none";
+      this._blShadowSp = shSp;
+      this.shadow.addChild(shSp);
+    }
+    shSp.visible = true;
+    shSp.position.set(r + 8, r + 8);
+    shSp.width = shSp.height = (r + 14) * 2;
+    shSp.tint = style.shadowColor ?? 0x000000;
+
+    // 3D extrude disc
+    this.extrude.clear();
+    let exSp = this._blExtrudeSp;
+    if (!exSp || exSp.destroyed) {
+      exSp = new PIXI.Sprite(atlas.solidCircle);
+      exSp.anchor.set(0.5);
+      exSp.eventMode = "none";
+      this._blExtrudeSp = exSp;
+      this.extrude.addChild(exSp);
+    }
+    exSp.visible = true;
+    exSp.position.set(r + 2, r + 2);
+    exSp.width = exSp.height = (r + 9.5) * 2;
+    exSp.tint = style.borderColor ?? 0x000000;
+
+    // Main background disc + outline stroke
+    this.bg.clear();
+    let fillSp = this._blFillSp;
+    if (!fillSp || fillSp.destroyed) {
+      fillSp = new PIXI.Sprite(atlas.solidCircle);
+      fillSp.anchor.set(0.5);
+      fillSp.eventMode = "none";
+      this._blFillSp = fillSp;
+      this.bg.addChild(fillSp);
+    }
+    fillSp.visible = true;
+    fillSp.position.set(r, r);
+    fillSp.width = fillSp.height = (r + 8.5) * 2;
+    fillSp.tint = style.backgroundColor ?? 0xFFFFFF;
+
+    let stSp = this._blStrokeSp;
+    if (!stSp || stSp.destroyed) {
+      stSp = new PIXI.Sprite(atlas.circleOutline);
+      stSp.anchor.set(0.5);
+      stSp.eventMode = "none";
+      this._blStrokeSp = stSp;
+      this.bg.addChild(stSp);
+    }
+    stSp.visible = true;
+    stSp.position.set(r, r);
+    stSp.width = stSp.height = (r + 9) * 2;
+    stSp.tint = style.borderColor ?? 0x000000;
+
+    perfStats.controlIconsBatched++;
+  });
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -748,12 +942,19 @@ export function installGpuPerfEngine() {
   } else {
     patchWallSprites();
     patchControlIcons();
+    patchDoorControls();
+    patchDnd5eMapLocationIcons();
     patchTokenUiCaching();
     patchAnimatedLightShaders();
   }
 
+  Hooks.once("ready", () => {
+    if (!isPrimePerfActive()) patchDnd5eMapLocationIcons();
+  });
+
   Hooks.on("canvasReady", () => {
     if (!isPrimePerfActive()) {
+      patchDnd5eMapLocationIcons();
       attachTokenUiBatcher();
       applyLightingRenderScale();
     }
@@ -774,11 +975,19 @@ export function refreshGpuPerfSettings() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiCache) {
     clearTokenUiBitmapCaches();
   }
-  // Re-render walls if currently active so toggle takes effect immediately
+  // Re-render walls and notes if currently active so toggle takes effect immediately
   const walls = globalThis.canvas?.walls?.placeables;
   if (walls?.length) {
     for (const w of walls) {
       w.renderFlags?.set?.({ refreshLine: true, refreshEndpoints: true });
+    }
+  }
+  const notes = globalThis.canvas?.notes?.placeables;
+  if (notes?.length) {
+    for (const n of notes) {
+      if (n.controlIcon && !n.controlIcon.destroyed) {
+        try { n.controlIcon._refresh?.(); } catch {}
+      }
     }
   }
 }

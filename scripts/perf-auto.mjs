@@ -63,6 +63,7 @@ export function rectsIntersect(ax0, ay0, ax1, ay1, vp) {
 export function restoreAllStandardCulling() {
   const c = globalThis.canvas;
   if (!c) return;
+  syncDecorativeTileShaders(false);
   for (const tile of c.tiles?.placeables ?? []) {
     if (tile.mesh && !tile.mesh.destroyed) tile.mesh.renderable = true;
   }
@@ -157,9 +158,9 @@ export function updateStandardSceneCulling() {
     }
   }
 
-  // Note control icons: only engage when scene has >= 20 notes
+  // Note control icons: engage when scene has >= 8 notes
   const notes = c.notes?.placeables ?? [];
-  if (notes.length >= 20) {
+  if (notes.length >= 8) {
     for (let i = 0; i < notes.length; i++) {
       const n = notes[i];
       const icon = n.controlIcon ?? n.controls;
@@ -177,6 +178,32 @@ export function updateStandardSceneCulling() {
   perfStats.autoCulledTiles = culledTiles;
   perfStats.autoCulledLights = culledLights;
   perfStats.autoCulledSounds = culledSounds;
+}
+
+/**
+ * Switch purely decorative native tiles (no occlusion, no light/weather restriction, non-video)
+ * onto PIXI's lightweight `"batch"` shader instead of Foundry's heavier `"batchOcclusion"` shader.
+ * Always resets to `null` (never `"batchOcclusion"`) so CanvasDepthMask's `"batchDepth"` stays intact.
+ */
+export function syncDecorativeTileShaders(enable) {
+  const tiles = globalThis.canvas?.tiles?.placeables;
+  if (!tiles?.length) return;
+  const allow = Boolean(enable && PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling && isStandardSceneActive());
+  for (let i = 0; i < tiles.length; i++) {
+    const t = tiles[i];
+    const m = t.mesh;
+    if (!m || m.destroyed || m._boundlessMesh) continue;
+    const isDecorative = !m.occlusionMode && !m.restrictsLight && !m.restrictsWeather && !t.isVideo && !t.document?.roof;
+    if (allow && isDecorative) {
+      if (m.pluginName !== "batch") {
+        m.pluginName = "batch";
+        m._blFastBatch = true;
+      }
+    } else if (m._blFastBatch) {
+      m.pluginName = null;
+      m._blFastBatch = false;
+    }
+  }
 }
 
 function scheduleStandardCulling() {
@@ -379,6 +406,7 @@ export function installAutoPerfEngine(controller) {
   if (globalThis.game?.settings?.get?.("core", "noCanvas")) return;
 
   Hooks.on("canvasReady", (c) => {
+    syncDecorativeTileShaders(true);
     updateStandardSceneCulling();
     scheduleVramCleanup();
     scheduleStandardLevelPrewarm();
@@ -390,7 +418,15 @@ export function installAutoPerfEngine(controller) {
     scheduleStandardCulling();
   });
 
-  for (const h of ["createTile", "updateTile", "deleteTile", "createAmbientLight", "deleteAmbientLight", "createAmbientSound", "deleteAmbientSound", "createNote", "deleteNote"]) {
+  for (const h of ["drawTile", "createTile", "updateTile", "deleteTile"]) {
+    Hooks.on(h, () => {
+      if (!isStandardSceneActive()) return;
+      syncDecorativeTileShaders(true);
+      scheduleStandardCulling();
+    });
+  }
+
+  for (const h of ["createAmbientLight", "deleteAmbientLight", "createAmbientSound", "deleteAmbientSound", "createNote", "deleteNote"]) {
     Hooks.on(h, () => {
       if (isStandardSceneActive()) scheduleStandardCulling();
     });
