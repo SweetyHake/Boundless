@@ -713,15 +713,17 @@ export function applyLightingRenderScale() {
   const perfMode = globalThis.canvas?.performance?.mode ?? 2;
   const preset = resolveLightingScalePreset(mode, perfMode);
 
-  for (const [layerKey, mult] of Object.entries(preset)) {
-    const layer = effects[layerKey];
+  const applyOne = (layer, mult) => {
     const filter = layer?.filter;
-    if (!filter) continue;
-    const targetRes = Math.max(0.25, Math.min(baseRes, Number((baseRes * mult).toFixed(3))));
+    if (!filter) return;
+    const targetRes = Math.max(0.25, Math.min(baseRes, Math.round(baseRes * mult * 1000) / 1000));
     if (Math.abs((filter.resolution || baseRes) - targetRes) > 0.01) {
       filter.resolution = targetRes;
     }
-  }
+  };
+  applyOne(effects.illumination, preset.illumination);
+  applyOne(effects.coloration, preset.coloration);
+  applyOne(effects.darkness, preset.darkness);
 }
 
 export function applyDisableUiBlur() {

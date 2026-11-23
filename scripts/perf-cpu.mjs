@@ -198,6 +198,11 @@ function collectVisionRanges() {
 
 function pruneOutOfSight() {
   if (!canvas?.visibility?.tokenVision) return;
+  const tokens = canvas.tokens?.placeables;
+  const notes = canvas.notes?.placeables;
+  const totalCandidates = (tokens?.length || 0) + (notes?.length || 0);
+  // Skip broad-phase overhead when there are barely any placeables to prune
+  if (totalCandidates < 8) return;
   if (game.user?.isGM && !canvas.effects?.visionSources?.some?.(s => s.active)) return;
   let ranges;
   try { ranges = collectVisionRanges(); } catch { return; }

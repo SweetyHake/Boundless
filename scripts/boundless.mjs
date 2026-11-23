@@ -14,6 +14,7 @@ import { PERF_CONFIG, perfStats, resetPerfStats, getPerfStatus } from "./perf-pa
 import { installGpuPerfEngine, refreshGpuPerfSettings } from "./perf-gpu.mjs";
 import { installCpuPerfEngine, invalidateCpuGeometry } from "./perf-cpu.mjs";
 import { installAutoPerfEngine, updateStandardSceneCulling, restoreAllStandardCulling } from "./perf-auto.mjs";
+import { runPerfBenchmark } from "./perf-benchmark.mjs";
 import {
   MODULE_ID,
   getShowstopperMovementApi,
@@ -5991,7 +5992,8 @@ controller.perf = {
   stats: perfStats,
   resetStats: resetPerfStats,
   status: getPerfStatus,
-  invalidateGeometry: invalidateCpuGeometry
+  invalidateGeometry: invalidateCpuGeometry,
+  benchmark: runPerfBenchmark
 };
 registerConfigUI(controller);
 registerPoiControls(controller);
