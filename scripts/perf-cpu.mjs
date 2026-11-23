@@ -39,7 +39,7 @@ let _measureCaches = new WeakMap();
 let _visGuardToken = null;
 let _visGuardWasVisible = false;
 
-const _dragQ = { last: 0, pending: null, scheduled: false };
+const _dragQ = { last: 0, pending: null, timerId: null };
 let _dragRecalcMs = 0;
 
 // ---------------------------------------------------------------------------
@@ -77,16 +77,21 @@ export function buildMeasureCacheKey(waypoints, options) {
 }
 
 function makeTickerThrottle(getMs, statKeys, opts = {}) {
-  const st = { last: 0, scheduled: false, original: null, lastSelf: null, lastArgs: null, dirty: false };
+  const st = { last: 0, timerId: null, original: null, lastSelf: null, lastArgs: null, dirty: false };
   const wrapper = function (wrapped, ...args) {
     const ms = getMs();
     if (!ms || !st.original) return wrapped(...args);
     const now = performance.now();
-    if ((now - st.last >= ms) || opts.force?.()) {
+    const elapsed = now - st.last;
+    if ((elapsed >= ms) || opts.force?.()) {
       st.last = now;
       st.dirty = false;
       st.lastSelf = null;
       st.lastArgs = null;
+      if (st.timerId !== null) {
+        clearTimeout(st.timerId);
+        st.timerId = null;
+      }
       perfStats[statKeys.run]++;
       const result = wrapped(...args);
       opts.onRun?.();
@@ -96,37 +101,36 @@ function makeTickerThrottle(getMs, statKeys, opts = {}) {
     st.dirty = true;
     st.lastSelf = this;
     st.lastArgs = args;
-    if (!st.scheduled) {
-      st.scheduled = true;
-      const ticker = globalThis.canvas?.app?.ticker;
-      if (!ticker) {
-        st.scheduled = false;
-        return wrapped(...args);
-      }
-      const trailing = () => {
-        const t = performance.now();
-        if (t - st.last < ms) {
-          ticker.addOnce(trailing);
-          return;
-        }
-        st.scheduled = false;
+    if (st.timerId === null) {
+      const delay = Math.max(1, Math.ceil(ms - elapsed));
+      st.timerId = setTimeout(() => {
+        st.timerId = null;
         const self = st.lastSelf;
         const args2 = st.lastArgs;
         st.lastSelf = null;
         st.lastArgs = null;
-        if (!self) return;
-        st.last = t;
+        if (!self || !globalThis.canvas?.ready) return;
+        st.last = performance.now();
         st.dirty = false;
         perfStats[statKeys.trail]++;
-        st.original.call(self, ...(args2 ?? []));
-        opts.onRun?.();
-      };
-      ticker.addOnce(trailing);
+        try {
+          st.original.call(self, ...(args2 ?? []));
+          opts.onRun?.();
+        } catch (err) {
+          console.error(`${MODULE_ID} | throttle trailing error:`, err);
+        }
+      }, delay);
     }
   };
   return {
     wrapper,
-    reset: () => { st.last = 0; st.scheduled = false; st.dirty = false; st.lastSelf = null; st.lastArgs = null; },
+    reset: () => {
+      if (st.timerId !== null) { clearTimeout(st.timerId); st.timerId = null; }
+      st.last = 0;
+      st.dirty = false;
+      st.lastSelf = null;
+      st.lastArgs = null;
+    },
     setOriginal: (fn) => { st.original = fn; },
     getOriginal: () => st.original,
     isDirty: () => st.dirty
@@ -421,17 +425,15 @@ function patchFogAndOcclusion() {
 
 function getDragWindowMs() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce) return 0;
-  return Math.min(90, Math.max(16, _dragRecalcMs * 3));
+  // Preserve silky 120–144 Hz responsiveness when drag recalc is fast; only throttle adaptively when heavy
+  return Math.min(50, Math.max(6, _dragRecalcMs * 2));
 }
 
-function flushDragDestination() {
-  const ms = getDragWindowMs();
-  const ticker = globalThis.canvas?.app?.ticker;
-  if (_dragQ.pending && ms && ticker && (performance.now() - _dragQ.last < ms)) {
-    ticker.addOnce(flushDragDestination);
-    return;
+function flushDragDestination(forceSync = false) {
+  if (_dragQ.timerId !== null && forceSync) {
+    clearTimeout(_dragQ.timerId);
+    _dragQ.timerId = null;
   }
-  _dragQ.scheduled = false;
   const pending = _dragQ.pending;
   if (!pending) return;
   _dragQ.pending = null;
@@ -452,9 +454,14 @@ function patchDragAndMovement() {
     if (!ms || !Number.isFinite(dest?.x) || !Number.isFinite(dest?.y)) return wrapped(event);
 
     const now = performance.now();
-    if (now - _dragQ.last >= ms) {
+    const elapsed = now - _dragQ.last;
+    if (elapsed >= ms) {
       _dragQ.last = now;
       _dragQ.pending = null;
+      if (_dragQ.timerId !== null) {
+        clearTimeout(_dragQ.timerId);
+        _dragQ.timerId = null;
+      }
       perfStats.dragDestRun++;
       const t0 = performance.now();
       const res = wrapped(event);
@@ -465,14 +472,17 @@ function patchDragAndMovement() {
     try { canvas._onDragCanvasPan(event); } catch {}
     _dragQ.pending = { token: this, point: { x: dest.x, y: dest.y }, snap: !event.shiftKey };
     perfStats.dragDestSkipped++;
-    if (!_dragQ.scheduled && canvas?.app?.ticker) {
-      _dragQ.scheduled = true;
-      canvas.app.ticker.addOnce(flushDragDestination);
+    if (_dragQ.timerId === null) {
+      const delay = Math.max(1, Math.ceil(ms - elapsed));
+      _dragQ.timerId = setTimeout(() => {
+        _dragQ.timerId = null;
+        flushDragDestination(false);
+      }, delay);
     }
   });
 
   const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
-    flushDragDestination();
+    flushDragDestination(true);
     return wrapped(...args);
   });
 
@@ -682,7 +692,7 @@ export function resetCpuCaches() {
   _fogGuardSnap.clear();
   _dragQ.last = 0;
   _dragQ.pending = null;
-  _dragQ.scheduled = false;
+  if (_dragQ.timerId !== null) { clearTimeout(_dragQ.timerId); _dragQ.timerId = null; }
   _fogThrottle.reset();
   _occMaskThrottle.reset();
   _occObjThrottle.reset();
