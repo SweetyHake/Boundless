@@ -1063,9 +1063,10 @@ class MegaWorld1000 {
   }
 
   _capFilterResolution(filter, maxRes = 1.0) {
-    if (!filter || this._patchedFilters.has(filter)) return;
+    if (!filter || filter.destroyed || this._patchedFilters.has(filter)) return;
     const rendererRes = canvas.app?.renderer?.resolution || 1;
-    const effectiveRes = filter.resolution ?? rendererRes;
+    let effectiveRes = rendererRes;
+    try { effectiveRes = filter.resolution ?? rendererRes; } catch { return; }
     if (effectiveRes <= maxRes) return;
     const desc = Object.getOwnPropertyDescriptor(filter, "resolution");
     this._patchedFilters.set(filter, desc || null);
@@ -1073,7 +1074,10 @@ class MegaWorld1000 {
     Object.defineProperty(filter, "resolution", {
       configurable: true,
       get() {
-        const raw = origGet ? origGet.call(this) : null;
+        let raw = null;
+        if (origGet) {
+          try { raw = origGet.call(this); } catch {}
+        }
         const v = raw ?? (canvas.app?.renderer?.resolution || 1);
         return Math.min(v, maxRes);
       },

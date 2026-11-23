@@ -386,6 +386,104 @@ export async function benchmarkCurrentScene(opts = {}) {
       });
       pushRow(`11. Hover Sweep (${canvas.tiles.placeables.length} tiles)`, off, on, {}, { absToleranceMs: 0.3 });
     }
+
+    // M12: LightingLayer GM View (zoomed in with >= 16 lights)
+    if ((canvas.lighting?.placeables?.length ?? 0) >= 16) {
+      canvas.lighting.activate();
+      canvas.pan({ x: (scene.width || 4000) * 0.35, y: (scene.height || 4000) * 0.35, scale: 1.0 });
+      await nextFrame();
+      const { off, on } = await runABBA(async (warmup) =>
+        measureGlRender(() => canvas.lighting.render(renderer), warmup ? 4 : 24)
+      );
+      pushRow(`12. Lighting Layer GM (${canvas.lighting.placeables.length} lights)`, off, on, {}, { absToleranceMs: 0.25 });
+    }
+
+    // M13: Showstopper Animated Door Compatibility & Speed (dynamic CanvasEdges leaf sweep check)
+    {
+      const activeLs = Array.from(canvas.effects?.lightSources ?? []).find(
+        (s) => s?.active && Number.isFinite(s.radius) && s.radius > 0 && s.data?.walls !== false
+      );
+      const EdgeCls = foundry.canvas?.geometry?.edges?.Edge;
+      const edges = canvas.level?.edges;
+      if (activeLs && EdgeCls && edges) {
+        let onShapesChanged = 0;
+        const runDoorSweep = async (isOn, warmup) => {
+          const steps = warmup ? 2 : 8;
+          let prevSig = "";
+          let changed = 0;
+          const t0 = performance.now();
+          for (let i = 0; i < steps; i++) {
+            const ang = (i / steps) * (Math.PI * 0.5);
+            const ex = activeLs.x + 25 + Math.cos(ang) * 45;
+            const ey = activeLs.y - 20 + Math.sin(ang) * 45;
+            edges.set("bl-bench-door.0", new EdgeCls(
+              { x: activeLs.x + 25, y: activeLs.y - 20 },
+              { x: ex, y: ey },
+              { id: "bl-bench-door.0", type: "wall", light: 20, sight: 20 }
+            ));
+            activeLs.initialize();
+            const pts = activeLs.shape?.points;
+            const sig = pts ? `${pts.length}:${Math.round(pts[0] || 0)}:${Math.round(pts[pts.length - 1] || 0)}` : "";
+            if (sig && sig !== prevSig) { changed++; prevSig = sig; }
+          }
+          edges.delete("bl-bench-door.0");
+          activeLs.initialize();
+          if (isOn && !warmup) onShapesChanged = Math.max(onShapesChanged, changed);
+          return { ms: performance.now() - t0 };
+        };
+        const { off, on } = await runABBA(async (warmup) => runDoorSweep(PERF_CONFIG.perfEnabled, warmup));
+        const extra = { shapesUpdated: onShapesChanged };
+        const cls = classifyMetric(off.ms, on.ms, { absToleranceMs: 0.6, warnPct: 12, failPct: 25 });
+        rows.push({
+          scene: scene.name,
+          mechanic: "13. Animated Door Sweep (Showstopper)",
+          offMs: cls.offMs,
+          onMs: cls.onMs,
+          gainPct: cls.gainPct,
+          offFps: null,
+          onFps: null,
+          offDraws: null,
+          onDraws: null,
+          status: onShapesChanged < 2 ? "REGRESSION" : cls.status,
+          ...extra
+        });
+      }
+    }
+
+    // M14: Static Token UI Cache in Idle Combat (>= 8 tokens with visible bars & nameplates)
+    if (tokens.length >= 8) {
+      canvas.tokens.activate();
+      canvas.pan({ x: (scene.width || 4000) * 0.5, y: (scene.height || 4000) * 0.5, scale: 0.45 });
+      await nextFrame();
+      const savedVis = tokens.map((t) => ({
+        t,
+        np: t.nameplate?.visible,
+        bars: t.bars?.visible,
+        b1: t.bars?.bar1?.visible
+      }));
+      try {
+        for (const t of tokens) {
+          if (t.nameplate) t.nameplate.visible = true;
+          if (t.bars) {
+            t.bars.visible = true;
+            try { t._drawBar?.(0, t.bars.bar1, { value: 30, max: 50 }); } catch {}
+            if (t.bars.bar1) t.bars.bar1.visible = true;
+          }
+        }
+        const { off, on } = await runABBA(async (warmup) => {
+          // Settle 3 frames so Static Token UI Cache bakes cleanly on ON
+          for (let k = 0; k < 3; k++) { canvas.tokens.objects.render(renderer); renderer.batch.flush(); }
+          return measureGlRender(() => canvas.tokens.objects.render(renderer), warmup ? 4 : 50);
+        });
+        pushRow(`14. Idle Combat Token UI (${tokens.length} tokens)`, off, on, {}, { absToleranceMs: 0.12 });
+      } finally {
+        for (const s of savedVis) {
+          if (s.t.nameplate && s.np !== undefined) s.t.nameplate.visible = s.np;
+          if (s.t.bars && s.bars !== undefined) s.t.bars.visible = s.bars;
+          if (s.t.bars?.bar1 && s.b1 !== undefined) s.t.bars.bar1.visible = s.b1;
+        }
+      }
+    }
   } finally {
     await game.settings.set("core", "tokenDragPreview", savedDragPreview);
     await setPerfMode(savedPerfEnabled);

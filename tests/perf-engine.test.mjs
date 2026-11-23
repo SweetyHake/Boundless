@@ -154,3 +154,41 @@ test("wrapTargetMethod wraps once without double-wrapping", () => {
   assert.equal(obj.add(2), 30);
   assert.equal(obj.calls, 1);
 });
+
+test("rewriteShaderNoiseGlsl handles arbitrary FBM octaves and amp", () => {
+  const frag2Oct = `
+precision mediump float;
+float noise(in vec2 uv) {
+  const vec2 d = vec2(0.0, 1.0);
+  vec2 b = floor(uv);
+  vec2 f = smoothstep(vec2(0.), vec2(1.0), fract(uv));
+  return mix(mix(random(b), random(b + d.yx), f.x), mix(random(b + d.xy), random(b + d.yy), f.x), f.y);
+}
+float fbm(in vec2 uv) {
+  float total = 0.0, amp = 0.5;
+  for (int i = 0; i < 2; i++) {
+    total += noise(uv) * amp;
+    uv += uv;
+    amp *= 0.5;
+  }
+  return total;
+}
+`;
+  const res = rewriteShaderNoiseGlsl(frag2Oct);
+  assert.equal(res.modified, true);
+  assert.ok(res.src.includes("texture2D(uBoundlessNoise, uv * 0.0625).g * 0.7500"));
+});
+
+test("collectSceneActiveAssetUrls supports v14 object foreground on scene and levels", () => {
+  const used = collectSceneActiveAssetUrls({
+    background: { src: "maps/base.webp" },
+    foreground: { src: "maps/roof.webp", tint: "#ffffff" },
+    levels: [
+      { background: { src: "maps/lvl2_bg.webp" }, foreground: { src: "maps/lvl2_fg.webp" } }
+    ]
+  });
+  assert.ok(used.has("maps/base.webp"));
+  assert.ok(used.has("maps/roof.webp"));
+  assert.ok(used.has("maps/lvl2_bg.webp"));
+  assert.ok(used.has("maps/lvl2_fg.webp"));
+});

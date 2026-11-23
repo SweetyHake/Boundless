@@ -24,6 +24,72 @@ let _gpuInstalled = false;
 let _uiAtlas = null;
 let _noiseLutTexture = null;
 
+// Static Token UI Layer Cache state (2-frame settle RenderTexture cache when scene/tokens are idle)
+const _tokLayerCache = {
+  rt: null,
+  sprite: null,
+  dirty: true,
+  cleanFrames: 0,
+  w: 0,
+  h: 0,
+  res: 1,
+  lastTx: NaN,
+  lastTy: NaN,
+  lastScale: NaN,
+  hooksBound: false
+};
+
+export function invalidateTokenLayerCache() {
+  _tokLayerCache.dirty = true;
+  _tokLayerCache.cleanFrames = 0;
+}
+
+function destroyTokenLayerCache() {
+  if (_tokLayerCache.sprite && !_tokLayerCache.sprite.destroyed) {
+    _tokLayerCache.sprite.destroy({ children: false, texture: false, baseTexture: false });
+  }
+  if (_tokLayerCache.rt && !_tokLayerCache.rt.destroyed) {
+    _tokLayerCache.rt.destroy(true);
+  }
+  _tokLayerCache.sprite = null;
+  _tokLayerCache.rt = null;
+  _tokLayerCache.dirty = true;
+  _tokLayerCache.cleanFrames = 0;
+  _tokLayerCache.w = 0;
+  _tokLayerCache.h = 0;
+}
+
+function ensureTokenLayerCacheHooks() {
+  if (_tokLayerCache.hooksBound || !globalThis.Hooks) return;
+  _tokLayerCache.hooksBound = true;
+  const inv = invalidateTokenLayerCache;
+  for (const h of [
+    "canvasPan",
+    "refreshToken",
+    "drawToken",
+    "createToken",
+    "deleteToken",
+    "updateToken",
+    "hoverToken",
+    "controlToken",
+    "targetToken",
+    "highlightObjects",
+    "sightRefresh",
+    "lightingRefresh",
+    "updateCombat",
+    "updateCombatant",
+    "createActiveEffect",
+    "updateActiveEffect",
+    "deleteActiveEffect"
+  ]) {
+    Hooks.on(h, inv);
+  }
+  Hooks.on("canvasTearDown", destroyTokenLayerCache);
+  if (typeof window !== "undefined") {
+    window.addEventListener("resize", inv, { passive: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Shared Pre-baked UI Atlas (Wall line, Wall endpoint, ControlIcon bg/border)
 // ---------------------------------------------------------------------------
@@ -542,14 +608,142 @@ function renderChildSafe(child, renderer) {
   child.render(renderer);
 }
 
+function hasActiveTokenAnimations() {
+  const anims = globalThis.foundry?.canvas?.animation?.CanvasAnimation?.animations
+    ?? globalThis.CanvasAnimation?.animations;
+  if (!anims) return false;
+  for (const k in anims) {
+    if (k.startsWith("Token.") || k.includes(".Token.")) return true;
+  }
+  return false;
+}
+
+function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
+  for (let i = 0; i < complexTokens.length; i++) {
+    complexTokens[i].render(renderer);
+  }
+  const n = visibleTokens.length;
+  if (n === 0) return;
+
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].border, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].effects, renderer);
+  for (let i = 0; i < n; i++) {
+    const t = visibleTokens[i];
+    renderChildSafe(t.targetArrows, renderer);
+    renderChildSafe(t.targetPips, renderer);
+  }
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].nameplate, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].tooltip, renderer);
+
+  for (let i = 0; i < n; i++) {
+    const t = visibleTokens[i];
+    const tKids = t.children;
+    for (let j = 0; j < tKids.length; j++) {
+      const c = tKids[j];
+      if (
+        c === t.turnMarker ||
+        c === t.border ||
+        c === t.bars ||
+        c === t.effects ||
+        c === t.targetArrows ||
+        c === t.targetPips ||
+        c === t.nameplate ||
+        c === t.tooltip
+      ) {
+        continue;
+      }
+      renderChildSafe(c, renderer);
+    }
+  }
+}
+
+function tryRenderStaticTokenLayerCache(renderer, visibleTokens, complexTokens) {
+  // Only engage static RT cache for >= 8 visible tokens when rendering directly to screen (no nested filter RT)
+  if (visibleTokens.length < 8) return false;
+  if (renderer.renderTexture?.current) return false;
+  if (globalThis.canvas?.tokens?.preview?.children?.length > 0) {
+    invalidateTokenLayerCache();
+    return false;
+  }
+  if (hasActiveTokenAnimations()) {
+    invalidateTokenLayerCache();
+    return false;
+  }
+
+  const stageWt = globalThis.canvas?.stage?.worldTransform;
+  if (!stageWt) return false;
+  const screen = renderer.screen;
+  const res = renderer.resolution || 1;
+  const sw = Math.max(1, Math.round(screen.width));
+  const sh = Math.max(1, Math.round(screen.height));
+
+  if (
+    stageWt.tx !== _tokLayerCache.lastTx ||
+    stageWt.ty !== _tokLayerCache.lastTy ||
+    stageWt.a !== _tokLayerCache.lastScale ||
+    sw !== _tokLayerCache.w ||
+    sh !== _tokLayerCache.h ||
+    res !== _tokLayerCache.res
+  ) {
+    _tokLayerCache.lastTx = stageWt.tx;
+    _tokLayerCache.lastTy = stageWt.ty;
+    _tokLayerCache.lastScale = stageWt.a;
+    _tokLayerCache.dirty = true;
+    _tokLayerCache.cleanFrames = 0;
+  }
+
+  // Require 2 consecutive clean frames before baking so pans/drags never waste RT bakes
+  if (_tokLayerCache.dirty) {
+    _tokLayerCache.cleanFrames++;
+    if (_tokLayerCache.cleanFrames < 2) return false;
+
+    if (!_tokLayerCache.rt || _tokLayerCache.rt.destroyed || _tokLayerCache.w !== sw || _tokLayerCache.h !== sh || _tokLayerCache.res !== res) {
+      destroyTokenLayerCache();
+      _tokLayerCache.rt = PIXI.RenderTexture.create({
+        width: sw,
+        height: sh,
+        resolution: res,
+        scaleMode: PIXI.SCALE_MODES.NEAREST
+      });
+      _tokLayerCache.sprite = new PIXI.Sprite(_tokLayerCache.rt);
+      _tokLayerCache.sprite.transform.worldTransform.identity();
+      _tokLayerCache.sprite.worldAlpha = 1;
+      _tokLayerCache.w = sw;
+      _tokLayerCache.h = sh;
+      _tokLayerCache.res = res;
+    }
+
+    renderer.batch.flush();
+    renderer.renderTexture.bind(_tokLayerCache.rt);
+    renderer.renderTexture.clear([0, 0, 0, 0]);
+    renderBatchedTokenPasses(renderer, visibleTokens, complexTokens);
+    renderer.batch.flush();
+    renderer.renderTexture.bind(null);
+
+    _tokLayerCache.dirty = false;
+    perfStats.tokenLayerCacheBakes++;
+  }
+
+  if (_tokLayerCache.sprite && !_tokLayerCache.sprite.destroyed) {
+    _tokLayerCache.sprite.transform.worldTransform.identity();
+    _tokLayerCache.sprite.worldAlpha = 1;
+    _tokLayerCache.sprite._render(renderer);
+    perfStats.tokenLayerCacheHits++;
+    return true;
+  }
+  return false;
+}
+
 function attachTokenUiBatcher() {
   const objects = globalThis.canvas?.tokens?.objects;
   if (!objects || objects._blBatcherAttached) return;
   objects._blBatcherAttached = true;
+  ensureTokenLayerCacheHooks();
 
   const visibleTokens = [];
   const complexTokens = [];
-  const customChildren = [];
 
   wrapTargetMethod(objects, "render", "TokenLayer.objects.render", function (wrapped, renderer) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiBatching || isPrimePerfActive()) {
@@ -562,19 +756,16 @@ function attachTokenUiBatcher() {
 
     const kids = this.children;
     const count = kids.length;
-    // Small token counts don't need multi-pass batching overhead
     if (count < 4) return wrapped(renderer);
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
     visibleTokens.length = 0;
     complexTokens.length = 0;
-    customChildren.length = 0;
 
     for (let i = 0; i < count; i++) {
       const tok = kids[i];
       if (!tok || !tok.visible || !tok.renderable || tok.worldAlpha <= 0) continue;
 
-      // Viewport frustum check (skip offscreen token UI entirely)
       if (vp && !tok.controlled && !tok.hover && !tok.isPreview) {
         const tx = tok.x ?? tok.document?.x ?? 0;
         const ty = tok.y ?? tok.document?.y ?? 0;
@@ -586,8 +777,6 @@ function attachTokenUiBatcher() {
         }
       }
 
-      // If token has custom filters/masks or isn't a standard Token shape, render normally
-      // Note: Foundry v14 sets `tok.cullable = true` by default; we already perform viewport frustum culling above.
       if (tok._mask || (tok.filters && tok.filters.length) || !tok.bars) {
         complexTokens.push(tok);
       } else {
@@ -595,56 +784,65 @@ function attachTokenUiBatcher() {
       }
     }
 
-    // Pass 0: complex/non-standard children
-    for (let i = 0; i < complexTokens.length; i++) {
-      complexTokens[i].render(renderer);
+    if (PERF_CONFIG.perfTokenUiCache && tryRenderStaticTokenLayerCache(renderer, visibleTokens, complexTokens)) {
+      return;
     }
 
-    const n = visibleTokens.length;
+    renderBatchedTokenPasses(renderer, visibleTokens, complexTokens);
+    perfStats.tokenBatchedFrames++;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 4b. LightingLayer GM View Batcher + Viewport Frustum Culling
+// ---------------------------------------------------------------------------
+
+function attachLightingLayerBatcher() {
+  const objects = globalThis.canvas?.lighting?.objects;
+  if (!objects || objects._blLightBatcherAttached) return;
+  objects._blLightBatcherAttached = true;
+
+  const visLights = [];
+
+  wrapTargetMethod(objects, "render", "LightingLayer.objects.render", function (wrapped, renderer) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfWallSprites) return wrapped(renderer);
+    if (!this.visible || this.worldAlpha <= 0 || !this.renderable) return;
+    const kids = this.children;
+    const count = kids.length;
+    if (count < 32) return wrapped(renderer);
+
+    const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
+    visLights.length = 0;
+    for (let i = 0; i < count; i++) {
+      const al = kids[i];
+      if (!al || !al.visible || !al.renderable || al.worldAlpha <= 0) continue;
+      if (vp && !al.controlled && !al.hover && !al.isPreview) {
+        const lx = al.document?.x ?? al.x ?? 0;
+        const ly = al.document?.y ?? al.y ?? 0;
+        const r = Math.max(80, al.lightSource?.radius ?? 100);
+        if (lx + r < vp.minX || lx - r > vp.maxX || ly + r < vp.minY || ly - r > vp.maxY) continue;
+      }
+      visLights.push(al);
+    }
+
+    const n = visLights.length;
     if (n === 0) return;
-
-    // Pass 1: turnMarker
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
-    // Pass 2: border (selection / hover outline)
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].border, renderer);
-    // Pass 3: resource bars (batched bitmap sprites!)
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
-    // Pass 4: status effects (batched bitmap sprites!)
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].effects, renderer);
-    // Pass 5: target arrows & pips
+    // Pass 1: field Graphics (radius rings)
+    for (let i = 0; i < n; i++) renderChildSafe(visLights[i].field, renderer);
+    // Pass 2: controls (batched sprites)
+    for (let i = 0; i < n; i++) renderChildSafe(visLights[i].controls ?? visLights[i].controlIcon, renderer);
+    // Pass 3: remaining children (tooltips, custom overlays)
     for (let i = 0; i < n; i++) {
-      const t = visibleTokens[i];
-      renderChildSafe(t.targetArrows, renderer);
-      renderChildSafe(t.targetPips, renderer);
-    }
-    // Pass 6: nameplates (text sprites batch together!)
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].nameplate, renderer);
-    // Pass 7: elevation tooltips
-    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].tooltip, renderer);
-
-    // Pass 8: any third-party module children attached to Token containers (preserve full compatibility)
-    for (let i = 0; i < n; i++) {
-      const t = visibleTokens[i];
-      const tKids = t.children;
-      for (let j = 0; j < tKids.length; j++) {
-        const c = tKids[j];
-        if (
-          c === t.turnMarker ||
-          c === t.border ||
-          c === t.bars ||
-          c === t.effects ||
-          c === t.targetArrows ||
-          c === t.targetPips ||
-          c === t.nameplate ||
-          c === t.tooltip
-        ) {
-          continue;
-        }
+      const al = visLights[i];
+      const ctrl = al.controls ?? al.controlIcon;
+      const alKids = al.children;
+      for (let j = 0; j < alKids.length; j++) {
+        const c = alKids[j];
+        if (c === al.field || c === ctrl) continue;
         renderChildSafe(c, renderer);
       }
     }
-
-    perfStats.tokenBatchedFrames++;
+    perfStats.lightingLayerBatched++;
   });
 }
 
@@ -706,6 +904,7 @@ function patchTokenUiCaching() {
 }
 
 export function clearTokenUiBitmapCaches() {
+  invalidateTokenLayerCache();
   const placeables = globalThis.canvas?.tokens?.placeables;
   if (!placeables) return;
   for (const tok of placeables) {
@@ -960,6 +1159,8 @@ export function installGpuPerfEngine() {
   });
 
   Hooks.on("canvasReady", () => {
+    invalidateTokenLayerCache();
+    attachLightingLayerBatcher();
     if (!isPrimePerfActive()) {
       patchDnd5eMapLocationIcons();
       attachTokenUiBatcher();

@@ -40,6 +40,7 @@ let _measureCaches = new WeakMap();
 
 let _visGuardToken = null;
 let _visGuardWasVisible = false;
+let _lastLightSig = null;
 
 const _dragQ = { last: 0, pending: null, timerId: null };
 let _dragRecalcMs = 0;
@@ -680,7 +681,77 @@ function patchMiscCpuGuards() {
     return wrapped(dt);
   });
 
-  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim)];
+  // Safe partial lighting rebuild: when only vision sources moved on a light-heavy standard scene (>= 16 lights),
+  // rebuild only the vision branch instead of clearing & re-adding all 50-150 static light meshes every step.
+  const computeLightsOnlySig = (effects) => {
+    const ls = effects.lightSources;
+    const ds = effects.darknessSources;
+    if (!ls || ls.size < 16) return null;
+    let sig = `${ls.size}|${ds?.size ?? 0}|${canvas.environment?.darknessLevel ?? ""}|${canvas.environment?.globalLightSource?.active ? 1 : 0}`;
+    const lv = canvas.visibility?.lightingVisibility;
+    if (lv) sig += `|${lv.background},${lv.illumination},${lv.coloration},${lv.darkness}`;
+    for (const s of ls) sig += `;${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
+    if (ds) for (const s of ds) sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
+    return sig;
+  };
+
+  const okPartialLight = wrapFoundryMethod("EffectsCanvasGroup", "refreshLighting", function (wrapped) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || globalThis.Boundless?.active) {
+      _lastLightSig = null;
+      return wrapped();
+    }
+    const sig = computeLightsOnlySig(this);
+    if (sig && sig === _lastLightSig && this.background?.vision && this.illumination?.lights && this.coloration) {
+      try {
+        const { background, illumination, coloration } = this;
+        if (illumination.filter) illumination.filter.uniforms.replacementColor = canvas.colors.background.rgb;
+        if (illumination.darknessLevelMeshes?.clearColor && illumination.darknessLevelMeshes.clearColor[0] !== canvas.environment.darknessLevel) {
+          illumination.darknessLevelMeshes.clearColor[0] = canvas.environment.darknessLevel;
+          illumination.invalidateDarknessLevelContainer?.(true);
+        }
+        const v = canvas.visibility?.filter;
+        if (v) {
+          v.uniforms.visionTexture = canvas.masks.vision.renderTexture;
+          v.uniforms.primaryTexture = canvas.primary.renderTexture;
+          canvas.colors.fogExplored.applyRGB(v.uniforms.exploredColor);
+          canvas.colors.fogUnexplored.applyRGB(v.uniforms.unexploredColor);
+          canvas.colors.background.applyRGB(v.uniforms.backgroundColor);
+        }
+        background.vision.removeChildren();
+        background.visionPreferred.removeChildren();
+        for (const vs of this.visionSources) {
+          const meshes = vs.drawMeshes?.() ?? {};
+          if (meshes.illumination?.parent) meshes.illumination.parent.removeChild(meshes.illumination);
+          if (meshes.coloration?.parent) meshes.coloration.parent.removeChild(meshes.coloration);
+          if (!vs.active || (vs.radius <= 0)) continue;
+          if (meshes.background) {
+            (vs.preferred ? background.visionPreferred : background.vision).addChild(meshes.background);
+          }
+          if (meshes.illumination) illumination.lights.addChild(meshes.illumination);
+          if (meshes.coloration) coloration.addChild(meshes.coloration);
+        }
+        if (background.vision.filter) background.vision.filter.enabled = background.vision.children.length > 0;
+        if (background.visionPreferred.filter) background.visionPreferred.filter.enabled = background.visionPreferred.children.length > 0;
+        const lightingOptions = canvas.visibility?.visionModeData?.activeLightingOptions ?? {};
+        background.vision.visible = background.vision.children.length > 0;
+        background.visionPreferred.visible = background.visionPreferred.children.length > 0;
+        background.lighting.visible = (background.lighting.children.length > 0)
+          || (lightingOptions.background?.postProcessingModes?.length > 0);
+        coloration.visible = (coloration.children.length > 1)
+          || (lightingOptions.coloration?.postProcessingModes?.length > 0);
+        perfStats.lightingPartialRebuilds++;
+        Hooks.callAll("lightingRefresh", this);
+        return;
+      } catch {
+        _lastLightSig = null;
+      }
+    }
+    const res = wrapped();
+    _lastLightSig = sig;
+    return res;
+  });
+
+  return [Boolean(okNp), Boolean(okTt), Boolean(okDet), Boolean(okFields), ...okSources, Boolean(okEnrich), Boolean(okRollVal), Boolean(okLightAnim), Boolean(okPartialLight)];
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +813,7 @@ export function resetCpuCaches() {
   _cellExploredCache.clear();
   _measureCaches = new WeakMap();
   _fogGuardSnap.clear();
+  _lastLightSig = null;
   _dragQ.last = 0;
   _dragQ.pending = null;
   if (_dragQ.timerId !== null) { clearTimeout(_dragQ.timerId); _dragQ.timerId = null; }
@@ -766,6 +838,7 @@ export function installCpuPerfEngine() {
   patchDragAndMovement();
   patchMiscCpuGuards();
 
+  Hooks.on("initializeVisionMode", () => { _lastLightSig = null; });
   Hooks.on("canvasReady", () => {
     resetCpuCaches();
     attachIdleFpsLimiter();

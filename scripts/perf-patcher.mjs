@@ -40,12 +40,16 @@ export const PERF_CONFIG = {
 export const perfStats = {
   // GPU
   tokenBatchedFrames: 0,
+  tokenLayerCacheHits: 0,
+  tokenLayerCacheBakes: 0,
   tokenCulledUi: 0,
   tokenBarsCached: 0,
   tokenEffectsCached: 0,
   wallSpritesUpdated: 0,
   controlIconsBatched: 0,
+  lightingLayerBatched: 0,
   lightShadersOptimized: 0,
+  lightingPartialRebuilds: 0,
 
   // CPU
   flagsDeduped: 0,
