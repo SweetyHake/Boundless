@@ -1085,11 +1085,16 @@ class MegaWorld1000 {
     });
   }
 
-  _syncInterfaceVoidFilter() {
+  _syncInterfaceVoidFilter(forceEnable = false) {
     const ifVoid = canvas.interface?.filters?.find(f => f?.constructor?.name === "VoidFilter");
     if (!ifVoid) return;
     if (this._origIfVoidEnabled === null) this._origIfVoidEnabled = ifVoid.enabled;
-    const needVoid = (canvas.tokens?.placeables?.length || 0) > 0;
+    const needVoid = Boolean(
+      forceEnable
+      || (canvas.tokens?.placeables?.length || 0) > 0
+      || (canvas.tokens?.objects?.children?.length || 0) > 0
+      || (canvas.scene?.tokens?.size || 0) > 0
+    );
     ifVoid.enabled = needVoid ? this._origIfVoidEnabled : false;
   }
 
@@ -6352,6 +6357,7 @@ Hooks.on("updateToken", (doc, changes) => {
 Hooks.on("drawToken", (tok) => {
   if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
   controller.tokenStreamer.onTokenDrawn(tok);
+  controller._syncInterfaceVoidFilter(true);
 });
 
 Hooks.on("refreshToken", (tok, flags) => {
@@ -6366,7 +6372,7 @@ Hooks.on("createToken", (doc) => {
   controller.tokenStreamer.onTokenCreated(doc);
   controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
-  controller._syncInterfaceVoidFilter();
+  controller._syncInterfaceVoidFilter(true);
   controller.updateSimAndLightBubbles(false);
   controller.syncRoofTokenOcclusion();
 });
@@ -6376,7 +6382,7 @@ Hooks.on("deleteToken", (doc) => {
   controller.tokenStreamer.onTokenDeleted(doc);
   controller.charPins.onTokenCreatedOrDeleted();
   controller._depthDirty = true;
-  controller._syncInterfaceVoidFilter();
+  queueMicrotask(() => { if (controller.active) controller._syncInterfaceVoidFilter(); });
   controller.updateSimAndLightBubbles(false);
 });
 

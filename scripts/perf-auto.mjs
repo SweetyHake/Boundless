@@ -373,6 +373,8 @@ export function disposeStaleSceneVramTextures() {
     const rawUrl = bt.resource?.url || (Array.isArray(bt.textureCacheIds) ? bt.textureCacheIds[0] : "");
     if (!rawUrl || typeof rawUrl !== "string") continue;
     if (/\.(webm|mp4|m4v|ogg|ogv)$/i.test(rawUrl)) continue;
+    // Never evict global Foundry/module spritesheets (token rings, UI atlases, weather masks)
+    if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
 
     const norm = normalizeAssetKey(rawUrl);
     if (!norm || activeUrls.has(norm)) continue;
