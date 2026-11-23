@@ -1,22 +1,11 @@
 {
   "id": "boundless",
   "title": "Boundless",
-  "description": "Seamless streaming engine for giant multi-level worlds (500×500 to 6000×6000+ cells) in Foundry VTT v14: Quadtree pyramid with Web Worker decoding, shadowed GPU light batching, chunked fog of war, POI fast-travel, native layer streaming, and client-side Lazy TokenLayer.",
+  "description": "All-in-one Foundry VTT v14 performance and seamless giant-world engine: zero-config GPU render batching (tokens, walls, icons, light shaders), CPU perception and drag optimization, automatic standard-scene culling and VRAM cleanup, plus Quadtree pyramid streaming and GPU light batching for massive multi-level maps.",
   "version": "1.1.3",
   "compatibility": {
     "minimum": "14",
     "verified": "14"
-  },
-  "relationships": {
-    "recommends": [
-      {
-        "id": "fvtt-perf-optim",
-        "type": "module",
-        "manifest": "https://github.com/Codas/foundryvtt-performance-hacks/releases/latest/download/module.json",
-        "reason": "Boosts canvas FPS with token UI batching, HUD/effect caching, lighting render scaling, and precomputed light noise shaders.",
-        "compatibility": {}
-      }
-    ]
   },
   "socket": true,
   "authors": [

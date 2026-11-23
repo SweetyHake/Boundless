@@ -10,6 +10,10 @@ import { LRUTextureManager } from "./texture-manager.mjs";
 import { MegaLightBatch, LIGHT_PAD_WORLD_PX, extractLightStyle } from "./light-batch.mjs";
 import { registerConfigUI } from "./config-ui.mjs";
 import { bakeSceneToBoundless, bakeSceneEditsToManifest, unbakeSceneFromBoundless } from "./scene-baker.mjs";
+import { PERF_CONFIG, perfStats, resetPerfStats, getPerfStatus } from "./perf-patcher.mjs";
+import { installGpuPerfEngine, refreshGpuPerfSettings } from "./perf-gpu.mjs";
+import { installCpuPerfEngine, invalidateCpuGeometry } from "./perf-cpu.mjs";
+import { installAutoPerfEngine, updateStandardSceneCulling, restoreAllStandardCulling } from "./perf-auto.mjs";
 import {
   MODULE_ID,
   getShowstopperMovementApi,
@@ -174,7 +178,7 @@ function installBulkSelectionPatch() {
 
   const origInitVision = TokenCls.prototype.initializeVisionSource;
   TokenCls.prototype.initializeVisionSource = function (...args) {
-    if (_bulkSelectDepth > 0 && controller?.active) {
+    if (_bulkSelectDepth > 0 && (controller?.active || PERF_CONFIG.perfEnabled)) {
       _bulkVisionDirty = true;
       return;
     }
@@ -185,7 +189,7 @@ function installBulkSelectionPatch() {
     const orig = TokenLayerCls.prototype[methodName];
     if (typeof orig !== "function") return;
     TokenLayerCls.prototype[methodName] = function (...args) {
-      if (!controller?.active) return orig.apply(this, args);
+      if (!controller?.active && !PERF_CONFIG.perfEnabled) return orig.apply(this, args);
       _bulkSelectDepth++;
       let result;
       try {
@@ -5982,14 +5986,149 @@ class MegaWorld1000 {
 }
 
 const controller = new MegaWorld1000();
+controller.perf = {
+  config: PERF_CONFIG,
+  stats: perfStats,
+  resetStats: resetPerfStats,
+  status: getPerfStatus,
+  invalidateGeometry: invalidateCpuGeometry
+};
 registerConfigUI(controller);
 registerPoiControls(controller);
 registerFogControls(controller);
 registerWallEditorControls(controller);
 registerLayerEditorControls(controller);
 
+function syncPerfConfigFromSettings() {
+  if (!game.settings?.get) return;
+  const read = (k, def) => {
+    try { return game.settings.get(MODULE_ID, k); } catch { return def; }
+  };
+  const master = Boolean(read("perfEnabled", true));
+  const tokUi = Boolean(read("perfTokenUiBatching", true));
+  const wallsIcons = Boolean(read("perfWallSprites", true));
+  const cpu = Boolean(read("perfCpuPerception", true));
+  const auto = Boolean(read("perfAutoCulling", true));
+
+  PERF_CONFIG.perfEnabled = master;
+  PERF_CONFIG.perfTokenUiBatching = tokUi;
+  PERF_CONFIG.perfTokenUiCache = tokUi;
+  PERF_CONFIG.perfWallSprites = wallsIcons;
+  PERF_CONFIG.perfControlIconCache = wallsIcons;
+  PERF_CONFIG.perfLightShaders = Boolean(read("perfLightShaders", true));
+  PERF_CONFIG.perfLightingScale = String(read("perfLightingScale", "auto") || "auto");
+  PERF_CONFIG.perfDisableUiBlur = Boolean(read("perfDisableUiBlur", false));
+  PERF_CONFIG.perfCpuPerception = cpu;
+  PERF_CONFIG.perfDragCoalesce = cpu;
+  PERF_CONFIG.perfFogOcclusionThrottle = cpu;
+  PERF_CONFIG.perfEnrichCache = cpu;
+  PERF_CONFIG.perfIdleFpsLimit = Boolean(read("perfIdleFpsLimit", false));
+  PERF_CONFIG.perfAutoCulling = auto;
+  PERF_CONFIG.perfVramCleanup = auto;
+  PERF_CONFIG.perfIdleLevelPrewarm = auto;
+  PERF_CONFIG.perfHeavySceneHint = auto;
+}
+
 Hooks.once("init", () => {
   if (game.settings?.register) {
+    const onPerfChange = () => {
+      syncPerfConfigFromSettings();
+      refreshGpuPerfSettings();
+      if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
+        updateStandardSceneCulling();
+      } else {
+        restoreAllStandardCulling();
+      }
+    };
+
+    game.settings.register(MODULE_ID, "perfEnabled", {
+      name: "BOUNDLESS.Perf.Enabled",
+      hint: "BOUNDLESS.Perf.EnabledHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfTokenUiBatching", {
+      name: "BOUNDLESS.Perf.TokenUi",
+      hint: "BOUNDLESS.Perf.TokenUiHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfWallSprites", {
+      name: "BOUNDLESS.Perf.WallsAndIcons",
+      hint: "BOUNDLESS.Perf.WallsAndIconsHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfLightShaders", {
+      name: "BOUNDLESS.Perf.LightShaders",
+      hint: "BOUNDLESS.Perf.LightShadersHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      requiresReload: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfLightingScale", {
+      name: "BOUNDLESS.Perf.LightingScale",
+      hint: "BOUNDLESS.Perf.LightingScaleHint",
+      scope: "client",
+      config: true,
+      type: String,
+      choices: {
+        auto: "BOUNDLESS.Perf.LightingScaleAuto",
+        full: "BOUNDLESS.Perf.LightingScaleFull",
+        balanced: "BOUNDLESS.Perf.LightingScaleBalanced",
+        performance: "BOUNDLESS.Perf.LightingScalePerformance"
+      },
+      default: "auto",
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfCpuPerception", {
+      name: "BOUNDLESS.Perf.CpuPerception",
+      hint: "BOUNDLESS.Perf.CpuPerceptionHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfAutoCulling", {
+      name: "BOUNDLESS.Perf.AutoScene",
+      hint: "BOUNDLESS.Perf.AutoSceneHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: true,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfDisableUiBlur", {
+      name: "BOUNDLESS.Perf.DisableUiBlur",
+      hint: "BOUNDLESS.Perf.DisableUiBlurHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: false,
+      onChange: onPerfChange
+    });
+    game.settings.register(MODULE_ID, "perfIdleFpsLimit", {
+      name: "BOUNDLESS.Perf.IdleFpsLimit",
+      hint: "BOUNDLESS.Perf.IdleFpsLimitHint",
+      scope: "client",
+      config: true,
+      type: Boolean,
+      default: false,
+      onChange: onPerfChange
+    });
     game.settings.register(MODULE_ID, "vramProfile", {
       name: "BOUNDLESS.Settings.VramProfile",
       hint: "BOUNDLESS.Settings.VramProfileHint",
@@ -6007,10 +6146,19 @@ Hooks.once("init", () => {
       onChange: (value) => controller.applyVramProfile(value)
     });
   }
+  syncPerfConfigFromSettings();
   controller.applyVramProfile();
   installLazyTokenLayerPatch();
+  installBulkSelectionPatch();
   installHoverFadeHitTestPatch();
   installCharacterSwitchPatch(controller);
+});
+
+Hooks.once("setup", () => {
+  syncPerfConfigFromSettings();
+  installGpuPerfEngine();
+  installCpuPerfEngine();
+  installAutoPerfEngine(controller);
 });
 
 Hooks.once("ready", async () => {
