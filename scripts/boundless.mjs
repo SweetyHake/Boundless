@@ -2497,10 +2497,30 @@ class MegaWorld1000 {
       return this.texMgr._estimateBytes(tex);
     };
     const isMoving = this.isActivelyMoving();
-    const gpuUploadBudget = isMoving ? (10 * 1024 * 1024) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
-    const maxFreshUploads = isMoving ? 2 : 4;
+    const HEAVY_UPLOAD_BYTES = 2 * 1024 * 1024; // 1024px+ pyramid tiles & roofs; small prop sprites (<=2MB) use the byte + small-count budget
+    const gpuUploadBudget = isMoving ? (12 * 1024 * 1024) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
+    const maxHeavyUploads = isMoving ? 2 : 4;
+    const maxSmallUploads = isMoving ? 14 : 32;
     let frameGpuUploadBytes = 0;
-    let frameFreshUploads = 0;
+    let frameHeavyUploads = 0;
+    let frameSmallUploads = 0;
+
+    const canUploadFresh = (estBytes) => {
+      if (estBytes <= 0) return true;
+      if (estBytes > HEAVY_UPLOAD_BYTES) {
+        if (frameHeavyUploads >= maxHeavyUploads) return false;
+      } else {
+        if (frameSmallUploads >= maxSmallUploads) return false;
+      }
+      if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) return false;
+      return true;
+    };
+    const recordFreshUpload = (estBytes) => {
+      if (estBytes <= 0) return;
+      frameGpuUploadBytes += estBytes;
+      if (estBytes > HEAVY_UPLOAD_BYTES) frameHeavyUploads++;
+      else frameSmallUploads++;
+    };
 
     const bindTextureNow = (tex) => {
       const bt = tex?.baseTexture;
@@ -2516,7 +2536,7 @@ class MegaWorld1000 {
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
         const peek = this.pendingTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (estBytes > 0 && (frameFreshUploads >= maxFreshUploads || (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget))) break;
+        if (!canUploadFresh(estBytes)) break;
         const item = this.pendingTileMounts.shift();
         const e = this.tilesByKey.get(item.key);
         if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
@@ -2532,11 +2552,10 @@ class MegaWorld1000 {
         if (this._mountTileMesh(e, tex, item.instant)) {
           mounted++;
           if (estBytes > 0) {
-            // Pre-upload EVERY fresh tile (visible, awaitingSwap, AND offscreen-padded!) within this frame's 2-tile budget
+            // Pre-upload EVERY fresh tile (visible, awaitingSwap, AND offscreen-padded!) within this frame's budget
             // so zooming out into the 28% padding never bursts 8-11 deferred gl.texImage2D uploads in a single render frame!
             bindTextureNow(tex);
-            frameGpuUploadBytes += estBytes;
-            frameFreshUploads++;
+            recordFreshUpload(estBytes);
           }
         }
       }
@@ -2549,15 +2568,14 @@ class MegaWorld1000 {
       const maxCachedOvMounts = isMoving ? 8 : 16;
       let mountedOv = 0;
       let freshHeavyOv = 0;
-      const curVp = this.getViewportWorldRect(0.35);
+      const curVp = this.getViewportWorldRect(0.35, null, { predictive: !this.isCameraFlying });
       const visNow = this.getViewportWorldRect(0.0);
       const roofsBlockingZ5 = this.visibleLevelLayers.some(l => this._hasPendingVisibleRoofs(l, visNow));
       while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
         const peek = this.pendingOverlayMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
         if (estBytes > 0) {
-          if (frameFreshUploads >= maxFreshUploads) break;
-          if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) break;
+          if (!canUploadFresh(estBytes)) break;
           if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
         }
         const item = this.pendingOverlayMounts.shift();
@@ -2567,8 +2585,7 @@ class MegaWorld1000 {
           if (estBytes > 0) {
             if (estimateFreshUploadBytes(item.tRoof) > 0) bindTextureNow(item.tRoof);
             if (estimateFreshUploadBytes(item.tWalls) > 0) bindTextureNow(item.tWalls);
-            frameGpuUploadBytes += estBytes;
-            frameFreshUploads++;
+            recordFreshUpload(estBytes);
             if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
           }
         }
@@ -2584,20 +2601,20 @@ class MegaWorld1000 {
       if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
     }
 
-    // 3. Frame-budgeted virtual tile mounting (strict time, count & fresh-upload budget during zoom/pan so hundreds of props never stall frames)
+    // 3. Frame-budgeted virtual tile mounting (small prop textures use byte + small-count budget so rooms never pop in 2 props/frame)
     if (this.pendingVirtualTileMounts.length > 0) {
-      const maxVtMounts = isMoving ? 16 : 48;
-      const vtTimeBudgetMs = isMoving ? 1.5 : 3.5;
+      const maxVtMounts = isMoving ? 28 : 64;
+      const vtTimeBudgetMs = isMoving ? 2.5 : 4.5;
       let mountedVt = 0;
       let anyVtLight = false;
       let anyVtOcc = false;
-      const curVp = this.getViewportWorldRect(0.28);
+      const curVp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
       const tStart = performance.now();
       while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
         if (mountedVt > 0 && (performance.now() - tStart) > vtTimeBudgetMs) break;
         const peek = this.pendingVirtualTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (estBytes > 0 && (frameFreshUploads >= maxFreshUploads || (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget))) break;
+        if (!canUploadFresh(estBytes)) break;
         const item = this.pendingVirtualTileMounts.shift();
         if (item?.fullId) this._pendingVirtualTileKeys.delete(item.fullId);
         const m = this._mountVirtualTileMesh(item, curVp);
@@ -2605,8 +2622,7 @@ class MegaWorld1000 {
           mountedVt++;
           if (estBytes > 0) {
             bindTextureNow(item.tex);
-            frameGpuUploadBytes += estBytes;
-            frameFreshUploads++;
+            recordFreshUpload(estBytes);
           }
           if (m.restrictsLight || m.restrictsWeather) anyVtLight = true;
           if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) anyVtOcc = true;
@@ -3443,7 +3459,14 @@ class MegaWorld1000 {
     const effectiveZ = Math.max(targetZ, showInterior ? (layer.zOffset + 5) : 0);
 
     const isMoving = this.isActivelyMoving();
-    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}_${isMoving ? "m" : "s"}_r${this.tileEditsRev}`;
+    // Quantize the predictive prefetch box into coarse viewport cells while moving so props entering
+    // the forward lookahead margin inside the SAME 2500px sector start loading BEFORE entering the screen!
+    const vpCellW = Math.max(256, Math.round((vp.x1 - vp.x0) * 0.25));
+    const vpCellH = Math.max(256, Math.round((vp.y1 - vp.y0) * 0.25));
+    const moveBucket = isMoving
+      ? `_m_${Math.floor(vp.x0 / vpCellW)}_${Math.floor(vp.y0 / vpCellH)}_${Math.floor(vp.x1 / vpCellW)}_${Math.floor(vp.y1 / vpCellH)}`
+      : "_s";
+    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}`;
     if (tileKey === layer.lastTileKey) return false;
     layer.lastTileKey = tileKey;
     if (isMoving) this._vtIdleCleanupNeeded = true;
@@ -3507,17 +3530,18 @@ class MegaWorld1000 {
     const gen = this._mountGen;
     const isViewedLayer = Boolean(level?.isView);
     const visVp = this.getViewportWorldRect(0.0);
-    const isOnVisScreen = (t) => {
+    const isInRect = (t, rect) => {
       const { pivX, pivY, halfDiag } = getVirtualTileBounds(t);
-      return pivX + halfDiag >= visVp.x0 && pivX - halfDiag <= visVp.x1 && pivY + halfDiag >= visVp.y0 && pivY - halfDiag <= visVp.y1;
+      return pivX + halfDiag >= rect.x0 && pivX - halfDiag <= rect.x1 && pivY + halfDiag >= rect.y0 && pivY - halfDiag <= rect.y1;
     };
     for (const [fullId, { tid, tSpec }] of needed) {
       if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId) || this._pendingVirtualTileKeys.has(fullId)) continue;
       if (!tSpec?.src || tSpec.hidden) continue;
 
-      const inVisRect = isOnVisScreen(tSpec);
-      // During active zoom/pan only stream props actually inside the visible screen; offscreen padding fills once idle
-      if (isMoving && !inVisRect) continue;
+      const inVisRect = isInRect(tSpec, visVp);
+      // During active zoom/pan stream everything inside the predictive prefetch viewport (`vp`) so props
+      // decode & mount off-screen BEFORE sliding into view (zero pop-in!), skipping only far corners of giant sectors
+      if (isMoving && !inVisRect && !isInRect(tSpec, vp)) continue;
       const onVis = isViewedLayer && inVisRect;
       const syncTex = this.texMgr.getSync(tSpec.src);
       if (syncTex) {
