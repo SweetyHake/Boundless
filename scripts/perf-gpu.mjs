@@ -392,8 +392,9 @@ function attachTokenUiBatcher() {
         }
       }
 
-      // If token has custom filters/masks/cullable or isn't a standard Token shape, render normally
-      if (tok._mask || (tok.filters && tok.filters.length) || tok.cullable || !tok.bars) {
+      // If token has custom filters/masks or isn't a standard Token shape, render normally
+      // Note: Foundry v14 sets `tok.cullable = true` by default; we already perform viewport frustum culling above.
+      if (tok._mask || (tok.filters && tok.filters.length) || !tok.bars) {
         complexTokens.push(tok);
       } else {
         visibleTokens.push(tok);
