@@ -1,5 +1,6 @@
 import { installCharacterSwitchPatch } from "./character-pins.mjs";
 import { installLazyTokenLayerPatch } from "./token-streamer.mjs";
+import { installGlobalSelectionPatches } from "./boundless-selection.mjs";
 import { PERF_CONFIG } from "./perf-patcher.mjs";
 import { installGpuPerfEngine, refreshGpuPerfSettings } from "./perf-gpu.mjs";
 import { installCpuPerfEngine } from "./perf-cpu.mjs";
@@ -24,64 +25,8 @@ export function installLosHorizonPatch() {
   losPatchInstalled = true;
 }
 
-/**
- * Eliminate Foundry v14's O(K^2) vision-polygon storm during marquee box-selection (`selectObjects`)
- * and `releaseAll`: normally every `Token#_onControl` / `_onRelease` loops over ALL `placeables`
- * calling `initializeVisionSource()`, recomputing K*(K+1)/2 vision polygons in one frame.
- * Batching defers vision source initialization to ONE single pass after the marquee loop finishes.
- */
-let bulkSelectPatchInstalled = false;
-let _bulkSelectDepth = 0;
-let _bulkVisionDirty = false;
 export function installBulkSelectionPatch(controller) {
-  if (bulkSelectPatchInstalled) return;
-  const TokenLayerCls = foundry.canvas?.layers?.TokenLayer ?? CONFIG.Token?.layerClass;
-  const TokenCls = foundry.canvas?.placeables?.Token ?? CONFIG.Token?.objectClass;
-  if (!TokenLayerCls?.prototype || !TokenCls?.prototype?.initializeVisionSource) return;
-
-  const origInitVision = TokenCls.prototype.initializeVisionSource;
-  TokenCls.prototype.initializeVisionSource = function (...args) {
-    if (_bulkSelectDepth > 0 && (controller?.active || PERF_CONFIG.perfEnabled)) {
-      _bulkVisionDirty = true;
-      return;
-    }
-    return origInitVision.apply(this, args);
-  };
-
-  const wrapBulk = (methodName) => {
-    const orig = TokenLayerCls.prototype[methodName];
-    if (typeof orig !== "function") return;
-    TokenLayerCls.prototype[methodName] = function (...args) {
-      if (!controller?.active && !PERF_CONFIG.perfEnabled) return orig.apply(this, args);
-      _bulkSelectDepth++;
-      let result;
-      try {
-        result = orig.apply(this, args);
-      } finally {
-        _bulkSelectDepth--;
-        if (_bulkSelectDepth === 0 && _bulkVisionDirty) {
-          _bulkVisionDirty = false;
-          const placeables = this.placeables;
-          if (Array.isArray(placeables)) {
-            for (let i = 0; i < placeables.length; i++) {
-              const t = placeables[i];
-              if (t && !t.destroyed) origInitVision.call(t);
-            }
-          }
-          canvas.perception?.update?.({
-            refreshVision: true,
-            refreshSounds: true,
-            refreshOcclusion: this.occlusionMode & CONST.TOKEN_OCCLUSION_MODES.CONTROLLED
-          });
-        }
-      }
-      return result;
-    };
-  };
-
-  wrapBulk("selectObjects");
-  wrapBulk("releaseAll");
-  bulkSelectPatchInstalled = true;
+  installGlobalSelectionPatches(controller, PERF_CONFIG);
 }
 
 /**
@@ -323,18 +268,21 @@ export function registerBoundlessHooks(controller) {
     controller.scheduleCameraSave();
     controller.updatePyramid();
     controller.scheduleViewportLightSync();
+    controller.selectionOverlay?.refresh?.();
   });
 
   let _controlTokenQueued = false;
   Hooks.on("controlToken", () => {
     if (!controller.active) return;
+    if (controller.tokenStreamer?._selectingBatch) return;
     if (_controlTokenQueued) return;
     _controlTokenQueued = true;
     queueMicrotask(() => {
       _controlTokenQueued = false;
-      if (!controller.active) return;
+      if (!controller.active || controller.tokenStreamer?._selectingBatch) return;
       controller.updateSimAndLightBubbles(false);
       controller.tokenStreamer.onVisibilityChanged();
+      controller.selectionOverlay?.refresh?.();
       controller._roofTokenOccDirty = true;
     });
   });
@@ -390,7 +338,10 @@ export function registerBoundlessHooks(controller) {
     if (posChanged || elevChanged || lightChanged) {
       if ((posChanged || elevChanged) && controller._hasMultiElevationDepth()) controller._depthDirty = true;
       if (posChanged || lightChanged) controller.updateSimAndLightBubbles(false);
-      if (posChanged || elevChanged) controller._roofTokenOccDirty = true;
+      if (posChanged || elevChanged) {
+        controller._roofTokenOccDirty = true;
+        controller.selectionOverlay?.refresh?.();
+      }
       if (posChanged && controller.needsOcclusionRefreshNear(doc)) {
         canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
       }
@@ -425,7 +376,12 @@ export function registerBoundlessHooks(controller) {
     controller.tokenStreamer.onTokenDeleted(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
-    queueMicrotask(() => { if (controller.active) controller._syncInterfaceVoidFilter(); });
+    queueMicrotask(() => {
+      if (controller.active) {
+        controller._syncInterfaceVoidFilter();
+        controller.selectionOverlay?.refresh?.();
+      }
+    });
     controller.updateSimAndLightBubbles(false);
   });
 
@@ -497,6 +453,7 @@ export function registerBoundlessHooks(controller) {
     if (!controller.active || (scene && scene.id !== canvas.scene?.id)) return;
     controller.simSectors.clear();
     controller.lastSimKey = "";
+    controller._lastActorSimKey = "";
     controller.updateSimAndLightBubbles(true);
   });
 

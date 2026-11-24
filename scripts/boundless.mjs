@@ -16,6 +16,7 @@ import { WORLD_MIN_SCALE, pyramidMethods } from "./boundless-pyramid.mjs";
 import { overlayMethods } from "./boundless-overlays.mjs";
 import { lightingMethods } from "./boundless-lighting.mjs";
 import { editsMethods } from "./boundless-edits.mjs";
+import { MacroSelectionOverlay } from "./boundless-selection.mjs";
 import {
   installLosHorizonPatch,
   installBulkSelectionPatch,
@@ -128,7 +129,9 @@ class MegaWorld1000 {
   // Hybrid Multi-Level Lighting: GPU MegaLightBatch (2 draw calls) + dynamic PointLightSources ONLY near open doors / active visionSources
   lightBatch = new MegaLightBatch();
   dynamicLights = new Map(); // "${levelId}::${sk}_${li}" -> PointLightSource
+  _lightFades = new Map();   // "${levelId}::${sk}_${li}" -> { dir: "in"|"out", t, dur, ls, baseColorAlpha, baseBgAlpha }
   lastDynLightKey = "";
+  _lastActorSimKey = "";
   _updatingBubbles = false;
   _patchedFilters = new Map();
   _origSmaaEnabled = null;
@@ -146,6 +149,7 @@ class MegaWorld1000 {
   layerEditors = new VirtualLayerEditors(this);
   tokenStreamer = new TokenStreamer(this);
   chunkStreamer = new ChunkStreamer(this);
+  selectionOverlay = new MacroSelectionOverlay(this);
   wallEdits = new Map();  // levelId -> Map<wKey, null | wallData>
   wallEditsRev = 0;
   lightEdits = new Map(); // levelId -> Map<lKey, null | lightData>
@@ -905,6 +909,7 @@ class MegaWorld1000 {
     this.wallEditor.mount();
     this.layerEditors.mount();
     this.tokenStreamer.mount(scene);
+    this.selectionOverlay.mount();
 
     this.updateAll(true);
     this.syncZoomLimits({ animate: false });
@@ -1014,6 +1019,7 @@ class MegaWorld1000 {
     // Unmount in reverse patch order so scene.updateEmbeddedDocuments / deleteEmbeddedDocuments restore cleanly
     this.layerEditors.unmount();
     this.wallEditor.unmount();
+    this.selectionOverlay.unmount();
     this.tokenStreamer.unmount();
     this.chunkStreamer.unmount();
     this.audioStreamer.unmount();
@@ -1113,6 +1119,8 @@ class MegaWorld1000 {
       ls.destroy();
     }
     this.dynamicLights.clear();
+    this._lightFades.clear();
+    this._lastActorSimKey = "";
     this.lightBatch.destroy();
     this.lightBatch.disposeBakedRoofMask();
     this.lightBatch.hideIndoorLights = false;

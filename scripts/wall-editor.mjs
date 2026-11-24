@@ -8,10 +8,12 @@ import {
 } from "./utils.mjs";
 
 const NATIVE_WALLS_MIN_SCALE = 0.22; // Stream all native Wall placeables when WallsLayer is active
-const NATIVE_DOORS_MIN_SCALE = 0.05; // Keep native door Walls (DoorMesh + DoorControl) mounted across map overview
+const NATIVE_DOORS_ENTER_SCALE = 0.055; // Hysteresis enter threshold for native door Walls
+const NATIVE_DOORS_EXIT_SCALE = 0.042;  // Hysteresis exit threshold prevents thrashing during zoom
 const DOOR_CONTROL_MIN_SCALE = 0.12; // Hide tiny DoorControl icons only at far orbital zoom while DoorMesh stays visible
 const MAX_NATIVE_WALLS_IN_VIEW = 420;
 const MAX_NATIVE_DOORS_IN_VIEW = 220;
+const WALL_MOUNT_BUDGET_MS = 1.6;    // Keep wall/door mounting strictly inside 120 FPS frame budget
 
 function getMacroWallColor(seg) {
   if (seg.door) {
@@ -47,6 +49,10 @@ export class VirtualWallEditor {
   _lastKey = "";
   _patches = null;
   _clearGen = 0;
+  _doorsZoomActive = false;
+  _pendingMounts = [];
+  _pendingMountKeys = new Set();
+  _mountRafId = null;
 
   constructor(controller) {
     this.controller = controller;
@@ -381,8 +387,49 @@ export class VirtualWallEditor {
     } catch {}
   }
 
+  _cancelPendingMounts() {
+    this._pendingMounts = [];
+    this._pendingMountKeys.clear();
+    if (this._mountRafId !== null) {
+      if (typeof cancelAnimationFrame === "function") {
+        try { cancelAnimationFrame(this._mountRafId); } catch {}
+      } else {
+        clearTimeout(this._mountRafId);
+      }
+      this._mountRafId = null;
+    }
+  }
+
+  _scheduleMountPump() {
+    if (this._mountRafId !== null || this._pendingMounts.length === 0) return;
+    const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+    this._mountRafId = sched(() => {
+      this._mountRafId = null;
+      this._pumpPendingMounts();
+    });
+  }
+
+  _pumpPendingMounts() {
+    if (!this.controller?.active || !canvas?.walls?.objects || this._pendingMounts.length === 0) return;
+    const gen = this._clearGen;
+    const maxPerFrame = this.active ? 10 : 4;
+    const t0 = performance.now();
+    let count = 0;
+    while (this._pendingMounts.length > 0 && count < maxPerFrame) {
+      if (count > 0 && (performance.now() - t0) >= WALL_MOUNT_BUDGET_MS) break;
+      const seg = this._pendingMounts.shift();
+      this._pendingMountKeys.delete(seg.wKey);
+      if (this.mountedByKey.has(seg.wKey)) continue;
+      if (this._lastNeededKeys && !this._lastNeededKeys.has(seg.wKey)) continue;
+      this._mountNativeWall(seg, gen);
+      count++;
+    }
+    if (this._pendingMounts.length > 0) this._scheduleMountPump();
+  }
+
   _clearMountedWalls() {
     this._clearGen++;
+    this._cancelPendingMounts();
     for (const entry of Array.from(this.mountedByKey.values())) {
       this._removeMountedEntry(entry, { closeSheet: true });
     }
@@ -619,9 +666,10 @@ export class VirtualWallEditor {
     }
 
     const isWallsEditMode = this.active && Boolean(game.user?.isGM);
-    const minScale = isWallsEditMode ? NATIVE_WALLS_MIN_SCALE : NATIVE_DOORS_MIN_SCALE;
     const effScale = getEffectiveScale(curVp.scale);
-    const inNativeZoom = effScale >= minScale;
+    if (effScale >= NATIVE_DOORS_ENTER_SCALE) this._doorsZoomActive = true;
+    else if (effScale < NATIVE_DOORS_EXIT_SCALE) this._doorsZoomActive = false;
+    const inNativeZoom = isWallsEditMode ? (effScale >= NATIVE_WALLS_MIN_SCALE) : this._doorsZoomActive;
     const showDoorControls = isWallsEditMode || effScale >= DOOR_CONTROL_MIN_SCALE;
 
     const qStep = 200;
@@ -704,10 +752,19 @@ export class VirtualWallEditor {
     }
 
     const gen = this._clearGen;
+    const maxSyncMounts = force ? (isWallsEditMode ? 24 : 8) : (isWallsEditMode ? 8 : 3);
+    const tMountStart = performance.now();
+    let syncMounted = 0;
     for (const seg of needed.values()) {
       const existing = this.mountedByKey.get(seg.wKey);
       if (!existing) {
-        this._mountNativeWall(seg, gen);
+        if (syncMounted < maxSyncMounts && (syncMounted === 0 || (performance.now() - tMountStart) < WALL_MOUNT_BUDGET_MS)) {
+          this._mountNativeWall(seg, gen);
+          syncMounted++;
+        } else if (!this._pendingMountKeys.has(seg.wKey)) {
+          this._pendingMountKeys.add(seg.wKey);
+          this._pendingMounts.push(seg);
+        }
       } else {
         const dKey = this._buildDoorKey(seg);
         const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, seg.ds) : (seg.ds || 0);
@@ -718,11 +775,18 @@ export class VirtualWallEditor {
             this._syncMountedEntryInPlace(existing, seg, dKey, liveDs, nextSig);
           } else {
             this._removeMountedEntry(existing, { closeSheet: isSheetActiveOrRendering(sheet, existing.wall) });
-            this._mountNativeWall(seg, gen);
+            if (syncMounted < maxSyncMounts && (performance.now() - tMountStart) < WALL_MOUNT_BUDGET_MS) {
+              this._mountNativeWall(seg, gen);
+              syncMounted++;
+            } else if (!this._pendingMountKeys.has(seg.wKey)) {
+              this._pendingMountKeys.add(seg.wKey);
+              this._pendingMounts.push(seg);
+            }
           }
         }
       }
     }
+    if (this._pendingMounts.length > 0) this._scheduleMountPump();
   }
 
   // Alias kept for convenience

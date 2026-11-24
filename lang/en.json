@@ -95,10 +95,10 @@
       "OtherLevel": "Other Level"
     },
     "PoiTool": "Boundless Location Pins",
-    "PoiToolHint": "Pin Mode: Left-click map to create, drag pin to move, Right-click for menu, Esc to exit.",
+    "PoiToolHint": "Pin Mode. Left-click map to create, drag pin to move, Right-click for menu, Esc to exit.",
     "DoorLocked": "This door is locked.",
     "FogBrushTool": "Boundless Fog Brush",
-    "FogBrushHint": "Fog Brush: Left-click to reveal, Shift + Left-click to hide, Alt + Wheel to resize, Esc to exit.",
+    "FogBrushHint": "Fog Brush. Left-click to reveal, Shift + Left-click to hide, Alt + Wheel to resize, Esc to exit.",
     "Settings": {
       "VramProfile": "VRAM Cache Budget",
       "VramProfileHint": "Texture cache limit for Boundless on this device. Auto adjusts based on your hardware.",
@@ -182,6 +182,13 @@
       "StepManifest": "Saving scene data...",
       "StepUpdatingScene": "Applying optimization...",
       "StepDone": "Done!"
+    },
+    "Selection": {
+      "ViewportSelected": "Selected objects in view ({selected} of {total}). Press Ctrl+A again to select all on this level.",
+      "ViewportEmpty": "No objects in view. Press Ctrl+A again to select all on this level ({total}).",
+      "LevelSelected": "Selected all objects on this level ({selected}).",
+      "LevelCapped": "Selected the nearest {selected} of {total} objects on this level to preserve performance.",
+      "ZoomInVirtualLayer": "Zoomed out too far to select virtual objects on this layer. Zoom closer to the target area."
     }
   }
 }

@@ -374,7 +374,7 @@ export const overlayMethods = {
     }
 
     if (this.lightBatch.hideIndoorLights !== prevHidden || this.lightBatch.useBakedRoofMask !== prevBaked) {
-      this.updateSimAndLightBubbles(false);
+      this.scheduleViewportLightSync(this.isActivelyMoving() ? 35 : 0);
     }
   },
 

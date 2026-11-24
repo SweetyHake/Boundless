@@ -38,6 +38,20 @@ test("encodeLightAnimPhase maps animation families to distinct shader modes", ()
   assert.ok(chroma >= 3000 && chroma < 4000);
   const rotCone = encodeLightAnimPhase("sunburst", 12, true);
   assert.ok(rotCone >= 4000 && rotCone < 5000);
+
+  // Verify every Foundry v14 light animation type maps to its intended mode family
+  for (const t of ["pulse", "reactivepulse", "wave", "witchwave", "emanation", "energy", "grid", "siren", "hexa", "ghost", "fog", "fairy", "starlight", "smokepatch"]) {
+    const p = encodeLightAnimPhase(t, 7, false);
+    assert.ok(p >= 1000 && p < 2000, `${t} should map to pulse/pattern mode, got ${p}`);
+  }
+  for (const t of ["sunburst", "revolving", "vortex", "dome", "radialrainbow", "rainbowswirl"]) {
+    const p = encodeLightAnimPhase(t, 7, false);
+    assert.ok(p >= 2000 && p < 3000, `${t} should map to rotate mode, got ${p}`);
+  }
+  for (const t of ["flame", "torch"]) {
+    const p = encodeLightAnimPhase(t, 7, false);
+    assert.ok(p >= 0 && p < 1000, `${t} should map to flame/torch flicker mode, got ${p}`);
+  }
 });
 
 test("MegaLightBatch caches polygons across same-scene rebuilds and invalidates on edits or scene change", () => {

@@ -320,8 +320,15 @@ export function extractLightStyle(src) {
   };
 }
 
-const PULSE_ANIM_TYPES = new Set(["pulse", "wave", "bewitchingwave", "emanation", "energy", "forcegrid", "siren"]);
-const ROTATE_ANIM_TYPES = new Set(["sunburst", "revolving", "vortex", "dome", "roiling", "radialrainbow", "swirlingrainbow"]);
+const PULSE_ANIM_TYPES = new Set([
+  "pulse", "reactivepulse", "wave", "witchwave", "bewitchingwave",
+  "emanation", "energy", "grid", "forcegrid", "siren",
+  "hexa", "ghost", "fog", "fairy", "starlight", "smokepatch"
+]);
+const ROTATE_ANIM_TYPES = new Set([
+  "sunburst", "revolving", "vortex", "dome", "roiling",
+  "radialrainbow", "rainbowswirl", "swirlingrainbow"
+]);
 const CHROMA_ANIM_TYPES = new Set(["chroma", "rainbow"]);
 
 /**
@@ -343,7 +350,13 @@ const PATTERN_ANIM_COLOR_GAIN = {
   ghost: 0.42,
   emanation: 0.40,
   hexa: 0.38,
-  dome: 0.45
+  dome: 0.45,
+  revolving: 0.55,
+  siren: 0.58,
+  vortex: 0.52,
+  sunburst: 0.65,
+  rainbowswirl: 0.60,
+  radialrainbow: 0.62
 };
 
 export function getAnimColorationGain(anim) {

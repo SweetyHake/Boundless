@@ -1006,11 +1006,11 @@ export const pyramidMethods = {
         if (!e.ready) this.tilesByKey.delete(spec.key);
         return;
       }
-      if (instant || e.z <= 1) {
+      if (instant || e.z === 0) {
         this._mountTileMesh(e, tex, instant);
       } else {
-        const qItem = { key: spec.key, entry, tex, instant };
-        if (isViewedLayer && onVisScreen) this.pendingTileMounts.unshift(qItem);
+        const qItem = { key: spec.key, entry, tex, instant: instant || e.z === 1 };
+        if (e.z <= 1 || (isViewedLayer && onVisScreen)) this.pendingTileMounts.unshift(qItem);
         else this.pendingTileMounts.push(qItem);
         this._tilesDirty = true;
       }
@@ -1319,6 +1319,7 @@ export const pyramidMethods = {
     if (!this.active || !canvas?.ready) return;
 
     this.tokenStreamer.step(dtMs);
+    this._stepDynamicLightFades?.(dtMs);
 
     // Keep CanvasDepthMask synced whenever any mounted roof fades in/out (hoverFade, ALT, token inside, or v14 Region Surface)
     // Also dynamically reveal interior z=6 tiles + wallsMesh on z=5 when a roof is occluded so ALT / tokens / Regions expose real interiors instead of baked pyramid roofs
@@ -1451,11 +1452,13 @@ export const pyramidMethods = {
       if (!bt || (bt._glTextures && Object.keys(bt._glTextures).length > 0)) return 0;
       return this.texMgr._estimateBytes(tex);
     };
+    const tFrameStart = performance.now();
     const isMoving = this.isActivelyMoving();
+    const stepBudgetMs = isMoving ? 1.8 : 3.0;
     const HEAVY_UPLOAD_BYTES = 2 * 1024 * 1024; // 1024px+ pyramid tiles & roofs; small prop sprites (<=2MB) use the byte + small-count budget
-    const gpuUploadBudget = isMoving ? (12 * 1024 * 1024) : MAX_GPU_UPLOAD_BYTES_PER_FRAME;
-    const maxHeavyUploads = isMoving ? 2 : 4;
-    const maxSmallUploads = isMoving ? 14 : 32;
+    const gpuUploadBudget = isMoving ? (5 * 1024 * 1024) : Math.min(9 * 1024 * 1024, MAX_GPU_UPLOAD_BYTES_PER_FRAME);
+    const maxHeavyUploads = isMoving ? 1 : 2;
+    const maxSmallUploads = isMoving ? 6 : 14;
     let frameGpuUploadBytes = 0;
     let frameHeavyUploads = 0;
     let frameSmallUploads = 0;
@@ -1486,9 +1489,10 @@ export const pyramidMethods = {
 
     // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
     if (this.pendingTileMounts.length > 0) {
-      const maxMounts = isMoving ? 12 : 24;
+      const maxMounts = isMoving ? 6 : 16;
       let mounted = 0;
       while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
+        if (mounted > 0 && (performance.now() - tFrameStart) >= stepBudgetMs) break;
         const peek = this.pendingTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
         if (!canUploadFresh(estBytes)) break;
@@ -1520,18 +1524,21 @@ export const pyramidMethods = {
     // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly; fresh roofs cap at 1/frame
     //    (allow mounting even while pyramid tiles queue if visible z>=5 tiles are waiting on these roofs so interiors never flash!)
     if (this.pendingOverlayMounts.length > 0) {
-      const maxCachedOvMounts = isMoving ? 8 : 16;
+      const maxCachedOvMounts = isMoving ? 6 : 12;
       let mountedOv = 0;
       let freshHeavyOv = 0;
       const curVp = this.getViewportWorldRect(0.35, null, { predictive: !this.isCameraFlying });
       const visNow = this.getViewportWorldRect(0.0);
       const roofsBlockingZ5 = this.visibleLevelLayers.some(l => this._hasPendingVisibleRoofs(l, visNow));
       while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
+        if ((mountedOv > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) {
+          if (!roofsBlockingZ5 || mountedOv > 0) break;
+        }
         const peek = this.pendingOverlayMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
         if (estBytes > 0) {
           if (!canUploadFresh(estBytes)) break;
-          if (estBytes > 8 * 1024 * 1024 && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
+          if (estBytes > HEAVY_UPLOAD_BYTES && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
         }
         const item = this.pendingOverlayMounts.shift();
         if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
@@ -1541,7 +1548,7 @@ export const pyramidMethods = {
             if (estimateFreshUploadBytes(item.tRoof) > 0) bindTextureNow(item.tRoof);
             if (estimateFreshUploadBytes(item.tWalls) > 0) bindTextureNow(item.tWalls);
             recordFreshUpload(estBytes);
-            if (estBytes > 8 * 1024 * 1024) freshHeavyOv++;
+            if (estBytes > HEAVY_UPLOAD_BYTES) freshHeavyOv++;
           }
         }
       }
@@ -1557,16 +1564,14 @@ export const pyramidMethods = {
     }
 
     // 3. Frame-budgeted virtual tile mounting (small prop textures use byte + small-count budget so rooms never pop in 2 props/frame)
-    if (this.pendingVirtualTileMounts.length > 0) {
-      const maxVtMounts = isMoving ? 28 : 64;
-      const vtTimeBudgetMs = isMoving ? 2.5 : 4.5;
+    if (this.pendingVirtualTileMounts.length > 0 && (performance.now() - tFrameStart) < stepBudgetMs) {
+      const maxVtMounts = isMoving ? 14 : 32;
       let mountedVt = 0;
       let anyVtLight = false;
       let anyVtOcc = false;
       const curVp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
-      const tStart = performance.now();
       while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
-        if (mountedVt > 0 && (performance.now() - tStart) > vtTimeBudgetMs) break;
+        if ((mountedVt > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) break;
         const peek = this.pendingVirtualTileMounts[0];
         const estBytes = estimateFreshUploadBytes(peek?.tex);
         if (!canUploadFresh(estBytes)) break;
@@ -1595,6 +1600,8 @@ export const pyramidMethods = {
         }
       }
       if (this.pendingVirtualTileMounts.length > 0) this._tilesDirty = true;
+    } else if (this.pendingVirtualTileMounts.length > 0) {
+      this._tilesDirty = true;
     }
 
     if (this._depthElevSyncNeeded) {

@@ -11,9 +11,9 @@ const LOD_DETAIL_MIN_SCALE = 0.22;  // Below 0.22x hide tiny unreadable nameplat
 const UNMOUNT_MIN_DIST_PX = 10000;  // Distance outside viewport before LRU-evicting offscreen PIXI placeable
 const MAX_MOUNTED_NPCS = 160;       // Client-side PIXI placeable budget (TokenDocuments stay 100% intact in DB!)
 const WARM_ORBIT_KEEP = 48;         // Keep a warm cache of 48 recently seen NPCs when zooming briefly to orbit
-const DRAW_FRAME_BUDGET_MS = 4.5;   // Max main-thread time spent calling native Token#draw() per animation frame
-const FLIGHT_PREWARM_BUDGET_MS = 2.0; // Low frame budget while camera is flying so 144 FPS flight stays silky
-const MAX_DRAWS_PER_FRAME = 6;      // Cap per rAF once textures are pre-decoded in parallel
+const DRAW_FRAME_BUDGET_MS = 2.4;   // Max main-thread time spent calling native Token#draw() per animation frame (120 FPS safe)
+const FLIGHT_PREWARM_BUDGET_MS = 1.6; // Low frame budget while camera is flying so 120+ FPS flight stays silky
+const MAX_DRAWS_PER_FRAME = 3;      // Cap per rAF once textures are pre-decoded in parallel
 const CROSSFADE_MS = 160;           // Smooth over-composite Impostor -> Native fade duration
 const PREDECODE_LOOKAHEAD = 6;      // Parallel off-blocking texture pre-decode batch size
 
@@ -168,6 +168,9 @@ export class TokenStreamer {
 
     this._rafId = null;
     this._materializeRafId = null;
+    this._selectRafId = null;
+    this._selectGen = 0;
+    this._selectingBatch = false;
     this._pumping = false;
     this._evictTimer = null;
     this._gen = 0;
@@ -345,6 +348,7 @@ export class TokenStreamer {
     this.enabled = false;
     this.sceneId = null;
     this._gen++;
+    this.cancelPendingSelection();
     this._cancelMaterialize();
     if (this._rafId !== null && typeof cancelAnimationFrame === "function") {
       try { cancelAnimationFrame(this._rafId); } catch {}
@@ -1187,6 +1191,385 @@ export class TokenStreamer {
   onVisibilityChanged() {
     if (!this.enabled) return;
     this.impostors.markVisibilityDirty();
+  }
+
+  /* ------------------------- Global Map Selection & Impostor Picking ------------------------- */
+
+  cancelPendingSelection() {
+    this._selectGen++;
+    this._selectingBatch = false;
+    if (this._selectRafId !== null) {
+      if (typeof cancelAnimationFrame === "function") {
+        try { cancelAnimationFrame(this._selectRafId); } catch {}
+      } else {
+        clearTimeout(this._selectRafId);
+      }
+      this._selectRafId = null;
+    }
+  }
+
+  _canUserControlDoc(doc) {
+    if (!doc || doc.viewed === false) return false;
+    const isGM = Boolean(game.user?.isGM);
+    if (!isGM) {
+      if (doc._source?.hidden ?? doc.hidden) return false;
+      const base = doc.baseActor;
+      const isOwner = Boolean(doc.isOwner || base?.testUserPermission?.(game.user, "OWNER"));
+      if (!isOwner) return false;
+    }
+    const existing = doc._object;
+    if (existing && !existing.destroyed) {
+      if (existing.visible === false || existing.isPreview) return false;
+      if (existing._ssHitboxRect?.occluded) return false;
+    } else if (!isGM && this.controller?.isPointUnderBakedRoof) {
+      const grid = canvas.grid?.size || 100;
+      const cx = (Number(doc._source?.x ?? doc.x ?? 0)) + (Number(doc._source?.width ?? doc.width ?? 1) * grid) * 0.5;
+      const cy = (Number(doc._source?.y ?? doc.y ?? 0)) + (Number(doc._source?.height ?? doc.height ?? 1) * grid) * 0.5;
+      const lid = doc._source?.level ?? doc.level ?? canvas.level?.id;
+      const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
+      if (this.controller.isPointUnderBakedRoof(lid, cx, cy, elev)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * O(K) spatial query returning every controllable TokenDocument on the current level overlapping `rect`.
+   * Works at ALL zoom levels — including orbital/macro zoom when tokens are rendered via GPU Impostors.
+   */
+  getControllableDocsInRect(rect) {
+    const out = [];
+    const scene = canvas?.scene;
+    if (!this.enabled || !scene?.tokens || !rect) return out;
+    const grid = canvas.grid?.size || 100;
+    const rx0 = Number(rect.x0 ?? rect.x ?? 0);
+    const ry0 = Number(rect.y0 ?? rect.y ?? 0);
+    const rx1 = rect.x1 !== undefined ? Number(rect.x1) : (rx0 + Number(rect.width ?? 0));
+    const ry1 = rect.y1 !== undefined ? Number(rect.y1) : (ry0 + Number(rect.height ?? 0));
+    const minX = Math.min(rx0, rx1);
+    const maxX = Math.max(rx0, rx1);
+    const minY = Math.min(ry0, ry1);
+    const maxY = Math.max(ry0, ry1);
+
+    // Pad sector search by max expected token footprint (8 cells) so huge tokens anchored in neighbor sectors are included
+    const sectorPad = grid * 8;
+    const sx0 = Math.floor((minX - sectorPad) / TOKEN_SECTOR_PX);
+    const sy0 = Math.floor((minY - sectorPad) / TOKEN_SECTOR_PX);
+    const sx1 = Math.floor((maxX + sectorPad) / TOKEN_SECTOR_PX);
+    const sy1 = Math.floor((maxY + sectorPad) / TOKEN_SECTOR_PX);
+
+    for (let sy = sy0; sy <= sy1; sy++) {
+      for (let sx = sx0; sx <= sx1; sx++) {
+        const ids = this.sectorIndex.get(`${sx}_${sy}`);
+        if (!ids) continue;
+        for (const docId of ids) {
+          const doc = scene.tokens.get(docId);
+          if (!this._canUserControlDoc(doc)) continue;
+          const x = Number(doc._source?.x ?? doc.x ?? 0);
+          const y = Number(doc._source?.y ?? doc.y ?? 0);
+          const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
+          const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
+          if (x + w < minX || x > maxX || y + h < minY || y > maxY) continue;
+          out.push(doc);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Return every controllable TokenDocument on the currently viewed level, sorted nearest-first to camera pivot.
+   */
+  getControllableDocsOnLevel() {
+    const out = [];
+    const scene = canvas?.scene;
+    if (!this.enabled || !scene?.tokens) return out;
+    const cx = canvas.stage?.pivot?.x ?? 0;
+    const cy = canvas.stage?.pivot?.y ?? 0;
+    for (const doc of scene.tokens) {
+      if (!this._canUserControlDoc(doc)) continue;
+      out.push(doc);
+    }
+    out.sort((a, b) => {
+      const da = ((Number(a._source?.x ?? a.x ?? 0) - cx) ** 2) + ((Number(a._source?.y ?? a.y ?? 0) - cy) ** 2);
+      const db = ((Number(b._source?.x ?? b.x ?? 0) - cx) ** 2) + ((Number(b._source?.y ?? b.y ?? 0) - cy) ** 2);
+      return da - db;
+    });
+    return out;
+  }
+
+  /**
+   * Pick the nearest controllable TokenDocument under world point `(wx, wy)` using at least `minHitRadiusWorld`
+   * so clicking tiny impostors on global/continental maps feels effortless.
+   */
+  findHitDocAtPoint(wx, wy, minHitRadiusWorld = 0) {
+    const scene = canvas?.scene;
+    if (!this.enabled || !scene?.tokens) return null;
+    const grid = canvas.grid?.size || 100;
+    const pad = Math.max(grid * 4, Number(minHitRadiusWorld) || 0);
+    const sx0 = Math.floor((wx - pad) / TOKEN_SECTOR_PX);
+    const sy0 = Math.floor((wy - pad) / TOKEN_SECTOR_PX);
+    const sx1 = Math.floor((wx + pad) / TOKEN_SECTOR_PX);
+    const sy1 = Math.floor((wy + pad) / TOKEN_SECTOR_PX);
+
+    let bestDoc = null;
+    let bestDistSq = Infinity;
+    for (let sy = sy0; sy <= sy1; sy++) {
+      for (let sx = sx0; sx <= sx1; sx++) {
+        const ids = this.sectorIndex.get(`${sx}_${sy}`);
+        if (!ids) continue;
+        for (const docId of ids) {
+          const doc = scene.tokens.get(docId);
+          if (!this._canUserControlDoc(doc)) continue;
+          const x = Number(doc._source?.x ?? doc.x ?? 0);
+          const y = Number(doc._source?.y ?? doc.y ?? 0);
+          const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
+          const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
+          const cx = x + w * 0.5;
+          const cy = y + h * 0.5;
+          const halfW = Math.max(w * 0.5, minHitRadiusWorld);
+          const halfH = Math.max(h * 0.5, minHitRadiusWorld);
+          const dx = Math.abs(wx - cx);
+          const dy = Math.abs(wy - cy);
+          if (dx > halfW || dy > halfH) continue;
+          const distSq = dx * dx + dy * dy;
+          if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            bestDoc = doc;
+          }
+        }
+      }
+    }
+    return bestDoc;
+  }
+
+  /**
+   * Ensure already-mounted Token placeables for `docs` have `renderable = true` so Foundry's
+   * `controllableObjects()` sees them even on macro zoom (impostor mode). Returns unmounted docs.
+   */
+  prepareMountedTokensForSelection(docs) {
+    const missing = [];
+    const layer = canvas?.tokens;
+    if (!layer?.objects || !Array.isArray(docs) || !docs.length) return missing;
+    const now = performance.now();
+    let revealedAny = false;
+    for (let i = 0; i < docs.length; i++) {
+      const doc = docs[i];
+      if (!doc) continue;
+      const tok = doc._object;
+      if (tok && !tok.destroyed && tok.parent === layer.objects) {
+        this.lastSeenMs.set(doc.id, now);
+        if (!tok.renderable) {
+          tok.renderable = true;
+          revealedAny = true;
+        }
+        if (tok.mesh && !tok.mesh.destroyed) {
+          if (!tok.mesh.renderable) {
+            tok.mesh.renderable = true;
+            revealedAny = true;
+          }
+          const hiddenByShowstopper = typeof tok._ssOcclusionAlpha === "number" && Number.isFinite(tok._ssOcclusionAlpha) && tok._ssOcclusionAlpha <= 0.01;
+          if (tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) {
+            tok.mesh.visible = true;
+          }
+        }
+      } else {
+        missing.push(doc);
+      }
+    }
+    if (revealedAny) {
+      invalidateTokenLayerCache();
+      this.impostors.refreshVisibility(true);
+      this.impostors.flush();
+    }
+    return missing;
+  }
+
+  /**
+   * Time-sliced materialization & selection for unmounted (or impostor-mode) TokenDocuments.
+   * Caps work to <= 2.4ms/frame so even selecting 150+ tokens on a global map stays locked at 120 FPS.
+   */
+  materializeAndSelect(docs, { releaseOthers = false, maxCount = 250, bulkRunner = null, onProgress = null } = {}) {
+    const layer = canvas?.tokens;
+    if (!this.enabled || !canvas?.ready || !layer?.objects || !layer.active) return { immediate: 0, queued: 0, capped: false };
+    const list = Array.isArray(docs) ? docs : [];
+    const capped = list.length > maxCount;
+    const targetDocs = capped ? list.slice(0, maxCount) : list.slice();
+
+    if (releaseOthers && layer.controlled.length > 0) {
+      layer.releaseAll();
+    }
+
+    this.cancelPendingSelection();
+    const selectGen = this._selectGen;
+    const gen = this._gen;
+    const runBulk = typeof bulkRunner === "function" ? bulkRunner : ((fn) => fn());
+
+    const missing = this.prepareMountedTokensForSelection(targetDocs);
+    const curVp = this._lastVp || this.controller?.getViewportWorldRect?.(0.1);
+    const grid = canvas.grid?.size || 100;
+    const isDocOnScreen = (doc) => {
+      if (!curVp || !doc) return true;
+      const x = Number(doc._source?.x ?? doc.x ?? 0);
+      const y = Number(doc._source?.y ?? doc.y ?? 0);
+      const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
+      const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
+      return !(x + w < curVp.x0 - CULL_VP_PAD_PX || x > curVp.x1 + CULL_VP_PAD_PX || y + h < curVp.y0 - CULL_VP_PAD_PX || y > curVp.y1 + CULL_VP_PAD_PX);
+    };
+
+    let immediate = 0;
+    runBulk(() => {
+      for (let i = 0; i < targetDocs.length; i++) {
+        const doc = targetDocs[i];
+        const tok = doc?._object;
+        if (tok && !tok.destroyed && tok.parent === layer.objects && !tok.controlled) {
+          const onScr = isDocOnScreen(doc);
+          if (!onScr && !this._nativeTokensActive) {
+            tok.renderable = false;
+            if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+          }
+          if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) immediate++;
+        }
+      }
+    });
+    if (immediate > 0) {
+      this.impostors.refreshVisibility(true);
+      this.impostors.flush();
+      if (!missing.length) {
+        ui.placeables?.render?.();
+        if (game.activeTool === "select") ui.placeablesPalette?.render?.();
+      }
+    }
+
+    if (!missing.length) {
+      onProgress?.({ done: true, selected: layer.controlled.length });
+      return { immediate, queued: 0, capped };
+    }
+
+    // Pre-decode first lookahead textures in parallel so Token#draw() never stalls
+    const loadTexFn = globalThis.foundry?.canvas?.loadTexture ?? globalThis.loadTexture;
+    const primeSlice = (queue) => {
+      if (typeof loadTexFn !== "function") return;
+      const n = Math.min(6, queue.length);
+      for (let i = 0; i < n; i++) {
+        const src = this._getDocTexSrc(queue[i]);
+        if (!src || this._isTexReady(src) || this._inflightTexLoads.has(src)) continue;
+        const p = Promise.resolve(loadTexFn(src)).catch(() => null).finally(() => {
+          if (gen === this._gen) {
+            this._inflightTexLoads.delete(src);
+            this._decodedTexSrcs.add(src);
+          }
+        });
+        this._inflightTexLoads.set(src, p);
+      }
+    };
+
+    const queue = missing.slice();
+    primeSlice(queue);
+    this._selectingBatch = true;
+
+    const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+    const step = async () => {
+      this._selectRafId = null;
+      if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || !layer.active) {
+        if (selectGen === this._selectGen) this._selectingBatch = false;
+        return;
+      }
+
+      const budgetMs = 1.8;
+      const maxPerFrame = 2;
+      let frameWorkMs = 0;
+      let drawn = 0;
+      const newlyMounted = [];
+
+      while (queue.length > 0 && drawn < maxPerFrame && frameWorkMs < budgetMs) {
+        const doc = queue.shift();
+        if (!doc || !canvas.scene?.tokens?.has?.(doc.id) || !this._canUserControlDoc(doc)) continue;
+        let obj = doc._object;
+        const onScr = isDocOnScreen(doc);
+        if (obj && !obj.destroyed && obj.parent === layer.objects) {
+          if (onScr) {
+            obj.renderable = true;
+            if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = true;
+          }
+          newlyMounted.push({ tok: obj, onScr });
+          continue;
+        }
+        if (this._drawingIds.has(doc.id)) {
+          queue.push(doc);
+          break;
+        }
+        this._drawingIds.add(doc.id);
+        try {
+          const src = this._getDocTexSrc(doc);
+          if (src && !this._isTexReady(src) && typeof loadTexFn === "function") {
+            await loadTexFn(src);
+            if (gen === this._gen) this._decodedTexSrcs.add(src);
+          }
+          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || !layer.active) break;
+          if (!canvas.scene?.tokens?.has?.(doc.id)) continue;
+          const tDraw = performance.now();
+          doc._destroyed = false;
+          obj = (doc._object && !doc._object.destroyed) ? doc._object : layer.createObject(doc);
+          doc._object = obj;
+          if (obj.parent !== layer.objects) layer.objects.addChild(obj);
+          await obj.draw();
+          frameWorkMs += (performance.now() - tDraw);
+          if (gen === this._gen) this._drawingIds.delete(doc.id);
+          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || obj.destroyed) continue;
+          // Keep offscreen tokens non-renderable so selecting 150+ continent tokens adds zero offscreen GPU cost!
+          const wantVis = onScr;
+          obj.renderable = wantVis;
+          if (obj.mesh && !obj.mesh.destroyed) {
+            obj.mesh.renderable = wantVis;
+            if (wantVis) obj.mesh.visible = true;
+          }
+          if (wantVis) this.lastSeenMs.set(doc.id, performance.now());
+          const showDetail = getEffectiveScale(this._lastVp?.scale ?? (canvas.stage?.scale?.x || 1)) >= LOD_DETAIL_MIN_SCALE;
+          if (!showDetail) {
+            if (obj.nameplate) obj.nameplate.renderable = false;
+            if (obj.tooltip) obj.tooltip.renderable = false;
+            if (obj.bars) obj.bars.renderable = false;
+            if (obj.effects) obj.effects.renderable = false;
+          }
+          newlyMounted.push({ tok: obj, onScr });
+          drawn++;
+        } catch (err) {
+          console.warn(`${MODULE_ID} | Failed to materialize selected token ${doc.id}:`, err);
+        } finally {
+          if (gen === this._gen) this._drawingIds.delete(doc.id);
+        }
+      }
+
+      if (newlyMounted.length > 0 && selectGen === this._selectGen && gen === this._gen && layer.active) {
+        runBulk(() => {
+          for (let i = 0; i < newlyMounted.length; i++) {
+            const { tok, onScr } = newlyMounted[i];
+            if (tok && !tok.destroyed && !tok.controlled) {
+              tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false });
+            }
+          }
+        });
+        invalidateTokenLayerCache();
+        this.impostors.markVisibilityDirty();
+      }
+
+      if (queue.length > 0 && selectGen === this._selectGen && gen === this._gen && this.enabled && layer.active) {
+        primeSlice(queue);
+        this._selectRafId = sched(() => { step(); });
+      } else if (selectGen === this._selectGen) {
+        this._selectingBatch = false;
+        this.impostors.refreshVisibility(true);
+        this.impostors.flush();
+        this.controller?.selectionOverlay?.refresh?.();
+        this.controller?.updateSimAndLightBubbles?.(false);
+        ui.placeables?.render?.();
+        if (game.activeTool === "select") ui.placeablesPalette?.render?.();
+        onProgress?.({ done: true, selected: layer.controlled.length });
+      }
+    };
+
+    this._selectRafId = sched(() => { step(); });
+    return { immediate, queued: queue.length, capped };
   }
 
   /* ------------------------- Utility: Migrate / Populate Native Tokens ------------------------- */

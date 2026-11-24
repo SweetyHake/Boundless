@@ -247,7 +247,22 @@ function pruneOutOfSight() {
   const totalCandidates = (tokens?.length || 0) + (notes?.length || 0);
   // Skip broad-phase overhead when there are barely any placeables to prune
   if (totalCandidates < 8) return;
-  if (game.user?.isGM && !canvas.effects?.visionSources?.some?.(s => s.active)) return;
+  const hasActiveVision = Boolean(canvas.effects?.visionSources?.some?.(s => s.active));
+  if (game.user?.isGM && !hasActiveVision) {
+    // In GM overview (no active vision sources), offscreen/impostor-culled tokens that are already visible
+    // don't need redundant Token#_refreshVisibility() runs on every lighting/zoom refresh.
+    const activeLvlId = canvas.level?.id;
+    for (const t of tokens ?? []) {
+      if (!t || t.destroyed || t.renderable || !t.visible || t.controlled || t.isPreview) continue;
+      if (t.detectionFilter || t._preview?._previewType === "config") continue;
+      if (activeLvlId && t.document?.level && t.document.level !== activeLvlId) continue;
+      if (t.renderFlags?.has?.("refreshVisibility")) {
+        t.renderFlags.delete("refreshVisibility");
+        perfStats.tokensPruned++;
+      }
+    }
+    return;
+  }
   let ranges;
   try { ranges = collectVisionRanges(); } catch { return; }
   if (!ranges) return;

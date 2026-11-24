@@ -140,3 +140,57 @@ test("getLevelCacheSigFn handles openDoors Map keys and wallEdits without throwi
   assert.ok(s1.includes("0_0_0"));
   b.openDoors.clear();
 });
+
+test("computeSmartSelectAllPlan implements safe two-stage Ctrl+A on global and large scenes", async () => {
+  const { computeSmartSelectAllPlan } = await import("../scripts/boundless-selection.mjs");
+
+  // Small standard scene keeps 100% native Foundry behavior
+  const small = computeSmartSelectAllPlan({
+    isBoundless: false, totalOnLevel: 25, inViewCount: 10, lastState: null, nowMs: 1000, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(small.action, "native");
+
+  // 1st Ctrl+A on Boundless map selects only viewport and prompts for level expansion
+  const first = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 22, lastState: null, nowMs: 1000, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(first.action, "viewport");
+  assert.equal(first.notify, true);
+  assert.ok(first.nextState);
+
+  // 2nd Ctrl+A within 2.5s on same layer & level expands to entire level
+  const second = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 22, lastState: first.nextState, nowMs: 2200, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(second.action, "level");
+  assert.equal(second.nextState, null);
+
+  // After 2.5s window expires, starts fresh at viewport again
+  const expired = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 22, lastState: first.nextState, nowMs: 4000, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(expired.action, "viewport");
+
+  // Switching layer or level resets repeat state
+  const diffLayer = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 22, lastState: first.nextState, nowMs: 1500, layerName: "walls", levelId: "lvl0"
+  });
+  assert.equal(diffLayer.action, "viewport");
+
+  // Empty viewport prompts to press again for full level
+  const emptyVp = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 0, lastState: null, nowMs: 1000, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(emptyVp.action, "prompt-level-empty");
+  const expandAfterEmpty = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 147, inViewCount: 0, lastState: emptyVp.nextState, nowMs: 1800, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(expandAfterEmpty.action, "level");
+
+  // When all objects are already in viewport, select without noisy notification
+  const allInView = computeSmartSelectAllPlan({
+    isBoundless: true, totalOnLevel: 12, inViewCount: 12, lastState: null, nowMs: 1000, layerName: "tokens", levelId: "lvl0"
+  });
+  assert.equal(allInView.action, "viewport");
+  assert.equal(allInView.notify, false);
+});

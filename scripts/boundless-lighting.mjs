@@ -330,6 +330,8 @@ export const lightingMethods = {
         addSimBubble(door.levelId, door.x, door.y, LIGHT_PAD_WORLD_PX);
       }
 
+      const actorSimKey = Array.from(neededSim.keys()).sort().join("|");
+
       // Guarantee every active dynamic PointLightSource has all wall sectors within its full radius
       for (const lid of neededDynLights) {
         const meta = this.lightBatch.lightMetaById.get(lid);
@@ -340,6 +342,7 @@ export const lightingMethods = {
 
       const simKey = Array.from(neededSim.keys()).sort().join("|");
       let edgesChanged = false;
+      const changedSectors = new Set();
 
       if (force || simKey !== this.lastSimKey) {
         this.lastSimKey = simKey;
@@ -348,6 +351,7 @@ export const lightingMethods = {
           if (!neededSim.has(fullKey)) {
             for (const eid of data.edgeIds) data.level.edges.delete(eid);
             this.simSectors.delete(fullKey);
+            changedSectors.add(fullKey);
             edgesChanged = true;
           }
         }
@@ -403,19 +407,64 @@ export const lightingMethods = {
           }
 
           this.simSectors.set(fullKey, { level, edgeIds });
+          changedSectors.add(fullKey);
           edgesChanged = true;
         }
       }
 
+      const actorEdgesChanged = Boolean(edgesChanged && (force || actorSimKey !== this._lastActorSimKey));
+      if (actorEdgesChanged || !this._lastActorSimKey) this._lastActorSimKey = actorSimKey;
+
+      const lightTouchesChangedSector = (meta) => {
+        if (!meta || meta.walls === false || !changedSectors.size) return false;
+        const layer = this.levelLayers.get(meta.levelId);
+        if (!layer) return false;
+        const { simGrid, simSectorPx } = layer;
+        const r = (meta.dimPx || 0) + 100;
+        const sx0 = Math.max(0, Math.floor((meta.lx - r) / simSectorPx));
+        const sy0 = Math.max(0, Math.floor((meta.ly - r) / simSectorPx));
+        const sx1 = Math.min(simGrid - 1, Math.floor((meta.lx + r) / simSectorPx));
+        const sy1 = Math.min(simGrid - 1, Math.floor((meta.ly + r) / simSectorPx));
+        for (let y = sy0; y <= sy1; y++) {
+          for (let x = sx0; x <= sx1; x++) {
+            if (changedSectors.has(`${meta.levelId}::${x}_${y}`)) return true;
+          }
+        }
+        return false;
+      };
+
       const dynKey = Array.from(neededDynLights).sort().join("|");
       let lightsChanged = false;
       let moreVpAnimPending = false;
-      const MAX_NEW_VP_PROMOTES_PER_TICK = force ? Infinity : 4;
+      // Always time-slice viewport-only animated lights (even on force/levelSwitch) so 18 lights never stall a single frame!
+      const MAX_NEW_VP_PROMOTES_PER_TICK = 2;
+      const VP_PROMOTE_BUDGET_MS = 1.6;
+      const tVpStart = performance.now();
       let newVpPromotes = 0;
 
       if (force || dynKey !== this.lastDynLightKey || edgesChanged) {
         for (const [lid, ls] of this.dynamicLights) {
           if (!neededDynLights.has(lid)) {
+            const canSmoothRetire = Boolean(
+              !force &&
+              !this._mounting &&
+              ls._boundlessVpAnimOnly &&
+              this.lightBatch.lightMetaById.has(lid) &&
+              ls.layers?.coloration?.mesh?.shader?.uniforms
+            );
+            if (canSmoothRetire) {
+              const existingFade = this._lightFades.get(lid);
+              if (!existingFade || existingFade.dir !== "out") {
+                const colU = ls.layers.coloration?.mesh?.shader?.uniforms;
+                const bgU = ls.layers.background?.mesh?.shader?.uniforms;
+                const baseColorAlpha = existingFade?.baseColorAlpha ?? (Number.isFinite(colU?.colorationAlpha) ? colU.colorationAlpha : null);
+                const baseBgAlpha = existingFade?.baseBgAlpha ?? (Number.isFinite(bgU?.backgroundAlpha) ? bgU.backgroundAlpha : null);
+                const startT = existingFade ? Math.max(0, 1 - existingFade.t) : 0;
+                this._lightFades.set(lid, { dir: "out", t: startT, dur: 200, ls, baseColorAlpha, baseBgAlpha });
+              }
+              continue;
+            }
+            this._lightFades.delete(lid);
             this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
             ls.destroy();
             this.dynamicLights.delete(lid);
@@ -426,21 +475,43 @@ export const lightingMethods = {
 
         for (const lid of neededDynLights) {
           if (this.dynamicLights.has(lid)) {
-            if (edgesChanged) {
-              const ls = this.dynamicLights.get(lid);
-              ls.initialize(ls.data);
+            const ls = this.dynamicLights.get(lid);
+            const isVpOnly = vpAnimOnlyIds.has(lid);
+            ls._boundlessVpAnimOnly = isVpOnly;
+            // Cancel any pending fade-out if the light came back into view or became door/vision driven
+            const activeFade = this._lightFades.get(lid);
+            if (activeFade && activeFade.dir === "out") {
+              if (!isVpOnly || force) {
+                this._finishLightFadeImmediate(lid, true);
+              } else {
+                activeFade.dir = "in";
+                activeFade.t = Math.max(0, 1 - activeFade.t);
+              }
+            }
+            // Only reinitialize existing lights if edges changed strictly for non-actor sectors touching THIS light
+            // (when actorEdgesChanged is true, `initializeLighting: true` below reinitializes all sources once!)
+            if (edgesChanged && !actorEdgesChanged) {
+              const meta = this.lightBatch.lightMetaById.get(lid);
+              if (lightTouchesChangedSector(meta)) {
+                ls.initialize(ls.data);
+                lightsChanged = true;
+              }
             }
             continue;
           }
-          // Spread viewport-only promotions across tiny slices (<= 4 lights/tick) to eliminate zoom stutter spikes
-          if (vpAnimOnlyIds.has(lid) && newVpPromotes >= MAX_NEW_VP_PROMOTES_PER_TICK) {
-            moreVpAnimPending = true;
-            continue;
+          // Spread viewport-only promotions across tiny slices (<= 2 lights & <= 1.6ms/tick) to eliminate zoom/levelSwitch spikes
+          if (vpAnimOnlyIds.has(lid)) {
+            if (newVpPromotes >= MAX_NEW_VP_PROMOTES_PER_TICK || (newVpPromotes > 0 && (performance.now() - tVpStart) >= VP_PROMOTE_BUDGET_MS)) {
+              moreVpAnimPending = true;
+              continue;
+            }
           }
           const meta = this.lightBatch.lightMetaById.get(lid);
           if (!meta) continue;
           const [lx, ly, dimFt, brightFt, color, alpha, anim] = meta.raw;
           const ls = new LightCls({ sourceId: `MegaLight.${lid}` });
+          const isVpOnly = vpAnimOnlyIds.has(lid);
+          ls._boundlessVpAnimOnly = isVpOnly;
           const initData = {
             x: lx, y: ly, level: meta.levelId, elevation: meta.elevation,
             walls: meta.walls !== false, vision: false,
@@ -456,10 +527,16 @@ export const lightingMethods = {
           ls.initialize(initData);
           ls.add();
           this.dynamicLights.set(lid, ls);
-          this.lightBatch.setLightWeight(lid, 0.0);
+          if (isVpOnly && !this._mounting) {
+            // Seamless 220ms coloration crossfade (illumination blends seamlessly via MAX_COLOR!)
+            this.lightBatch.setLightWeight(lid, 1.0);
+            this._lightFades.set(lid, { dir: "in", t: 0, dur: 220, ls, baseColorAlpha: null, baseBgAlpha: null });
+          } else {
+            this.lightBatch.setLightWeight(lid, 0.0);
+          }
           this._emit("dynamicLightMount", { id: lid, light: ls, meta });
           lightsChanged = true;
-          if (vpAnimOnlyIds.has(lid)) newVpPromotes++;
+          if (isVpOnly) newVpPromotes++;
         }
 
         this.lastDynLightKey = moreVpAnimPending ? "" : dynKey;
@@ -467,29 +544,112 @@ export const lightingMethods = {
 
       this.lightBatch.flushWeights();
 
-      if (edgesChanged || lightsChanged) {
+      if (actorEdgesChanged || lightsChanged) {
         canvas.perception.update({
-          initializeVision: edgesChanged,
-          initializeLighting: edgesChanged,
-          initializeSounds: edgesChanged,
-          refreshLightSources: lightsChanged && !edgesChanged,
+          initializeVision: actorEdgesChanged,
+          initializeLighting: actorEdgesChanged,
+          initializeSounds: actorEdgesChanged,
+          refreshLightSources: lightsChanged && !actorEdgesChanged,
           refreshLighting: true,
-          refreshVision: edgesChanged
+          refreshVision: actorEdgesChanged
         });
         // Flush perception synchronously so MegaLightBatch weight changes and native PointLightSource meshes
         // swap atomically within the exact same frame (eliminates 1-frame dark flicker during handoff!).
         if (!this._mounting && typeof canvas.perception.applyRenderFlags === "function") {
           canvas.perception.applyRenderFlags();
         }
+        // Apply initial alpha=0 on newly fading-in viewport lights right after meshes are drawn
+        if (this._lightFades.size > 0) {
+          this._stepDynamicLightFades(0);
+        }
       } else {
         this.lightBatch.attachTo(canvas.effects);
       }
 
       if (moreVpAnimPending && !this._mounting) {
-        this.scheduleViewportLightSync(45);
+        this.scheduleViewportLightSync(24);
       }
     } finally {
       this._updatingBubbles = false;
+    }
+  },
+
+  _finishLightFadeImmediate(lid, keepLight = true) {
+    const f = this._lightFades.get(lid);
+    if (!f) return;
+    this._lightFades.delete(lid);
+    const colU = f.ls?.layers?.coloration?.mesh?.shader?.uniforms;
+    const bgU = f.ls?.layers?.background?.mesh?.shader?.uniforms;
+    if (colU && f.baseColorAlpha !== null) colU.colorationAlpha = f.baseColorAlpha;
+    if (bgU && f.baseBgAlpha !== null) bgU.backgroundAlpha = f.baseBgAlpha;
+    if (keepLight) {
+      this.lightBatch.setLightWeight(lid, 0.0);
+    }
+  },
+
+  _stepDynamicLightFades(dtMs) {
+    if (!this._lightFades || this._lightFades.size === 0) return;
+    const dt = dtMs > 0 ? Math.min(50, dtMs) : 0;
+    let weightsDirty = false;
+    let retiredAny = false;
+    let retiresThisFrame = 0;
+
+    for (const [lid, f] of Array.from(this._lightFades.entries())) {
+      const ls = f.ls;
+      if (!ls || ls.destroyed || this.dynamicLights.get(lid) !== ls) {
+        this._lightFades.delete(lid);
+        continue;
+      }
+
+      const colU = ls.layers?.coloration?.mesh?.shader?.uniforms;
+      const bgU = ls.layers?.background?.mesh?.shader?.uniforms;
+      if (f.baseColorAlpha === null && colU && Number.isFinite(colU.colorationAlpha)) {
+        f.baseColorAlpha = colU.colorationAlpha;
+      }
+      if (f.baseBgAlpha === null && bgU && Number.isFinite(bgU.backgroundAlpha)) {
+        f.baseBgAlpha = bgU.backgroundAlpha;
+      }
+
+      if (dt > 0) {
+        f.t = Math.min(1.0, f.t + dt / f.dur);
+      }
+      const ease = f.t * f.t * (3 - 2 * f.t); // smoothstep
+
+      if (f.dir === "in") {
+        const shaderFactor = ease;
+        const batchWeight = 1.0 - ease;
+        if (colU && f.baseColorAlpha !== null) colU.colorationAlpha = f.baseColorAlpha * shaderFactor;
+        if (bgU && f.baseBgAlpha !== null) bgU.backgroundAlpha = f.baseBgAlpha * shaderFactor;
+        this.lightBatch.setLightWeight(lid, batchWeight);
+        weightsDirty = true;
+        if (f.t >= 1.0) {
+          if (colU && f.baseColorAlpha !== null) colU.colorationAlpha = f.baseColorAlpha;
+          if (bgU && f.baseBgAlpha !== null) bgU.backgroundAlpha = f.baseBgAlpha;
+          this.lightBatch.setLightWeight(lid, 0.0);
+          this._lightFades.delete(lid);
+        }
+      } else {
+        const shaderFactor = 1.0 - ease;
+        const batchWeight = ease;
+        if (colU && f.baseColorAlpha !== null) colU.colorationAlpha = f.baseColorAlpha * shaderFactor;
+        if (bgU && f.baseBgAlpha !== null) bgU.backgroundAlpha = f.baseBgAlpha * shaderFactor;
+        this.lightBatch.setLightWeight(lid, batchWeight);
+        weightsDirty = true;
+        if (f.t >= 1.0 && retiresThisFrame < 2) {
+          this._lightFades.delete(lid);
+          this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
+          ls.destroy();
+          this.dynamicLights.delete(lid);
+          this.lightBatch.setLightWeight(lid, 1.0);
+          retiredAny = true;
+          retiresThisFrame++;
+        }
+      }
+    }
+
+    if (weightsDirty) this.lightBatch.flushWeights();
+    if (retiredAny && canvas?.perception?.update) {
+      canvas.perception.update({ refreshLightSources: true, refreshLighting: true });
     }
   },
 
