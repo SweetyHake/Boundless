@@ -1580,7 +1580,22 @@ export const pyramidMethods = {
       }
     }
     // Track light/weather-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
-    if (this.activeVirtualTiles.size > 0) {
+    // Iterate only tracked occludable virtual tiles (typically 0-5) instead of scanning 500-1000 decorative props @ 120Hz!
+    const trackedOccVt = this._trackedOccVirtualTiles;
+    if (trackedOccVt && trackedOccVt.size > 0) {
+      let vtIdx = 0;
+      for (const fullId of trackedOccVt) {
+        const vt = this.activeVirtualTiles.get(fullId);
+        const m = vt?.mesh;
+        if (!m || m.destroyed) { trackedOccVt.delete(fullId); continue; }
+        vtIdx++;
+        if ((!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
+        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+        occCount++;
+      }
+    } else if (!trackedOccVt && this.activeVirtualTiles.size > 0) {
       let vtIdx = 0;
       for (const vt of this.activeVirtualTiles.values()) {
         vtIdx++;

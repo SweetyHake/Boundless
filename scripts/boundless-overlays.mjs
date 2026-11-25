@@ -971,6 +971,10 @@ export const overlayMethods = {
     this._syncShowstopperMeshDof(m);
     const vtEntry = { levelId: lid, mesh: m, src: tSpec.src, tSpec };
     this.activeVirtualTiles.set(fullId, vtEntry);
+    if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) {
+      if (!this._trackedOccVirtualTiles) this._trackedOccVirtualTiles = new Set();
+      this._trackedOccVirtualTiles.add(fullId);
+    }
     this._emit("virtualTileMount", { key: fullId, vt: vtEntry });
     return m;
   },
@@ -1088,7 +1092,10 @@ export const overlayMethods = {
         for (const tid of candidateTids) {
           const rawTile = spec.tiles[tid];
           if (!rawTile) continue;
-          if (!hasTileEditsOnLevel && rawTile.minZ === undefined) continue;
+          if (!hasTileEditsOnLevel) {
+            if (rawTile.minZ === undefined || rawTile.hidden || (rawTile.alpha ?? 1) < 0.35 || (rawTile.elevation ?? 0) <= tokElev) continue;
+            if (rawTile.maxZ !== undefined && curTargetZ > rawTile.maxZ) continue;
+          }
           const tSpec = this.resolveVirtualTile(layerId, tid, rawTile, level);
           if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
           if (tSpec.maxZ !== undefined && curTargetZ > tSpec.maxZ) continue;
@@ -1234,6 +1241,26 @@ export const overlayMethods = {
   syncRoofTokenOcclusion() {
     if (!this.active || !canvas?.tokens?.placeables) return;
 
+    // Fast O(1) bailout on maps with no baked roofs, no minZ tiles, and no previously hidden tokens
+    if (this._roofHiddenTokens.size === 0 && this.visibleLevelLayers?.length) {
+      const tileRev = this.tileEditsRev || 0;
+      let anyCanHide = false;
+      for (let i = 0; i < this.visibleLevelLayers.length; i++) {
+        const layer = this.visibleLevelLayers[i];
+        const spec = layer?.spec;
+        if (!spec) continue;
+        if (layer._roofCheckRev !== tileRev || layer._roofCheckSpec !== spec) {
+          anyCanHide = true;
+          break;
+        }
+        if (layer._hasRoofOverlays || layer._hasMinZTiles) {
+          anyCanHide = true;
+          break;
+        }
+      }
+      if (!anyCanHide) return;
+    }
+
     const nextHidden = new Set();
     for (const tok of canvas.tokens.placeables) {
       if (this.isTokenUnderBakedRoof(tok)) {
@@ -1286,15 +1313,32 @@ export const overlayMethods = {
       const rx = Math.max(ov.roofMesh.width || 0, ov.roofMesh.height || 0) * 0.65 + 250;
       if (Math.abs(tx - ov.roofMesh.x) <= rx && Math.abs(ty - ov.roofMesh.y) <= rx) return true;
     }
-    for (const vt of this.activeVirtualTiles.values()) {
-      const m = vt.mesh;
-      if (!m?.visible || !m.occlusionMode) continue;
-      const b = m.canvasBounds;
-      if (b && Number.isFinite(b.x) && Number.isFinite(b.width)) {
-        if (tx >= b.x - 250 && tx <= b.x + b.width + 250 && ty >= b.y - 250 && ty <= b.y + b.height + 250) return true;
-      } else {
-        const rx = Math.max(m.width || 0, m.height || 0) + 250;
-        if (Math.abs(tx - m.x) <= rx && Math.abs(ty - m.y) <= rx) return true;
+    const tracked = this._trackedOccVirtualTiles;
+    if (tracked && tracked.size > 0) {
+      for (const fullId of tracked) {
+        const vt = this.activeVirtualTiles.get(fullId);
+        const m = vt?.mesh;
+        if (!m || m.destroyed) { tracked.delete(fullId); continue; }
+        if (!m.visible || !m.occlusionMode) continue;
+        const b = m.canvasBounds;
+        if (b && Number.isFinite(b.x) && Number.isFinite(b.width)) {
+          if (tx >= b.x - 250 && tx <= b.x + b.width + 250 && ty >= b.y - 250 && ty <= b.y + b.height + 250) return true;
+        } else {
+          const rx = Math.max(m.width || 0, m.height || 0) + 250;
+          if (Math.abs(tx - m.x) <= rx && Math.abs(ty - m.y) <= rx) return true;
+        }
+      }
+    } else if (!tracked) {
+      for (const vt of this.activeVirtualTiles.values()) {
+        const m = vt.mesh;
+        if (!m?.visible || !m.occlusionMode) continue;
+        const b = m.canvasBounds;
+        if (b && Number.isFinite(b.x) && Number.isFinite(b.width)) {
+          if (tx >= b.x - 250 && tx <= b.x + b.width + 250 && ty >= b.y - 250 && ty <= b.y + b.height + 250) return true;
+        } else {
+          const rx = Math.max(m.width || 0, m.height || 0) + 250;
+          if (Math.abs(tx - m.x) <= rx && Math.abs(ty - m.y) <= rx) return true;
+        }
       }
     }
     return false;

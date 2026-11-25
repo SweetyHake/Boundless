@@ -3085,3 +3085,36 @@ test("pyramidMethods._hasDefineSurfaceRegions caches lookup and invalidates on _
   assert.equal(ctrl._hasDefineSurfaceRegions(), true);
   assert.equal(behaviorReads, 2, "incrementing _regionsRev must invalidate cache");
 });
+
+test("applyLightingRenderScale binds childAdded/childRemoved on CanvasDarknessEffects so external meshes unhide it", async () => {
+  installBaseGlobals();
+  const { applyLightingRenderScale } = await import("../scripts/perf-gpu.mjs");
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const listeners = new Map();
+  const darkLayer = {
+    destroyed: false,
+    visible: true,
+    children: [],
+    filters: [{}],
+    on(ev, fn) { listeners.set(ev, fn); }
+  };
+  globalThis.canvas = {
+    ready: true,
+    performance: { mode: 2 },
+    effects: { darkness: darkLayer }
+  };
+  const prevEn = PERF_CONFIG.perfEnabled;
+  PERF_CONFIG.perfEnabled = true;
+  try {
+    applyLightingRenderScale();
+    assert.equal(darkLayer.visible, false, "empty darkness layer should hide");
+    darkLayer.children.push({ id: "extMesh" });
+    listeners.get("childAdded")?.();
+    assert.equal(darkLayer.visible, true, "adding external child must immediately reveal darkness layer");
+    darkLayer.children.length = 0;
+    listeners.get("childRemoved")?.();
+    assert.equal(darkLayer.visible, false, "removing last child must re-hide darkness layer");
+  } finally {
+    PERF_CONFIG.perfEnabled = prevEn;
+  }
+});

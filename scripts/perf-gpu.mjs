@@ -383,6 +383,8 @@ function patchControlIcons() {
       bgSp.eventMode = "none";
       this._blBgSprite = bgSp;
       this.bg.addChild(bgSp);
+    } else if (bgSp.parent !== this.bg) {
+      this.bg.addChild(bgSp);
     }
     bgSp.visible = true;
     bgSp.position.set(0, 0);
@@ -396,6 +398,8 @@ function patchControlIcons() {
       bdSp = new PIXI.Sprite(atlas.iconBorder);
       bdSp.eventMode = "none";
       this._blBorderSprite = bdSp;
+      this.border.addChild(bdSp);
+    } else if (bdSp.parent !== this.border) {
       this.border.addChild(bdSp);
     }
     bdSp.visible = true;
@@ -1883,13 +1887,22 @@ export function applyLightingRenderScale() {
 
   // Skip empty full-screen CanvasDarknessEffects FBO clear + VoidFilter blit on scenes with 0 darkness sources
   if (effects.darkness && !effects.darkness.destroyed) {
-    if (PERF_CONFIG.perfEnabled) {
-      const hasDarkChildren = (effects.darkness.children?.length ?? 0) > 0;
-      const hasCustomFilters = (effects.darkness.filters?.length ?? 0) > 1;
-      effects.darkness.visible = hasDarkChildren || hasCustomFilters;
-    } else {
-      effects.darkness.visible = true;
+    const syncDarkVis = () => {
+      if (!effects.darkness || effects.darkness.destroyed) return;
+      if (PERF_CONFIG.perfEnabled) {
+        const hasDarkChildren = (effects.darkness.children?.length ?? 0) > 0;
+        const hasCustomFilters = (effects.darkness.filters?.length ?? 0) > 1;
+        effects.darkness.visible = hasDarkChildren || hasCustomFilters;
+      } else {
+        effects.darkness.visible = true;
+      }
+    };
+    if (!effects.darkness._blDarkVisBound && typeof effects.darkness.on === "function") {
+      effects.darkness._blDarkVisBound = true;
+      effects.darkness.on("childAdded", syncDarkVis);
+      effects.darkness.on("childRemoved", syncDarkVis);
     }
+    syncDarkVis();
   }
 }
 

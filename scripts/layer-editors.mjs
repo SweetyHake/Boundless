@@ -549,6 +549,43 @@ export class VirtualLayerEditors {
     const sy0 = Math.max(0, Math.floor((curVp.y0 - pad) / simSectorPx));
     const sx1 = Math.min(simGrid - 1, Math.floor((curVp.x1 + pad) / simSectorPx));
     const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
+    const lvlLightEdits = this.controller.lightEdits?.get(lid);
+
+    // Zero-alloc macro overview fast-path when level has no lightEdits: avoid creating thousands of resolved objects just to draw dots
+    if (!inZoom && !lvlLightEdits?.size) {
+      this._clearLights({ keepProtected: true });
+      if (this.lightMacroGfx) {
+        const g = this.lightMacroGfx;
+        g.clear();
+        g.visible = true;
+        const pts = [];
+        const minX = curVp.x0 - pad, maxX = curVp.x1 + pad, minY = curVp.y0 - pad, maxY = curVp.y1 + pad;
+        for (let sy = sy0; sy <= sy1; sy++) {
+          for (let sx = sx0; sx <= sx1; sx++) {
+            const list = spec.sectors[`${sx}_${sy}`]?.l;
+            if (!list?.length) continue;
+            for (let li = 0; li < list.length; li++) {
+              const raw = list[li];
+              if (!raw) continue;
+              const lx = raw[0], ly = raw[1];
+              if (lx < minX || lx > maxX || ly < minY || ly > maxY) continue;
+              pts.push(lx, ly);
+            }
+          }
+        }
+        const total = pts.length >> 1;
+        if (total > 0) {
+          const r = Math.max(12, Math.min(180, 6 / Math.max(0.01, curVp.scale)));
+          const step = total > MAX_MACRO_MARKERS ? Math.ceil(total / MAX_MACRO_MARKERS) : 1;
+          g.lineStyle(Math.max(2, r * 0.2), 0x000000, 0.8);
+          g.beginFill(0xffcc44, 0.85);
+          for (let i = 0; i < total; i += step) g.drawCircle(pts[i * 2], pts[i * 2 + 1], r);
+          g.endFill();
+        }
+      }
+      return;
+    }
+
     const items = [];
     const seenKeys = new Set();
     for (let sy = sy0; sy <= sy1; sy++) {
@@ -566,7 +603,6 @@ export class VirtualLayerEditors {
         }
       }
     }
-    const lvlLightEdits = this.controller.lightEdits?.get(lid);
     if (lvlLightEdits?.size) {
       for (const [lKey, ov] of lvlLightEdits) {
         if (!ov || seenKeys.has(lKey)) continue;
@@ -946,6 +982,43 @@ export class VirtualLayerEditors {
     const sy0 = Math.max(0, Math.floor((curVp.y0 - pad) / simSectorPx));
     const sx1 = Math.min(simGrid - 1, Math.floor((curVp.x1 + pad) / simSectorPx));
     const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
+    const lvlSoundEdits = this.controller.soundEdits?.get(lid);
+
+    // Zero-alloc macro overview fast-path when level has no soundEdits
+    if (!inZoom && !lvlSoundEdits?.size) {
+      this._clearSounds({ keepProtected: true });
+      if (this.soundMacroGfx) {
+        const g = this.soundMacroGfx;
+        g.clear();
+        g.visible = true;
+        const pts = [];
+        const minX = curVp.x0 - pad, maxX = curVp.x1 + pad, minY = curVp.y0 - pad, maxY = curVp.y1 + pad;
+        for (let sy = sy0; sy <= sy1; sy++) {
+          for (let sx = sx0; sx <= sx1; sx++) {
+            const list = spec.sectors[`${sx}_${sy}`]?.s;
+            if (!list?.length) continue;
+            for (let si = 0; si < list.length; si++) {
+              const raw = list[si];
+              if (!raw) continue;
+              const rx = raw[0], ry = raw[1];
+              if (rx < minX || rx > maxX || ry < minY || ry > maxY) continue;
+              pts.push(rx, ry);
+            }
+          }
+        }
+        const total = pts.length >> 1;
+        if (total > 0) {
+          const r = Math.max(14, Math.min(180, 7 / Math.max(0.01, curVp.scale)));
+          const step = total > MAX_MACRO_MARKERS ? Math.ceil(total / MAX_MACRO_MARKERS) : 1;
+          g.lineStyle(Math.max(2, r * 0.2), 0x000000, 0.8);
+          g.beginFill(0x66ccff, 0.85);
+          for (let i = 0; i < total; i += step) g.drawCircle(pts[i * 2], pts[i * 2 + 1], r);
+          g.endFill();
+        }
+      }
+      return;
+    }
+
     const items = [];
     const seenKeys = new Set();
     for (let sy = sy0; sy <= sy1; sy++) {
@@ -963,7 +1036,6 @@ export class VirtualLayerEditors {
         }
       }
     }
-    const lvlSoundEdits = this.controller.soundEdits?.get(lid);
     if (lvlSoundEdits?.size) {
       for (const [sKey, ov] of lvlSoundEdits) {
         if (!ov || seenKeys.has(sKey)) continue;
