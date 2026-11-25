@@ -298,15 +298,25 @@ function pruneOutOfSight() {
 
 function sourceLosSig(vs) {
   const uid = vs.updateId ?? 0;
-  if (vs._blLosSigVer === _perceptionVer && vs._blLosSigUid === uid && vs._blLosSigStr) {
+  const d = vs.data ?? {};
+  const vx = vs.x ?? d.x ?? 0;
+  const vy = vs.y ?? d.y ?? 0;
+  if (
+    vs._blLosSigVer === _perceptionVer &&
+    vs._blLosSigUid === uid &&
+    vs._blLosSigX === vx &&
+    vs._blLosSigY === vy &&
+    vs._blLosSigStr
+  ) {
     return vs._blLosSigStr;
   }
-  const d = vs.data ?? {};
-  const sig = `${Math.round((vs.x ?? d.x ?? 0) * 10)},${Math.round((vs.y ?? d.y ?? 0) * 10)},${d.elevation ?? 0}`
+  const sig = `${Math.round(vx * 10)},${Math.round(vy * 10)},${d.elevation ?? 0}`
     + `,${vs.level?.id ?? ""},${d.walls !== false ? 1 : 0},${uid}`
     + `,${vs.radius ?? d.radius ?? 0},${d.angle ?? 360},${d.rotation ?? 0},${d.externalRadius ?? ""}`;
   vs._blLosSigVer = _perceptionVer;
   vs._blLosSigUid = uid;
+  vs._blLosSigX = vx;
+  vs._blLosSigY = vy;
   vs._blLosSigStr = sig;
   return sig;
 }

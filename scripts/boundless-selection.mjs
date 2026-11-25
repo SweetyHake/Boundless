@@ -318,7 +318,15 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
   });
 
   // 3. `controlAll`: previously unwrapped in Foundry v14 -> caused O(K^2) vision storm on Ctrl+A!
-  wrapBulkMethod("controlAll");
+  //    Also restore `renderable` on mounted tokens when called directly at macro zoom on Boundless.
+  wrapBulkMethod("controlAll", {
+    before() {
+      const streamer = controller?.tokenStreamer;
+      if (!controller?.active || !streamer?.enabled || streamer._nativeTokensActive) return;
+      const docs = streamer.getControllableDocsOnLevel?.();
+      if (docs?.length) streamer.prepareMountedTokensForSelection?.(docs);
+    }
+  });
 
   // 4. Smart two-stage Ctrl+A on PlaceablesLayer
   let lastSelectAllState = null;
