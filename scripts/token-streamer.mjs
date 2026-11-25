@@ -25,8 +25,17 @@ function getSectorCoords(x, y) {
 }
 
 function getSectorKey(x, y) {
-  const [sx, sy] = getSectorCoords(x, y);
-  return `${sx}_${sy}`;
+  return `${Math.floor((Number(x) || 0) / TOKEN_SECTOR_PX)}_${Math.floor((Number(y) || 0) / TOKEN_SECTOR_PX)}`;
+}
+
+function buildCombatTokenIdSet(sceneId) {
+  const combatants = game.combat?.combatants;
+  if (!combatants?.size) return null;
+  const ids = new Set();
+  for (const c of combatants) {
+    if (c?.tokenId && (!sceneId || c.sceneId === sceneId)) ids.add(c.tokenId);
+  }
+  return ids.size > 0 ? ids : null;
 }
 
 function getTokenDocBounds(doc, grid) {
@@ -46,7 +55,7 @@ function getTokenDocBounds(doc, grid) {
  * (PCs, linked story actors, combatants, light emitters, GM-pinned, controlled/targeted).
  * Never touches `doc.actor` so Foundry v14 lazy `ActorDelta` stays untouched for idle NPCs.
  */
-function isAlwaysMountedTokenDoc(doc) {
+function isAlwaysMountedTokenDoc(doc, combatTokenIds = undefined) {
   if (!doc) return true;
   if (doc.actorLink) return true;
   const base = doc.baseActor;
@@ -55,7 +64,11 @@ function isAlwaysMountedTokenDoc(doc) {
   if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && hasTokenPermissionLazy(doc, game.user, "OBSERVER")) return true;
   if (doc.flags?.[MODULE_ID]?.pinned) return true;
   if (doc.combatant) return true;
-  if (game.combat?.combatants?.some?.(c => c.tokenId === doc.id && c.sceneId === doc.parent?.id)) return true;
+  if (combatTokenIds !== undefined) {
+    if (combatTokenIds && combatTokenIds.has(doc.id)) return true;
+  } else if (game.combat?.combatants?.some?.(c => c.tokenId === doc.id && c.sceneId === doc.parent?.id)) {
+    return true;
+  }
   const light = doc.light ?? doc._source?.light;
   if ((Number(light?.dim) || 0) > 0 || (Number(light?.bright) || 0) > 0) return true;
   const obj = doc._object;
@@ -128,8 +141,9 @@ export function installLazyTokenLayerPatch() {
       return;
     }
     const viewKey = `${scene.id}::${canvas?.level?.id ?? ""}`;
+    const combatIds = buildCombatTokenIdSet(scene.id);
     for (const doc of origViewed.call(this)) {
-      if (isAlwaysMountedTokenDoc(doc)) {
+      if (isAlwaysMountedTokenDoc(doc, combatIds)) {
         yield doc;
       } else {
         lazyFilteredViewKey = viewKey;
@@ -990,6 +1004,18 @@ export class TokenStreamer {
             anyVisionDrawn = true;
           }
 
+          // Immediately suppress newly drawn token if sitting beneath an unmounted/baked roof BEFORE starting any 160ms crossfade
+          if (this.controller?.isTokenUnderBakedRoof?.(obj)) {
+            this.controller._roofHiddenTokens?.add?.(obj);
+            obj.renderable = false;
+            if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
+            if (obj._ssJumpShadow && !obj._ssJumpShadow.destroyed) obj._ssJumpShadow.renderable = false;
+            this.impostors.upsertToken(doc);
+            this.impostors.setFadeOverride(doc.id, null);
+            this.impostors.flush();
+            continue;
+          }
+
           // Start smooth 160ms over-composite crossfade via mesh.unoccludedAlpha (never touches tok.alpha or mesh.alpha!)
           if (shouldFade && obj.mesh && !obj.mesh.destroyed) {
             const hasUnoccluded = "unoccludedAlpha" in obj.mesh;
@@ -1014,14 +1040,6 @@ export class TokenStreamer {
             this.impostors.upsertToken(doc);
             this.impostors.setFadeOverride(doc.id, null);
             this.impostors.flush();
-          }
-
-          // Immediately suppress newly drawn token if sitting beneath an unmounted/baked roof so it never flashes for 1 frame
-          if (this.controller?.isTokenUnderBakedRoof?.(obj)) {
-            this.controller._roofHiddenTokens?.add?.(obj);
-            obj.renderable = false;
-            if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
-            if (obj._ssJumpShadow && !obj._ssJumpShadow.destroyed) obj._ssJumpShadow.renderable = false;
           }
 
           // Apply current LOD detail state immediately to newly drawn token
@@ -1093,12 +1111,13 @@ export class TokenStreamer {
     const evictY1 = vp.y1 + UNMOUNT_MIN_DIST_PX;
     const candidates = [];
 
+    const combatIds = buildCombatTokenIdSet(canvas.scene?.id);
     for (let i = 0; i < placeables.length; i++) {
       const tok = placeables[i];
       if (!tok || tok.destroyed || tok.isPreview) continue;
       if ((coreDrawingCounts.get(tok) || 0) > 0 || !tok.mesh || tok.mesh.destroyed) continue;
       const doc = tok.document;
-      if (!doc || this._drawingIds.has(doc.id) || isAlwaysMountedTokenDoc(doc)) continue;
+      if (!doc || this._drawingIds.has(doc.id) || isAlwaysMountedTokenDoc(doc, combatIds)) continue;
 
       const tx = doc._source?.x ?? doc.x ?? tok.x ?? 0;
       const ty = doc._source?.y ?? doc.y ?? tok.y ?? 0;

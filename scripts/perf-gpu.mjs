@@ -1227,10 +1227,42 @@ function patchTokenUiCaching() {
     const res = wrapped(...args);
     if (this._blBorderDirty && this.border && !this.border.destroyed && this.border.visible) {
       this._blBorderDirty = false;
-      this._refreshBorder();
+      if (this.renderFlags?.set) {
+        if (!this.renderFlags.has?.("refreshBorder")) {
+          this.renderFlags.set({ refreshBorder: true });
+        }
+      } else {
+        this._refreshBorder();
+      }
     }
     return res;
   }, { type: "WRAPPER" });
+
+  // Dirty-skip Token#_drawTargetArrows: v14's 120Hz targeting animation holds constant (m=0.5, alpha=1) for 60% of every 2s cycle!
+  wrapFoundryMethod("Token", "_drawTargetArrows", function (wrapped, reticule) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiCache || isPrimePerfActive()) {
+      this._blTargetArrowSig = null;
+      return wrapped(reticule);
+    }
+    const targetedSelf = Boolean(this.targeted?.size && this.targeted.has(globalThis.game?.user));
+    if (!targetedSelf) {
+      if (this._blTargetArrowSig === "empty" && !this.targetArrows?.geometry?.graphicsData?.length) return;
+      this._blTargetArrowSig = "empty";
+      return wrapped(reticule);
+    }
+    const r = reticule || {};
+    const m = r.margin ?? 0;
+    const a = r.alpha ?? 1;
+    const sz = r.size ?? globalThis.CONFIG?.Canvas?.targeting?.size ?? 0.2;
+    const col = r.color ?? (typeof this._getBorderColor === "function" ? this._getBorderColor() : 0);
+    const bw = r.border?.width ?? 2;
+    const bc = r.border?.color ?? 0;
+    const uiScale = globalThis.canvas?.dimensions?.uiScale ?? 1;
+    const sig = `${m}|${a}|${sz}|${col}|${bw}|${bc}|${this.w}|${this.h}|${uiScale}`;
+    if (sig === this._blTargetArrowSig && this.targetArrows?.geometry?.graphicsData?.length > 0) return;
+    this._blTargetArrowSig = sig;
+    return wrapped(reticule);
+  }, { type: "MIXED" });
 
   return [Boolean(okDrawBar), Boolean(okDrawFx), Boolean(okRefFx)];
 }
@@ -1249,8 +1281,10 @@ export function refreshTokenBars() {
         hideBar3SliceSprites(tok.bars.bar2);
       }
     }
-    if (tok.effects && !tok.effects.destroyed && tok.effects.children?.length > 1 && typeof tok._refreshEffects === "function") {
-      try { tok._refreshEffects(); } catch {}
+    if (tok.effects && !tok.effects.destroyed && typeof tok._refreshEffects === "function") {
+      if (tok.effects.children?.length > 1 || tok.effects.bg?._blFxBgSprites?.length) {
+        try { tok._refreshEffects(); } catch {}
+      }
     }
   }
 }
@@ -1271,7 +1305,18 @@ export function clearTokenUiBitmapCaches() {
         hideBar3SliceSprites(tok.bars.bar2);
       }
     }
-    if (tok.effects) tok.effects.cacheAsBitmap = false;
+    if (tok.effects) {
+      tok.effects.cacheAsBitmap = false;
+      const arr = tok.effects.bg?._blFxBgSprites;
+      if (arr) {
+        for (let i = 0; i < arr.length; i++) arr[i].visible = false;
+      }
+    }
+    if (tok._blBorderDirty) {
+      tok._blBorderDirty = false;
+      tok.renderFlags?.set?.({ refreshBorder: true });
+    }
+    tok._blTargetArrowSig = null;
   }
   refreshTokenBars();
 }
@@ -1615,7 +1660,7 @@ function patchV14CoreRenderPasses() {
     // Skip HeadsUpDisplayContainer#align() DOM style mutations during pan/zoom when no HUD is open
     const HudCtrCls = globalThis.foundry?.applications?.hud?.HeadsUpDisplayContainer;
     if (HudCtrCls?.prototype?.align) {
-      results.push(wrapTargetMethod(HudCtrCls.prototype, "align", "HeadsUpDisplayContainer.prototype.align", function (wrapped) {
+      results.push(wrapTargetMethod(HudCtrCls.prototype, "align", "HeadsUpDisplayContainer.prototype.align", function (wrapped, forceAlign = false) {
         if (!this.rendered) return;
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) {
           this._blAlignDirty = false;
@@ -1624,6 +1669,7 @@ function patchV14CoreRenderPasses() {
         }
         const hud = this.element;
         let hasActiveHud = Boolean(
+          forceAlign ||
           this.token?.rendered ||
           this.tile?.rendered ||
           this.drawing?.rendered ||
@@ -1680,22 +1726,24 @@ function patchV14CoreRenderPasses() {
         return wrapped();
       }));
 
-      const syncHudIfDirty = () => {
+      const syncHudIfDirty = (force = false) => {
         const hud = globalThis.canvas?.hud;
         if (hud?._blAlignDirty) {
           hud._blAlignDirty = false;
           hud._blHudX = NaN;
-          try { hud.align(); } catch {}
+          try { hud.align(force); } catch {}
         }
       };
-      for (const hk of ["renderTokenHUD", "renderTileHUD", "renderDrawingHUD", "chatBubble"]) {
-        Hooks.on(hk, syncHudIfDirty);
+      for (const hk of ["renderTokenHUD", "renderTileHUD", "renderDrawingHUD"]) {
+        Hooks.on(hk, () => syncHudIfDirty(true));
       }
+      // Use non-deprecated v14 hook "chatBubbleHTML" (fires before append, so force=true guarantees alignment!)
+      Hooks.on("chatBubbleHTML", () => syncHudIfDirty(true));
       const BaseHudCls = globalThis.foundry?.applications?.hud?.BasePlaceableHUD;
       if (BaseHudCls?.prototype?._onRender) {
         results.push(wrapTargetMethod(BaseHudCls.prototype, "_onRender", "BasePlaceableHUD.prototype._onRender", function (wrapped, ...args) {
           const res = wrapped(...args);
-          syncHudIfDirty();
+          syncHudIfDirty(true);
           return res;
         }));
       }
@@ -1706,7 +1754,21 @@ function patchV14CoreRenderPasses() {
         if (RCls?.prototype?.refresh) {
           results.push(wrapTargetMethod(RCls.prototype, "refresh", `${rName}.prototype.refresh`, function (wrapped, ...args) {
             const res = wrapped(...args);
-            if (this.active || this.visible) syncHudIfDirty();
+            if (this.active || this.visible) syncHudIfDirty(true);
+            return res;
+          }));
+        }
+        if (rName === "Ruler" && RCls?.prototype?._refresh) {
+          results.push(wrapTargetMethod(RCls.prototype, "_refresh", "Ruler.prototype._refresh", function (wrapped, ...args) {
+            const res = wrapped(...args);
+            if (this.active || this.visible) syncHudIfDirty(true);
+            return res;
+          }));
+        }
+        if (rName === "TokenRuler" && RCls?.prototype?._onVisibleChange) {
+          results.push(wrapTargetMethod(RCls.prototype, "_onVisibleChange", "TokenRuler.prototype._onVisibleChange", function (wrapped, ...args) {
+            const res = wrapped(...args);
+            if (this.visible) syncHudIfDirty(true);
             return res;
           }));
         }
@@ -1795,6 +1857,67 @@ function patchV14CoreRenderPasses() {
       lastStageWorldId = -1;
       lastDepthSigCount = -1;
     });
+  }
+
+  // Dirty-tracked PrimaryCanvasGroup#update: skip 5-level updateCanvasTransform chain on unchanged leaf PrimarySpriteMeshes @ 120Hz
+  const PrimGroupCls = globalThis.foundry?.canvas?.groups?.PrimaryCanvasGroup;
+  if (PrimGroupCls?.prototype?.update) {
+    results.push(wrapTargetMethod(PrimGroupCls.prototype, "update", "PrimaryCanvasGroup.prototype.update", function (wrapped) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || globalThis.CONFIG?.debug?.canvas?.primary?.bounds) {
+        return wrapped();
+      }
+      if (this.sortDirty) this.sortChildren();
+      const children = this.children;
+      const parentCid = this._canvasTransformID ?? -1;
+      for (let i = 0, n = children.length; i < n; i++) {
+        const c = children[i];
+        const t = c.transform;
+        if (
+          c._blPrimInit &&
+          c.children?.length === 0 &&
+          t &&
+          t._localID === t._currentLocalID &&
+          c._blPrimLocalID === t._currentLocalID &&
+          c._blPrimParentCid === parentCid &&
+          c._canvasBounds &&
+          c._canvasBounds.updateID === c._canvasBoundsID &&
+          c._blPrimRestrict === c._restrictionState &&
+          c._blPrimHidden === c.hidden &&
+          c._blPrimElev === c.elevation &&
+          c._blPrimOccluded === c.occluded
+        ) {
+          continue;
+        }
+        c.updateCanvasTransform?.();
+        if (t && c.children?.length === 0 && c._canvasBounds) {
+          c._blPrimInit = true;
+          c._blPrimLocalID = t._currentLocalID;
+          c._blPrimParentCid = parentCid;
+          c._blPrimRestrict = c._restrictionState;
+          c._blPrimHidden = c.hidden;
+          c._blPrimElev = c.elevation;
+          c._blPrimOccluded = c.occluded;
+        }
+      }
+      globalThis.canvas?.masks?.depth?._update?.();
+    }));
+  }
+
+  // Zero-alloc GridLayer#highlightPosition on square grids: direct drawRect instead of getShape() + new PIXI.Polygon per cell
+  const GridLayerCls = globalThis.foundry?.canvas?.layers?.GridLayer;
+  if (GridLayerCls?.prototype?.highlightPosition) {
+    results.push(wrapTargetMethod(GridLayerCls.prototype, "highlightPosition", "GridLayer.prototype.highlightPosition", function (wrapped, name, opts) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || !opts) return wrapped(name, opts);
+      const grid = globalThis.canvas?.grid;
+      if (!grid?.isSquare) return wrapped(name, opts);
+      const layer = this.highlightLayers?.[name];
+      if (!layer) return;
+      const { x, y, color = 0x33BBFF, border = null, alpha = 0.25 } = opts;
+      if (!layer.highlight(x, y)) return;
+      layer.beginFill(color, alpha);
+      if (border !== null) layer.lineStyle(grid.thickness, border, Math.min(alpha * 1.5, 1.0));
+      layer.drawRect(x, y, grid.sizeX, grid.sizeY).endFill();
+    }));
   }
 
   return results;

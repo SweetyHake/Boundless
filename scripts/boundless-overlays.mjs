@@ -804,6 +804,7 @@ export const overlayMethods = {
         this._emit("virtualTileRetire", { key: fullId, vt, mesh: vt.mesh });
         if (vt.mesh) this.retireMesh(vt.mesh);
         this.activeVirtualTiles.delete(fullId);
+        this._trackedOccVirtualTiles?.delete(fullId);
         removedAny = true;
         changed = true;
       }
@@ -1089,11 +1090,13 @@ export const overlayMethods = {
         );
         const curTargetZ = layer.lastTargetZ ?? 0;
         const hasTileEditsOnLevel = Boolean(this.tileEdits?.get?.(layerId)?.size);
+        const defaultLvlElev = getLevelBaseElevation(level);
         for (const tid of candidateTids) {
           const rawTile = spec.tiles[tid];
           if (!rawTile) continue;
           if (!hasTileEditsOnLevel) {
-            if (rawTile.minZ === undefined || rawTile.hidden || (rawTile.alpha ?? 1) < 0.35 || (rawTile.elevation ?? 0) <= tokElev) continue;
+            const rawElev = Number.isFinite(rawTile.elevation) ? rawTile.elevation : defaultLvlElev;
+            if (rawTile.minZ === undefined || rawTile.hidden || (rawTile.alpha ?? 1) < 0.35 || rawElev <= tokElev) continue;
             if (rawTile.maxZ !== undefined && curTargetZ > rawTile.maxZ) continue;
           }
           const tSpec = this.resolveVirtualTile(layerId, tid, rawTile, level);

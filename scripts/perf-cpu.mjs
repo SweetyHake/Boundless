@@ -1389,14 +1389,25 @@ function patchMiscCpuGuards() {
         let opts = this._blAnimOpts;
         if (!opts || this._blAnimSrc !== anim) {
           opts = {};
+          let nKeys = 0;
           for (const k in anim) {
-            if (k !== "animation") opts[k] = anim[k];
+            if (k !== "animation") { opts[k] = anim[k]; nKeys++; }
           }
           this._blAnimSrc = anim;
           this._blAnimOpts = opts;
+          this._blAnimKeys = nKeys;
         } else {
+          let nKeys = 0;
           for (const k in anim) {
-            if (k !== "animation") opts[k] = anim[k];
+            if (k !== "animation") { opts[k] = anim[k]; nKeys++; }
+          }
+          if (nKeys !== this._blAnimKeys) {
+            opts = {};
+            for (const k in anim) {
+              if (k !== "animation") opts[k] = anim[k];
+            }
+            this._blAnimOpts = opts;
+            this._blAnimKeys = nKeys;
           }
         }
         return fn.call(this, dt, opts);
@@ -1473,26 +1484,50 @@ function patchMiscCpuGuards() {
     ) {
       return wrapped(phase);
     }
-    let hasChanges = false;
-    let hasActive = false;
+    const isInitial = phase === "initial";
+    const statuses = isInitial ? this.statuses : null;
     for (const effect of this.allApplicableEffects()) {
       if (!effect?.active) continue;
-      hasActive = true;
-      if (effect.system?.changes?.length > 0) {
-        hasChanges = true;
-        break;
+      if (effect.system?.changes?.length > 0) return wrapped(phase);
+      if (statuses && effect.statuses) {
+        for (const statusId of effect.statuses) statuses.add(statusId);
       }
     }
-    if (hasChanges) return wrapped(phase);
     this._completedActiveEffectPhases.add(phase);
-    if (phase === "initial" && hasActive && this.statuses) {
-      for (const effect of this.allApplicableEffects()) {
-        if (!effect?.active || !effect.statuses) continue;
-        for (const statusId of effect.statuses) this.statuses.add(statusId);
-      }
-    }
     if (this.tokenActiveEffectChanges) this.tokenActiveEffectChanges[phase] = [];
   }, { type: "MIXED" });
+
+  // Lazy TokenDocument#applyActiveEffects: v14 calls actor.getRollData() BEFORE checking if tokenActiveEffectChanges[phase] is empty!
+  wrapFoundryMethod("TokenDocument", "applyActiveEffects", function (wrapped, phase) {
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception) {
+      const raw = this.actor?.tokenActiveEffectChanges?.[phase];
+      if (!raw || raw.length === 0) return;
+    }
+    return wrapped(phase);
+  }, { type: "MIXED" });
+
+  // Skip no-op empty TokenRuler#refresh during scene load (avoids 2N measureMovementPath([]) + async DOM calls on idle tokens)
+  const TokenRulerCls = globalThis.foundry?.canvas?.placeables?.tokens?.TokenRuler;
+  if (TokenRulerCls?.prototype?.refresh) {
+    wrapTargetMethod(TokenRulerCls.prototype, "refresh", "TokenRuler.prototype.refresh", function (wrapped, data) {
+      if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && data) {
+        const hasPassed = Boolean(data.passedWaypoints?.length);
+        const hasPending = Boolean(data.pendingWaypoints?.length);
+        let hasPlanned = false;
+        const pm = data.plannedMovement;
+        if (pm) {
+          for (const _ in pm) { hasPlanned = true; break; }
+        }
+        if (!hasPassed && !hasPending && !hasPlanned) {
+          if (!this._blRulerHasContent) return;
+          this._blRulerHasContent = false;
+          return wrapped(data);
+        }
+        this._blRulerHasContent = true;
+      }
+      return wrapped(data);
+    });
+  }
 
   // Safe partial lighting rebuild: when only vision sources moved on a light-heavy standard scene (>= 16 lights),
   // rebuild only the vision branch instead of clearing & re-adding all 50-150 static light meshes every step.

@@ -119,6 +119,7 @@ class MegaWorld1000 {
   // Virtual Streamed Tiles (per level: "${levelId}::${tid}", supports all Foundry v14 Tile properties)
   activeVirtualTiles = new Map();
   virtualTilePending = new Set();
+  _trackedOccVirtualTiles = new Set();
 
   // Lightweight public event bus for third-party integrations (e.g. burn-living-map) — avoids per-frame polling
   _eventListeners = new Map();
@@ -861,6 +862,7 @@ class MegaWorld1000 {
               this._emit("virtualTileRetire", { key: k, vt, mesh: vt.mesh });
               this.retireMesh(vt.mesh);
               this.activeVirtualTiles.delete(k);
+              this._trackedOccVirtualTiles.delete(k);
             }
           }
           for (const [k, e] of Array.from(this.tilesByKey.entries())) {
@@ -1367,6 +1369,7 @@ class MegaWorld1000 {
     }
     this.activeVirtualTiles.clear();
     this.virtualTilePending.clear();
+    this._trackedOccVirtualTiles.clear();
 
     for (const m of this.meshPool) destroyMeshSafe(m);
     this.meshPool = [];

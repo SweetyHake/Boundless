@@ -214,17 +214,27 @@ export const editsMethods = {
     }
     const [x, y, dim, bright, color, alpha, anim, customElev, extra] = raw;
     const ex = extra && typeof extra === "object" ? extra : null;
+    if (!ex) {
+      return {
+        levelId, sk, idx, lKey,
+        x, y, dim: dim || 0, bright: bright || 0,
+        color: color ?? null, alpha: alpha ?? 0.5, anim: anim || "",
+        elevation: Number.isFinite(customElev) ? customElev : defaultElev,
+        hidden: false, walls: true, angle: 360, rotation: 0, darkMin: 0, darkMax: 1,
+        speed: 3, intensity: 3, attenuation: 0.5, luminosity: 0.5, coloration: null
+      };
+    }
     return {
       levelId, sk, idx, lKey,
       x, y, dim: dim || 0, bright: bright || 0,
       color: color ?? null, alpha: alpha ?? 0.5, anim: anim || "",
       elevation: Number.isFinite(customElev) ? customElev : defaultElev,
-      hidden: Boolean(ex?.hidden),
-      walls: ex?.walls !== false,
-      angle: ex?.angle ?? 360,
-      rotation: ex?.rotation ?? 0,
-      darkMin: ex?.darkMin ?? 0,
-      darkMax: ex?.darkMax ?? 1,
+      hidden: Boolean(ex.hidden),
+      walls: ex.walls !== false,
+      angle: ex.angle ?? 360,
+      rotation: ex.rotation ?? 0,
+      darkMin: ex.darkMin ?? 0,
+      darkMax: ex.darkMax ?? 1,
       ...extractLightStyle(ex)
     };
   },
@@ -333,6 +343,7 @@ export const editsMethods = {
       if (vt.mesh) this.retireMesh(vt.mesh);
     }
     this.activeVirtualTiles.clear();
+    this._trackedOccVirtualTiles?.clear();
     this.virtualTilePending.clear();
     this.pendingVirtualTileMounts = [];
     this._pendingVirtualTileKeys.clear();

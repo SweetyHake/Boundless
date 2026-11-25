@@ -871,7 +871,10 @@ export class TokenImpostorLayer {
       try {
         const bmp = await workerPool.decode(src, { priority: 1, maxDim: 256 });
         if (bmp) return { drawable: bmp, shouldClose: true };
-      } catch {}
+      } catch (err) {
+        // Do not retry 404/410 or cancelled decodes on the main thread
+        if (err?.notFound || err?.aborted) return { drawable: null, shouldClose: false };
+      }
     }
     if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
       try {

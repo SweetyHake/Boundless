@@ -3118,3 +3118,19 @@ test("applyLightingRenderScale binds childAdded/childRemoved on CanvasDarknessEf
     PERF_CONFIG.perfEnabled = prevEn;
   }
 });
+
+test("resolveVirtualLight inline fast-path matches extractLightStyle defaults when extra is null", async () => {
+  installBaseGlobals();
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+  const { extractLightStyle } = await import("../scripts/light-batch.mjs");
+  const ctrl = { ...editsMethods, lightEdits: new Map() };
+  const lvl = { id: "l0", elevation: { bottom: 10, top: 30 } };
+  const res = ctrl.resolveVirtualLight("l0", "0_0", 0, [100, 200, 40, 20, "#ffaa00", 0.5, "torch", null, null], lvl);
+  const def = extractLightStyle(null);
+  assert.equal(res.attenuation, def.attenuation);
+  assert.equal(res.luminosity, def.luminosity);
+  assert.equal(res.speed, def.speed);
+  assert.equal(res.intensity, def.intensity);
+  assert.equal(res.coloration, def.coloration);
+  assert.equal(res.elevation, 16);
+});
