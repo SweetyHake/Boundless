@@ -418,8 +418,10 @@ export class VirtualLayerEditors {
     this._lightGen++;
     this._purgeMountQueue("light");
     const keptKeys = keepProtected ? new Set() : null;
+    const curLid = canvas?.level?.id;
+    const lvlEdits = curLid ? this.controller?.lightEdits?.get?.(curLid) : null;
     for (const entry of Array.from(this.lightsByKey.values())) {
-      if (keepProtected) {
+      if (keepProtected && entry.levelId === curLid && lvlEdits?.get(entry.key) !== null) {
         const sheet = getExistingSheet(entry.doc);
         if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
           keptKeys.add(entry.key);
@@ -815,8 +817,10 @@ export class VirtualLayerEditors {
     this._soundGen++;
     this._purgeMountQueue("sound");
     const keptKeys = keepProtected ? new Set() : null;
+    const curLid = canvas?.level?.id;
+    const lvlEdits = curLid ? this.controller?.soundEdits?.get?.(curLid) : null;
     for (const entry of Array.from(this.soundsByKey.values())) {
-      if (keepProtected) {
+      if (keepProtected && entry.levelId === curLid && lvlEdits?.get(entry.key) !== null) {
         const sheet = getExistingSheet(entry.doc);
         if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
           keptKeys.add(entry.key);
@@ -1180,8 +1184,10 @@ export class VirtualLayerEditors {
     this._tileGen++;
     this._purgeMountQueue("tile");
     const keptKeys = keepProtected ? new Set() : null;
+    const curLid = canvas?.level?.id;
+    const lvlEdits = curLid ? this.controller?.tileEdits?.get?.(curLid) : null;
     for (const entry of Array.from(this.tilesByKey.values())) {
-      if (keepProtected) {
+      if (keepProtected && entry.levelId === curLid && lvlEdits?.get(entry.key) !== null) {
         const sheet = getExistingSheet(entry.doc);
         if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
           keptKeys.add(entry.key);

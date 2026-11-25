@@ -91,14 +91,15 @@ export const pyramidMethods = {
   },
 
   _getCameraStorageKey(scene = canvas.scene) {
-    if (!scene?.id) return null;
+    const sid = typeof scene === "string" ? scene : scene?.id;
+    if (!sid) return null;
     const worldId = game.world?.id || "world";
-    return `${CAMERA_STORAGE_PREFIX}.${worldId}.${scene.id}`;
+    return `${CAMERA_STORAGE_PREFIX}.${worldId}.${sid}`;
   },
 
-  _saveCameraNow(force = false) {
+  _saveCameraNow(force = false, sceneOrId = null) {
     if (!this.active || this._restoringCamera || (!force && !canvas?.ready) || !canvas?.stage?.pivot || !canvas.stage.scale) return;
-    const key = this._getCameraStorageKey();
+    const key = this._getCameraStorageKey(sceneOrId || this._mountedSceneId || canvas.scene);
     if (!key) return;
     const x = canvas.stage.pivot.x;
     const y = canvas.stage.pivot.y;
@@ -1027,7 +1028,7 @@ export const pyramidMethods = {
       x: spec.x,
       y: spec.y,
       src: spec.src,
-      tint: spec.tint ?? 0xffffff,
+      tint: spec.tint ?? null,
       x0,
       y0,
       sizePx,
@@ -1130,8 +1131,9 @@ export const pyramidMethods = {
     if (isFg) m._occludedBySameElevationSurfaces = false;
     m.occludedAlpha = layer.isUpper ? 0.08 : 1.0;
     m.hoverFade = layer.isUpper;
-    // On single-level worlds skip coarse z=0 depth writes; on multi-level scenes z=0 MUST write depth so lower-level (basement) lights never bleed through floors when zoomed all the way out!
-    const needZ0Depth = this.visibleLevelLayers.length > 1;
+    // On single-level worlds skip coarse z=0 depth writes; on multi-level scenes (including hybrid Boundless+native)
+    // z=0 MUST write depth so lower-level (basement) lights never bleed through floors when zoomed all the way out!
+    const needZ0Depth = this._hasMultiElevationDepth ? this._hasMultiElevationDepth() : (this.visibleLevelLayers.length > 1);
     m.restrictsLight = !isFg && (e.z > 0 || needZ0Depth);
     m.restrictsWeather = !isFg && (e.z > 0 || needZ0Depth);
 
@@ -1162,9 +1164,9 @@ export const pyramidMethods = {
     canvas.primary.addChild(m);
     m.updateCanvasTransform?.();
     // Static ground/lower pyramid tiles never move so skip per-frame quadtree churn;
-    // ONLY use plain PIXI "batch" when the tile does NOT write to CanvasDepthMask (restrictsLight/restrictsWeather require "batchOcclusion" / DepthSamplerShader!)
+    // ONLY use plain PIXI "batch" when the tile does NOT write to CanvasDepthMask AND does not use occlusionMode (e.g. SURFACE on foreground)!
     if (!layer.isUpper) {
-      if (!m.restrictsLight && !m.restrictsWeather) m.pluginName = "batch";
+      if (!m.restrictsLight && !m.restrictsWeather && m.occlusionMode === CONST.OCCLUSION_MODES.NONE) m.pluginName = "batch";
       m.updateCanvasTransform = NOOP_TRANSFORM;
       if (!isFg && e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
     }
@@ -1238,8 +1240,18 @@ export const pyramidMethods = {
         const fgZ0 = this.tilesByKey.get(`${lid}::fg::0_0_0`);
         // For sparse foreground pyramids, once targetZ > 0 and all visible desired fg tiles are ready
         // (even 0 tiles in an empty open-field area), hide the coarse z=0 fallback so walls never double-render.
+        let allVisDesiredFgReady = Boolean(stFg?.visDesiredReady);
+        if (!stFg && layer.lastForegroundTargetZ > 0 && layer.foregroundTileSet) {
+          allVisDesiredFgReady = true;
+          for (const [, tile] of this.tilesByKey) {
+            if (tile.levelId === lid && tile.channel === "fg" && tile.desired && tile.z === layer.lastForegroundTargetZ && (!tile.ready || tile.awaitingSwap)) {
+              allVisDesiredFgReady = false;
+              break;
+            }
+          }
+        }
         const fgCovered = Boolean(
-          layer.lastForegroundTargetZ > 0 && stFg?.visDesiredReady
+          layer.lastForegroundTargetZ > 0 && allVisDesiredFgReady
         ) || this._isViewportCoveredByHigherTiles(layer, visVp, "fg");
         if (fgZ0?.mesh) {
           const shouldShowFgBase = !fgCovered;
@@ -1255,7 +1267,8 @@ export const pyramidMethods = {
       canvas.primary.sortDirty = true;
     }
     if (anyBgChanged) {
-      this._markDepthDirty({ elev: true, syncElev: this.visibleLevelLayers.length > 1 });
+      const multiElev = this._hasMultiElevationDepth ? this._hasMultiElevationDepth() : (this.visibleLevelLayers.length > 1);
+      this._markDepthDirty({ elev: true, syncElev: multiElev });
     }
     return anyBgChanged || anyFgChanged;
   },
@@ -1503,6 +1516,18 @@ export const pyramidMethods = {
         const m = nativeTiles[i]?.mesh;
         if (!m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
         const v = (0x200000 ^ (i << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
+        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+        occCount++;
+      }
+    }
+    if (this.tilesByKey.size > 0) {
+      let ptIdx = 0;
+      for (const e of this.tilesByKey.values()) {
+        const m = e?.mesh;
+        if (!e?.ready || !e.layer?.isUpper || !m || m.destroyed || !m.visible || (!m.restrictsLight && !m.restrictsWeather)) continue;
+        ptIdx++;
+        const v = (0x300000 ^ (ptIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
         occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
         occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
         occCount++;

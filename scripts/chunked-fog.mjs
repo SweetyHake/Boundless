@@ -1217,20 +1217,18 @@ export class ChunkedFogManager {
     const sceneResetId = scene?.flags?.[MODULE_ID]?.fogResetId?.[this.levelId] || "";
 
     // Discard stale user-flag exploration written before the latest GM fog reset (e.g. Assistant GM or in-flight race).
-    // Prefer exact sceneResetId comparison (immune to GM vs player clock skew); only fall back to timestamp when resetId is absent.
+    // Prefer exact sceneResetId comparison (immune to GM vs player clock skew); missing fogMeta on a reset scene is treated as stale.
     if (personalFromUser && (sceneResetId || resetAt > 0)) {
       const meta = game.user?.flags?.[MODULE_ID]?.fogMeta?.[this.sceneId]?.[this.levelId];
-      if (meta && typeof meta === "object") {
-        const isStale = sceneResetId
-          ? (meta.resetId !== sceneResetId)
-          : (resetAt > 0 && (Number(meta.savedAt) || 0) < resetAt);
-        if (isStale) {
-          personalFromUser = null;
-          game.user?.update?.({
-            [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null,
-            [`flags.${MODULE_ID}.fogMeta.${this.sceneId}.-=${this.levelId}`]: null
-          })?.catch?.(() => {});
-        }
+      const isStale = sceneResetId
+        ? (!meta || meta.resetId !== sceneResetId)
+        : (resetAt > 0 && (Number(meta?.savedAt) || 0) < resetAt);
+      if (isStale) {
+        personalFromUser = null;
+        game.user?.update?.({
+          [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null,
+          [`flags.${MODULE_ID}.fogMeta.${this.sceneId}.-=${this.levelId}`]: null
+        })?.catch?.(() => {});
       }
     }
 

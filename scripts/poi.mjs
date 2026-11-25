@@ -822,7 +822,8 @@ export class PoiManager {
     }
 
     const activeManifest = manifest ?? this.controller?.manifest;
-    const sg = activeManifest?.superGrid ? activeManifest.superGrid : null;
+    const explicitlyEmptied = Array.isArray(cfg.pois) && cfg.pois.length === 0;
+    const sg = (!explicitlyEmptied && cfg.showSubPois !== false && activeManifest?.superGrid) ? activeManifest.superGrid : null;
     this._superGridInfo = sg
       ? { cols: sg.cols || 6, rows: sg.rows || 6, regionPx: sg.regionPx || 100000 }
       : null;

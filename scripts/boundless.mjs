@@ -650,6 +650,7 @@ class MegaWorld1000 {
   }
 
   _hasMultiElevationDepth() {
+    if (this.visibleLevelLayers?.length > 1) return true;
     const visibleLevels = (canvas.scene?.levels?.sorted || []).filter(l => l.isVisible);
     if (visibleLevels.length > 1) return true;
     const baseElev = getLevelBaseElevation(canvas.level);
@@ -815,50 +816,71 @@ class MegaWorld1000 {
       this._webglContextLostView = glView;
       this._webglContextLostFn = () => {
         console.warn(`${MODULE_ID} | WebGL context lost; releasing non-pinned texture cache.`);
+        this.pendingTileMounts.length = 0;
+        this.pendingOverlayMounts.length = 0;
+        this._pendingOverlayKeys.clear();
+        this.pendingVirtualTileMounts.length = 0;
+        this._pendingVirtualTileKeys.clear();
         this.texMgr.clear(false);
       };
       this._webglContextRestoredFn = () => {
-        if (!this.active || this._mounting) return;
-        console.info(`${MODULE_ID} | WebGL context restored; rebuilding GPU roof mask and broken textures.`);
-        // Purge active overlays, virtual tiles, and pyramid tiles referencing destroyed BaseTextures
-        for (const [k, ov] of Array.from(this.activeOverlays.entries())) {
-          if ((ov.roofMesh && !isTextureUsable(ov.roofMesh.texture)) || (ov.wallsMesh && !isTextureUsable(ov.wallsMesh.texture))) {
-            if (ov.roofMesh) this._emit("overlayRetire", { key: k, ov, mesh: ov.roofMesh });
-            if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
-            if (ov.roofMesh) this.retireMesh(ov.roofMesh);
-            this.activeOverlays.delete(k);
+        const runRestore = () => {
+          if (!this.active) return;
+          console.info(`${MODULE_ID} | WebGL context restored; rebuilding GPU roof mask and broken textures.`);
+          this.pendingTileMounts.length = 0;
+          this.pendingOverlayMounts.length = 0;
+          this._pendingOverlayKeys.clear();
+          this.pendingVirtualTileMounts.length = 0;
+          this._pendingVirtualTileKeys.clear();
+          // Purge active overlays, virtual tiles, and pyramid tiles referencing destroyed BaseTextures
+          for (const [k, ov] of Array.from(this.activeOverlays.entries())) {
+            if ((ov.roofMesh && !isTextureUsable(ov.roofMesh.texture)) || (ov.wallsMesh && !isTextureUsable(ov.wallsMesh.texture))) {
+              if (ov.roofMesh) this._emit("overlayRetire", { key: k, ov, mesh: ov.roofMesh });
+              if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
+              if (ov.roofMesh) this.retireMesh(ov.roofMesh);
+              this.activeOverlays.delete(k);
+            }
           }
-        }
-        for (const [k, vt] of Array.from(this.activeVirtualTiles.entries())) {
-          if (vt?.mesh && !isTextureUsable(vt.mesh.texture)) {
-            this._emit("virtualTileRetire", { key: k, vt, mesh: vt.mesh });
-            this.retireMesh(vt.mesh);
-            this.activeVirtualTiles.delete(k);
+          for (const [k, vt] of Array.from(this.activeVirtualTiles.entries())) {
+            if (vt?.mesh && !isTextureUsable(vt.mesh.texture)) {
+              this._emit("virtualTileRetire", { key: k, vt, mesh: vt.mesh });
+              this.retireMesh(vt.mesh);
+              this.activeVirtualTiles.delete(k);
+            }
           }
-        }
-        for (const [k, e] of Array.from(this.tilesByKey.entries())) {
-          if (e?.mesh && !isTextureUsable(e.mesh.texture)) {
-            this.retireMesh(e.mesh);
-            this.tilesByKey.delete(k);
+          for (const [k, e] of Array.from(this.tilesByKey.entries())) {
+            if (e?.mesh && !isTextureUsable(e.mesh.texture)) {
+              this.retireMesh(e.mesh);
+              this.tilesByKey.delete(k);
+            }
           }
+          for (const layer of this.visibleLevelLayers) {
+            layer.lastPyramidKey = "";
+            layer.lastForegroundPyramidKey = "";
+            layer.lastOverlayKey = "";
+            layer.lastTileKey = "";
+          }
+          if (this.lightBatch?.bakedRoofMask) {
+            try { this.lightBatch.bakedRoofMask.destroy(true); } catch {}
+            this.lightBatch.bakedRoofMask = null;
+            this.lightBatch.useBakedRoofMask = false;
+          }
+          this._syncIndoorLightVisibility?.();
+          this._bakeRoofMask(this.visibleLevelLayers, canvas.scene?.id, canvas.level?.id);
+          if (this.tokenStreamer?.impostors?.atlasTexture?.baseTexture) {
+            this.tokenStreamer.impostors.atlasDirty = true;
+            this.tokenStreamer.impostors.flush({ forceAtlas: true });
+          }
+          this._markDepthDirty({ elev: true, syncElev: true });
+          this._occlusionDirty = true;
+          this.invalidateShowstopperSurfaces?.();
+          this.updatePyramid();
+        };
+        if (this._mounting && this._mountPromise) {
+          this._mountPromise.finally(() => runRestore());
+          return;
         }
-        for (const layer of this.visibleLevelLayers) {
-          layer.lastPyramidKey = "";
-          layer.lastForegroundPyramidKey = "";
-          layer.lastOverlayKey = "";
-          layer.lastTileKey = "";
-        }
-        if (this.lightBatch?.bakedRoofMask) {
-          try { this.lightBatch.bakedRoofMask.destroy(true); } catch {}
-          this.lightBatch.bakedRoofMask = null;
-          this.lightBatch.useBakedRoofMask = false;
-        }
-        this._bakeRoofMask(this.visibleLevelLayers, canvas.scene?.id, canvas.level?.id);
-        if (this.tokenStreamer?.impostors?.atlasTexture?.baseTexture) {
-          this.tokenStreamer.impostors.atlasDirty = true;
-          this.tokenStreamer.impostors.flush();
-        }
-        this.updatePyramid();
+        runRestore();
       };
       glView.addEventListener("webglcontextlost", this._webglContextLostFn, false);
       glView.addEventListener("webglcontextrestored", this._webglContextRestoredFn, false);
@@ -1105,7 +1127,7 @@ class MegaWorld1000 {
     const wasActive = this.active;
     const prevSceneId = this._mountedSceneId;
     if (wasActive) {
-      this._saveCameraNow(true);
+      this._saveCameraNow(true, prevSceneId);
       this._emit("unmount", {});
       Hooks.callAll("boundlessUnmount", this);
     }

@@ -591,16 +591,18 @@ export class CharacterPinManager {
 
   _getCircularAvatarTexture(src) {
     if (!src) return Promise.resolve(null);
+    const gen = this._mountGen || 0;
     if (this._avatarTexCache.has(src)) {
       return this._avatarTexCache.get(src).then((cachedTex) => {
-        if (cachedTex && !cachedTex.destroyed && cachedTex.baseTexture && !cachedTex.baseTexture.destroyed) {
+        if (!cachedTex) return null;
+        if (!cachedTex.destroyed && cachedTex.baseTexture && !cachedTex.baseTexture.destroyed) {
           return cachedTex;
         }
+        if (gen !== (this._mountGen || 0)) return null;
         this._avatarTexCache.delete(src);
         return this._getCircularAvatarTexture(src);
       });
     }
-    const gen = this._mountGen || 0;
     const promise = bakeCircularAvatarTexture(src, 128).then((tex) => {
       if (gen !== (this._mountGen || 0)) {
         if (tex) try { tex.destroy(true); } catch {}

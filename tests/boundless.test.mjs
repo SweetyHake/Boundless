@@ -53,7 +53,7 @@ test("foreground pyramid meshes sort above tokens, below roofs and upper floors,
   assert.equal(fgZ2.mesh.sortLayer, 0);
   assert.equal(fgZ2.mesh.sort, -180);
   assert.equal(fgZ2.mesh.restrictsLight, false);
-  assert.equal(fgZ2.mesh.pluginName, "batch");
+  assert.notEqual(fgZ2.mesh.pluginName, "batch", "foreground SURFACE occlusion must not be downgraded to plain PIXI batch");
   assert.equal(fgZ2.mesh._occludedBySameElevationSurfaces, false);
 
   b.retireMesh(bgZ0.mesh);

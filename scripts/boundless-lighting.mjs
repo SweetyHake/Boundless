@@ -64,6 +64,7 @@ export const lightingMethods = {
     const rangedChanged = this.lightBatch.syncDarknessLevel(darkness);
     this.lightBatch.attachTo(effects);
     this._optimizeEffectsLayers(effects);
+    if (this._lightFades?.size > 0) this._stepDynamicLightFades(0);
     this.tokenStreamer.onVisibilityChanged();
     if (rangedChanged) {
       this._depthDirty = true;
@@ -629,14 +630,22 @@ export const lightingMethods = {
       let newVpPromotes = 0;
 
       if (force || dynKey !== this.lastDynLightKey || edgesChanged || (dynKey === "" && this.dynamicLights.size > 0)) {
+        const curDarkness = canvas?.environment?.darknessLevel ?? 0;
+        const hidingIndoors = Boolean(this.lightBatch?.hideIndoorLights);
         for (const [lid, ls] of this.dynamicLights) {
           if (!neededDynLights.has(lid)) {
+            const meta = this.lightBatch.lightMetaById.get(lid);
+            const suppressedByRoofOrDarkness = Boolean(
+              (hidingIndoors && meta?.isIndoor) ||
+              (meta && (curDarkness < (meta.darkMin ?? 0) || curDarkness > (meta.darkMax ?? 1)))
+            );
             const canSmoothRetire = Boolean(
               !force &&
               !this._mounting &&
+              !suppressedByRoofOrDarkness &&
               !isLightSourceDead(ls) &&
               ls._boundlessVpAnimOnly &&
-              this.lightBatch.lightMetaById.has(lid) &&
+              meta &&
               ls.layers?.coloration?.mesh?.shader?.uniforms
             );
             if (canSmoothRetire) {

@@ -257,9 +257,9 @@ function getTokenRenderSpec(doc) {
   const ringColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.ring, ringInfo?.defaultRingCss || "") : "";
   const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, ringInfo?.defaultBkgCss || "") : "";
 
-  const liveRingSuffix = (liveRingName || liveBkgName) ? `|${liveRingName}:${liveBkgName}` : "";
+  // Use canonical ring key (independent of live doc._object?.ring) so mounting a native DTR token never doubles atlas slot usage
   const slotKey = ringEnabled
-    ? `R${hasDistinctSubject ? "P" : "C"}|${ringPack}${liveRingSuffix}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
+    ? `R${hasDistinctSubject ? "P" : "C"}|${ringPack}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
     : `T|${artSrc}`;
 
   return {
@@ -676,8 +676,12 @@ export class TokenImpostorLayer {
 
   _requestAtlasSlot(spec) {
     if (!spec?.artSrc) return null;
+    const now = performance.now();
     let slot = this.slotsByKey.get(spec.slotKey);
-    if (slot) return slot;
+    if (slot) {
+      slot.lastUsedMs = now;
+      return slot;
+    }
 
     const colsPerRow = Math.floor(this.atlasSize / CELL_PX);
     const maxSlots = colsPerRow * colsPerRow;
@@ -687,7 +691,7 @@ export class TokenImpostorLayer {
       col = idx % colsPerRow;
       row = Math.floor(idx / colsPerRow);
     } else {
-      // Recycle an unused or failed atlas slot (zero refcount in docsByKey, or permanently failed decode)
+      // 1. Prefer unused or failed atlas slots
       let victimKey = null;
       let victimSlot = null;
       for (const [k, s] of this.slotsByKey) {
@@ -698,7 +702,47 @@ export class TokenImpostorLayer {
           break;
         }
       }
+      // 2. Fallback: LRU-evict an atlas slot whose tokens are not on the currently viewed level (or oldest non-visible)
+      if (!victimSlot) {
+        const sceneTokens = globalThis.canvas?.scene?.tokens;
+        let oldestOffLevelKey = null, oldestOffLevelSlot = null, oldestOffLevelMs = Infinity;
+        let oldestAnyKey = null, oldestAnySlot = null, oldestAnyMs = Infinity;
+        for (const [k, s] of this.slotsByKey) {
+          if (s.decoding) continue;
+          const usedMs = s.lastUsedMs || 0;
+          const ids = this.docsByKey.get(k);
+          let hasViewed = false;
+          if (ids && sceneTokens) {
+            for (const docId of ids) {
+              if (sceneTokens.get(docId)?.viewed) { hasViewed = true; break; }
+            }
+          }
+          if (!hasViewed && usedMs < oldestOffLevelMs) {
+            oldestOffLevelMs = usedMs;
+            oldestOffLevelKey = k;
+            oldestOffLevelSlot = s;
+          }
+          if (usedMs < oldestAnyMs) {
+            oldestAnyMs = usedMs;
+            oldestAnyKey = k;
+            oldestAnySlot = s;
+          }
+        }
+        victimKey = oldestOffLevelSlot ? oldestOffLevelKey : oldestAnyKey;
+        victimSlot = oldestOffLevelSlot || oldestAnySlot;
+      }
       if (!victimSlot) return null;
+      // Clear atlasRect of any tokens that previously pointed to the evicted slot so they don't render the new token's art
+      const evictedDocIds = this.docsByKey.get(victimKey);
+      if (evictedDocIds?.size && this.atlasRectArr) {
+        for (const docId of evictedDocIds) {
+          const idx = this.docIndexById.get(docId);
+          if (idx !== undefined) {
+            this._writeQuad4(this.atlasRectArr, idx, 0, 0, 0, 0);
+            this._bufDirty.atlasRect = true;
+          }
+        }
+      }
       this.slotsByKey.delete(victimKey);
       this._decodeQueuedSet.delete(victimKey);
       col = victimSlot.col;
@@ -713,6 +757,7 @@ export class TokenImpostorLayer {
       v0: (row * CELL_PX + PAD_PX) * inv,
       uSpan: CONTENT_PX * inv,
       spec,
+      lastUsedMs: now,
       ready: false,
       failed: false,
       decoding: false
@@ -1102,9 +1147,11 @@ export class TokenImpostorLayer {
     const slot = spec.artSrc ? this._requestAtlasSlot(spec) : null;
     const hasSlot = Boolean(slot?.ready);
 
-    // Keep Dynamic Token Rings circular even on non-square (e.g. 2x1) footprints
-    const halfW = spec.ringEnabled ? (Math.min(w, h) * 0.5) : (w * 0.5);
-    const halfH = spec.ringEnabled ? (Math.min(w, h) * 0.5) : (h * 0.5);
+    // Keep Dynamic Token Rings circular (min(w, h)) and non-ring art square (max(w, h)) because _decodeAndPack
+    // already letterboxes raw art with its authentic aspect ratio inside the square atlas cell (avoids double-squashing 2x1/1x2 tokens).
+    const halfDim = spec.ringEnabled ? (Math.min(w, h) * 0.5) : (Math.max(w, h) * 0.5);
+    const halfW = halfDim;
+    const halfH = halfDim;
 
     this._writeQuad2(this.centerArr, idx, cx, cy);
     this._writeQuad4(this.sizeInfoArr, idx, halfW, halfH, rotRad, elev);
@@ -1451,13 +1498,13 @@ export class TokenImpostorLayer {
     }
   }
 
-  flush() {
+  flush({ forceAtlas = false } = {}) {
     if (!this.mounted) return;
     if (this.atlasDirty && this.atlasTexture?.baseTexture) {
       const now = performance.now();
       const stillStreaming = this._activeDecodes > 0 || this._decodeQueue.length > 0;
       // Coalesce expensive 2048x2048 mipmapped atlas uploads while portraits are actively streaming in
-      if (!stillStreaming || (now - (this._lastAtlasUploadMs || 0)) >= 180) {
+      if (forceAtlas || !stillStreaming || (now - (this._lastAtlasUploadMs || 0)) >= 180) {
         this.atlasDirty = false;
         this._lastAtlasUploadMs = now;
         this.atlasTexture.baseTexture.update();

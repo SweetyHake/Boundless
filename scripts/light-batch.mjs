@@ -107,6 +107,21 @@ function indexEdgeByAabb(sectorEdges, fallbackSk, edge, simSectorPx) {
       }
       return;
     }
+    // For ultra-long walls (> 16 sectors), walk along the segment (O(steps)) so every crossed sector indexes the edge
+    const steps = Math.min(256, Math.max(Math.abs(sx1 - sx0), Math.abs(sy1 - sy0)) * 2 + 1);
+    const visited = new Set();
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const sx = Math.max(0, Math.floor((edge.a.x + (edge.b.x - edge.a.x) * t) / simSectorPx));
+      const sy = Math.max(0, Math.floor((edge.a.y + (edge.b.y - edge.a.y) * t) / simSectorPx));
+      const tSk = `${sx}_${sy}`;
+      if (visited.has(tSk)) continue;
+      visited.add(tSk);
+      let arr = sectorEdges.get(tSk);
+      if (!arr) { arr = []; sectorEdges.set(tSk, arr); }
+      arr.push(edge);
+    }
+    return;
   }
   let arr = sectorEdges.get(fallbackSk);
   if (!arr) { arr = []; sectorEdges.set(fallbackSk, arr); }
@@ -512,48 +527,47 @@ void main() {
   float animRot = 0.0;
   float animAmp = 0.0;
 
-  if (aParams.w >= 4000.0) {
-    // Mode 4: Rotating directional beam / lighthouse cone (no nearby wall shadow distortion)
-    float ph = aParams.w - 4000.0;
-    float rot = uTime * (max(aStyle.z, 0.0) * 0.28) + ph;
-    float cr = cos(rot);
-    float sr = sin(rot);
-    effOffset = vec2(aOffset.x * cr - aOffset.y * sr, aOffset.x * sr + aOffset.y * cr);
-    float amp = clamp(aStyle.w * 0.06, 0.0, 0.55);
-    pulse = 0.85 + amp * 0.35 * sin(rot * 2.0);
-  } else if (aParams.w >= 3000.0) {
-    // Mode 3: Chroma / Rainbow hue cycle
-    float ph = aParams.w - 3000.0;
-    float ang = uTime * (max(aStyle.z, 0.0) * 0.45) + ph;
-    effColor = rotateHue(aColor, ang);
-    float amp = clamp(aStyle.w * 0.05, 0.0, 0.4);
-    pulse = 0.82 + amp * (0.5 + 0.5 * sin(ang * 2.0));
-  } else if (aParams.w >= 2000.0) {
-    // Mode 2: Rotating angular rays inside shadowed polygon (sunburst / vortex / revolving)
-    float ph = aParams.w - 2000.0;
-    animRot = uTime * (max(aStyle.z, 0.0) * 0.35) + ph;
-    animAmp = clamp(aStyle.w * 0.08, 0.0, 0.85);
-    pulse = 0.82 + animAmp * 0.15 * sin(animRot);
-  } else if (aParams.w >= 1000.0) {
-    // Mode 1: Smooth pulse / wave breathing
-    float ph = aParams.w - 1000.0;
-    float t = uTime * (max(aStyle.z, 0.0) * 0.55) + ph;
-    float amp = clamp(aStyle.w * 0.085, 0.0, 0.85);
-    float wave = 0.5 + 0.5 * sin(t);
-    pulse = clamp(0.86 - amp * 0.65, 0.2, 0.95) + wave * amp * 0.65;
-    effRatio = aParams.y > 0.001 ? clamp(aParams.y * (1.0 - amp * 0.35) + wave * amp * 0.35, 0.0, 1.0) : 0.0;
-  } else if (aParams.w >= 0.0) {
-    // Mode 0: Match Foundry v14 Torch flickering with per-light speed & intensity
-    float t = uTime * (max(aStyle.z, 0.0) * 0.6) + aParams.w;
-    float s = 0.5
-      + 0.28 * sin(t)
-      + 0.14 * sin(t * 2.37 + 1.1)
-      + 0.08 * sin(t * 4.13 + 2.7);
-    float amp = clamp(aStyle.w * 0.09, 0.0, 0.9);
-    float pulseBase = clamp(0.82 - amp, 0.15, 0.95);
-    float n = clamp(s, 0.0, 1.0) * amp;
-    pulse = pulseBase + n;
-    effRatio = aParams.y > 0.001 ? clamp(aParams.y * (1.0 - amp * 0.37) + n * 0.222, 0.0, 1.0) : 0.0;
+  if (uTime >= 0.0) {
+    if (aParams.w >= 4000.0) {
+      // Mode 4: Rotating internal rays inside directional cone (preserve configured cone rotation)
+      float ph = aParams.w - 4000.0;
+      animRot = uTime * (max(aStyle.z, 0.0) * 0.35) + ph;
+      animAmp = clamp(aStyle.w * 0.08, 0.0, 0.85);
+      pulse = 0.85 + animAmp * 0.15 * sin(animRot);
+    } else if (aParams.w >= 3000.0) {
+      // Mode 3: Chroma / Rainbow hue cycle
+      float ph = aParams.w - 3000.0;
+      float ang = uTime * (max(aStyle.z, 0.0) * 0.45) + ph;
+      effColor = rotateHue(aColor, ang);
+      float amp = clamp(aStyle.w * 0.05, 0.0, 0.4);
+      pulse = 0.82 + amp * (0.5 + 0.5 * sin(ang * 2.0));
+    } else if (aParams.w >= 2000.0) {
+      // Mode 2: Rotating angular rays inside shadowed polygon (sunburst / vortex / revolving)
+      float ph = aParams.w - 2000.0;
+      animRot = uTime * (max(aStyle.z, 0.0) * 0.35) + ph;
+      animAmp = clamp(aStyle.w * 0.08, 0.0, 0.85);
+      pulse = 0.82 + animAmp * 0.15 * sin(animRot);
+    } else if (aParams.w >= 1000.0) {
+      // Mode 1: Smooth pulse / wave breathing
+      float ph = aParams.w - 1000.0;
+      float t = uTime * (max(aStyle.z, 0.0) * 0.55) + ph;
+      float amp = clamp(aStyle.w * 0.085, 0.0, 0.85);
+      float wave = 0.5 + 0.5 * sin(t);
+      pulse = clamp(0.86 - amp * 0.65, 0.2, 0.95) + wave * amp * 0.65;
+      effRatio = aParams.y > 0.001 ? clamp(aParams.y * (1.0 - amp * 0.35) + wave * amp * 0.35, 0.0, 1.0) : 0.0;
+    } else if (aParams.w >= 0.0) {
+      // Mode 0: Match Foundry v14 Torch flickering with per-light speed & intensity
+      float t = uTime * (max(aStyle.z, 0.0) * 0.6) + aParams.w;
+      float s = 0.5
+        + 0.28 * sin(t)
+        + 0.14 * sin(t * 2.37 + 1.1)
+        + 0.08 * sin(t * 4.13 + 2.7);
+      float amp = clamp(aStyle.w * 0.09, 0.0, 0.9);
+      float pulseBase = clamp(0.82 - amp, 0.15, 0.95);
+      float n = clamp(s, 0.0, 1.0) * amp;
+      pulse = pulseBase + n;
+      effRatio = aParams.y > 0.001 ? clamp(aParams.y * (1.0 - amp * 0.37) + n * 0.222, 0.0, 1.0) : 0.0;
+    }
   }
 
   vec2 worldPos = aCenter + effOffset * effectiveRadius;
@@ -674,8 +688,13 @@ void main() {
       rayMod = 1.0 - vAnimAmp * 0.45 * (0.5 - 0.5 * sin(ang * 6.0 - vAnimRot));
     }
     float edgeFade = (1.0 - smoothstep(1.0 - max(att, 0.0001), 1.0, dist)) * depthMask * rayMod;
-    float lumScale = clamp(vLuminosity * 2.0, 0.0, 2.0);
-    outCol = mix(bg, finalCol, clamp(edgeFade * lumScale, 0.0, 1.0));
+    if (vLuminosity > 0.5) {
+      vec3 boostedCol = clamp(finalCol * (1.0 + (vLuminosity - 0.5) * 1.4), 0.0, 1.0);
+      outCol = mix(bg, boostedCol, clamp(edgeFade, 0.0, 1.0));
+    } else {
+      float lumScale = clamp(vLuminosity * 2.0, 0.0, 1.0);
+      outCol = mix(bg, finalCol, clamp(edgeFade * lumScale, 0.0, 1.0));
+    }
   }
 
   gl_FragColor = vec4(outCol, 1.0);
@@ -1766,7 +1785,10 @@ export class MegaLightBatch {
     const levelId = level.id;
     const sectors = spec.sectors;
     const defaultLightElev = getLevelBaseElevation(level) + 6;
+    const prevPxPerFt = this._buildPxPerFt;
+    this._buildPxPerFt = pxPerFt;
     const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
+    this._buildPxPerFt = prevPxPerFt;
     const rawExtraSig = getLevelCacheSigFn ? String(getLevelCacheSigFn(levelId) ?? "") : "";
     const extraLevelSig = rawExtraSig.replace(/\|od:[^|]*/g, "");
     const hasSigWallEdits = Boolean(extraLevelSig && /(?:^|\|)we:(?!0(?:\||$))/.test(extraLevelSig));
@@ -2483,6 +2505,10 @@ export class MegaLightBatch {
     this.activeLightsCount += batch.activeCount;
     this.totalVertices += job.vertCursor;
 
+    const initVis = batch.activeCount > 0 && Boolean(this._lastVp);
+    illumMesh.visible = initVis;
+    colorMesh.visible = initVis;
+
     const effects = this._effects || canvas?.effects;
     if (effects) this._attachSingleBatch(batch, effects);
     if (this._lastVp) {
@@ -2636,7 +2662,7 @@ export class MegaLightBatch {
   }
 
   _getEffectiveShaderTime() {
-    if (canvas.effects?.animateLightSources === false) return this._frozenTime;
+    if (canvas.effects?.animateLightSources === false) return -1.0;
     this._frozenTime = (canvas.app?.ticker?.lastTime || 0) * 0.001;
     return this._frozenTime;
   }

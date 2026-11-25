@@ -910,7 +910,8 @@ function patchMiscCpuGuards() {
     return out;
   };
 
-  let _priorityEnvVersion = 0;
+  let _priorityLightVersion = 0;
+  let _darknessSourceVersion = 0;
 
   const sourceInitWrapper = function (wrapped, data = {}, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) {
@@ -930,16 +931,13 @@ function patchMiscCpuGuards() {
     const darkLevel = Number(((env?.darknessLevel ?? 0)).toFixed(4));
     const globalLightActive = env?.globalLightSource?.active ? 1 : 0;
     const darkSrcCount = globalThis.canvas?.effects?.darknessSources?.size || 0;
-    const isPriorityOrDarkness = Boolean(
-      this.requiresEdges === true
-      || (this.data?.priority ?? 0) > 0
-      || (data?.priority ?? 0) > 0
-      || this.constructor?.name?.includes?.("Darkness")
-    );
+    const isDarknessSrc = Boolean(this.requiresEdges === true || this.constructor?.name?.includes?.("Darkness"));
+    const isPriorityLight = !isDarknessSrc && Boolean((this.data?.priority ?? 0) > 0 || (data?.priority ?? 0) > 0);
     const stateSig = quickStateSig(this);
-    // Do not include _priorityEnvVersion in priority/darkness sources' own key so multiple darkness/priority sources never cascade-invalidate each other
-    const prioPart = isPriorityOrDarkness ? "" : `|${_priorityEnvVersion}`;
-    const curV = `${_geometryVersion}|${_edgeVersion}${prioPart}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${stateSig}`;
+    // Split priority-light vs darkness versions so multiple darkness sources or multiple Daylight sources
+    // never cascade-invalidate each other, while Daylight still invalidates darkness suppression and vice versa.
+    const envDep = `${isPriorityLight ? "" : _priorityLightVersion}:${isDarknessSrc ? "" : _darknessSourceVersion}`;
+    const curV = `${_geometryVersion}|${_edgeVersion}|${envDep}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${stateSig}`;
     const hasValidGeom = !this.attached || this.data?.disabled || isCompatibleSourceGeom(this._geometry) || Boolean(this._geometry && !this._geometry.destroyed);
     if (!options?.reset && this.shape && hasValidGeom && dataSame && this.__blSweepV === curV) {
       perfStats.sweepSkipped++;
@@ -947,18 +945,18 @@ function patchMiscCpuGuards() {
     }
     if (this.requiresEdges === true && (!dataSame || options?.reset)) _edgeVersion++;
     const envChanged = this.__blLastDark !== darkLevel || this.__blLastGlobal !== globalLightActive;
-    if (isPriorityOrDarkness && (!dataSame || options?.reset || envChanged)) _priorityEnvVersion++;
+    if (!dataSame || options?.reset || envChanged) {
+      if (isDarknessSrc) _darknessSourceVersion++;
+      else if (isPriorityLight) _priorityLightVersion++;
+    }
     perfStats.sweepRun++;
     const result = wrapped(data, options);
     this.__blLastDark = darkLevel;
     this.__blLastGlobal = globalLightActive;
-    const postIsPrio = Boolean(
-      this.requiresEdges === true
-      || (this.data?.priority ?? 0) > 0
-      || this.constructor?.name?.includes?.("Darkness")
-    );
-    const postPrioPart = postIsPrio ? "" : `|${_priorityEnvVersion}`;
-    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}${postPrioPart}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
+    const postIsDarkness = Boolean(this.requiresEdges === true || this.constructor?.name?.includes?.("Darkness"));
+    const postIsPrioLight = !postIsDarkness && Boolean((this.data?.priority ?? 0) > 0);
+    const postEnvDep = `${postIsPrioLight ? "" : _priorityLightVersion}:${postIsDarkness ? "" : _darknessSourceVersion}`;
+    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${postEnvDep}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
     return result;
   };
 

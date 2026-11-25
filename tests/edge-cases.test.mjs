@@ -2365,11 +2365,13 @@ test("VirtualLayerEditors._clearLights({ keepProtected: true }) keeps open confi
   installBaseGlobals();
   const { VirtualLayerEditors } = await import("../scripts/layer-editors.mjs");
 
+  globalThis.canvas = { level: { id: "lvl1" } };
+  let closedOnSwitch = false;
   const ed = new VirtualLayerEditors({ active: true });
   const openEntry = {
     id: "ml1", key: "0_0:l:0", levelId: "lvl1",
-    doc: { _sheet: { rendered: true, close() { throw new Error("must not close open sheet"); } } },
-    placeable: { controlled: false, destroyed: false }
+    doc: { _sheet: { rendered: true, close() { closedOnSwitch = true; } } },
+    placeable: { controlled: false, destroyed: false, destroy() {} }
   };
   const idleEntry = {
     id: "ml2", key: "0_0:l:1", levelId: "lvl1",
@@ -2382,6 +2384,199 @@ test("VirtualLayerEditors._clearLights({ keepProtected: true }) keeps open confi
   ed.lightsById.set(idleEntry.id, idleEntry);
 
   ed._clearLights({ keepProtected: true });
-  assert.equal(ed.lightsByKey.has(openEntry.key), true, "light with open sheet must survive zoom-out clear");
+  assert.equal(ed.lightsByKey.has(openEntry.key), true, "light with open sheet on current level must survive zoom-out clear");
+  assert.equal(closedOnSwitch, false, "must not close open sheet on same level");
   assert.equal(ed.lightsByKey.has(idleEntry.key), false, "idle light should be unmounted on zoom-out");
+
+  // Switching to another level must tear down protected entries from the old level
+  globalThis.canvas = { level: { id: "lvl2" } };
+  ed._clearLights({ keepProtected: true });
+  assert.equal(ed.lightsByKey.has(openEntry.key), false, "old-level sheet must be closed after level switch");
+  assert.equal(closedOnSwitch, true);
+});
+
+test("VirtualWallEditor prioritizes viewed level in _getDoorLayers and hides other-level DoorControls", async () => {
+  installBaseGlobals();
+  const { VirtualWallEditor } = await import("../scripts/wall-editor.mjs");
+
+  const layerGround = { level: { id: "ground", elevation: { base: 0 } }, spec: { sectors: {} } };
+  const layerUpper = { level: { id: "upper", elevation: { base: 10 } }, spec: { sectors: {} } };
+  globalThis.canvas = {
+    level: layerUpper.level,
+    scene: { id: "s1" }
+  };
+  const ctrl = {
+    active: true,
+    levelLayers: new Map([["ground", layerGround], ["upper", layerUpper]]),
+    visibleLevelLayers: [layerGround, layerUpper]
+  };
+  const editor = new VirtualWallEditor(ctrl);
+  const ordered = editor._getDoorLayers(true);
+  assert.equal(ordered[0].level.id, "upper", "viewed level must come first so lower floors cannot exhaust doorCap");
+  assert.equal(ordered[1].level.id, "ground");
+
+  const dcGround = { visible: true, isVisible: true, destroyed: false };
+  const dcUpper = { visible: true, isVisible: true, destroyed: false };
+  editor.mountedByDoorKey.set("ground::0_0_0", { levelId: "ground", wall: { doorControl: dcGround } });
+  editor.mountedByDoorKey.set("upper::0_0_0", { levelId: "upper", wall: { doorControl: dcUpper } });
+  editor.refreshDoorVisibility();
+  assert.equal(dcGround.visible, false, "DoorControl from non-viewed level must be hidden");
+  assert.equal(dcUpper.visible, true, "DoorControl on viewed level must stay visible");
+});
+
+test("MegaLightBatch returns -1.0 shader time when animateLightSources is false", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+
+  const lb = new MegaLightBatch();
+  globalThis.canvas = {
+    effects: { animateLightSources: false },
+    app: { ticker: { lastTime: 12345 } }
+  };
+  assert.equal(lb._getEffectiveShaderTime(), -1.0, "disabled animation must send negative uTime sentinel so shader stays static");
+
+  globalThis.canvas.effects.animateLightSources = true;
+  assert.equal(lb._getEffectiveShaderTime(), 12.345);
+});
+
+test("ChunkedFogManager._loadPersistedFog treats missing fogMeta as stale when sceneResetId is set", async () => {
+  installBaseGlobals();
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  let mergedCount = 0;
+  let clearedFlag = false;
+  globalThis.game.user = {
+    id: "u1",
+    isGM: false,
+    flags: {
+      boundless: {
+        fog: { sc1: { lvl1: { "0_0": "data:image/png;base64,AA==" } } }
+        // No fogMeta at all (legacy / pre-reset fog)
+      }
+    },
+    update: async () => { clearedFlag = true; }
+  };
+  const mgr = new ChunkedFogManager();
+  mgr.sceneId = "sc1";
+  mgr.levelId = "lvl1";
+  mgr.fogMode = 0;
+  mgr._mergeChunkMap = () => { mergedCount++; };
+
+  const scene = {
+    id: "sc1",
+    flags: { boundless: { fogResetId: { lvl1: "reset99" }, fogResetAt: { lvl1: 5000 } } }
+  };
+  mgr._loadPersistedFog(scene);
+  assert.equal(mergedCount, 0, "legacy player fog without fogMeta must NOT resurrect after GM Reset Fog");
+  assert.equal(clearedFlag, true, "stale legacy fog flag should be cleaned up");
+});
+
+test("overlayMethods.isPointUnderBakedRoof respects maxZ and pyramidMethods._saveCameraNow targets explicit sceneId", async () => {
+  installBaseGlobals();
+  const { overlayMethods } = await import("../scripts/boundless-overlays.mjs");
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+
+  // 1) isPointUnderBakedRoof must ignore virtual roof tiles above their maxZ cutoff
+  const lvlObj = { id: "lvl1", isView: true, elevation: { bottom: 0, top: 20 } };
+  globalThis.canvas = { level: lvlObj, masks: {} };
+  const tileSpec = { x: 0, y: 0, w: 500, h: 500, elevation: 20, alpha: 1, minZ: 1, maxZ: 4, src: "roof.webp" };
+  const ovCtrl = {
+    ...overlayMethods,
+    activeOverlays: new Map(),
+    activeVirtualTiles: new Map(),
+    resolveVirtualTile: (_lid, _tid, raw) => raw,
+    _collectVirtualTileCandidates: () => [0],
+    levelLayers: new Map([[
+      "lvl1",
+      {
+        level: lvlObj,
+        simGrid: 4,
+        simSectorPx: 1000,
+        lastTargetZ: 5,
+        spec: {
+          tiles: [tileSpec]
+        }
+      }
+    ]])
+  };
+  assert.equal(ovCtrl.isPointUnderBakedRoof("lvl1", 100, 100, 0), false, "roof tile with maxZ=4 must not occlude when curTargetZ=5");
+  ovCtrl.levelLayers.get("lvl1").lastTargetZ = 4;
+  assert.equal(ovCtrl.isPointUnderBakedRoof("lvl1", 100, 100, 0), true, "roof tile with maxZ=4 should occlude when curTargetZ=4 and unmounted");
+
+  // 2) _saveCameraNow(true, prevSceneId) must write to prevSceneId even if canvas.scene already switched
+  const storage = new Map();
+  globalThis.localStorage = {
+    setItem(k, v) { storage.set(k, v); },
+    getItem(k) { return storage.get(k) ?? null; }
+  };
+  globalThis.game = { world: { id: "w1" }, user: { id: "u1" } };
+  globalThis.canvas = {
+    scene: { id: "newScene" },
+    stage: { pivot: { x: 1234, y: 5678 }, scale: { x: 0.75 } }
+  };
+  const pyrCtrl = {
+    ...pyramidMethods,
+    active: true,
+    _mountedSceneId: "oldScene",
+    _lastSavedCamStr: ""
+  };
+  pyrCtrl._saveCameraNow(true, "oldScene");
+  assert.equal(storage.has("boundless.camera.w1.oldScene"), true, "camera must be saved under prevSceneId");
+  assert.equal(storage.has("boundless.camera.w1.newScene"), false, "must NOT overwrite newScene camera slot");
+});
+
+test("TokenImpostorLayer evicts LRU atlas slots when full and resets atlas on flush({ forceAtlas: true })", async () => {
+  installBaseGlobals();
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  const layer = new TokenImpostorLayer({});
+  layer.mounted = true;
+  layer.atlasCanvas = { width: 1024, height: 1024 };
+  let clearRectCalls = 0;
+  layer.atlasCtx = { clearRect() { clearRectCalls++; } };
+  layer.atlasBaseTex = { update() {}, destroy() {} };
+  layer.atlasTex = { destroy() {} };
+  layer._initAtlas = () => {
+    layer.atlasCanvas = { width: 1024, height: 1024 };
+    layer.atlasCtx = { clearRect() { clearRectCalls++; } };
+    layer.atlasBaseTex = { update() {} };
+  };
+  layer._decodeAndPack = async () => {};
+
+  // Fill atlas manually up to capacity (CELL_PX=160 -> atlasSize=320 => 2x2 = 4 slots)
+  layer.atlasSize = 320;
+  for (let i = 0; i < 4; i++) {
+    const k = `T|art_${i}.webp`;
+    layer.slotsByKey.set(k, {
+      col: i % 2,
+      row: Math.floor(i / 2),
+      ready: true,
+      failed: false,
+      decoding: false,
+      lastUsedMs: 100 + i * 10,
+      spec: { slotKey: k, artSrc: `art_${i}.webp` }
+    });
+    layer.docsByKey.set(k, new Set([`tok_${i}`]));
+  }
+  layer.nextSlotIdx = 4;
+
+  // Requesting a 5th slot must evict the oldest LRU slot (art_0.webp)
+  const evicted = layer._requestAtlasSlot({ slotKey: "T|art_new.webp", artSrc: "art_new.webp" });
+  assert.ok(evicted, "should allocate a slot via LRU eviction when atlas is full");
+  assert.equal(layer.slotsByKey.has("T|art_0.webp"), false, "oldest LRU slot must be evicted");
+  assert.equal(layer.slotsByKey.has("T|art_new.webp"), true, "new slot must be registered");
+  assert.equal(evicted.col, 0);
+  assert.equal(evicted.row, 0);
+
+  // flush({ forceAtlas: true }) must bypass the 180ms streaming throttle and immediately upload atlasTexture
+  let atlasUpdates = 0;
+  layer.atlasTexture = { baseTexture: { update() { atlasUpdates++; } } };
+  layer.atlasDirty = true;
+  layer._activeDecodes = 1;
+  layer._lastAtlasUploadMs = performance.now();
+  layer.flush();
+  assert.equal(atlasUpdates, 0, "normal flush should throttle atlas upload while streaming");
+  layer.flush({ forceAtlas: true });
+  assert.equal(atlasUpdates, 1, "forceAtlas flush must immediately upload atlasTexture");
+  assert.equal(layer.atlasDirty, false);
 });

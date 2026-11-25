@@ -1045,9 +1045,11 @@ export const overlayMethods = {
           Math.max(0, sx - 1), Math.max(0, sy - 1),
           Math.min(simGrid - 1, sx + 1), Math.min(simGrid - 1, sy + 1)
         );
+        const curTargetZ = layer.lastTargetZ ?? 0;
         for (const tid of candidateTids) {
           const tSpec = this.resolveVirtualTile(layerId, tid, spec.tiles[tid], level);
           if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
+          if (tSpec.maxZ !== undefined && curTargetZ > tSpec.maxZ) continue;
           if (tSpec.minZ !== undefined) {
             if (tSpec.src && missingSrcs?.has?.(tSpec.src)) continue;
             const mountedVt = this.activeVirtualTiles.get(`${layerId}::${tid}`)?.mesh;

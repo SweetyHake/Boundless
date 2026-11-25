@@ -228,10 +228,12 @@ export class VirtualWallEditor {
 
   refreshDoorVisibility() {
     const showCtrl = this._showDoorControls !== false;
+    const viewedLvlId = canvas?.level?.id;
     for (const entry of this.mountedByDoorKey.values()) {
       const dc = entry.wall?.doorControl;
       if (dc && !dc.destroyed) {
-        dc.visible = showCtrl && dc.isVisible;
+        const onViewedLevel = !viewedLvlId || !entry.levelId || entry.levelId === viewedLvlId;
+        dc.visible = onViewedLevel && showCtrl && dc.isVisible;
       }
     }
   }
@@ -241,6 +243,7 @@ export class VirtualWallEditor {
     if (!entry?.wall || entry.wall.destroyed) return false;
     if (entry.doc.ds === ds) return false;
     entry.doc.updateSource({ ds });
+    entry.liveDs = ds;
     entry.sig = this._wallSig({
       levelId: entry.levelId,
       c: entry.doc.c, move: entry.doc.move, sight: entry.doc.sight, light: entry.doc.light, sound: entry.doc.sound,
@@ -255,11 +258,42 @@ export class VirtualWallEditor {
       } : null
     }, ds);
     entry.wall._onUpdate({ ds }, { sound: playSound }, game.user?.id);
+    this._syncDoorMeshesElevation(entry.wall, entry.levelId);
     if (!this.active) entry.wall.visible = false;
     const dc = entry.wall.doorControl;
-    if (dc && !dc.destroyed) dc.visible = (this._showDoorControls !== false) && dc.isVisible;
+    const viewedLvlId = canvas?.level?.id;
+    const onViewedLevel = !viewedLvlId || !entry.levelId || entry.levelId === viewedLvlId;
+    if (dc && !dc.destroyed) dc.visible = onViewedLevel && (this._showDoorControls !== false) && dc.isVisible;
     this._syncOpenWallSheet(entry, { ds }, { syncDoorControl: true });
     return true;
+  }
+
+  _syncDoorMeshesElevation(wall, levelId) {
+    if (!wall?.doorMeshes?.size || !canvas?.primary) return;
+    const lvl = canvas.scene?.levels?.get?.(levelId);
+    if (!lvl) return;
+    const baseElev = getLevelBaseElevation(lvl);
+    const viewedLvlId = canvas.level?.id;
+    const isOtherLevel = Boolean(viewedLvlId && levelId && levelId !== viewedLvlId);
+    const topRaw = lvl.elevation?.top;
+    const roofElev = Number.isFinite(topRaw) ? topRaw : (baseElev + 20);
+    let dirty = false;
+    for (const m of wall.doorMeshes) {
+      let targetElev = m.elevation;
+      if (isOtherLevel) {
+        // Clamp other-level DoorMesh cleanly within its own level band so lower-floor doors never draw above upper floors
+        targetElev = Math.max(baseElev, roofElev - 0.05);
+      } else if (baseElev !== 0 && m.elevation < baseElev) {
+        targetElev = baseElev;
+      }
+      if (m.elevation !== targetElev) {
+        m.elevation = targetElev;
+        if (m._closedPosition) m._closedPosition.elevation = targetElev;
+        if (m._animatedPosition) m._animatedPosition.elevation = targetElev;
+        dirty = true;
+      }
+    }
+    if (dirty) canvas.primary.sortDirty = true;
   }
 
   _syncPreviewDoorControl(previewWall) {
@@ -308,10 +342,15 @@ export class VirtualWallEditor {
   }
 
   _getDoorLayers(doorsOnly = false) {
-    if (doorsOnly && this.controller?.visibleLevelLayers?.length) {
-      return this.controller.visibleLevelLayers.filter(l => l?.spec?.sectors);
-    }
     const viewed = this._getViewedLayer();
+    if (doorsOnly && this.controller?.visibleLevelLayers?.length) {
+      const valid = this.controller.visibleLevelLayers.filter(l => l?.spec?.sectors);
+      if (viewed?.spec?.sectors) {
+        // Always prioritize the currently viewed level first so dense lower floors never exhaust doorCap
+        return [viewed, ...valid.filter(l => l !== viewed)];
+      }
+      return valid;
+    }
     return viewed?.spec?.sectors ? [viewed] : [];
   }
 
@@ -471,16 +510,28 @@ export class VirtualWallEditor {
     if (this._pendingMounts.length > 0) this._scheduleMountPump();
   }
 
-  _clearMountedWalls() {
+  _clearMountedWalls({ keepProtected = false } = {}) {
     this._clearGen++;
     this._cancelPendingMounts();
+    const keptKeys = keepProtected ? new Set() : null;
     for (const entry of Array.from(this.mountedByKey.values())) {
+      if (keepProtected) {
+        const sheet = getExistingSheet(entry.doc);
+        if (entry.wall?.controlled || isSheetActiveOrRendering(sheet, entry.wall)) {
+          keptKeys.add(entry.mKey || `${entry.levelId}::${entry.wKey}`);
+          continue;
+        }
+      }
       this._removeMountedEntry(entry, { closeSheet: true });
     }
-    this.mountedByKey.clear();
-    this.mountedById.clear();
-    this.mountedByDoorKey.clear();
-    this._lastNeededKeys = null;
+    if (!keepProtected) {
+      this.mountedByKey.clear();
+      this.mountedById.clear();
+      this.mountedByDoorKey.clear();
+      this._lastNeededKeys = null;
+    } else {
+      this._lastNeededKeys = keptKeys;
+    }
   }
 
   async _mountNativeWall(seg, gen) {
@@ -579,6 +630,7 @@ export class VirtualWallEditor {
       };
     }
 
+    const selfEditor = this;
     const wall = canvas.walls.createObject(doc);
     // Bypass v14 ui.placeables sidebar filter so streamed native walls & doors render cleanly
     Object.defineProperty(wall, "isFilteredOut", { value: false, configurable: true });
@@ -594,18 +646,7 @@ export class VirtualWallEditor {
             try { this.destroyDoorMeshes?.(); } catch {}
             return;
           }
-          const lvl = canvas.scene?.levels?.get?.(seg.levelId);
-          const lvlElev = getLevelBaseElevation(lvl);
-          if (lvlElev !== 0 && this.doorMeshes?.size) {
-            for (const m of this.doorMeshes) {
-              if (m.elevation < lvlElev) {
-                m.elevation = lvlElev;
-                if (m._closedPosition) m._closedPosition.elevation = lvlElev;
-                if (m._animatedPosition) m._animatedPosition.elevation = lvlElev;
-              }
-            }
-            canvas.primary.sortDirty = true;
-          }
+          selfEditor._syncDoorMeshesElevation(this, seg.levelId);
         }).catch(() => {});
         return doorMeshChain;
       };
@@ -650,7 +691,9 @@ export class VirtualWallEditor {
     // When WallsLayer is inactive, hide wall edit lines (DoorControl & DoorMesh live on their own layers!)
     if (!this.active) wall.visible = false;
     if (wall.doorControl && !wall.doorControl.destroyed) {
-      wall.doorControl.visible = (this._showDoorControls !== false) && wall.doorControl.isVisible;
+      const viewedLvlId = canvas?.level?.id;
+      const onViewedLevel = !viewedLvlId || !seg.levelId || seg.levelId === viewedLvlId;
+      wall.doorControl.visible = onViewedLevel && (this._showDoorControls !== false) && wall.doorControl.isVisible;
     }
     wall._updateQuadtree?.();
   }
@@ -682,6 +725,7 @@ export class VirtualWallEditor {
     if (diff && !foundry.utils.isEmpty(diff)) {
       if (entry.wall && !entry.wall.destroyed) {
         try { entry.wall._onUpdate(diff, { sound: false }, game.user?.id); } catch {}
+        this._syncDoorMeshesElevation(entry.wall, entry.levelId);
         if (!this.active) entry.wall.visible = false;
         entry.wall._updateQuadtree?.();
       }
@@ -775,9 +819,9 @@ export class VirtualWallEditor {
     }
     if (!isWallsEditMode) this._doorsCapped = false;
 
-    // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview
+    // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview (keeping controlled/open-sheet walls intact)
     if (isWallsEditMode && (!inNativeZoom || segments.length > MAX_NATIVE_WALLS_IN_VIEW)) {
-      this._clearMountedWalls();
+      this._clearMountedWalls({ keepProtected: true });
       this._drawMacroOverview(segments, curVp.scale);
       return;
     }
@@ -813,15 +857,18 @@ export class VirtualWallEditor {
       } else if (!neededSeg) {
         if (!entry.wall?.controlled && !isSheetActiveOrRendering(sheet, entry.wall)) {
           this._removeMountedEntry(entry);
-        } else if (resolved) {
-          const dKey = this._buildDoorKey(resolved);
-          const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, resolved.ds) : (resolved.ds || 0);
-          const nextSig = this._wallSig(resolved, liveDs);
-          if (entry.sig !== nextSig) {
-            if (sheet?.rendered) {
-              this._syncMountedEntryInPlace(entry, resolved, dKey, liveDs, nextSig);
-            } else {
-              this._removeMountedEntry(entry, { closeSheet: isSheetActiveOrRendering(sheet, entry.wall) });
+        } else {
+          this._lastNeededKeys.add(mKey);
+          if (resolved) {
+            const dKey = this._buildDoorKey(resolved);
+            const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, resolved.ds) : (resolved.ds || 0);
+            const nextSig = this._wallSig(resolved, liveDs);
+            if (entry.sig !== nextSig) {
+              if (sheet?.rendered) {
+                this._syncMountedEntryInPlace(entry, resolved, dKey, liveDs, nextSig);
+              } else {
+                this._removeMountedEntry(entry, { closeSheet: isSheetActiveOrRendering(sheet, entry.wall) });
+              }
             }
           }
         }
@@ -946,7 +993,7 @@ export class VirtualWallEditor {
         sound: entry.doc.sound,
         dir: entry.doc.dir || 0,
         door: entry.doc.door || 0,
-        ds: entry.doc.ds || 0,
+        ds: entry.doc.door ? (entry.doc.ds || 0) : 0,
         doorSound: entry.doc.doorSound || "",
         threshold: threshOut,
         animation: animOut
@@ -998,6 +1045,7 @@ export class VirtualWallEditor {
         }
         entry.wall.renderFlags.set({ refresh: true });
         entry.wall.applyRenderFlags();
+        this._syncDoorMeshesElevation(entry.wall, entry.levelId);
         if (!this.active) entry.wall.visible = false;
         entry.wall._updateQuadtree?.();
       }
@@ -1104,10 +1152,10 @@ export class VirtualWallEditor {
       this._removeMountedEntry(entry, { closeSheet: true });
     }
 
-    if (deletedDocs.length && canvas.walls?.clipboard?.objects?.length) {
+    if (deletedDocs.length && canvas.walls?.clipboard?.cut && canvas.walls.clipboard.objects?.length) {
       const deletedIdSet = new Set(virtIds);
       canvas.walls.clipboard.objects = canvas.walls.clipboard.objects.filter(
-        o => !o.document?._destroyed && !deletedIdSet.has(o.document?.id)
+        o => !deletedIdSet.has(o.document?.id)
       );
     }
 
@@ -1136,6 +1184,7 @@ export class VirtualWallEditor {
 export function registerWallEditorControls(controller) {
   Hooks.on("activateWallsLayer", () => {
     if (!controller.active) return;
+    if (!controller.wallEditor._patches) controller.wallEditor.mount();
     controller.wallEditor.activate();
   });
 
