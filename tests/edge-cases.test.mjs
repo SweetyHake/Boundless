@@ -728,3 +728,242 @@ test("TokenImpostorLayer zeroes orphaned GPU slots in refreshVisibility and recy
   assert.equal(imp.activeVisibleCount, 0);
   assert.equal(imp.mesh.visible, false);
 });
+
+test("pyramidMethods.retireMesh / acquireMesh prevents double-pool corruption and resets leaked properties", async () => {
+  installBaseGlobals();
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+  const ctrl = Object.assign(Object.create(pyramidMethods), { meshPool: [] });
+
+  const makePoint = (x = 0, y = 0) => ({ x, y, set(nx, ny = nx) { this.x = nx; this.y = ny; } });
+  const mesh = {
+    destroyed: false,
+    name: "Tile.Old",
+    visible: false,
+    renderable: false,
+    alpha: 0.2,
+    unoccludedAlpha: 0.3,
+    occludedAlpha: 0.08,
+    restrictsLight: true,
+    restrictsWeather: true,
+    elevation: 25,
+    sort: 99,
+    sortLayer: 5,
+    angle: 45,
+    tint: 0xff0000,
+    anchor: makePoint(0.5, 0.5),
+    position: makePoint(100, 200),
+    pivot: makePoint(10, 20),
+    skew: makePoint(1, 2),
+    scale: makePoint(2, 3),
+    filters: [{ name: "customFilter" }],
+    filterArea: { x: 1, y: 2 },
+    mask: { name: "maskObj" },
+    parent: { removeChild() {} }
+  };
+
+  // Retiring twice must push only once
+  ctrl.retireMesh(mesh);
+  ctrl.retireMesh(mesh);
+  assert.equal(ctrl.meshPool.length, 1, "double retireMesh must not duplicate mesh in pool");
+
+  // Re-acquiring must cleanly reset every property
+  const reused = ctrl.acquireMesh();
+  assert.equal(reused, mesh);
+  assert.equal(reused._inMeshPool, false);
+  assert.equal(reused.visible, true);
+  assert.equal(reused.renderable, true);
+  assert.equal(reused.unoccludedAlpha, 1.0);
+  assert.equal(reused.occludedAlpha, 1.0);
+  assert.equal(reused.restrictsLight, false);
+  assert.equal(reused.restrictsWeather, false);
+  assert.equal(reused.elevation, 0);
+  assert.equal(reused.filters, null);
+  assert.equal(reused.filterArea, null);
+  assert.equal(reused.mask, null);
+  assert.equal(reused.anchor.x, 0);
+  assert.equal(reused.anchor.y, 0);
+  assert.equal(reused.pivot.x, 0);
+  assert.equal(reused.skew.x, 0);
+  assert.equal(reused._occludedBySameElevationSurfaces, true);
+});
+
+test("stepCrossfades survives NaN dtMs, retires superGrid z=0 roofs, and preserves blockFlags z=6 fallback at z=7", async () => {
+  installBaseGlobals();
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+
+  const retiredMeshes = [];
+  const sgLayer = {
+    level: { id: "lvl1", isView: true },
+    hasPyramid: true,
+    zOffset: 3,
+    lastTargetZ: 0,
+    bounds: { x: 0, y: 0, w: 600000, h: 600000 },
+    spec: { blockFlags: ["6666"] }
+  };
+  const z7Layer = {
+    level: { id: "lvl2", isView: true },
+    hasPyramid: true,
+    zOffset: 0,
+    lastTargetZ: 7,
+    bounds: { x: 0, y: 0, w: 100000, h: 100000 },
+    spec: { blockFlags: ["6666"] }
+  };
+
+  globalThis.canvas = {
+    ready: true,
+    stage: { scale: { x: 0.01 }, pivot: { x: 300000, y: 300000 } },
+    screenDimensions: [1600, 1000],
+    dimensions: { width: 600000, height: 600000 },
+    primary: { sortDirty: false, levelTextures: [] },
+    masks: { occlusion: { occludedSurfaces: null }, depth: { renderDirty: false } },
+    tiles: { placeables: [] }
+  };
+
+  const roofMesh = { visible: true, destroyed: false, occlusionMode: 1 };
+  const fadeTile = { key: "lvl1::1_0_0", levelId: "lvl1", channel: "bg", layer: sgLayer, z: 1, x: 0, y: 0, x0: 0, y0: 0, sizePx: 300000, ready: true, desired: true, alpha: 0.5, awaitingSwap: false, mesh: { visible: true, unoccludedAlpha: 0.5 } };
+  const fallbackZ6 = { key: "lvl2::6_0_0", levelId: "lvl2", channel: "bg", layer: z7Layer, z: 6, x: 0, y: 0, x0: 0, y0: 0, sizePx: 1562.5, ready: true, desired: true, isReveal: true, alpha: 1.0, awaitingSwap: false, mesh: { visible: true, unoccludedAlpha: 1.0 } };
+
+  const ctrl = Object.assign(Object.create(pyramidMethods), {
+    active: true,
+    visibleLevelLayers: [sgLayer, z7Layer],
+    levelLayers: new Map([["lvl1", sgLayer], ["lvl2", z7Layer]]),
+    tilesByKey: new Map([[fadeTile.key, fadeTile], [fallbackZ6.key, fallbackZ6]]),
+    activeOverlays: new Map([["lvl1::ov1", { levelId: "lvl1", retiring: true, roofMesh, ovSpec: { cx: 300000, cy: 300000, w: 500, h: 500 } }]]),
+    activeVirtualTiles: new Map(),
+    pendingTileMounts: [],
+    pendingOverlayMounts: [],
+    pendingVirtualTileMounts: [],
+    _revealTileKeys: new Set([fallbackZ6.key]),
+    _hiddenNativeLevelBg: new Map(),
+    _hiddenNativeLevelFg: new Map(),
+    _tilesDirty: true,
+    tokenStreamer: { step() {} },
+    texMgr: { needsPrune: () => false },
+    _emit() {},
+    _isRoofRevealed: () => false,
+    _shouldMountRoofs: () => false,
+    retireMesh(m) { retiredMeshes.push(m); },
+    syncRoofTokenOcclusion() {},
+    invalidateShowstopperSurfaces() {}
+  });
+
+  ctrl.stepCrossfades(NaN);
+
+  assert.ok(Number.isFinite(fadeTile.alpha) && fadeTile.alpha > 0.5, "NaN dtMs must fall back cleanly and advance fade");
+  assert.equal(ctrl.activeOverlays.size, 0, "superGrid z=0 retiring roof must retire even when localZ < 0");
+  assert.equal(retiredMeshes.length, 1);
+  assert.equal(fallbackZ6.desired, true, "live blockFlags z=6 fallback tile at targetZ=7 must not be deleted on reveal cleanup");
+});
+
+test("computePredictiveViewportRect never inverts bounds and isLevelAbove handles Infinity/ties", async () => {
+  installBaseGlobals();
+  const { computePredictiveViewportRect, getLevelBottomElevation, isLevelAbove } = await import("../scripts/utils.mjs");
+
+  // Camera panned far off the left/top edge + non-finite velocity -> x0 <= x1, y0 <= y1, finite numbers
+  const rect = computePredictiveViewportRect(-50000, -50000, 1600, 1000, 0, 10000, 10000, { velX: NaN, velY: Infinity });
+  assert.ok(Number.isFinite(rect.x0) && Number.isFinite(rect.x1) && rect.x0 <= rect.x1);
+  assert.ok(Number.isFinite(rect.y0) && Number.isFinite(rect.y1) && rect.y0 <= rect.y1);
+
+  // +Infinity bottom must fall back to finite base/0, while -Infinity is preserved
+  assert.equal(getLevelBottomElevation({ elevation: { bottom: Infinity, base: 10 } }), 10);
+  assert.equal(getLevelBottomElevation({ elevation: { bottom: -Infinity, base: 0 } }), -Infinity);
+
+  // Equal-bottom tie-breaker by level.index
+  const lvlA = { index: 0, elevation: { bottom: -Infinity } };
+  const lvlB = { index: 1, elevation: { bottom: -Infinity } };
+  assert.equal(isLevelAbove(lvlB, lvlA), true);
+  assert.equal(isLevelAbove(lvlA, lvlB), false);
+});
+
+test("perf-auto normalizeAssetKey strips routePrefix, protects live BaseTextures, and preserves custom tile shaders", async () => {
+  installBaseGlobals();
+  globalThis.location = { origin: "https://example.test" };
+  globalThis.foundry = { utils: { getRoute: (p) => `/foundry/${p}` } };
+
+  const { normalizeAssetKey, disposeStaleSceneVramTextures, syncDecorativeTileShaders } = await import("../scripts/perf-auto.mjs");
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  PERF_CONFIG.perfEnabled = true;
+  PERF_CONFIG.perfAutoCulling = true;
+  PERF_CONFIG.perfVramCleanup = true;
+
+  assert.equal(normalizeAssetKey("https://example.test/foundry/modules/my%20mod/bg.webp?v=1"), "modules/my mod/bg.webp");
+  assert.equal(normalizeAssetKey("modules/my%20mod/bg.webp"), "modules/my mod/bg.webp");
+  // Malformed percent sequence must not re-include origin or routePrefix
+  assert.equal(normalizeAssetKey("https://example.test/foundry/maps/100%_map.webp"), "maps/100%_map.webp");
+
+  // Live BaseTexture attached to an active tile must NOT be disposed even if URL isn't in scene doc
+  let liveDisposed = false;
+  let staleDisposed = false;
+  const liveBt = { realWidth: 2048, realHeight: 2048, resource: { url: "https://example.test/foundry/custom/live.webp" }, dispose() { liveDisposed = true; } };
+  const staleBt = { realWidth: 2048, realHeight: 2048, resource: { url: "https://example.test/foundry/maps/old_scene.webp" }, dispose() { staleDisposed = true; } };
+
+  const customTileMesh = { destroyed: false, pluginName: "customFxShader", occlusionMode: 0, restrictsLight: false, restrictsWeather: false, texture: { baseTexture: liveBt } };
+  const defaultTileMesh = { destroyed: false, pluginName: "batchOcclusion", occlusionMode: 0, restrictsLight: false, restrictsWeather: false, texture: { baseTexture: liveBt } };
+
+  globalThis.canvas = {
+    ready: true,
+    scene: { flags: {}, _source: {}, tiles: [], tokens: [], drawings: [], templates: [], notes: [] },
+    app: { renderer: { texture: { managedTextures: [liveBt, staleBt] } } },
+    tiles: {
+      placeables: [
+        { document: { alpha: 1, occlusion: {}, restrictions: {} }, isVideo: false, mesh: customTileMesh },
+        { document: { alpha: 1, occlusion: {}, restrictions: {} }, isVideo: false, mesh: defaultTileMesh }
+      ]
+    }
+  };
+
+  disposeStaleSceneVramTextures();
+  assert.equal(liveDisposed, false, "live scene tile BaseTexture must never be disposed from VRAM");
+  assert.equal(staleDisposed, true, "stale off-scene large texture should be disposed");
+
+  syncDecorativeTileShaders(true);
+  assert.equal(customTileMesh.pluginName, "customFxShader", "custom tile shader must not be overwritten with batch");
+  assert.equal(defaultTileMesh.pluginName, "batch", "default decorative batchOcclusion tile should use batch");
+});
+
+test("buildMeasureCacheKey bails out on waypoint terrain/cost and rewriteShaderNoiseGlsl preserves custom shaders", async () => {
+  installBaseGlobals();
+  const { buildMeasureCacheKey } = await import("../scripts/perf-cpu.mjs");
+  const { rewriteShaderNoiseGlsl } = await import("../scripts/perf-gpu.mjs");
+
+  assert.notEqual(buildMeasureCacheKey([{ x: 0, y: 0 }, { x: 100, y: 0 }], {}), null);
+  assert.equal(buildMeasureCacheKey([{ x: 0, y: 0 }, { x: 100, y: 0, terrain: { difficulty: 2 } }], {}), null, "waypoint terrain must bypass memo cache");
+  assert.equal(buildMeasureCacheKey([{ x: 0, y: 0 }, { x: 100, y: 0, cost: 10 }], {}), null, "waypoint explicit cost must bypass memo cache");
+
+  // Custom noise() without return mix() followed by another function with return mix() must NOT be corrupted
+  const customGlsl = [
+    "precision mediump float;",
+    "float noise(in vec2 uv) { return fract(sin(dot(uv, vec2(12.9898, 78.233)))); }",
+    "float helper(float a, float b) { return mix(a, b, 0.5); }"
+  ].join("\n");
+  const customRes = rewriteShaderNoiseGlsl(customGlsl);
+  assert.equal(customRes.modified, false, "non-Foundry noise() must not eat subsequent functions");
+  assert.equal(customRes.src, customGlsl);
+
+  // Shader without precision line but with #extension must place uniform AFTER #extension
+  const extGlsl = [
+    "#extension GL_OES_standard_derivatives : enable",
+    "float noise(in vec2 uv) { vec2 i = floor(uv); return mix(0.0, 1.0, i.x); }"
+  ].join("\n");
+  const extRes = rewriteShaderNoiseGlsl(extGlsl);
+  assert.equal(extRes.modified, true);
+  assert.ok(extRes.src.indexOf("#extension") < extRes.src.indexOf("uniform sampler2D uBoundlessNoise;"), "uniform must be inserted after #extension directives");
+});
+
+test("lang/ru.json and lang/en.json have identical keys and contain no forbidden UI characters", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const root = path.resolve(import.meta.dirname, "..");
+  const ru = JSON.parse(fs.readFileSync(path.join(root, "lang/ru.json"), "utf8"));
+  const en = JSON.parse(fs.readFileSync(path.join(root, "lang/en.json"), "utf8"));
+  const flatten = (o, p = "") => Object.entries(o).flatMap(([k, v]) => {
+    const key = p ? `${p}.${k}` : k;
+    return v && typeof v === "object" && !Array.isArray(v) ? flatten(v, key) : [[key, String(v)]];
+  });
+  const ruMap = new Map(flatten(ru));
+  const enMap = new Map(flatten(en));
+  assert.deepEqual([...ruMap.keys()].sort(), [...enMap.keys()].sort(), "ru.json and en.json keys must match 1:1");
+  for (const [k, v] of [...ruMap.entries(), ...enMap.entries()]) {
+    assert.ok(!/[—–:]/.test(v), `UI string ${k} contains forbidden dash or colon: ${v}`);
+  }
+});

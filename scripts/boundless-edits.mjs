@@ -322,7 +322,7 @@ export const editsMethods = {
   },
 
   onSceneUpdate(scene, changes) {
-    if (scene?.id !== canvas.scene?.id) return;
+    if (!globalThis.canvas?.ready || scene?.id !== globalThis.canvas.scene?.id) return;
 
     const flagChanges = changes?.flags?.[MODULE_ID];
     const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));

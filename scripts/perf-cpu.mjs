@@ -68,6 +68,8 @@ export function buildMeasureCacheKey(waypoints, options) {
   for (let i = 0; i < waypoints.length; i++) {
     const w = waypoints[i];
     if (!Number.isFinite(w?.x) || !Number.isFinite(w?.y)) return null;
+    // TerrainData or explicit per-waypoint cost can vary dynamically (difficult terrain / regions) -> skip cache
+    if (w.terrain != null || w.cost != null) return null;
     const qx = Math.round(w.x * 16) | 0;
     const qy = Math.round(w.y * 16) | 0;
     h1 = (Math.imul(h1, 33) ^ qx) | 0;
@@ -187,16 +189,32 @@ function makeTickerThrottle(methodName, getMs, statKeys, opts = {}) {
 function patchRenderFlags() {
   return wrapFoundryMethod("RenderFlags", "set", function (wrapped, changes) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && changes && typeof changes === "object") {
-      let allPresent = true;
-      for (const k in changes) {
-        if (changes[k] && (!this.has(k) || (this.flags?.[k]?.reset?.length > 0))) {
-          allPresent = false;
-          break;
+      const pending = this.object ? globalThis.canvas?.pendingRenderFlags?.[this.priority] : null;
+      const queued = !pending || pending.has(this.object);
+      if (queued) {
+        let allPresent = true;
+        for (const k in changes) {
+          if (!changes[k]) continue;
+          const cfg = this.flags?.[k];
+          if (!this.has(k) || (cfg?.reset?.length > 0)) {
+            allPresent = false;
+            break;
+          }
+          const prop = cfg?.propagate;
+          if (prop?.length) {
+            for (let i = 0; i < prop.length; i++) {
+              if (!this.has(prop[i])) {
+                allPresent = false;
+                break;
+              }
+            }
+            if (!allPresent) break;
+          }
         }
-      }
-      if (allPresent) {
-        perfStats.flagsDeduped++;
-        return;
+        if (allPresent) {
+          perfStats.flagsDeduped++;
+          return;
+        }
       }
     }
     return wrapped(changes);
@@ -301,22 +319,37 @@ function sourceLosSig(vs) {
   const d = vs.data ?? {};
   const vx = vs.x ?? d.x ?? 0;
   const vy = vs.y ?? d.y ?? 0;
+  const elev = d.elevation ?? 0;
+  const lvlId = vs.level?.id ?? "";
+  const angle = d.angle ?? 360;
+  const rot = d.rotation ?? 0;
+  const rad = vs.radius ?? d.radius ?? 0;
   if (
     vs._blLosSigVer === _perceptionVer &&
     vs._blLosSigUid === uid &&
     vs._blLosSigX === vx &&
     vs._blLosSigY === vy &&
+    vs._blLosSigElev === elev &&
+    vs._blLosSigLvl === lvlId &&
+    vs._blLosSigAngle === angle &&
+    vs._blLosSigRot === rot &&
+    vs._blLosSigRad === rad &&
     vs._blLosSigStr
   ) {
     return vs._blLosSigStr;
   }
-  const sig = `${Math.round(vx * 10)},${Math.round(vy * 10)},${d.elevation ?? 0}`
-    + `,${vs.level?.id ?? ""},${d.walls !== false ? 1 : 0},${uid}`
-    + `,${vs.radius ?? d.radius ?? 0},${d.angle ?? 360},${d.rotation ?? 0},${d.externalRadius ?? ""}`;
+  const sig = `${Math.round(vx * 10)},${Math.round(vy * 10)},${elev}`
+    + `,${lvlId},${d.walls !== false ? 1 : 0},${uid}`
+    + `,${rad},${angle},${rot},${d.externalRadius ?? ""}`;
   vs._blLosSigVer = _perceptionVer;
   vs._blLosSigUid = uid;
   vs._blLosSigX = vx;
   vs._blLosSigY = vy;
+  vs._blLosSigElev = elev;
+  vs._blLosSigLvl = lvlId;
+  vs._blLosSigAngle = angle;
+  vs._blLosSigRot = rot;
+  vs._blLosSigRad = rad;
   vs._blLosSigStr = sig;
   return sig;
 }
@@ -339,7 +372,7 @@ function patchVisibilityAndLos() {
     const p = test?.point;
     if (!p) return wrapped(visionSource, mode, target, test);
     const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round((p.elevation ?? 0) * 10)}`
-      + `|${test.level?.id ?? ""}|${this.constructor.name}|${this.walls ? 1 : 0}${this.angle ? 1 : 0}`
+      + `|${test.level?.id ?? ""}|${this.constructor.name}:${this.id ?? ""}:${this.type ?? ""}|${this.walls ? 1 : 0}${this.angle ? 1 : 0}`
       + `|${visionSource.sourceId}|${sourceLosSig(visionSource)}`;
     const hit = _losCache.get(key);
     if (hit !== undefined) {
@@ -365,7 +398,7 @@ function patchVisibilityAndLos() {
     const p = arr[0];
     if (!Number.isFinite(p?.x) || !Number.isFinite(p?.y)) return wrapped(points, options);
     const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
-    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|t${options.tolerance ?? 2}|v${_perceptionVer}`;
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;
@@ -382,7 +415,7 @@ function patchVisibilityAndLos() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
       return wrapped(point);
     }
-    const key = `${point.x.toFixed(1)},${point.y.toFixed(1)}|e${_exploredVer}`;
+    const key = `${point.x.toFixed(1)},${point.y.toFixed(1)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|e${_exploredVer}`;
     const hit = _cellExploredCache.get(key);
     if (hit !== undefined) {
       perfStats.cellFogHits++;
@@ -478,14 +511,27 @@ function patchFogAndOcclusion() {
   const regOcc1 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOcclusionMask", _occMaskThrottle.wrapper);
   const regOcc2 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOccludedObjects", _occObjThrottle.wrapper);
 
-  // Track v14 surfaceExposure changes (roofs/levels) so sourceInitWrapper never skips light/vision recompute
+  // Track v14 surfaceExposure changes (roofs/levels) so sourceInitWrapper never skips light/vision recompute.
+  // In v14 PerceptionManager.applyRenderFlags clears renderFlags BEFORE calling _updateOccludedSurfaces(flags),
+  // mutating args[0] (`flags.initializeLightSources` / `flags.initializeVision`), so check both args[0] and surface set diff!
   const regOccSurf = wrapFoundryMethod("CanvasOcclusionMask", "_updateOccludedSurfaces", function (wrapped, ...args) {
-    const prevSize = this.occludedSurfaces?.size ?? -1;
+    const prevSet = this.occludedSurfaces ? new Set(this.occludedSurfaces) : null;
     const res = wrapped(...args);
-    const nextSize = this.occludedSurfaces?.size ?? -1;
+    const nextSet = this.occludedSurfaces;
+    let changed = Boolean(args[0]?.initializeLightSources || args[0]?.initializeVision);
+    if (!changed && prevSet && nextSet) {
+      if (prevSet.size !== nextSet.size) changed = true;
+      else {
+        for (const s of nextSet) {
+          if (!prevSet.has(s)) { changed = true; break; }
+        }
+      }
+    }
     const pf = globalThis.canvas?.perception?.renderFlags;
-    if (nextSize !== prevSize || pf?.has?.("initializeLightSources") || pf?.has?.("initializeVision")) {
+    if (changed || pf?.has?.("initializeLightSources") || pf?.has?.("initializeVision")) {
       _geometryVersion++;
+      _perceptionVer++;
+      _losCache.clear();
     }
     return res;
   });
@@ -687,7 +733,7 @@ function patchMiscCpuGuards() {
   const okNp = wrapFoundryMethod("Token", "_refreshNameplate", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
     const docName = this.document?.name ?? "";
-    const key = `${docName}|${this.w}|${this.h}`;
+    const key = `${docName}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}`;
     if (this.__blNpKey === key && this.nameplate?.text === docName) {
       perfStats.textSkipped++;
       return;
@@ -1138,12 +1184,17 @@ function patchMiscCpuGuards() {
     for (const s of ls) {
       if (sourceHasLayerReset(s)) return null;
       const d = s.data;
-      sig += `;${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.color ?? ""}:${d?.alpha ?? ""}:${d?.luminosity ?? ""}:${d?.attenuation ?? ""}`;
+      const lb = s.layers?.background;
+      const li = s.layers?.illumination;
+      const lc = s.layers?.coloration;
+      sig += `;${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.color ?? ""}:${d?.alpha ?? ""}:${d?.luminosity ?? ""}:${d?.attenuation ?? ""}:${d?.coloration ?? ""}:${d?.elevation ?? ""}:${d?.contrast ?? ""}:${d?.saturation ?? ""}:${d?.shadows ?? ""}:${d?.animation?.type ?? ""}:${lb?.active ? 1 : 0}:${li?.active ? 1 : 0}:${lc?.active ? 1 : 0}:${lb?.mesh?.shader?.program?.id ?? ""}:${li?.mesh?.shader?.program?.id ?? ""}:${lc?.mesh?.shader?.program?.id ?? ""}`;
     }
     if (ds) {
       for (const s of ds) {
         if (sourceHasLayerReset(s)) return null;
-        sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}`;
+        const d = s.data;
+        const ld = s.layers?.darkness;
+        sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.elevation ?? ""}:${d?.animation?.type ?? ""}:${ld?.active ? 1 : 0}:${ld?.mesh?.shader?.program?.id ?? ""}`;
       }
     }
     return sig;
@@ -1366,9 +1417,18 @@ export function installCpuPerfEngine() {
   });
 
   for (const h of ["createWall", "updateWall", "deleteWall", "createRegion", "updateRegion", "deleteRegion", "createLevel", "updateLevel", "deleteLevel", "updateScene"]) {
-    Hooks.on(h, () => { _geometryVersion++; });
+    Hooks.on(h, () => {
+      _geometryVersion++;
+      _perceptionVer++;
+      _losCache.clear();
+      _cellVisCache.clear();
+      if (h === "updateScene" || h === "updateLevel" || h === "createLevel" || h === "deleteLevel") {
+        _exploredVer++;
+        _cellExploredCache.clear();
+      }
+    });
   }
-  for (const h of ["createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "updateToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect"]) {
+  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "updateToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
   }
   for (const h of ["updateActor", "deleteActor", "updateItem", "deleteItem", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry"]) {

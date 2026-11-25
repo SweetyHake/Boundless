@@ -42,8 +42,20 @@ export function getLevelBaseElevation(level) {
  */
 export function getLevelBottomElevation(level) {
   const bottom = level?.elevation?.bottom;
-  if (typeof bottom === "number" && !Number.isNaN(bottom)) return bottom;
+  if (typeof bottom === "number" && !Number.isNaN(bottom) && bottom !== Infinity) return bottom;
   return getLevelBaseElevation(level);
+}
+
+/**
+ * Consistent level elevation ordering comparator matching Foundry v14's `levels.sorted`:
+ * compares `getLevelBottomElevation` first, breaking equal-bottom ties (e.g. both unset `-Infinity`) by `level.index`.
+ */
+export function isLevelAbove(levelA, levelB) {
+  if (!levelA || !levelB || levelA === levelB) return false;
+  const ea = getLevelBottomElevation(levelA);
+  const eb = getLevelBottomElevation(levelB);
+  if (ea !== eb) return ea > eb;
+  return (levelA.index ?? 0) > (levelB.index ?? 0);
 }
 
 /**
@@ -79,10 +91,11 @@ export function getEffectiveScale(scale) {
 }
 
 export function getLiveStageTransform(stageScale, px, py, sw, sh) {
+  const stage = globalThis.canvas?.stage;
   const a = stageScale;
-  const d = canvas.stage?.scale?.y || stageScale;
-  const posX = Number.isFinite(canvas.stage?.position?.x) ? canvas.stage.position.x : sw * 0.5;
-  const posY = Number.isFinite(canvas.stage?.position?.y) ? canvas.stage.position.y : sh * 0.5;
+  const d = stage?.scale?.y || stageScale;
+  const posX = Number.isFinite(stage?.position?.x) ? stage.position.x : sw * 0.5;
+  const posY = Number.isFinite(stage?.position?.y) ? stage.position.y : sh * 0.5;
   return { a, d, tx: posX - px * a, ty: posY - py * d };
 }
 
@@ -212,22 +225,32 @@ export function computePredictiveViewportRect(
     minTrailFraction = 0.1
   } = {}
 ) {
-  const s = scale || 1;
-  const wWorld = screenW / s;
-  const hWorld = screenH / s;
-  const basePadX = wWorld * padFraction;
-  const basePadY = hWorld * padFraction;
+  const s = (Number.isFinite(scale) && scale > 0) ? scale : 1;
+  const px = Number.isFinite(pivotX) ? pivotX : 0;
+  const py = Number.isFinite(pivotY) ? pivotY : 0;
+  const sw = (Number.isFinite(screenW) && screenW > 0) ? screenW : 1600;
+  const sh = (Number.isFinite(screenH) && screenH > 0) ? screenH : 1000;
+  const mw = (Number.isFinite(maxW) && maxW > 0) ? maxW : 100000;
+  const mh = (Number.isFinite(maxH) && maxH > 0) ? maxH : 100000;
+  const padFrac = (Number.isFinite(padFraction) && padFraction >= 0) ? padFraction : 0;
+  const vx = Number.isFinite(velX) ? velX : 0;
+  const vy = Number.isFinite(velY) ? velY : 0;
+
+  const wWorld = sw / s;
+  const hWorld = sh / s;
+  const basePadX = wWorld * padFrac;
+  const basePadY = hWorld * padFrac;
 
   let padLeft = basePadX;
   let padRight = basePadX;
   let padTop = basePadY;
   let padBottom = basePadY;
 
-  if (padFraction > 0 && (velX || velY)) {
-    const minTrailX = wWorld * Math.min(minTrailFraction, padFraction);
-    const minTrailY = hWorld * Math.min(minTrailFraction, padFraction);
-    const leadX = Math.max(-wWorld * maxLeadFraction, Math.min(wWorld * maxLeadFraction, velX * lookaheadSec));
-    const leadY = Math.max(-hWorld * maxLeadFraction, Math.min(hWorld * maxLeadFraction, velY * lookaheadSec));
+  if (padFrac > 0 && (vx || vy)) {
+    const minTrailX = wWorld * Math.min(minTrailFraction, padFrac);
+    const minTrailY = hWorld * Math.min(minTrailFraction, padFrac);
+    const leadX = Math.max(-wWorld * maxLeadFraction, Math.min(wWorld * maxLeadFraction, vx * lookaheadSec));
+    const leadY = Math.max(-hWorld * maxLeadFraction, Math.min(hWorld * maxLeadFraction, vy * lookaheadSec));
 
     if (leadX > 0) {
       padRight = basePadX + leadX;
@@ -246,11 +269,10 @@ export function computePredictiveViewportRect(
     }
   }
 
-  return {
-    scale: s,
-    x0: Math.max(0, pivotX - wWorld * 0.5 - padLeft),
-    y0: Math.max(0, pivotY - hWorld * 0.5 - padTop),
-    x1: Math.min(maxW, pivotX + wWorld * 0.5 + padRight),
-    y1: Math.min(maxH, pivotY + hWorld * 0.5 + padBottom)
-  };
+  const x0 = Math.max(0, Math.min(mw, px - wWorld * 0.5 - padLeft));
+  const y0 = Math.max(0, Math.min(mh, py - hWorld * 0.5 - padTop));
+  const x1 = Math.max(x0, Math.min(mw, px + wWorld * 0.5 + padRight));
+  const y1 = Math.max(y0, Math.min(mh, py + hWorld * 0.5 + padBottom));
+
+  return { scale: s, x0, y0, x1, y1 };
 }

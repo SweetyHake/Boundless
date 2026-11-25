@@ -503,7 +503,7 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
   }).join("");
 
   const journalOptions = [
-    `<option value="">${escapeHtml(loc("BOUNDLESS.Config.PoiJournalNone", "— Не привязан —"))}</option>`,
+    `<option value="">${escapeHtml(loc("BOUNDLESS.Config.PoiJournalNone", "Не привязан"))}</option>`,
     ...Array.from(game.journal || []).map(j => {
       const sel = j.uuid === initial.journalUuid ? "selected" : "";
       return `<option value="${escapeHtml(j.uuid)}" ${sel}>${escapeHtml(j.name)}</option>`;
@@ -1469,7 +1469,7 @@ export class PoiManager {
     if (this._placementHintEl) return;
     const el = document.createElement("div");
     el.className = "boundless-tool-hint";
-    el.innerHTML = `<i class="fa-solid fa-map-pin"></i><span>${escapeHtml(loc("BOUNDLESS.PoiToolHint", "Режим меток: ЛКМ по карте — создать, перетащить метку — переместить, ПКМ — меню, Esc — выход."))}</span>`;
+    el.innerHTML = `<i class="fa-solid fa-map-pin"></i><span>${escapeHtml(loc("BOUNDLESS.PoiToolHint", "Режим меток. ЛКМ по карте создать, перетащить метку переместить, ПКМ меню, Esc выход."))}</span>`;
     document.body.appendChild(el);
     this._placementHintEl = el;
   }

@@ -155,7 +155,7 @@ export class MacroSelectionOverlay {
     }
 
     const color = CONFIG?.Canvas?.dispositionColors?.CONTROLLED ?? 0xFF9829;
-    const invScale = 1 / Math.max(0.008, rawScale);
+    const invScale = 1 / Math.max(0.0005, rawScale);
     const lineWidth = Math.max(3, 2.5 * invScale);
     const pad = Math.max(4, 5 * invScale);
     const minBox = 18 * invScale;
@@ -171,8 +171,9 @@ export class MacroSelectionOverlay {
       const tok = controlled[i];
       if (!tok || tok.destroyed) continue;
       const doc = tok.document;
-      const w = tok.w || ((Number(doc?.width) || 1) * grid);
-      const h = tok.h || ((Number(doc?.height) || 1) * grid);
+      const docSz = (!tok.w || !tok.h) ? doc?.getSize?.() : null;
+      const w = tok.w || docSz?.width || ((Number(doc?.width) || 1) * grid);
+      const h = tok.h || docSz?.height || ((Number(doc?.height) || 1) * grid);
       const tx = Number.isFinite(tok.x) ? tok.x : (Number(doc?.x) || 0);
       const ty = Number.isFinite(tok.y) ? tok.y : (Number(doc?.y) || 0);
       const drawW = Math.max(w + pad * 2, minBox);
@@ -199,7 +200,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
 
   const origInitVision = TokenCls.prototype.initializeVisionSource;
   TokenCls.prototype.initializeVisionSource = function (...args) {
-    if (_bulkSelectDepth > 0 && (controller?.active || PERF_CONFIG?.perfEnabled)) {
+    if (_bulkSelectDepth > 0 && !args[0]?.deleted && globalThis.canvas?.ready && (controller?.active || PERF_CONFIG?.perfEnabled)) {
       _bulkVisionDirty = true;
       return;
     }
@@ -233,7 +234,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         _bulkVisionDirty = false;
         _bulkPerceptionFlags = null;
 
-        if (visionDirty) {
+        if (visionDirty && globalThis.canvas?.ready) {
           const placeables = layer?.placeables;
           if (Array.isArray(placeables)) {
             for (let i = 0; i < placeables.length; i++) {
@@ -241,7 +242,9 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
               if (!t || t.destroyed) continue;
               // Skip blind NPCs that have no vision source and no sight enabled
               const hasSight = Boolean(t.vision?.active || t.document?._source?.sight?.enabled || t.document?.sight?.enabled);
-              if (hasSight) origInitVision.call(t);
+              if (hasSight) {
+                try { origInitVision.call(t); } catch {}
+              }
             }
           }
           const finalFlags = mergedFlags ? { ...mergedFlags } : {};
@@ -250,11 +253,11 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
           if (layer?.occlusionMode & CONST.TOKEN_OCCLUSION_MODES.CONTROLLED) {
             finalFlags.refreshOcclusion = true;
           }
-          canvas.perception?.update?.(finalFlags);
-        } else if (mergedFlags) {
-          canvas.perception?.update?.(mergedFlags);
+          try { canvas.perception?.update?.(finalFlags); } catch {}
+        } else if (mergedFlags && globalThis.canvas?.ready) {
+          try { canvas.perception?.update?.(mergedFlags); } catch {}
         }
-        controller?.selectionOverlay?.refresh?.();
+        try { controller?.selectionOverlay?.refresh?.(); } catch {}
       }
     }
   };
@@ -272,33 +275,53 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
   };
 
   // 1. Marquee `selectObjects`: support impostors & unmounted TokenDocuments seamlessly at ANY zoom!
-  let pendingMarqueeMissing = null;
-  wrapBulkMethod("selectObjects", {
-    before(args) {
-      pendingMarqueeMissing = null;
+  if (typeof TokenLayerCls.prototype.selectObjects === "function") {
+    const origSelectObjects = TokenLayerCls.prototype.selectObjects;
+    TokenLayerCls.prototype.selectObjects = function (...args) {
+      if (!controller?.active && !PERF_CONFIG?.perfEnabled) return origSelectObjects.apply(this, args);
+      let missing = null;
       const streamer = controller?.tokenStreamer;
-      if (!controller?.active || !streamer?.enabled) return;
-      const rect = args[0];
-      if (!rect || typeof rect.x !== "number" || typeof rect.y !== "number") return;
-      streamer.cancelPendingSelection();
-      const docs = streamer.getControllableDocsInRect(rect);
-      if (!docs.length) return;
-      const missing = streamer.prepareMountedTokensForSelection(docs);
-      if (missing.length > 0) pendingMarqueeMissing = missing;
-    },
-    after() {
-      const missing = pendingMarqueeMissing;
-      pendingMarqueeMissing = null;
-      const streamer = controller?.tokenStreamer;
-      if (missing?.length && controller?.active && streamer?.enabled) {
+      const callArgs = args.slice();
+      if (controller?.active && streamer?.enabled && this.options?.controllableObjects !== false) {
+        const rect = callArgs[0];
+        if (
+          rect &&
+          Number.isFinite(rect.x) &&
+          Number.isFinite(rect.y) &&
+          Number.isFinite(rect.width) &&
+          Number.isFinite(rect.height) &&
+          rect.width !== 0 &&
+          rect.height !== 0
+        ) {
+          const normRect = (rect.width < 0 || rect.height < 0)
+            ? {
+                ...rect,
+                x: rect.width < 0 ? rect.x + rect.width : rect.x,
+                y: rect.height < 0 ? rect.y + rect.height : rect.y,
+                width: Math.abs(rect.width),
+                height: Math.abs(rect.height)
+              }
+            : rect;
+          callArgs[0] = normRect;
+          streamer.cancelPendingSelection();
+          const docs = streamer.getControllableDocsInRect(normRect);
+          if (docs.length > 0) {
+            const m = streamer.prepareMountedTokensForSelection(docs);
+            if (m.length > 0) missing = m;
+          }
+        }
+      }
+      const res = runBulkOnTokenLayer(this, () => origSelectObjects.apply(this, callArgs));
+      if (missing?.length && controller?.active && streamer?.enabled && this.options?.controllableObjects !== false) {
         streamer.materializeAndSelect(missing, {
           releaseOthers: false,
           maxCount: MAX_MARQUEE_MATERIALIZE,
           bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
         });
       }
-    }
-  });
+      return res;
+    };
+  }
 
   // 2. `releaseAll`: cancel pending async selection and smoothly hand macro-zoom tokens back to Impostors
   wrapBulkMethod("releaseAll", {
@@ -329,10 +352,20 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
   });
 
   // 4. Smart two-stage Ctrl+A on PlaceablesLayer
+  const isEditableFocused = () => {
+    if (globalThis.game?.keyboard?.hasFocus) return true;
+    const el = globalThis.document?.activeElement;
+    if (!el || el === globalThis.document?.body) return false;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    return Boolean(el.isContentEditable || el.closest?.('[contenteditable="true"], .ProseMirror'));
+  };
+
   let lastSelectAllState = null;
   if (PlaceablesLayerCls?.prototype?._onSelectAllKey) {
     const origSelectAllKey = PlaceablesLayerCls.prototype._onSelectAllKey;
     PlaceablesLayerCls.prototype._onSelectAllKey = function (event) {
+      if (isEditableFocused()) return false;
       if (!this.options?.controllableObjects || !this.active) {
         return origSelectAllKey.call(this, event);
       }
@@ -463,24 +496,32 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
     TokenLayerCls.prototype._onClickLeft = function (event) {
       const streamer = controller?.tokenStreamer;
       if (
+        this.active &&
         controller?.active &&
         streamer?.enabled &&
         !streamer._nativeTokensActive &&
         !this._draggedToken &&
         !this.hover &&
         game.activeTool === "select" &&
+        !event?.ctrlKey &&
+        !event?.metaKey &&
         !canvas.controls?.ruler?.active &&
         !CONFIG.Canvas?.rulerClass?.canMeasure
       ) {
         const origin = event?.interactionData?.origin ?? event?.getLocalPosition?.(this);
         if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
-          const rawScale = Math.max(0.008, canvas.stage?.scale?.x || 1);
+          const rawScale = Math.max(0.0005, canvas.stage?.scale?.x || 1);
           const minHitRadius = Math.max(40, 14 / rawScale);
           const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
           if (hitDoc) {
             if (event.shiftKey && hitDoc._object?.controlled) {
               hitDoc._object.release();
               controller?.selectionOverlay?.refresh?.();
+              queueMicrotask(() => {
+                if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
+                  streamer.scheduleSync(null, true);
+                }
+              });
               return;
             }
             streamer.materializeAndSelect([hitDoc], {
@@ -501,21 +542,33 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
     TokenLayerCls.prototype._onClickLeft2 = function (event) {
       const streamer = controller?.tokenStreamer;
       if (
+        this.active &&
         controller?.active &&
         streamer?.enabled &&
         !streamer._nativeTokensActive &&
+        !this._draggedToken &&
         !this.hover &&
-        game.activeTool === "select"
+        game.activeTool === "select" &&
+        !event?.ctrlKey &&
+        !event?.metaKey &&
+        !canvas.controls?.ruler?.active &&
+        !CONFIG.Canvas?.rulerClass?.canMeasure
       ) {
         const origin = event?.interactionData?.origin ?? event?.getLocalPosition?.(this);
         if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
-          const rawScale = Math.max(0.008, canvas.stage?.scale?.x || 1);
+          const rawScale = Math.max(0.0005, canvas.stage?.scale?.x || 1);
           const minHitRadius = Math.max(40, 14 / rawScale);
           const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
           if (hitDoc) {
-            if (event.altKey) hitDoc.sheet?.render?.(true);
-            else hitDoc.actor?.sheet?.render?.(true);
-            return;
+            if (event.altKey) {
+              if (hitDoc.canUserModify?.(game.user, "update") && hitDoc.sheet?.render) {
+                hitDoc.sheet.render(true);
+                return;
+              }
+            } else if (hitDoc.actor?.sheet?.render) {
+              hitDoc.actor.sheet.render(true);
+              return;
+            }
           }
         }
       }

@@ -27,7 +27,8 @@ import {
   MODULE_ID,
   isTextureUsable,
   getLevelBaseElevation,
-  getLevelBottomElevation
+  getLevelBottomElevation,
+  isLevelAbove
 } from "./utils.mjs";
 
 /**
@@ -163,6 +164,8 @@ class MegaWorld1000 {
 
   // Camera persistence (F5), cinematic POI flight & controlled-token zoom clamp
   _worldMinScale = WORLD_MIN_SCALE;
+  _origScaleMin = null;
+  _origScaleMax = null;
   _camSaveTimer = null;
   _beforeUnloadFn = null;
   _restoringCamera = false;
@@ -202,12 +205,26 @@ class MegaWorld1000 {
     const baseSimSectorPx = base.simSectorPx || Math.ceil(regionPx / baseSimGrid);
     const baseOverlays = base.overlays || [];
     const baseSectors = base.sectors || {};
+    const parseTintHex = (hex) => {
+      if (typeof hex === "number") return Number.isFinite(hex) ? hex : 0xffffff;
+      const parsed = parseInt(String(hex).replace("#", ""), 16);
+      return Number.isFinite(parsed) ? parsed : 0xffffff;
+    };
     const parsedTints = Array.isArray(sg.tints)
-      ? sg.tints.map(row => row.map(hex => (typeof hex === "number" ? hex : parseInt(String(hex).replace("#", ""), 16) || 0xffffff)))
+      ? sg.tints.map(row => row.map(parseTintHex))
       : null;
 
     const overlays = [];
     const sectors = {};
+    const exactSectorDiv = (regionPx % baseSimSectorPx) === 0;
+    const getOrCreateSector = (sk) => {
+      let s = sectors[sk];
+      if (!s) {
+        s = { w: [], d: [], l: [], o: [] };
+        sectors[sk] = s;
+      }
+      return s;
+    };
     let totalWalls = 0, totalDoors = 0, totalLights = 0;
 
     for (let gy = 0; gy < rows; gy++) {
@@ -231,41 +248,48 @@ class MegaWorld1000 {
 
         for (const [bsk, bsec] of Object.entries(baseSectors)) {
           const [bsx, bsy] = bsk.split("_").map(Number);
-          const sk = `${secOffX + bsx}_${secOffY + bsy}`;
-          const sec = { w: [], d: [], l: [], o: [] };
+          const defaultSk = exactSectorDiv
+            ? `${secOffX + bsx}_${secOffY + bsy}`
+            : `${Math.floor((offX + bsx * baseSimSectorPx) / baseSimSectorPx)}_${Math.floor((offY + bsy * baseSimSectorPx) / baseSimSectorPx)}`;
           if (bsec.w?.length) {
             for (let i = 0; i < bsec.w.length; i++) {
               const w = bsec.w[i];
-              const row = [w[0] + offX, w[1] + offY, w[2] + offX, w[3] + offY, w[4], w[5], w[6], w[7], w[8]];
+              const x0 = w[0] + offX, y0 = w[1] + offY, x1 = w[2] + offX, y1 = w[3] + offY;
+              const row = [x0, y0, x1, y1, w[4], w[5], w[6], w[7], w[8]];
               if (w[9] !== undefined) row.push(w[9]);
-              sec.w.push(row);
+              const targetSk = exactSectorDiv ? defaultSk : `${Math.floor(((x0 + x1) * 0.5) / baseSimSectorPx)}_${Math.floor(((y0 + y1) * 0.5) / baseSimSectorPx)}`;
+              getOrCreateSector(targetSk).w.push(row);
             }
-            totalWalls += sec.w.length;
+            totalWalls += bsec.w.length;
           }
           if (bsec.d?.length) {
             for (let i = 0; i < bsec.d.length; i++) {
               const d = bsec.d[i];
-              const row = [d[0] + offX, d[1] + offY, d[2] + offX, d[3] + offY, d[4], d[5]];
+              const x0 = d[0] + offX, y0 = d[1] + offY, x1 = d[2] + offX, y1 = d[3] + offY;
+              const row = [x0, y0, x1, y1, d[4], d[5]];
               if (d[6] !== undefined) row.push(d[6]);
-              sec.d.push(row);
+              const targetSk = exactSectorDiv ? defaultSk : `${Math.floor(((x0 + x1) * 0.5) / baseSimSectorPx)}_${Math.floor(((y0 + y1) * 0.5) / baseSimSectorPx)}`;
+              getOrCreateSector(targetSk).d.push(row);
             }
-            totalDoors += sec.d.length;
+            totalDoors += bsec.d.length;
           }
           if (bsec.l?.length) {
             for (let i = 0; i < bsec.l.length; i++) {
               const l = bsec.l[i];
-              const row = [l[0] + offX, l[1] + offY, l[2], l[3], l[4], l[5], l[6], l[7]];
+              const lx = l[0] + offX, ly = l[1] + offY;
+              const row = [lx, ly, l[2], l[3], l[4], l[5], l[6], l[7]];
               if (l[8] !== undefined) row.push(l[8]);
-              sec.l.push(row);
+              const targetSk = exactSectorDiv ? defaultSk : `${Math.floor(lx / baseSimSectorPx)}_${Math.floor(ly / baseSimSectorPx)}`;
+              getOrCreateSector(targetSk).l.push(row);
             }
-            totalLights += sec.l.length;
+            totalLights += bsec.l.length;
           }
           if (bsec.o?.length) {
+            const sec = getOrCreateSector(defaultSk);
             for (let i = 0; i < bsec.o.length; i++) {
               sec.o.push(bsec.o[i] + ovOffset);
             }
           }
-          sectors[sk] = sec;
         }
       }
     }
@@ -310,7 +334,11 @@ class MegaWorld1000 {
     if (data?.chunks?.baseUrl) {
       if (Array.isArray(data.superGrid?.tints) && !data.superGrid.parsedTints) {
         data.superGrid.parsedTints = data.superGrid.tints.map(row =>
-          row.map(hex => (typeof hex === "number" ? hex : parseInt(String(hex).replace("#", ""), 16) || 0xffffff))
+          row.map(hex => {
+            if (typeof hex === "number") return Number.isFinite(hex) ? hex : 0xffffff;
+            const parsed = parseInt(String(hex).replace("#", ""), 16);
+            return Number.isFinite(parsed) ? parsed : 0xffffff;
+          })
         );
       }
       if (!data.sectors) data.sectors = {};
@@ -356,11 +384,8 @@ class MegaWorld1000 {
     const foregroundMaxZoomZ = rawSpec.foregroundMaxZoomZ ?? (hasForegroundPyramid ? (rawSpec.maxZoomZ ?? (7 + zOffset)) : 0);
     const cfgFgElev = levelCfg.foregroundElevation;
     const rawFgElev = rawSpec.foregroundElevation;
-    const foregroundElevation = (cfgFgElev !== undefined && cfgFgElev !== null && Number.isFinite(Number(cfgFgElev)))
-      ? Number(cfgFgElev)
-      : ((rawFgElev !== undefined && rawFgElev !== null && Number.isFinite(Number(rawFgElev)))
-          ? Number(rawFgElev)
-          : null);
+    const parseOptElev = (v) => (v !== undefined && v !== null && v !== "" && Number.isFinite(Number(v))) ? Number(v) : null;
+    const foregroundElevation = parseOptElev(cfgFgElev) ?? parseOptElev(rawFgElev);
     const foregroundTileSet = parseSparseTileSet(rawSpec.foregroundTiles);
 
     const defaultBounds = superGrid
@@ -386,7 +411,7 @@ class MegaWorld1000 {
       simGrid,
       simSectorPx,
       bounds,
-      isUpper: !level.isView && (getLevelBottomElevation(level) > getLevelBottomElevation(canvas.level)),
+      isUpper: !level.isView && isLevelAbove(level, canvas.level),
       lastPyramidKey: "",
       lastForegroundPyramidKey: "",
       lastOverlayKey: "",
@@ -609,7 +634,7 @@ class MegaWorld1000 {
   _hasMultiElevationDepth() {
     const visibleLevels = (canvas.scene?.levels?.sorted || []).filter(l => l.isVisible);
     if (visibleLevels.length > 1) return true;
-    const baseElev = getLevelBottomElevation(canvas.level);
+    const baseElev = getLevelBaseElevation(canvas.level);
 
     // Check native TileDocuments that restrict light above base elevation
     if (canvas.tiles?.placeables) {
@@ -681,12 +706,30 @@ class MegaWorld1000 {
     this.unmount({ clearTextures: switchingScene });
     const mountGen = ++this._mountGen;
     this._mounting = true;
-    const p = this._mountImpl(scene, mountGen).finally(() => {
+    const p = this._mountImpl(scene, mountGen).catch((err) => {
+      console.error(`${MODULE_ID} | Failed to mount scene "${scene?.name ?? scene?.id ?? ""}":`, err);
+      if (this._mountGen === mountGen) this.unmount();
+    }).finally(() => {
       if (this._mountGen === mountGen) this._mounting = false;
       if (this._mountPromise === p) this._mountPromise = null;
     });
     this._mountPromise = p;
     return p;
+  }
+
+  _recomputeWorldMinScale() {
+    if (!canvas?.dimensions?.scale) return;
+    if (this._origScaleMin === null) this._origScaleMin = canvas.dimensions.scale.min;
+    if (this._origScaleMax === null) this._origScaleMax = canvas.dimensions.scale.max;
+    const [rawSw, rawSh] = canvas.screenDimensions || [];
+    const sw = (Number.isFinite(rawSw) && rawSw > 0) ? rawSw : 1600;
+    const sh = (Number.isFinite(rawSh) && rawSh > 0) ? rawSh : 1000;
+    const worldMax = Math.max(canvas.dimensions.width || 100000, canvas.dimensions.height || 100000);
+    const fitScale = Math.max(0.0005, Math.min(sw, sh) / (worldMax * 1.25));
+    const baseMin = (Number.isFinite(this._origScaleMin) && this._origScaleMin > 0) ? this._origScaleMin : WORLD_MIN_SCALE;
+    this._worldMinScale = Math.max(0.0005, Math.min(baseMin, WORLD_MIN_SCALE, fitScale));
+    canvas.dimensions.scale.min = this._worldMinScale;
+    canvas.dimensions.scale.max = Math.max(this._origScaleMax || 3, 2.5);
   }
 
   async _mountImpl(scene, mountGen) {
@@ -729,14 +772,7 @@ class MegaWorld1000 {
     for (const l of layers) this.levelLayers.set(l.level.id, l);
 
     // Allow full seamless zoom-out across giant worlds (including 6000x6000 continents) and deep 2.5x combat zoom-in
-    if (canvas.dimensions?.scale) {
-      const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
-      const worldMax = Math.max(canvas.dimensions.width || 100000, canvas.dimensions.height || 100000);
-      const fitScale = Math.min(sw, sh) / (worldMax * 1.25);
-      this._worldMinScale = Math.min(canvas.dimensions.scale.min, WORLD_MIN_SCALE, fitScale);
-      canvas.dimensions.scale.min = this._worldMinScale;
-      canvas.dimensions.scale.max = Math.max(canvas.dimensions.scale.max, 2.5);
-    }
+    this._recomputeWorldMinScale();
 
     // Persist camera on F5 / tab close and restore last saved view immediately before tile streaming starts
     this._beforeUnloadFn = () => this._saveCameraNow();
@@ -755,11 +791,15 @@ class MegaWorld1000 {
         // Purge active overlays, virtual tiles, and pyramid tiles referencing destroyed BaseTextures
         for (const [k, ov] of Array.from(this.activeOverlays.entries())) {
           if ((ov.roofMesh && !isTextureUsable(ov.roofMesh.texture)) || (ov.wallsMesh && !isTextureUsable(ov.wallsMesh.texture))) {
-            this._retireOverlayEntry(k, ov);
+            if (ov.roofMesh) this._emit("overlayRetire", { key: k, ov, mesh: ov.roofMesh });
+            if (ov.wallsMesh) this.retireMesh(ov.wallsMesh);
+            if (ov.roofMesh) this.retireMesh(ov.roofMesh);
+            this.activeOverlays.delete(k);
           }
         }
         for (const [k, vt] of Array.from(this.activeVirtualTiles.entries())) {
           if (vt?.mesh && !isTextureUsable(vt.mesh.texture)) {
+            this._emit("virtualTileRetire", { key: k, vt, mesh: vt.mesh });
             this.retireMesh(vt.mesh);
             this.activeVirtualTiles.delete(k);
           }
@@ -771,6 +811,8 @@ class MegaWorld1000 {
           }
         }
         for (const layer of this.visibleLevelLayers) {
+          layer.lastPyramidKey = "";
+          layer.lastForegroundPyramidKey = "";
           layer.lastOverlayKey = "";
           layer.lastTileKey = "";
         }
@@ -892,7 +934,7 @@ class MegaWorld1000 {
       const z1TileSz = this._getPyramidTileSize(layer, 1);
       const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
       const maxY1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.h || layer.worldPx) - 0.001) / z1TileSz));
-      if (layer.hasPyramid && layer.maxZoomZ >= 1) {
+      if (layer.hasPyramid && layer.maxZoomZ >= 1 && (!layer.superGrid || (layer.superGrid.macroMaxZ ?? 2) >= 1)) {
         const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
         for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
           this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
@@ -950,6 +992,7 @@ class MegaWorld1000 {
     this.tokenStreamer.mount(scene);
     this.selectionOverlay.mount();
 
+    this._mounting = false;
     this.updateAll(true);
     this.syncZoomLimits({ animate: false });
     this._depthElevSyncNeeded = true;
@@ -1129,6 +1172,15 @@ class MegaWorld1000 {
         canvas.app.renderer.textureGC.mode = this._origTextureGcMode;
       }
       this._origTextureGcMode = null;
+    }
+
+    if (this._origScaleMin !== null || this._origScaleMax !== null) {
+      if (canvas?.dimensions?.scale) {
+        if (this._origScaleMin !== null) canvas.dimensions.scale.min = this._origScaleMin;
+        if (this._origScaleMax !== null) canvas.dimensions.scale.max = this._origScaleMax;
+      }
+      this._origScaleMin = null;
+      this._origScaleMax = null;
     }
 
     for (const [, bgMesh] of this._hiddenNativeLevelBg) {

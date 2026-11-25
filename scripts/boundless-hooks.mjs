@@ -16,9 +16,11 @@ export function installLosHorizonPatch() {
   const orig = PVS.prototype._getPolygonConfiguration;
   PVS.prototype._getPolygonConfiguration = function (...args) {
     const cfg = orig.apply(this, args);
-    const megaCfg = canvas?.scene?.flags?.[MODULE_ID];
-    if (megaCfg?.enabled && cfg.radius > (megaCfg.maxLosPx || MAX_LOS_RADIUS_PX)) {
-      cfg.radius = megaCfg.maxLosPx || MAX_LOS_RADIUS_PX;
+    const megaCfg = globalThis.canvas?.scene?.flags?.[MODULE_ID];
+    const lvlCfg = globalThis.canvas?.level?.flags?.[MODULE_ID];
+    if (megaCfg?.enabled || lvlCfg?.enabled || globalThis.Boundless?.active) {
+      const maxLos = lvlCfg?.maxLosPx || megaCfg?.maxLosPx || MAX_LOS_RADIUS_PX;
+      if (cfg.radius > maxLos) cfg.radius = maxLos;
     }
     return cfg;
   };
@@ -252,7 +254,7 @@ export function registerBoundlessHooks(controller) {
 
   Hooks.on("updateLevel", (level, changes) => {
     const parentScene = level?.parent;
-    if (!parentScene || parentScene.id !== canvas.scene?.id) return;
+    if (!globalThis.canvas?.ready || !parentScene || parentScene.id !== globalThis.canvas.scene?.id) return;
     const flagChanges = changes?.flags?.[MODULE_ID];
     const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
     if (flagChanges || flagDeleted) {
@@ -260,8 +262,10 @@ export function registerBoundlessHooks(controller) {
     }
   });
 
+  const isRuntimeReady = () => Boolean(controller.active && !controller._mounting && globalThis.canvas?.ready);
+
   Hooks.on("canvasPan", () => {
-    if (!controller.active || controller._restoringCamera || controller._mounting) return;
+    if (!isRuntimeReady() || controller._restoringCamera) return;
     const now = performance.now();
     controller._lastPanMs = now;
     controller._updateCameraVelocity(now);
@@ -273,13 +277,13 @@ export function registerBoundlessHooks(controller) {
 
   let _controlTokenQueued = false;
   Hooks.on("controlToken", () => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     if (controller.tokenStreamer?._selectingBatch) return;
     if (_controlTokenQueued) return;
     _controlTokenQueued = true;
     queueMicrotask(() => {
       _controlTokenQueued = false;
-      if (!controller.active || controller.tokenStreamer?._selectingBatch) return;
+      if (!isRuntimeReady() || controller.tokenStreamer?._selectingBatch) return;
       controller.updateSimAndLightBubbles(false);
       controller.tokenStreamer.onVisibilityChanged();
       controller.selectionOverlay?.refresh?.();
@@ -288,18 +292,18 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("lightingRefresh", (effects) => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     controller.onLightingRefresh(effects);
   });
 
   let _sightRefreshQueued = false;
   Hooks.on("sightRefresh", () => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     if (_sightRefreshQueued) return;
     _sightRefreshQueued = true;
     queueMicrotask(() => {
       _sightRefreshQueued = false;
-      if (!controller.active) return;
+      if (!isRuntimeReady()) return;
       controller.fogManager.revealFromActiveVision();
       controller.wallEditor.refreshDoorVisibility();
       const hasVision = (canvas.effects?.visionSources?.size ?? 0) > 0;
@@ -318,7 +322,7 @@ export function registerBoundlessHooks(controller) {
         } else if (!controller._sightBubbleTimer) {
           controller._sightBubbleTimer = setTimeout(() => {
             controller._sightBubbleTimer = null;
-            if (!controller.active) return;
+            if (!isRuntimeReady()) return;
             controller._lastSightBubbleMs = performance.now();
             controller.updateSimAndLightBubbles(false);
           }, Math.max(16, Math.ceil(100 - elapsed)));
@@ -355,18 +359,18 @@ export function registerBoundlessHooks(controller) {
       _tokBatchVoidFilter = false;
       _tokBatchVoidFilterForce = false;
       _tokBatchOcclusion = false;
-      if (!controller.active) return;
+      if (!isRuntimeReady()) return;
       if (doVoidFilter) controller._syncInterfaceVoidFilter(doVoidForce);
       if (doBubbles) controller.updateSimAndLightBubbles(false);
       if (doSelection) controller.selectionOverlay?.refresh?.(true);
       if (doOcclusion) {
-        canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
+        canvas.perception?.update?.({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
       }
     });
   };
 
   Hooks.on("updateToken", (doc, changes) => {
-    if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
+    if (!isRuntimeReady() || doc?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenUpdated(doc, changes);
     controller.charPins.onTokenUpdated(doc, changes);
     const posChanged = "x" in changes || "y" in changes || "level" in changes;
@@ -385,20 +389,20 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("drawToken", (tok) => {
-    if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
+    if (!isRuntimeReady() || tok?.document?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenDrawn(tok);
     if (!tok.isPreview) queueTokenBatchFlush({ voidFilter: true, voidFilterForce: true });
   });
 
   Hooks.on("refreshToken", (tok, flags) => {
-    if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
+    if (!isRuntimeReady() || tok?.document?.parent?.id !== canvas.scene?.id) return;
     if (flags?.refreshPosition || flags?.refreshElevation) {
       controller._roofTokenOccDirty = true;
     }
   });
 
   Hooks.on("createToken", (doc) => {
-    if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
+    if (!isRuntimeReady() || doc?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenCreated(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
@@ -407,7 +411,7 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("deleteToken", (doc) => {
-    if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
+    if (!isRuntimeReady() || doc?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenDeleted(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
@@ -415,43 +419,45 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("updateUser", (_user, changes) => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     if ("character" in changes || "color" in changes) {
       controller.charPins.onUserOrActorUpdated();
     }
   });
 
   Hooks.on("updateActor", (_actor, changes) => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     if ("img" in changes || "name" in changes || "ownership" in changes) {
       controller.charPins.onUserOrActorUpdated();
     }
   });
 
   // Sync TokenImpostorLayer visibility immediately when INVISIBLE / BURROW effects toggle on unmounted NPCs
-  const onEffectVisibilityChange = (effect) => {
-    if (!controller.active || !controller.tokenStreamer?.enabled) return;
+  const onEffectVisibilityChange = (effect, changes = null) => {
+    if (!isRuntimeReady() || !controller.tokenStreamer?.enabled) return;
     const inv = CONFIG?.specialStatusEffects?.INVISIBLE || "invisible";
     const bur = CONFIG?.specialStatusEffects?.BURROW || "burrow";
     const statuses = effect?.statuses;
-    if (statuses?.has?.(inv) || statuses?.has?.(bur)) {
+    const removedOrToggled = Boolean(changes && ("statuses" in changes || "disabled" in changes));
+    if (removedOrToggled || statuses?.has?.(inv) || statuses?.has?.(bur)) {
       controller.tokenStreamer.onVisibilityChanged();
     }
   };
-  Hooks.on("createActiveEffect", onEffectVisibilityChange);
-  Hooks.on("updateActiveEffect", onEffectVisibilityChange);
-  Hooks.on("deleteActiveEffect", onEffectVisibilityChange);
+  Hooks.on("createActiveEffect", (e) => onEffectVisibilityChange(e));
+  Hooks.on("updateActiveEffect", (e, ch) => onEffectVisibilityChange(e, ch));
+  Hooks.on("deleteActiveEffect", (e) => onEffectVisibilityChange(e));
 
   Hooks.on("collapseSidebar", () => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     controller.charPins._lastSidebarCheckMs = 0;
     setTimeout(() => {
-      if (controller.active) controller.charPins.updateViewport();
+      if (isRuntimeReady()) controller.charPins.updateViewport();
     }, 120);
   });
 
   window.addEventListener("resize", () => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
+    controller._recomputeWorldMinScale?.();
     controller.poiManager._layoutDirty = true;
     controller.poiManager.updateViewport();
     controller.charPins._lastSidebarCheckMs = 0;
@@ -461,7 +467,7 @@ export function registerBoundlessHooks(controller) {
   // React seamlessly to native TileDocuments added/edited/removed on any level (floors blocking lower-level lights, roofs, etc.)
   for (const hookName of ["createTile", "updateTile", "deleteTile"]) {
     Hooks.on(hookName, (doc) => {
-      if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
+      if (!isRuntimeReady() || doc?.parent?.id !== canvas.scene?.id) return;
       controller._depthDirty = true;
       controller._depthElevSyncNeeded = true;
       controller._occlusionDirty = true;
@@ -471,20 +477,20 @@ export function registerBoundlessHooks(controller) {
   // React to native WallDocuments added/edited/removed on any level so GPU light shadows stay in sync
   for (const hookName of ["createWall", "updateWall", "deleteWall"]) {
     Hooks.on(hookName, (doc) => {
-      if (!controller.active || !controller.visibleLevelLayers.length || doc?.parent?.id !== canvas.scene?.id) return;
+      if (!isRuntimeReady() || !controller.visibleLevelLayers.length || doc?.parent?.id !== canvas.scene?.id) return;
       controller.scheduleLightBatchRebuild();
     });
   }
 
   // React to ALT highlight & v14 Region/Surface changes so CanvasDepthMask and z=5 interior reveal sync immediately
   Hooks.on("highlightObjects", () => {
-    if (!controller.active) return;
+    if (!isRuntimeReady()) return;
     controller._depthDirty = true;
   });
 
   for (const hookName of ["createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior"]) {
     Hooks.on(hookName, (doc) => {
-      if (!controller.active) return;
+      if (!isRuntimeReady()) return;
       const sc = doc?.parent?.documentName === "Scene" ? doc.parent : doc?.parent?.parent;
       if (sc && sc.id !== canvas.scene?.id) return;
       controller._depthDirty = true;
@@ -493,7 +499,7 @@ export function registerBoundlessHooks(controller) {
   }
 
   Hooks.on("initializeEdges", (scene) => {
-    if (!controller.active || (scene && scene.id !== canvas.scene?.id)) return;
+    if (!isRuntimeReady() || (scene && scene.id !== canvas.scene?.id)) return;
     controller.simSectors.clear();
     controller.lastSimKey = "";
     controller._lastActorSimKey = "";

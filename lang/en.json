@@ -59,7 +59,7 @@
       "BakeConfirmTitle": "Bake Level into Boundless",
       "BakeConfirmBody": "Bake tiles, walls, lights, and ambient sounds on level \"{level}\" into Boundless spatial streaming?",
       "BakeRemoveOriginals": "Remove original documents from the scene after baking",
-      "BakeDone": "Level \"{level}\" baked: {tiles} tiles, {walls} walls, {lights} lights, {sounds} sounds."
+      "BakeDone": "Level \"{level}\" baked ({tiles} tiles, {walls} walls, {lights} lights, {sounds} sounds)."
     },
     "DefaultPOI": {
       "City": "Capital City",

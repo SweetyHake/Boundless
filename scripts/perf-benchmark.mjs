@@ -1,5 +1,5 @@
 import { MODULE_ID } from "./utils.mjs";
-import { PERF_CONFIG, resetPerfStats } from "./perf-patcher.mjs";
+import { PERF_CONFIG, perfStats, resetPerfStats } from "./perf-patcher.mjs";
 import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
 import { resetCpuCaches } from "./perf-cpu.mjs";
 import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
@@ -287,8 +287,7 @@ async function runRealMouseDrag(tok, steps = 28) {
     }
   } finally {
     try { tok.mouseInteractionManager?.cancel?.(); } catch {}
-    try { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true })); } catch {}
-    try { view.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
+    try { globalThis.canvas?.tokens?._finalizeDragLeft?.(); } catch {}
     await nextFrame();
   }
 
@@ -309,6 +308,7 @@ export async function benchmarkCurrentScene(opts = {}) {
 
   const savedPerfEnabled = PERF_CONFIG.perfEnabled;
   const savedIdleFpsLimit = PERF_CONFIG.perfIdleFpsLimit;
+  const savedStats = { ...perfStats };
   PERF_CONFIG.perfIdleFpsLimit = false;
   const savedLayer = canvas.activeLayer;
   const savedCamera = {
@@ -573,7 +573,9 @@ export async function benchmarkCurrentScene(opts = {}) {
             }
           } finally {
             edges.delete("bl-bench-door.0");
-            activeLs.initialize();
+            if (!activeLs.destroyed && globalThis.canvas?.scene?.id === scene.id) {
+              try { activeLs.initialize(); } catch {}
+            }
           }
           if (isOn && !warmup) onShapesChanged = Math.max(onShapesChanged, changed);
           return { ms: performance.now() - t0 };
@@ -615,7 +617,13 @@ export async function benchmarkCurrentScene(opts = {}) {
               }
             } finally {
               edges.delete("bl-bench-door.0");
-              for (let j = 0; j < activeLights.length; j++) activeLights[j].initialize();
+              if (globalThis.canvas?.scene?.id === scene.id) {
+                for (let j = 0; j < activeLights.length; j++) {
+                  if (!activeLights[j].destroyed) {
+                    try { activeLights[j].initialize(); } catch {}
+                  }
+                }
+              }
             }
             return { ms: (performance.now() - t0) / steps };
           };
@@ -664,8 +672,11 @@ export async function benchmarkCurrentScene(opts = {}) {
     PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
     try { await game.settings.set("core", "tokenDragPreview", savedDragPreview); } catch {}
     try { await setPerfMode(savedPerfEnabled); } catch {}
-    try { savedLayer?.activate?.(); } catch {}
-    try { canvas.pan(savedCamera); } catch {}
+    Object.assign(perfStats, savedStats);
+    if (globalThis.canvas?.scene?.id === scene.id) {
+      try { savedLayer?.activate?.(); } catch {}
+      try { canvas.pan(savedCamera); } catch {}
+    }
   }
 
   const regressions = rows.filter((r) => r.status === "REGRESSION");
@@ -686,6 +697,9 @@ export async function benchmarkCurrentScene(opts = {}) {
  */
 export async function benchmarkGameplayMechanics() {
   const savedPerfEnabled = PERF_CONFIG.perfEnabled;
+  const savedIdleFpsLimit = PERF_CONFIG.perfIdleFpsLimit;
+  const savedStats = { ...perfStats };
+  PERF_CONFIG.perfIdleFpsLimit = false;
   const rows = [];
   const pushRow = (mechanic, offRes, onRes, thresholds = {}) => {
     const cls = classifyMetric(offRes.ms, onRes.ms, thresholds);
@@ -728,7 +742,7 @@ export async function benchmarkGameplayMechanics() {
         for (let i = 0; i < n; i++) {
           if (atkAct?.rollAttack) {
             try {
-              const rolls = await atkAct.rollAttack({}, { configure: false }, { create: false });
+              const rolls = await atkAct.rollAttack({ consume: false }, { configure: false }, { create: false });
               if (Array.isArray(rolls)) {
                 for (const r of rolls) await r.render();
               }
@@ -742,7 +756,7 @@ export async function benchmarkGameplayMechanics() {
           }
           if (atkAct?.rollDamage) {
             try {
-              const dmg = await atkAct.rollDamage({}, { configure: false }, { create: false });
+              const dmg = await atkAct.rollDamage({ consume: false }, { configure: false }, { create: false });
               if (Array.isArray(dmg)) {
                 for (const r of dmg) await r.render();
               }
@@ -790,7 +804,9 @@ export async function benchmarkGameplayMechanics() {
       pushRow(`G4. Actor Sheet Open+Render (${pc.items.size} items)`, off, on, { absToleranceMs: 8, warnPct: 8, failPct: 15 });
     }
   } finally {
+    PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
     try { await setPerfMode(savedPerfEnabled); } catch {}
+    Object.assign(perfStats, savedStats);
   }
 
   return rows;

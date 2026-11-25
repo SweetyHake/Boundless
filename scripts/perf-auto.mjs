@@ -133,13 +133,21 @@ export function updateStandardSceneCulling() {
         continue;
       }
       const doc = t.document;
-      const x = doc.x ?? 0;
-      const y = doc.y ?? 0;
-      const w = doc.width ?? 0;
-      const h = doc.height ?? 0;
-      // Generous padding for rotated tiles
-      const diagPad = doc.rotation ? Math.max(w, h) * 0.5 : 0;
-      const inView = rectsIntersect(x - diagPad, y - diagPad, x + w + diagPad, y + h + diagPad, vp);
+      const rawW = Number(doc.width) || 0;
+      const rawH = Number(doc.height) || 0;
+      const absW = Math.abs(rawW);
+      const absH = Math.abs(rawH);
+      const scaleX = Math.max(1, Math.abs(Number(doc.texture?.scaleX) || 1));
+      const scaleY = Math.max(1, Math.abs(Number(doc.texture?.scaleY) || 1));
+      const x0 = rawW >= 0 ? (doc.x ?? 0) : (doc.x ?? 0) + rawW;
+      const y0 = rawH >= 0 ? (doc.y ?? 0) : (doc.y ?? 0) + rawH;
+      const cx = x0 + absW * 0.5;
+      const cy = y0 + absH * 0.5;
+      const halfW = absW * scaleX * 0.5;
+      const halfH = absH * scaleY * 0.5;
+      // Generous padding for rotated/scaled/flipped tiles
+      const diagPad = doc.rotation ? Math.max(halfW, halfH) : 0;
+      const inView = rectsIntersect(cx - halfW - diagPad, cy - halfH - diagPad, cx + halfW + diagPad, cy + halfH + diagPad, vp);
       mesh.renderable = inView;
       if (!inView) culledTiles++;
     }
@@ -358,7 +366,8 @@ function syncSingleDecorativeTile(t, allow) {
     !m.restrictsWeather &&
     !t.isVideo;
   if (isDecorative) {
-    if (m.pluginName !== "batch") {
+    // Only switch default Foundry batchOcclusion tiles; preserve any custom tile shader (FXMaster, Showstopper, TokenMagic)
+    if (m.pluginName === "batchOcclusion") {
       m.pluginName = "batch";
       m._blFastBatch = true;
       _hasFastBatchTiles = true;
@@ -388,30 +397,50 @@ export function syncDecorativeTileShaders(enable) {
   if (!allow) _hasFastBatchTiles = false;
 }
 
-function scheduleStandardCulling() {
+let _cullRaf = null;
+function scheduleStandardCulling(immediateFrame = false) {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return;
-  if (_cullTimer) return;
+  if (immediateFrame && typeof globalThis.requestAnimationFrame === "function") {
+    if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
+    if (_cullRaf !== null) return;
+    _cullRaf = globalThis.requestAnimationFrame(() => {
+      _cullRaf = null;
+      updateStandardSceneCulling();
+    });
+    return;
+  }
+  if (_cullTimer || _cullRaf !== null) return;
   _cullTimer = setTimeout(() => {
     _cullTimer = null;
     updateStandardSceneCulling();
-  }, 40);
+  }, 16);
 }
 
 // ---------------------------------------------------------------------------
 // 2. Smart Cross-Scene Idle VRAM Cleanup
 // ---------------------------------------------------------------------------
 
-function normalizeAssetKey(url) {
+export function normalizeAssetKey(url) {
   if (typeof url !== "string" || !url) return "";
+  let clean = url.split("?")[0].split("#")[0];
+  const origin = globalThis.location?.origin;
+  if (origin && clean.startsWith(origin)) {
+    clean = clean.slice(origin.length);
+  }
+  // Strip Foundry server routePrefix (e.g. "/foundry/") when configured
+  let routePrefix = "";
   try {
-    const clean = url.split("?")[0].split("#")[0];
-    const origin = globalThis.location?.origin;
-    if (origin && clean.startsWith(origin)) {
-      return decodeURIComponent(clean.slice(origin.length).replace(/^\/+/, ""));
-    }
-    return decodeURIComponent(clean.replace(/^\/+/, ""));
+    const rawRoute = globalThis.foundry?.utils?.getRoute?.("") ?? globalThis.ROUTE_PREFIX ?? "";
+    if (typeof rawRoute === "string") routePrefix = rawRoute.replace(/^\/+|\/+$/g, "");
+  } catch {}
+  clean = clean.replace(/^\/+/, "");
+  if (routePrefix && (clean === routePrefix || clean.startsWith(`${routePrefix}/`))) {
+    clean = clean.slice(routePrefix.length).replace(/^\/+/, "");
+  }
+  try {
+    return decodeURIComponent(clean);
   } catch {
-    return url;
+    return clean;
   }
 }
 
@@ -460,10 +489,28 @@ export function disposeStaleSceneVramTextures() {
 
   const activeUrls = collectSceneActiveAssetUrls(scene);
   const protectedBts = new Set();
-  const ringBt = globalThis.CONFIG?.Token?.ring?.ringClass?.baseTexture;
-  if (ringBt) protectedBts.add(ringBt);
-  const ringSheetBt = globalThis.CONFIG?.Token?.ring?.spritesheet?.baseTexture;
-  if (ringSheetBt) protectedBts.add(ringSheetBt);
+  const protectTex = (t) => {
+    const bt = t?.baseTexture ?? (t?.realWidth !== undefined ? t : null);
+    if (bt) protectedBts.add(bt);
+  };
+  protectTex(globalThis.CONFIG?.Token?.ring?.ringClass?.baseTexture);
+  protectTex(globalThis.CONFIG?.Token?.ring?.spritesheet?.baseTexture);
+  // Protect every live BaseTexture currently attached to active scene display objects (including custom module assets)
+  const c = globalThis.canvas;
+  protectTex(c?.primary?.background?.texture);
+  protectTex(c?.primary?.foreground?.texture);
+  for (const lt of c?.primary?.levelTextures ?? []) protectTex(lt?.texture);
+  for (const ch of c?.primary?.children ?? []) protectTex(ch?.texture);
+  for (const t of c?.tiles?.placeables ?? []) protectTex(t?.mesh?.texture);
+  for (const tok of c?.tokens?.placeables ?? []) {
+    protectTex(tok?.mesh?.texture);
+    protectTex(tok?.ring?.subjectTexture);
+    protectTex(tok?.turnMarker?.mesh?.texture);
+  }
+  for (const d of c?.drawings?.placeables ?? []) protectTex(d?.shape?.texture);
+  for (const tpl of c?.templates?.placeables ?? []) protectTex(tpl?.texture);
+  protectTex(c?.visibility?.visibilityOverlay?.texture);
+  for (const ch of c?.weather?.children ?? []) protectTex(ch?.texture);
 
   let disposed = 0;
   let bytes = 0;
@@ -482,7 +529,7 @@ export function disposeStaleSceneVramTextures() {
     // Require a real URL-backed resource so CanvasResource / dynamic spritesheets are never evicted
     const rawUrl = bt.resource?.url;
     if (!rawUrl || typeof rawUrl !== "string") continue;
-    if (/\.(webm|mp4|m4v|ogg|ogv)$/i.test(rawUrl)) continue;
+    if (/\.(webm|mp4|m4v|ogg|ogv|mov)(?:[?#]|$)/i.test(rawUrl)) continue;
     // Never evict global Foundry or module spritesheets (token rings, VFX, weather, UI atlases)
     if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|more-dynamic-token-rings\/|cs-rings\/|showstopper\/|fxmaster\/|jb2a|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
 
@@ -538,7 +585,7 @@ function scheduleStandardLevelPrewarm() {
   for (const lvl of levels) {
     if (lvl.id === activeLevelId) continue;
     const src = lvl.background?.src;
-    if (src && !/\.(webm|mp4|m4v)$/i.test(src)) urls.push(src);
+    if (src && !/\.(webm|mp4|m4v|ogv|ogg|mov)(?:[?#]|$)/i.test(src)) urls.push(src);
   }
   if (!urls.length) return;
 
@@ -616,7 +663,7 @@ export function installAutoPerfEngine(controller) {
 
   Hooks.on("canvasPan", () => {
     if (!isStandardSceneActive()) return;
-    scheduleStandardCulling();
+    scheduleStandardCulling(true);
   });
 
   Hooks.on("drawTile", (tile) => {
@@ -652,12 +699,25 @@ export function installAutoPerfEngine(controller) {
     "createAmbientSound", "updateAmbientSound", "deleteAmbientSound",
     "createNote", "updateNote", "deleteNote",
     "createWall", "updateWall", "deleteWall",
+    "controlTile", "hoverTile",
+    "controlAmbientLight", "hoverAmbientLight",
+    "controlAmbientSound", "hoverAmbientSound",
+    "controlNote", "hoverNote",
+    "controlWall", "hoverWall",
     "highlightObjects", "lightingRefresh"
   ]) {
     Hooks.on(h, () => {
-      if (isStandardSceneActive()) scheduleStandardCulling();
+      if (isStandardSceneActive()) scheduleStandardCulling(true);
     });
   }
+
+  Hooks.on("updateToken", (doc, changes) => {
+    if (!isStandardSceneActive()) return;
+    if ((globalThis.canvas?.effects?.lightSources?.size ?? 0) < 16) return;
+    if (doc?.object?.light?.active && changes && ("x" in changes || "y" in changes || "light" in changes || "level" in changes)) {
+      scheduleStandardCulling(true);
+    }
+  });
 
   Hooks.on("canvasTearDown", () => {
     _prewarmGen++;
@@ -665,6 +725,10 @@ export function installAutoPerfEngine(controller) {
     _hasStandardCulling = false;
     _tileShadersSynced = false;
     if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
+    if (_cullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
+      globalThis.cancelAnimationFrame(_cullRaf);
+      _cullRaf = null;
+    }
     if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
     if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }
   });

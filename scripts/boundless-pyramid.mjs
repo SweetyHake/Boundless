@@ -5,6 +5,7 @@ import {
   getLevelBaseElevation,
   getLevelBottomElevation,
   getLevelRoofElevation,
+  isLevelAbove,
   getEffectiveScale,
   getVirtualTileBounds,
   hasSpecOverlays,
@@ -38,16 +39,26 @@ export const pyramidMethods = {
 
   _updateCameraVelocity(now = performance.now()) {
     const pivot = canvas?.stage?.pivot;
-    const scale = canvas?.stage?.scale?.x || 1;
-    if (!pivot) return;
+    const scale = canvas?.stage?.scale?.x;
+    if (!pivot || !Number.isFinite(pivot.x) || !Number.isFinite(pivot.y) || !Number.isFinite(scale) || scale <= 0) {
+      this._camVelX = 0;
+      this._camVelY = 0;
+      this._camPrevX = null;
+      this._camPrevY = null;
+      this._camPrevMs = 0;
+      return;
+    }
     if (this._camPrevMs > 0 && this._camPrevX !== null && this._camPrevY !== null) {
       const dtMs = now - this._camPrevMs;
       if (dtMs > 4 && dtMs < 250) {
         const dx = pivot.x - this._camPrevX;
         const dy = pivot.y - this._camPrevY;
-        const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
+        const [rawSw, rawSh] = canvas.screenDimensions || [];
+        const sw = (Number.isFinite(rawSw) && rawSw > 0) ? rawSw : 1600;
+        const sh = (Number.isFinite(rawSh) && rawSh > 0) ? rawSh : 1000;
         const maxJump = Math.max(sw, sh) / scale * 2.5;
-        if (Math.hypot(dx, dy) > maxJump) {
+        const dist = Math.hypot(dx, dy);
+        if (!Number.isFinite(dist) || dist > maxJump) {
           this._camVelX = 0;
           this._camVelY = 0;
         } else {
@@ -55,8 +66,8 @@ export const pyramidMethods = {
           const vx = dx / dtSec;
           const vy = dy / dtSec;
           const alpha = Math.min(1, dtSec * 14);
-          this._camVelX = this._camVelX * (1 - alpha) + vx * alpha;
-          this._camVelY = this._camVelY * (1 - alpha) + vy * alpha;
+          this._camVelX = (Number.isFinite(this._camVelX) ? this._camVelX : 0) * (1 - alpha) + vx * alpha;
+          this._camVelY = (Number.isFinite(this._camVelY) ? this._camVelY : 0) * (1 - alpha) + vy * alpha;
         }
       } else if (dtMs >= 250) {
         this._camVelX = 0;
@@ -320,7 +331,8 @@ export const pyramidMethods = {
       const macroExact = Math.log2(Math.max(0.5, (worldPx * scale) / tilePx));
       return Math.max(0, Math.min(macroMaxZ, applyHyst(macroExact)));
     }
-    const exactZ = Math.log2((worldPx * scale) / tilePx);
+    const span = Math.max(layer.bounds?.w || worldPx, layer.bounds?.h || worldPx);
+    const exactZ = Math.log2((span * scale) / tilePx);
     return Math.max(0, Math.min(effMaxZ, applyHyst(exactZ)));
   },
 
@@ -361,10 +373,9 @@ export const pyramidMethods = {
         worldW: e.sizePx,
         worldH: e.sizePx
       };
-      const myElev = getLevelBottomElevation(layer.level);
       let invalidatedLower = false;
       for (const other of this.visibleLevelLayers) {
-        if (other !== layer && !other.level?.isView && getLevelBottomElevation(other.level) < myElev) {
+        if (other !== layer && !other.level?.isView && isLevelAbove(layer.level, other.level)) {
           other.lastTileKey = "";
           other.lastPyramidKey = "";
           invalidatedLower = true;
@@ -386,11 +397,10 @@ export const pyramidMethods = {
    */
   _isRectOccludedByUpperLevels(layer, rx, ry, rw, rh) {
     if (!layer || layer.level?.isView || layer.isUpper) return false;
-    const myElev = getLevelBottomElevation(layer.level);
     let uppers = null;
     for (let i = 0; i < this.visibleLevelLayers.length; i++) {
       const u = this.visibleLevelLayers[i];
-      if (!u.isUpper && u.opacityMask && getLevelBottomElevation(u.level) > myElev) {
+      if (!u.isUpper && u.opacityMask && isLevelAbove(u.level, layer.level)) {
         if (!uppers) uppers = [u.opacityMask];
         else uppers.push(u.opacityMask);
       }
@@ -474,20 +484,40 @@ export const pyramidMethods = {
   },
 
   acquireMesh() {
-    if (this.meshPool.length > 0) {
+    while (this.meshPool.length > 0) {
       const m = this.meshPool.pop();
+      if (!m || m.destroyed) continue;
+      m._inMeshPool = false;
       m.name = null;
       m.visible = true;
+      m.renderable = true;
       m.alpha = 1.0;
+      m.unoccludedAlpha = 1.0;
+      m.occludedAlpha = 1.0;
       m.occluded = false;
+      m.hoverFade = false;
+      m.occlusionMode = CONST.OCCLUSION_MODES.NONE;
+      m.restrictsLight = false;
+      m.restrictsWeather = false;
+      m.elevation = 0;
+      m.sort = 0;
+      m.sortLayer = 0;
       m.angle = 0;
-      m.scale.set(1, 1);
+      m.anchor?.set?.(0, 0);
+      m.position?.set?.(0, 0);
+      m.pivot?.set?.(0, 0);
+      m.skew?.set?.(0, 0);
+      m.scale?.set?.(1, 1);
       m.tint = 0xffffff;
+      m.filters = null;
+      m.filterArea = null;
+      m.mask = null;
       m.textureAlphaThreshold = 0.75;
       m._occludedBySameElevationSurfaces = true;
       m._ssDofBlurPx = 0;
       m._boundlessMesh = true;
       m._boundlessTile = false;
+      m._boundlessFgTile = false;
       if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
       // Must reset to null (NOT "batchOcclusion") so PrimarySpriteMesh#pluginName getter falls back to this._shader.pluginName
       // and switches to "batchDepth" during CanvasDepthMask#renderDepthData!
@@ -499,16 +529,35 @@ export const pyramidMethods = {
     m.anchor.set(0, 0);
     m.eventMode = "none";
     m.textureAlphaThreshold = 0.75;
+    m._occludedBySameElevationSurfaces = true;
+    m._inMeshPool = false;
     m._boundlessMesh = true;
     m._boundlessTile = false;
+    m._boundlessFgTile = false;
     return m;
   },
 
   retireMesh(m) {
-    if (!m) return;
-    // Clear any Showstopper Depth-of-Field filter & occlusion state before pooling so reused meshes never inherit stale state
+    if (!m || m.destroyed || m._inMeshPool) return;
+    // Clear any Showstopper Depth-of-Field filter, custom filters, & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
+    m.visible = true;
+    m.renderable = true;
     m.alpha = 1.0;
+    m.unoccludedAlpha = 1.0;
+    m.occludedAlpha = 1.0;
+    m.restrictsLight = false;
+    m.restrictsWeather = false;
+    m.elevation = 0;
+    m.sort = 0;
+    m.sortLayer = 0;
+    m.angle = 0;
+    m.tint = 0xffffff;
+    m.anchor?.set?.(0, 0);
+    m.position?.set?.(0, 0);
+    m.pivot?.set?.(0, 0);
+    m.skew?.set?.(0, 0);
+    m.scale?.set?.(1, 1);
     m._boundlessTile = false;
     m._boundlessFgTile = false;
     if (Object.prototype.hasOwnProperty.call(m, "updateCanvasTransform")) delete m.updateCanvasTransform;
@@ -537,17 +586,14 @@ export const pyramidMethods = {
     m._ssDofBlurPx = 0;
     if (m._ssDofBlurFilter) {
       try { m._ssDofBlurFilter.blur = 0; } catch {}
-      if (Array.isArray(m.filters)) {
-        const next = m.filters.filter(f => f !== m._ssDofBlurFilter);
-        m.filters = next.length > 0 ? next : null;
-      }
     }
-    if (m._ssSetFilterArea) {
-      m.filterArea = null;
-      m._ssSetFilterArea = false;
-    }
+    m.filters = null;
+    m.filterArea = null;
+    m.mask = null;
+    m._ssSetFilterArea = false;
     m.parent?.removeChild(m);
     if (this.meshPool.length < 1024) {
+      m._inMeshPool = true;
       this.meshPool.push(m);
     } else {
       try { m._ssDofBlurFilter?.destroy?.(); } catch {}
@@ -821,11 +867,13 @@ export const pyramidMethods = {
   },
 
   getViewportWorldRect(padFraction = 0.25, worldPx = null, { predictive = false } = {}) {
-    const scale = canvas.stage.scale.x || 1;
-    const pivot = canvas.stage.pivot;
-    const [sw, sh] = canvas.screenDimensions;
-    const maxW = worldPx || canvas.dimensions?.width || 100000;
-    const maxH = worldPx || canvas.dimensions?.height || 100000;
+    const scale = canvas?.stage?.scale?.x || 1;
+    const pivot = canvas?.stage?.pivot || { x: 0, y: 0 };
+    const [rawSw, rawSh] = canvas?.screenDimensions || [];
+    const sw = (Number.isFinite(rawSw) && rawSw > 0) ? rawSw : 1600;
+    const sh = (Number.isFinite(rawSh) && rawSh > 0) ? rawSh : 1000;
+    const maxW = (Number.isFinite(worldPx) && worldPx > 0) ? worldPx : (canvas?.dimensions?.width || 100000);
+    const maxH = (Number.isFinite(worldPx) && worldPx > 0) ? worldPx : (canvas?.dimensions?.height || 100000);
     const vel = predictive ? this._getCameraVelocity() : { velX: 0, velY: 0 };
     return computePredictiveViewportRect(pivot.x, pivot.y, sw, sh, scale, maxW, maxH, {
       padFraction,
@@ -835,7 +883,7 @@ export const pyramidMethods = {
   },
 
   updatePyramid() {
-    if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready || this._inUpdatePyramid) return;
+    if (!this.active || this._mounting || !this.visibleLevelLayers.length || !canvas?.ready || this._inUpdatePyramid) return;
     this._inUpdatePyramid = true;
     try {
     const vp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
@@ -1386,14 +1434,20 @@ export const pyramidMethods = {
                 halfW = (w * c + h * s) * 0.55;
                 halfH = (w * s + h * c) * 0.55;
               }
-              const tx0 = Math.max(0, Math.floor((ov.ovSpec.cx - halfW - bounds.x) / tileWorldSize));
-              const ty0 = Math.max(0, Math.floor((ov.ovSpec.cy - halfH - bounds.y) / tileWorldSize));
-              const tx1 = Math.min(nx - 1, Math.floor((ov.ovSpec.cx + halfW - bounds.x) / tileWorldSize));
-              const ty1 = Math.min(ny - 1, Math.floor((ov.ovSpec.cy + halfH - bounds.y) / tileWorldSize));
-              for (let ty = ty0; ty <= ty1; ty++) {
-                for (let tx = tx0; tx <= tx1; tx++) {
-                  const spec = this.resolvePyramidTile(layer, revealZ, tx, ty);
-                  nextRevealSpecs.set(spec.key, { layer, spec });
+              const rx0 = Math.max(bounds.x, ov.ovSpec.cx - halfW);
+              const ry0 = Math.max(bounds.y, ov.ovSpec.cy - halfH);
+              const rx1 = Math.min(bounds.x + bounds.w, ov.ovSpec.cx + halfW);
+              const ry1 = Math.min(bounds.y + bounds.h, ov.ovSpec.cy + halfH);
+              if (rx0 < rx1 && ry0 < ry1) {
+                const tx0 = Math.max(0, Math.floor((rx0 - bounds.x) / tileWorldSize));
+                const ty0 = Math.max(0, Math.floor((ry0 - bounds.y) / tileWorldSize));
+                const tx1 = Math.min(nx - 1, Math.floor((rx1 - 0.001 - bounds.x) / tileWorldSize));
+                const ty1 = Math.min(ny - 1, Math.floor((ry1 - 0.001 - bounds.y) / tileWorldSize));
+                for (let ty = ty0; ty <= ty1; ty++) {
+                  for (let tx = tx0; tx <= tx1; tx++) {
+                    const spec = this.resolvePyramidTile(layer, revealZ, tx, ty);
+                    nextRevealSpecs.set(spec.key, { layer, spec });
+                  }
                 }
               }
             }
@@ -1441,8 +1495,17 @@ export const pyramidMethods = {
         if (e) {
           e.isReveal = false;
           if (e.layer && e.z !== e.layer.lastTargetZ) {
-            e.desired = false;
-            this._tilesDirty = true;
+            // Preserve live z=6 blockFlags fallback tiles when currently viewing targetZ=7
+            const isBlockFallback = Boolean(
+              e.layer.spec?.blockFlags &&
+              (e.layer.lastTargetZ - e.layer.zOffset) === 7 &&
+              (e.z - e.layer.zOffset) === 6 &&
+              this.resolvePyramidTile(e.layer, e.layer.lastTargetZ, e.x * 2, e.y * 2)?.key === e.key
+            );
+            if (!isBlockFallback) {
+              e.desired = false;
+              this._tilesDirty = true;
+            }
           }
         }
         this._revealTileKeys.delete(oldKey);
@@ -1687,7 +1750,8 @@ export const pyramidMethods = {
 
     if (!this._tilesDirty) return;
 
-    const step = dtMs / CROSSFADE_MS;
+    const safeDt = (Number.isFinite(dtMs) && dtMs > 0) ? Math.min(dtMs, 250) : 16.6;
+    const step = safeDt / CROSSFADE_MS;
     const vp = this.getViewportWorldRect(0.28);
     const visVp = this.getViewportWorldRect(0.0);
     const toDelete = [];
@@ -1811,7 +1875,8 @@ export const pyramidMethods = {
           || (isFg
               ? Boolean(st?.visDesiredReady && curTargetZ > 0)
               : Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero));
-        if (canDropOld) {
+        const inVis = !(e.x0 + e.sizePx < visVp.x0 || e.x0 > visVp.x1 || e.y0 + e.sizePx < visVp.y0 || e.y0 > visVp.y1);
+        if (canDropOld || !inVis || (st?.visDesiredReady && !st.hasVisDesiredNonZero && e.z > curTargetZ)) {
           toDelete.push(k);
           anyPyramidSwapped = true;
           if (!isFg) anyBgPyramidSwapped = true;
@@ -1849,7 +1914,7 @@ export const pyramidMethods = {
       const roofsMounted = this._shouldMountRoofs(layer, vp.scale);
       const st = levelReadyState.get(ov.levelId);
       if (ov.retiring) {
-        const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || localZ === 0;
+        const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || layer.lastTargetZ <= 0;
         const spec = ov.ovSpec;
         const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
         const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);

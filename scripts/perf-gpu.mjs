@@ -24,71 +24,11 @@ let _gpuInstalled = false;
 let _uiAtlas = null;
 let _noiseLutTexture = null;
 
-// Static Token UI Layer Cache state (2-frame settle RenderTexture cache when scene/tokens are idle)
-const _tokLayerCache = {
-  rt: null,
-  sprite: null,
-  dirty: true,
-  cleanFrames: 0,
-  w: 0,
-  h: 0,
-  res: 1,
-  lastTx: NaN,
-  lastTy: NaN,
-  lastScale: NaN,
-  hooksBound: false
-};
+export function invalidateTokenLayerCache() {}
 
-export function invalidateTokenLayerCache() {
-  _tokLayerCache.dirty = true;
-  _tokLayerCache.cleanFrames = 0;
-}
+function destroyTokenLayerCache() {}
 
-function destroyTokenLayerCache() {
-  if (_tokLayerCache.sprite && !_tokLayerCache.sprite.destroyed) {
-    _tokLayerCache.sprite.destroy({ children: false, texture: false, baseTexture: false });
-  }
-  if (_tokLayerCache.rt && !_tokLayerCache.rt.destroyed) {
-    _tokLayerCache.rt.destroy(true);
-  }
-  _tokLayerCache.sprite = null;
-  _tokLayerCache.rt = null;
-  _tokLayerCache.dirty = true;
-  _tokLayerCache.cleanFrames = 0;
-  _tokLayerCache.w = 0;
-  _tokLayerCache.h = 0;
-}
-
-function ensureTokenLayerCacheHooks() {
-  if (_tokLayerCache.hooksBound || !globalThis.Hooks) return;
-  _tokLayerCache.hooksBound = true;
-  const inv = invalidateTokenLayerCache;
-  for (const h of [
-    "canvasPan",
-    "refreshToken",
-    "drawToken",
-    "createToken",
-    "deleteToken",
-    "updateToken",
-    "hoverToken",
-    "controlToken",
-    "targetToken",
-    "highlightObjects",
-    "sightRefresh",
-    "lightingRefresh",
-    "updateCombat",
-    "updateCombatant",
-    "createActiveEffect",
-    "updateActiveEffect",
-    "deleteActiveEffect"
-  ]) {
-    Hooks.on(h, inv);
-  }
-  Hooks.on("canvasTearDown", destroyTokenLayerCache);
-  if (typeof window !== "undefined") {
-    window.addEventListener("resize", inv, { passive: true });
-  }
-}
+function ensureTokenLayerCacheHooks() {}
 
 // ---------------------------------------------------------------------------
 // 1. Shared Pre-baked UI Atlas (Wall line, Wall endpoint, ControlIcon bg/border)
@@ -614,25 +554,41 @@ function renderChildSafe(child, renderer) {
   child.render(renderer);
 }
 
-function hasActiveTokenAnimations() {
-  const anims = globalThis.foundry?.canvas?.animation?.CanvasAnimation?.animations
-    ?? globalThis.CanvasAnimation?.animations;
-  if (!anims) return false;
-  for (const k in anims) {
-    if (k.startsWith("Token.") || k.includes(".Token.")) return true;
+function isStandardTokenChild(t, c) {
+  return (
+    c === t.turnMarker ||
+    c === t.border ||
+    c === t.voidMesh ||
+    c === t.detectionFilterMesh ||
+    c === t.bars ||
+    c === t.effects ||
+    c === t.targetArrows ||
+    c === t.targetPips ||
+    c === t.nameplate ||
+    c === t.tooltip
+  );
+}
+
+function hasCustomUnderlayChild(t) {
+  const kids = t.children;
+  for (let j = 0; j < kids.length; j++) {
+    const c = kids[j];
+    if (!isStandardTokenChild(t, c) && (c.zIndex ?? 0) < 0) return true;
   }
   return false;
 }
 
-function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
-  for (let i = 0; i < complexTokens.length; i++) {
-    complexTokens[i].render(renderer);
-  }
+function renderBatchedTokenPasses(renderer, visibleTokens) {
   const n = visibleTokens.length;
   if (n === 0) return;
 
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].border, renderer);
+  // Render normal-depth borders before voidMesh; hovered / highlighted borders (zIndex > 0) render after tooltip
+  // so voidMesh ERASE cutout never punches holes in hover borders on pop-out tokens (Hero in a Box / Multiple Rings).
+  for (let i = 0; i < n; i++) {
+    const b = visibleTokens[i].border;
+    if (b && (b.zIndex ?? 0) <= 0) renderChildSafe(b, renderer);
+  }
   // Render voidMesh (ERASE cutout) & detectionFilterMesh strictly BEFORE UI overlays (bars, effects, nameplates)
   // so voidMesh never erases token bars, status icons, or tooltips.
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].voidMesh, renderer);
@@ -652,115 +608,22 @@ function renderBatchedTokenPasses(renderer, visibleTokens, complexTokens) {
     const tKids = t.children;
     for (let j = 0; j < tKids.length; j++) {
       const c = tKids[j];
-      if (
-        c === t.turnMarker ||
-        c === t.border ||
-        c === t.voidMesh ||
-        c === t.detectionFilterMesh ||
-        c === t.bars ||
-        c === t.effects ||
-        c === t.targetArrows ||
-        c === t.targetPips ||
-        c === t.nameplate ||
-        c === t.tooltip
-      ) {
-        continue;
-      }
+      if (isStandardTokenChild(t, c)) continue;
       renderChildSafe(c, renderer);
     }
   }
-}
-
-function tryRenderStaticTokenLayerCache(renderer, visibleTokens, complexTokens) {
-  // Only engage static RT cache for >= 8 visible tokens when rendering directly to screen (no nested VoidFilter RT)
-  // and no animated turnMarkers are active.
-  if (visibleTokens.length < 8) {
-    if (_tokLayerCache.rt) destroyTokenLayerCache();
-    return false;
+  for (let i = 0; i < n; i++) {
+    const b = visibleTokens[i].border;
+    if (b && (b.zIndex ?? 0) > 0) renderChildSafe(b, renderer);
   }
-  if (renderer.renderTexture?.current) return false;
-  if (globalThis.canvas?.tokens?.turnMarkers?.size > 0) return false;
-  if (globalThis.canvas?.tokens?.preview?.children?.length > 0) {
-    invalidateTokenLayerCache();
-    return false;
-  }
-  if (hasActiveTokenAnimations()) {
-    invalidateTokenLayerCache();
-    return false;
-  }
-
-  const stageWt = globalThis.canvas?.stage?.worldTransform;
-  if (!stageWt) return false;
-  const screen = renderer.screen;
-  const res = renderer.resolution || 1;
-  const sw = Math.max(1, Math.round(screen.width));
-  const sh = Math.max(1, Math.round(screen.height));
-
-  if (
-    stageWt.tx !== _tokLayerCache.lastTx ||
-    stageWt.ty !== _tokLayerCache.lastTy ||
-    stageWt.a !== _tokLayerCache.lastScale ||
-    sw !== _tokLayerCache.w ||
-    sh !== _tokLayerCache.h ||
-    res !== _tokLayerCache.res
-  ) {
-    _tokLayerCache.lastTx = stageWt.tx;
-    _tokLayerCache.lastTy = stageWt.ty;
-    _tokLayerCache.lastScale = stageWt.a;
-    _tokLayerCache.dirty = true;
-    _tokLayerCache.cleanFrames = 0;
-  }
-
-  // Require 2 consecutive clean frames before baking so pans/drags never waste RT bakes
-  if (_tokLayerCache.dirty) {
-    _tokLayerCache.cleanFrames++;
-    if (_tokLayerCache.cleanFrames < 2) return false;
-
-    if (!_tokLayerCache.rt || _tokLayerCache.rt.destroyed || _tokLayerCache.w !== sw || _tokLayerCache.h !== sh || _tokLayerCache.res !== res) {
-      destroyTokenLayerCache();
-      _tokLayerCache.rt = PIXI.RenderTexture.create({
-        width: sw,
-        height: sh,
-        resolution: res,
-        scaleMode: PIXI.SCALE_MODES.NEAREST
-      });
-      _tokLayerCache.sprite = new PIXI.Sprite(_tokLayerCache.rt);
-      _tokLayerCache.sprite.transform.worldTransform.identity();
-      _tokLayerCache.sprite.worldAlpha = 1;
-      _tokLayerCache.w = sw;
-      _tokLayerCache.h = sh;
-      _tokLayerCache.res = res;
-    }
-
-    renderer.batch.flush();
-    renderer.renderTexture.bind(_tokLayerCache.rt);
-    renderer.renderTexture.clear([0, 0, 0, 0]);
-    renderBatchedTokenPasses(renderer, visibleTokens, complexTokens);
-    renderer.batch.flush();
-    renderer.renderTexture.bind(null);
-
-    _tokLayerCache.dirty = false;
-    perfStats.tokenLayerCacheBakes++;
-  }
-
-  if (_tokLayerCache.sprite && !_tokLayerCache.sprite.destroyed) {
-    _tokLayerCache.sprite.transform.worldTransform.identity();
-    _tokLayerCache.sprite.worldAlpha = 1;
-    _tokLayerCache.sprite._render(renderer);
-    perfStats.tokenLayerCacheHits++;
-    return true;
-  }
-  return false;
 }
 
 function attachTokenUiBatcher() {
   const objects = globalThis.canvas?.tokens?.objects;
   if (!objects || objects._blBatcherAttached) return;
   objects._blBatcherAttached = true;
-  ensureTokenLayerCacheHooks();
 
-  const visibleTokens = [];
-  const complexTokens = [];
+  const batchTokens = [];
 
   wrapTargetMethod(objects, "render", "TokenLayer.objects.render", function (wrapped, renderer) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiBatching || isPrimePerfActive()) {
@@ -777,8 +640,7 @@ function attachTokenUiBatcher() {
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
-    visibleTokens.length = 0;
-    complexTokens.length = 0;
+    batchTokens.length = 0;
 
     for (let i = 0; i < count; i++) {
       const tok = kids[i];
@@ -795,25 +657,29 @@ function attachTokenUiBatcher() {
         }
       }
 
-      // Preserve vision-5e custom render(renderer) children-swapping for non-precise detections
+      // Preserve exact z-order with complex tokens (masks, filters, vision-5e non-precise detections, under-token auras)
       if (
         tok._mask ||
         (tok.filters && tok.filters.length) ||
         !tok.bars ||
         tok.detectionFilter != null ||
-        (tok._detectionLevel !== undefined && tok._detectionLevel < 2)
+        (tok._detectionLevel !== undefined && tok._detectionLevel < 2) ||
+        hasCustomUnderlayChild(tok)
       ) {
-        complexTokens.push(tok);
+        if (batchTokens.length > 0) {
+          renderBatchedTokenPasses(renderer, batchTokens);
+          batchTokens.length = 0;
+        }
+        tok.render(renderer);
       } else {
-        visibleTokens.push(tok);
+        batchTokens.push(tok);
       }
     }
 
-    if (PERF_CONFIG.perfTokenUiCache && tryRenderStaticTokenLayerCache(renderer, visibleTokens, complexTokens)) {
-      return;
+    if (batchTokens.length > 0) {
+      renderBatchedTokenPasses(renderer, batchTokens);
+      batchTokens.length = 0;
     }
-
-    renderBatchedTokenPasses(renderer, visibleTokens, complexTokens);
     perfStats.tokenBatchedFrames++;
   });
 }
@@ -831,7 +697,7 @@ function attachLightingLayerBatcher() {
   const complexLights = [];
 
   wrapTargetMethod(objects, "render", "LightingLayer.objects.render", function (wrapped, renderer) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfWallSprites || isPrimePerfActive()) return wrapped(renderer);
+    if (!PERF_CONFIG.perfEnabled || (!PERF_CONFIG.perfControlIconCache && !PERF_CONFIG.perfAutoCulling) || isPrimePerfActive()) return wrapped(renderer);
     if (!this.visible || this.worldAlpha <= 0 || !this.renderable) return;
     if (this._mask || (this.filters && this.filters.length) || this.cullable) return wrapped(renderer);
     const kids = this.children;
@@ -1033,8 +899,8 @@ export function rewriteShaderNoiseGlsl(src) {
   let out = src;
   let modified = false;
 
-  // Match Foundry's AbstractBaseShader.NOISE block
-  const noiseRe = /float\s+noise\s*\(\s*in\s+vec2\s+uv\s*\)\s*\{[\s\S]*?return\s+mix\s*\([\s\S]*?\);\s*\}/;
+  // Match Foundry's AbstractBaseShader.NOISE block strictly within a single function body (no `{` or `}` crossing)
+  const noiseRe = /float\s+noise\s*\(\s*in\s+vec2\s+uv\s*\)\s*\{[^{}]*?return\s+mix\s*\([^{}]*?\);\s*\}/;
   if (noiseRe.test(out)) {
     out = out.replace(
       noiseRe,
@@ -1060,12 +926,18 @@ export function rewriteShaderNoiseGlsl(src) {
   }
 
   if (modified) {
-    // Inject uniform right after precision declaration or at top of shader
+    // Inject uniform after precision declaration, or after leading #version / #extension directives
     const precRe = /(precision\s+\w+\s+float\s*;)/;
     if (precRe.test(out)) {
       out = out.replace(precRe, "$1\nuniform sampler2D uBoundlessNoise;");
     } else {
-      out = `uniform sampler2D uBoundlessNoise;\n${out}`;
+      const lines = out.split("\n");
+      let insertAt = 0;
+      while (insertAt < lines.length && /^\s*(?:#(?:version|extension|pragma)\b|\/\/|$)/.test(lines[insertAt])) {
+        insertAt++;
+      }
+      lines.splice(insertAt, 0, "uniform sampler2D uBoundlessNoise;");
+      out = lines.join("\n");
     }
   }
 
@@ -1096,15 +968,10 @@ function patchAnimatedLightShaders() {
     }
   }
 
-  // Inject uBoundlessNoise uniform when AdaptiveLightingShader.create instantiates a rewritten program
+  // Always bind uBoundlessNoise whenever a compiled program references it (shader programs stay cached on classes even if setting toggles off)
   wrapTargetMethod(Adaptive, "create", "AdaptiveLightingShader.create", function (wrapped, uniforms = {}, options = {}) {
     const shader = wrapped(uniforms, options);
-    if (
-      PERF_CONFIG.perfEnabled &&
-      PERF_CONFIG.perfLightShaders &&
-      !isPrimePerfActive() &&
-      shader?.program?.fragmentSrc?.includes("uBoundlessNoise")
-    ) {
+    if (shader?.program?.fragmentSrc?.includes("uBoundlessNoise")) {
       const tex = getNoiseLutTexture();
       if (tex && shader.uniforms) {
         shader.uniforms.uBoundlessNoise = tex;
@@ -1248,8 +1115,9 @@ export function refreshGpuPerfSettings() {
   const sounds = globalThis.canvas?.sounds?.placeables;
   if (sounds?.length) {
     for (const s of sounds) {
-      if (s.controlIcon && !s.controlIcon.destroyed) {
-        try { s.controlIcon._refresh?.(); } catch {}
+      const ctrl = s.controlIcon ?? s.controls;
+      if (ctrl && !ctrl.destroyed) {
+        try { ctrl._refresh?.(); } catch {}
       }
     }
   }
