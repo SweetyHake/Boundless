@@ -119,7 +119,7 @@ export class LRUTextureManager {
         // Never unload Foundry-managed PIXI.Assets textures that native Tiles/Tokens/Lights may still share
         return null;
       }
-      if (tex?.baseTexture) {
+      if (isTextureUsable(tex)) {
         this._fallbackFailures.delete(src);
         const prevOwned = this.workerOwned.get(src);
         if (prevOwned) {
@@ -127,7 +127,8 @@ export class LRUTextureManager {
           try { prevOwned.tex?.destroy?.(true); } catch {}
           try { prevOwned.bitmap?.close?.(); } catch {}
         }
-        this._configureBaseTexture(tex, mipmap);
+        // Do NOT set _boundlessManaged or mutate wrapMode/mipmap on shared Foundry PIXI.Assets BaseTextures
+        // (avoids permanent VRAM leak after scene switch and per-frame video mipmap regeneration).
         this._trackLru(src, tex);
         return tex;
       }

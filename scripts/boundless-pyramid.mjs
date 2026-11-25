@@ -491,6 +491,7 @@ export const pyramidMethods = {
       if (!m || m.destroyed) continue;
       m._inMeshPool = false;
       m.name = null;
+      m.hidden = false;
       m.visible = true;
       m.renderable = true;
       m.alpha = 1.0;
@@ -544,6 +545,7 @@ export const pyramidMethods = {
     if (!m || m.destroyed || m._inMeshPool) return;
     // Clear any Showstopper Depth-of-Field filter, custom filters, & occlusion state before pooling so reused meshes never inherit stale state
     m.name = null;
+    m.hidden = false;
     m.visible = true;
     m.renderable = true;
     m.alpha = 1.0;

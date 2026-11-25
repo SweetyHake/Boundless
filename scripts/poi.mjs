@@ -485,7 +485,7 @@ function rectsOverlap(a, b, pad = 0) {
  * Shared DialogV2 modal for creating or editing a POI pin (used both from map right-click/tool and SceneConfig).
  */
 export async function openPoiEditorDialog(controller, scene, initial = {}) {
-  if (!scene) return null;
+  if (!scene || !game.user?.isGM) return null;
   const DialogV2 = foundry.applications.api.DialogV2;
   const isEdit = Boolean(initial.id);
   const currentScale = canvas.ready && canvas.scene?.id === scene?.id
@@ -493,7 +493,9 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
     : 0.45;
   const defaultIcon = inferPoiIcon(initial);
   const defaultKind = normalizePoiKind(initial.kind || (isEdit ? "major" : "minor"));
-  const defaultColor = initial.color || POI_ICON_META[defaultIcon]?.defaultColor || "#f5c96b";
+  const rawDefaultColor = initial.color || POI_ICON_META[defaultIcon]?.defaultColor || "#f5c96b";
+  const parsedDefaultColor = foundry.utils?.Color?.from?.(rawDefaultColor);
+  const defaultColor = parsedDefaultColor?.valid ? parsedDefaultColor.css : "#f5c96b";
   const tierDef = POI_TIER_DEFAULTS[defaultKind];
   const defaultScale = Number(initial.targetScale ?? initial.scale ?? (isEdit ? currentScale : tierDef.defaultTargetScale)) || tierDef.defaultTargetScale;
 
@@ -502,9 +504,15 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
     return `<option value="${escapeHtml(key)}" ${sel}>${escapeHtml(loc(meta.labelKey, key))}</option>`;
   }).join("");
 
+  const journalsList = Array.from(game.journal || []);
+  const hasInitialJournalInWorld = Boolean(initial.journalUuid && journalsList.some(j => j.uuid === initial.journalUuid));
+  const extraJournalOption = (initial.journalUuid && !hasInitialJournalInWorld)
+    ? [`<option value="${escapeHtml(initial.journalUuid)}" selected>${escapeHtml(initial.journalUuid)}</option>`]
+    : [];
   const journalOptions = [
     `<option value="">${escapeHtml(loc("BOUNDLESS.Config.PoiJournalNone", "Не привязан"))}</option>`,
-    ...Array.from(game.journal || []).map(j => {
+    ...extraJournalOption,
+    ...journalsList.map(j => {
       const sel = j.uuid === initial.journalUuid ? "selected" : "";
       return `<option value="${escapeHtml(j.uuid)}" ${sel}>${escapeHtml(j.name)}</option>`;
     })
@@ -814,7 +822,7 @@ export class PoiManager {
     }
 
     const activeManifest = manifest ?? this.controller?.manifest;
-    const sg = (!Array.isArray(cfg.pois) && activeManifest?.superGrid) ? activeManifest.superGrid : null;
+    const sg = activeManifest?.superGrid ? activeManifest.superGrid : null;
     this._superGridInfo = sg
       ? { cols: sg.cols || 6, rows: sg.rows || 6, regionPx: sg.regionPx || 100000 }
       : null;
@@ -841,7 +849,21 @@ export class PoiManager {
     if (!this._superGridInfo || !this.container) return;
     // Only materialize sub-location pins for provinces currently on screen when descending below 0.022x
     if (stageScale < 0.022 && !this.placementActive) {
-      if (this._pendingSubPins.length > 0) this._pendingSubPins.length = 0;
+      if (this._pendingSubPins.length > 0) {
+        // Remove incomplete province buckets whose pending sub-pins are being dropped so zooming back in creates all of them
+        const incompleteKeys = new Set();
+        for (let i = 0; i < this._pendingSubPins.length; i++) incompleteKeys.add(this._pendingSubPins[i].key);
+        this._pendingSubPins.length = 0;
+        for (const k of incompleteKeys) {
+          const bucket = this._superGridSubProvinces.get(k);
+          if (!bucket) continue;
+          for (const p of bucket.entries) {
+            p.root.parent?.removeChild(p.root);
+            p.root.destroy({ children: true });
+          }
+          this._superGridSubProvinces.delete(k);
+        }
+      }
       return;
     }
 
@@ -1812,6 +1834,7 @@ export class PoiManager {
 
   async flyTo(poi, options = {}) {
     if (!poi || !canvas?.ready || !canvas.stage) return false;
+    if (poi.hidden && !game.user?.isGM) return false;
     if (!Number.isFinite(poi.x) || !Number.isFinite(poi.y)) return false;
 
     const seq = ++this._flightSeq;
@@ -2041,6 +2064,12 @@ export class PoiManager {
 }
 
 export function registerPoiControls(controller) {
+  Hooks.on("deactivateNotesLayer", () => {
+    if (controller.poiManager?.placementActive) {
+      controller.poiManager.setPlacementActive(false);
+    }
+  });
+
   Hooks.on("getSceneControlButtons", (controls) => {
     const notes = controls?.notes;
     if (!notes?.tools) return;

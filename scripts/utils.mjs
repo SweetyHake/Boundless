@@ -47,7 +47,8 @@ export function hasTokenPermissionLazy(doc, user, level = "OWNER") {
     }
   }
   const levels = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS || { NONE: 0, LIMITED: 1, OBSERVER: 2, OWNER: 3, INHERIT: -1 };
-  const reqLvl = typeof level === "number" ? level : (levels[level] ?? 3);
+  const levelKey = typeof level === "string" ? level.toUpperCase() : level;
+  const reqLvl = typeof level === "number" ? level : (levels[levelKey] ?? 3);
   const inheritLvl = levels.INHERIT ?? -1;
   const deltaOwn = doc._source?.delta?.ownership;
   const baseOwn = doc.baseActor?.ownership;
@@ -67,12 +68,12 @@ export function hasTokenPermissionLazy(doc, user, level = "OWNER") {
   }
   if (!baseOwn && typeof doc.baseActor?.testUserPermission === "function") {
     try {
-      return Boolean(doc.baseActor.testUserPermission(user, level));
+      return Boolean(doc.baseActor.testUserPermission(user, levelKey));
     } catch {
       return false;
     }
   }
-  return false;
+  return reqLvl <= 0;
 }
 
 /**
@@ -126,6 +127,7 @@ export function getLevelRoofElevation(level) {
 }
 
 export function smoothstep(edge0, edge1, x) {
+  if (edge0 === edge1) return x < edge0 ? 0 : 1;
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
   return t * t * (3 - 2 * t);
 }
@@ -207,14 +209,14 @@ export function attachVirtualCollectionProxy(doc, id, realColl) {
 export function getVirtualTileBounds(tSpec) {
   const sx = Number.isFinite(tSpec.scaleX) && tSpec.scaleX !== 0 ? tSpec.scaleX : 1;
   const sy = Number.isFinite(tSpec.scaleY) && tSpec.scaleY !== 0 ? tSpec.scaleY : 1;
-  const rawAx = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
-  const rawAy = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+  const rawAx = tSpec.anchorX != null ? tSpec.anchorX : 0.5;
+  const rawAy = tSpec.anchorY != null ? tSpec.anchorY : 0.5;
   const ax = sx < 0 ? (1 - rawAx) : rawAx;
   const ay = sy < 0 ? (1 - rawAy) : rawAy;
   const effW = Math.abs(tSpec.w || 0) * Math.abs(sx);
   const effH = Math.abs(tSpec.h || 0) * Math.abs(sy);
-  const pivX = tSpec.anchorX === undefined ? (tSpec.x + (tSpec.w || 0) * 0.5) : tSpec.x;
-  const pivY = tSpec.anchorY === undefined ? (tSpec.y + (tSpec.h || 0) * 0.5) : tSpec.y;
+  const pivX = tSpec.anchorX == null ? (tSpec.x + (tSpec.w || 0) * 0.5) : tSpec.x;
+  const pivY = tSpec.anchorY == null ? (tSpec.y + (tSpec.h || 0) * 0.5) : tSpec.y;
   const halfDiag = Math.hypot(effW, effH) * Math.max(ax, 1 - ax, ay, 1 - ay);
   return { pivX, pivY, halfDiag };
 }

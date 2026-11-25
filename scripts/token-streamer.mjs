@@ -638,7 +638,7 @@ export class TokenStreamer {
       const animOnScreen = isAnimating && (tok.x + w >= cullX0 && tok.x <= cullX1 && tok.y + h >= cullY0 && tok.y <= cullY1);
       const onScreen = showTokens && (docOnScreen || animOnScreen);
       const isActiveTurn = Boolean(tok.turnMarker?.visible || (activeTurnTokenId && doc.id === activeTurnTokenId));
-      const keepVisible = onScreen || tok.controlled || isActiveTurn;
+      const keepVisible = onScreen || tok.controlled || isActiveTurn || (tok.targeted?.size > 0);
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
       let blockedByRoof = Boolean(roofHidden?.has?.(tok));
@@ -1336,7 +1336,17 @@ export class TokenStreamer {
     if (!this.enabled || !doc || !canvas?.ready || !canvas.tokens?.objects) return null;
     if (doc.parent?.id !== this.sceneId || !doc.viewed) return null;
     let obj = doc._object;
-    if (obj && !obj.destroyed && obj.parent === canvas.tokens.objects) return obj;
+    if (obj && !obj.destroyed && obj.parent === canvas.tokens.objects) {
+      if (!obj.renderable && !this.isTokenDrawing(obj)) {
+        obj.renderable = true;
+        if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = true;
+        invalidateTokenLayerCache();
+        this.impostors.upsertToken(doc);
+        this.impostors.flush();
+      }
+      return obj;
+    }
+    if (this._drawingIds.has(doc.id) || (obj && this.isTokenDrawing(obj))) return null;
     const gen = this._gen;
     const layer = canvas.tokens;
     this._drawingIds.add(doc.id);
@@ -1355,7 +1365,10 @@ export class TokenStreamer {
       if (obj.parent !== layer.objects) layer.objects.addChild(obj);
       await obj.draw();
       obj.applyRenderFlags?.();
+      obj.renderable = true;
+      if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = true;
       this.lastSeenMs.set(doc.id, performance.now());
+      invalidateTokenLayerCache();
       this.impostors.upsertToken(doc);
       this.impostors.flush();
       return obj;

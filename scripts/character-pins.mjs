@@ -266,7 +266,7 @@ export class CharacterPinManager {
     const pushEntry = (tokenDoc, user, isSelf) => {
       if (!tokenDoc || seenTokenIds.has(tokenDoc.id)) return;
       seenTokenIds.add(tokenDoc.id);
-      const actor = tokenDoc.baseActor || (!tokenDoc.isLazyDelta ? tokenDoc.actor : null) || null;
+      const actor = (!tokenDoc.isLazyDelta && tokenDoc.actor) ? tokenDoc.actor : (tokenDoc.baseActor || null);
       const rawColor = user?.color?.css || (typeof user?.color === "string" ? user.color : null) || (isSelf ? "#f5c96b" : "#58d5ff");
       const parsedColor = foundry.utils.Color.from(rawColor);
       results.push({
@@ -554,6 +554,7 @@ export class CharacterPinManager {
       entry.hovered = true;
       drawFrame(true);
       namePill.visible = true;
+      root.alpha = 1;
       root.zIndex = 600;
       this.container.sortDirty = true;
       this._applyPinScale(entry, canvas.stage?.scale?.x || 1);
@@ -566,7 +567,9 @@ export class CharacterPinManager {
       namePill.visible = isSelf;
       root.zIndex = isSelf ? 30 : 15;
       this.container.sortDirty = true;
-      this._applyPinScale(entry, canvas.stage?.scale?.x || 1);
+      const stageScale = canvas.stage?.scale?.x || 1;
+      root.alpha = smoothstep(CHAR_PIN_FADE_START, CHAR_PIN_FADE_FULL, stageScale);
+      this._applyPinScale(entry, stageScale);
     });
 
     root.on("pointerdown", (ev) => {
@@ -588,7 +591,15 @@ export class CharacterPinManager {
 
   _getCircularAvatarTexture(src) {
     if (!src) return Promise.resolve(null);
-    if (this._avatarTexCache.has(src)) return this._avatarTexCache.get(src);
+    if (this._avatarTexCache.has(src)) {
+      return this._avatarTexCache.get(src).then((cachedTex) => {
+        if (cachedTex && !cachedTex.destroyed && cachedTex.baseTexture && !cachedTex.baseTexture.destroyed) {
+          return cachedTex;
+        }
+        this._avatarTexCache.delete(src);
+        return this._getCircularAvatarTexture(src);
+      });
+    }
     const gen = this._mountGen || 0;
     const promise = bakeCircularAvatarTexture(src, 128).then((tex) => {
       if (gen !== (this._mountGen || 0)) {
@@ -745,9 +756,10 @@ export class CharacterPinManager {
         entry.worldVisible = false;
         const levelObj = canvas.scene?.levels?.get?.(doc.level);
         const levelName = levelObj?.name || loc("BOUNDLESS.CharPin.OtherLevel", "Другой уровень");
-        const ex = safe.left + 8 + otherLevelCount * 56;
+        const ex = Math.min(safe.right - 8, safe.left + 8 + otherLevelCount * 56);
         const ey = safe.bottom - 6;
         otherLevelCount++;
+        placedEdges.push({ x: ex, y: ey });
 
         this._setEdgeDom(entry, {
           display: "",
@@ -790,16 +802,36 @@ export class CharacterPinManager {
         let ex = cx + dx * scaleEdge;
         let ey = cy + dy * scaleEdge;
 
-        // Avoid stacking multiple off-screen indicators on top of each other (offset inward near corners)
-        for (const prev of placedEdges) {
-          const d = Math.hypot(ex - prev.x, ey - prev.y);
-          if (d < 54) {
-            const onHorizontalEdge = Math.abs(ey - safe.top) < 6 || Math.abs(ey - safe.bottom) < 6;
-            if (onHorizontalEdge) {
-              ex = (ex + 56 <= safe.right) ? (ex + 56) : Math.max(safe.left, ex - 56);
-            } else {
-              ey = (ey + 56 <= safe.bottom) ? (ey + 56) : Math.max(safe.top, ey - 56);
+        // Avoid stacking multiple off-screen indicators on top of each other without ping-pong oscillation
+        const collides = (px, py) => {
+          for (let pi = 0; pi < placedEdges.length; pi++) {
+            if (Math.hypot(px - placedEdges[pi].x, py - placedEdges[pi].y) < 54) return true;
+          }
+          return false;
+        };
+        if (collides(ex, ey)) {
+          const onHorizontalEdge = Math.abs(ey - safe.top) < 6 || Math.abs(ey - safe.bottom) < 6;
+          for (let step = 1; step <= 8; step++) {
+            const delta = step * 56;
+            const cands = onHorizontalEdge
+              ? [
+                  { x: Math.min(safe.right, ex + delta), y: ey },
+                  { x: Math.max(safe.left, ex - delta), y: ey }
+                ]
+              : [
+                  { x: ex, y: Math.min(safe.bottom, ey + delta) },
+                  { x: ex, y: Math.max(safe.top, ey - delta) }
+                ];
+            let placed = false;
+            for (const c of cands) {
+              if (!collides(c.x, c.y)) {
+                ex = c.x;
+                ey = c.y;
+                placed = true;
+                break;
+              }
             }
+            if (placed) break;
           }
         }
         placedEdges.push({ x: ex, y: ey });

@@ -87,9 +87,18 @@ export class TileWorkerPool {
       const w = this._workerFactory
         ? this._workerFactory(idx)
         : new Worker(this._workerUrl, { type: "module" });
-      w.onmessage = (ev) => this._onWorkerMessage(idx, ev);
-      w.onerror = (err) => this._onWorkerError(idx, err);
-      w.onmessageerror = (err) => this._onWorkerError(idx, err);
+      w.onmessage = (ev) => {
+        if (this._workers[idx] !== w) return;
+        this._onWorkerMessage(idx, ev);
+      };
+      w.onerror = (err) => {
+        if (this._workers[idx] !== w) return;
+        this._onWorkerError(idx, err);
+      };
+      w.onmessageerror = (err) => {
+        if (this._workers[idx] !== w) return;
+        this._onWorkerError(idx, err);
+      };
       this._workers[idx] = w;
       this._workerLoad[idx] = 0;
       return true;
@@ -101,16 +110,18 @@ export class TileWorkerPool {
 
   _ensureWorkers() {
     if (this._initialized) {
-      if (this._workers.some(Boolean)) return true;
-      // Attempt bounded respawn of crashed worker slots before giving up
-      let respawned = false;
+      const hasAlive = this._workers.some(Boolean);
+      const now = performance.now();
+      // Respawn dead slots immediately if none are alive, or after a 2s cooldown when healthy workers can absorb traffic
+      this._respawnAfterMs ??= [];
       for (let i = 0; i < this._workers.length; i++) {
         if (!this._workers[i] && (this._respawnCounts[i] || 0) < MAX_RESPAWNS_PER_SLOT) {
+          if (hasAlive && now < (this._respawnAfterMs[i] || 0)) continue;
           this._respawnCounts[i] = (this._respawnCounts[i] || 0) + 1;
-          if (this._spawnWorkerSlot(i)) respawned = true;
+          this._spawnWorkerSlot(i);
         }
       }
-      if (respawned) {
+      if (this._workers.some(Boolean)) {
         this._supported = true;
         return true;
       }
@@ -176,6 +187,17 @@ export class TileWorkerPool {
         }
       }
       this._queue.splice(insertAt, 0, job);
+      // Cap queue depth to avoid unbounded RAM growth during rapid camera sweeps
+      while (this._queue.length > 256) {
+        const dropped = this._queue.pop();
+        if (dropped) {
+          this._untrackSrc(dropped.src, dropped.id);
+          this.stats.aborted++;
+          const err = new Error("aborted");
+          err.aborted = true;
+          dropped.reject(err);
+        }
+      }
       this._dispatch();
     });
   }
@@ -405,7 +427,10 @@ export class TileWorkerPool {
     console.warn(`boundless | Tile decoder worker #${workerIdx} error:`, err?.message || err);
     const dead = this._workers[workerIdx];
     this._workers[workerIdx] = null;
+    this._respawnAfterMs ??= [];
+    this._respawnAfterMs[workerIdx] = performance.now() + 2000;
     if (dead) {
+      try { dead.onmessage = null; dead.onerror = null; dead.onmessageerror = null; } catch {}
       try { dead.terminate(); } catch {}
     }
     // Reject all jobs assigned to this worker so callers fall back cleanly

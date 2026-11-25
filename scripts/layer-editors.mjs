@@ -414,15 +414,27 @@ export class VirtualLayerEditors {
     }
   }
 
-  _clearLights() {
+  _clearLights({ keepProtected = false } = {}) {
     this._lightGen++;
-    this._lastLightNeededKeys = null;
     this._purgeMountQueue("light");
+    const keptKeys = keepProtected ? new Set() : null;
     for (const entry of Array.from(this.lightsByKey.values())) {
+      if (keepProtected) {
+        const sheet = getExistingSheet(entry.doc);
+        if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
+          keptKeys.add(entry.key);
+          continue;
+        }
+      }
       this._destroyPlaceable(canvas?.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
     }
-    this.lightsByKey.clear();
-    this.lightsById.clear();
+    if (!keepProtected) {
+      this._lastLightNeededKeys = null;
+      this.lightsByKey.clear();
+      this.lightsById.clear();
+    } else {
+      this._lastLightNeededKeys = keptKeys;
+    }
   }
 
   async _mountNativeLight(item, gen, editsRev = this.controller?.lightEditsRev || 0) {
@@ -570,7 +582,7 @@ export class VirtualLayerEditors {
     }
 
     if (!inZoom || items.length > MAX_LIGHTS_IN_VIEW) {
-      this._clearLights();
+      this._clearLights({ keepProtected: true });
       if (this.lightMacroGfx) {
         const g = this.lightMacroGfx;
         g.clear();
@@ -607,6 +619,7 @@ export class VirtualLayerEditors {
           this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
         } else if (resolved) {
           needed.set(entry.key, resolved);
+          this._lastLightNeededKeys.add(entry.key);
         }
       }
     }
@@ -798,15 +811,27 @@ export class VirtualLayerEditors {
     }
   }
 
-  _clearSounds() {
+  _clearSounds({ keepProtected = false } = {}) {
     this._soundGen++;
-    this._lastSoundNeededKeys = null;
     this._purgeMountQueue("sound");
+    const keptKeys = keepProtected ? new Set() : null;
     for (const entry of Array.from(this.soundsByKey.values())) {
+      if (keepProtected) {
+        const sheet = getExistingSheet(entry.doc);
+        if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
+          keptKeys.add(entry.key);
+          continue;
+        }
+      }
       this._destroyPlaceable(canvas?.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
     }
-    this.soundsByKey.clear();
-    this.soundsById.clear();
+    if (!keepProtected) {
+      this._lastSoundNeededKeys = null;
+      this.soundsByKey.clear();
+      this.soundsById.clear();
+    } else {
+      this._lastSoundNeededKeys = keptKeys;
+    }
   }
 
   async _mountNativeSound(item, gen, editsRev = this.controller?.soundEditsRev || 0) {
@@ -952,7 +977,7 @@ export class VirtualLayerEditors {
     }
 
     if (!inZoom || items.length > MAX_SOUNDS_IN_VIEW) {
-      this._clearSounds();
+      this._clearSounds({ keepProtected: true });
       if (this.soundMacroGfx) {
         const g = this.soundMacroGfx;
         g.clear();
@@ -989,6 +1014,7 @@ export class VirtualLayerEditors {
           this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
         } else if (resolved) {
           needed.set(entry.key, resolved);
+          this._lastSoundNeededKeys.add(entry.key);
         }
       }
     }
@@ -1150,16 +1176,28 @@ export class VirtualLayerEditors {
     this.controller?.setVirtualTilesVisible?.(true);
   }
 
-  _clearTiles() {
+  _clearTiles({ keepProtected = false } = {}) {
     this._tileGen++;
     this._purgeMountQueue("tile");
-    this._lastTileNeededKeys = null;
+    const keptKeys = keepProtected ? new Set() : null;
     for (const entry of Array.from(this.tilesByKey.values())) {
+      if (keepProtected) {
+        const sheet = getExistingSheet(entry.doc);
+        if (entry.placeable?.controlled || isSheetActiveOrRendering(sheet, entry.placeable)) {
+          keptKeys.add(entry.key);
+          continue;
+        }
+      }
       this._setRawVirtualTileVisible(entry.fullId, true);
       this._destroyPlaceable(canvas?.tiles, entry, this.tilesByKey, this.tilesById, { closeSheet: true });
     }
-    this.tilesByKey.clear();
-    this.tilesById.clear();
+    if (!keepProtected) {
+      this._lastTileNeededKeys = null;
+      this.tilesByKey.clear();
+      this.tilesById.clear();
+    } else {
+      this._lastTileNeededKeys = keptKeys;
+    }
   }
 
   _cleanupLeakedTileMesh(placeable) {
@@ -1301,7 +1339,7 @@ export class VirtualLayerEditors {
     this._lastTileKey = key;
 
     if (!inZoom) {
-      this._clearTiles();
+      this._clearTiles({ keepProtected: true });
       return;
     }
 
@@ -1383,6 +1421,7 @@ export class VirtualLayerEditors {
           this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
         } else if (resolved) {
           needed.set(entry.key, resolved);
+          this._lastTileNeededKeys.add(entry.key);
         }
       }
     }
@@ -1604,6 +1643,7 @@ export class VirtualLayerEditors {
 export function registerLayerEditorControls(controller) {
   Hooks.on("activateLightingLayer", () => {
     if (!controller.active) return;
+    if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateLighting();
   });
   Hooks.on("deactivateLightingLayer", () => {
@@ -1612,6 +1652,7 @@ export function registerLayerEditorControls(controller) {
 
   Hooks.on("activateSoundsLayer", () => {
     if (!controller.active) return;
+    if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateSounds();
   });
   Hooks.on("deactivateSoundsLayer", () => {
@@ -1620,6 +1661,7 @@ export function registerLayerEditorControls(controller) {
 
   Hooks.on("activateTilesLayer", () => {
     if (!controller.active) return;
+    if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateTiles();
   });
   Hooks.on("deactivateTilesLayer", () => {

@@ -473,6 +473,10 @@ export function registerBoundlessHooks(controller) {
       controller.charPins.onUserOrActorUpdated();
     }
   });
+  Hooks.on("deleteActor", () => {
+    if (!isRuntimeReady()) return;
+    controller.charPins.onUserOrActorUpdated();
+  });
 
   // Sync TokenImpostorLayer visibility immediately when INVISIBLE / BURROW effects toggle on unmounted NPCs
   const onEffectVisibilityChange = (effect, changes = null) => {

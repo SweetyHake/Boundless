@@ -2232,3 +2232,156 @@ test("overlayMethods renders hidden tiles at 0.5x for GM without alpha^2 on batc
   assert.equal(decMesh.pluginName, "batch");
   assert.ok(Math.abs(decMesh.alpha - 0.4) < 1e-6, "hidden decorative tile for GM must render at 0.5x alpha");
 });
+
+test("utils edge cases: case-insensitive hasTokenPermissionLazy, NONE level, smoothstep equal edges, and null anchorX", async () => {
+  installBaseGlobals();
+  globalThis.CONST.DOCUMENT_OWNERSHIP_LEVELS = { INHERIT: -1, NONE: 0, LIMITED: 1, OBSERVER: 2, OWNER: 3 };
+  const { hasTokenPermissionLazy, smoothstep, getVirtualTileBounds } = await import("../scripts/utils.mjs");
+
+  const doc = { isLazyDelta: true, _source: { delta: { ownership: {} } }, baseActor: { ownership: { u1: 2, default: 0 } } };
+  assert.equal(hasTokenPermissionLazy(doc, { id: "u1", isGM: false }, "observer"), true, "lowercase 'observer' must not escalate to OWNER");
+  assert.equal(hasTokenPermissionLazy({ isLazyDelta: true, _source: {}, baseActor: { ownership: {} } }, { id: "u2", isGM: false }, "NONE"), true, "NONE (0) permission must return true");
+  assert.equal(Number.isNaN(smoothstep(5, 5, 5)), false, "smoothstep(e, e, e) must not produce NaN");
+  assert.equal(smoothstep(5, 5, 5), 1);
+  assert.equal(smoothstep(5, 5, 4), 0);
+
+  const b = getVirtualTileBounds({ x: 100, y: 200, w: 400, h: 200, anchorX: null, anchorY: null });
+  assert.equal(b.pivX, 300, "null anchorX must center pivot like undefined");
+  assert.equal(b.pivY, 300);
+});
+
+test("perf-auto preserves third-party mesh.renderable = false hides (fa-nexus / burn-living-map)", async () => {
+  installBaseGlobals();
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const { updateStandardSceneCulling, restoreAllStandardCulling } = await import("../scripts/perf-auto.mjs");
+
+  const prevEnabled = PERF_CONFIG.perfEnabled;
+  const prevAuto = PERF_CONFIG.perfAutoCulling;
+  PERF_CONFIG.perfEnabled = true;
+  PERF_CONFIG.perfAutoCulling = true;
+  try {
+    const thirdPartyHiddenMesh = {
+      renderable: false,
+      destroyed: false,
+      canvasBounds: { x: 100, y: 100, width: 100, height: 100 }
+    };
+    const offscreenMesh = {
+      renderable: true,
+      destroyed: false,
+      canvasBounds: { x: 9000, y: 9000, width: 100, height: 100 }
+    };
+    const tiles = [
+      { mesh: thirdPartyHiddenMesh, document: { x: 100, y: 100, width: 100, height: 100 } },
+      { mesh: offscreenMesh, document: { x: 9000, y: 9000, width: 100, height: 100 } }
+    ];
+    for (let i = 0; i < 12; i++) {
+      tiles.push({
+        mesh: { renderable: true, destroyed: false, canvasBounds: { x: 200, y: 200, width: 50, height: 50 } },
+        document: { x: 200, y: 200, width: 50, height: 50 }
+      });
+    }
+    globalThis.canvas = {
+      ready: true,
+      scene: { id: "std2", flags: {} },
+      level: { id: "lvl1", flags: {} },
+      stage: { worldTransform: { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 } },
+      app: { renderer: { screen: { x: 0, y: 0, width: 1000, height: 1000 } } },
+      tiles: { placeables: tiles, highlightObjects: false }
+    };
+
+    updateStandardSceneCulling();
+    assert.equal(thirdPartyHiddenMesh.renderable, false, "third-party hidden mesh must stay renderable=false on viewport culling");
+    assert.equal(offscreenMesh.renderable, false, "offscreen tile should be culled by Boundless");
+    assert.equal(offscreenMesh._blStdCulled, true);
+
+    restoreAllStandardCulling();
+    assert.equal(thirdPartyHiddenMesh.renderable, false, "restoreAllStandardCulling must NOT unhide third-party hidden meshes");
+    assert.equal(offscreenMesh.renderable, true, "Boundless-culled tile must be restored");
+  } finally {
+    PERF_CONFIG.perfEnabled = prevEnabled;
+    PERF_CONFIG.perfAutoCulling = prevAuto;
+  }
+});
+
+test("ChunkedFogManager._loadPersistedFog tolerates player clock skew when meta.resetId matches sceneResetId", async () => {
+  installBaseGlobals();
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  let mergedCount = 0;
+  let userDeleted = false;
+  globalThis.game.user = {
+    id: "u1",
+    isGM: false,
+    flags: {
+      boundless: {
+        fog: { sc1: { lvl1: { "0_0": "data:image/png;base64,AA==" } } },
+        // Player clock lags 10 minutes behind GM's fogResetAt, but resetId matches!
+        fogMeta: { sc1: { lvl1: { resetId: "reset42", savedAt: 100 } } }
+      }
+    },
+    update: async () => { userDeleted = true; }
+  };
+  const mgr = new ChunkedFogManager();
+  mgr.sceneId = "sc1";
+  mgr.levelId = "lvl1";
+  mgr.fogMode = 0;
+  mgr._mergeChunkMap = () => { mergedCount++; };
+
+  const scene = {
+    id: "sc1",
+    flags: { boundless: { fogResetId: { lvl1: "reset42" }, fogResetAt: { lvl1: 999999 } } }
+  };
+  mgr._loadPersistedFog(scene);
+  assert.equal(mergedCount, 1, "valid player fog with matching resetId must survive GM/player clock skew");
+  assert.equal(userDeleted, false, "valid player fog must NOT be deleted due to clock skew");
+});
+
+test("PoiManager blocks non-GM flyTo on hidden POIs and cleans incomplete superGrid buckets on zoom-out", async () => {
+  installBaseGlobals();
+  const { PoiManager } = await import("../scripts/poi.mjs");
+
+  const mgr = new PoiManager({});
+  globalThis.game.user = { id: "p1", isGM: false };
+  globalThis.canvas = { ready: true, stage: { scale: { x: 1 } } };
+  const okPlayer = await mgr.flyTo({ id: "secret", x: 500, y: 500, hidden: true });
+  assert.equal(okPlayer, false, "non-GM must not flyTo a hidden POI");
+
+  // Incomplete superGrid bucket must be evicted when pending sub-pins are cancelled on orbital zoom-out
+  let destroyedCount = 0;
+  mgr.container = {};
+  mgr._superGridInfo = { cols: 6, rows: 6, regionPx: 100000 };
+  mgr._superGridSubProvinces.set("0_0", {
+    lastUsedMs: 1,
+    entries: [{ root: { parent: null, destroy() { destroyedCount++; } } }]
+  });
+  mgr._pendingSubPins = [{ key: "0_0", subPoi: {}, orderIndex: 1001 }];
+  mgr._syncSuperGridSubPins(0.01, { a: 0.01, d: 0.01, tx: 0, ty: 0 }, 1000, 1000);
+  assert.equal(mgr._pendingSubPins.length, 0);
+  assert.equal(mgr._superGridSubProvinces.has("0_0"), false, "incomplete province bucket must be removed on orbital abort");
+  assert.equal(destroyedCount, 1);
+});
+
+test("VirtualLayerEditors._clearLights({ keepProtected: true }) keeps open config sheets alive on zoom-out", async () => {
+  installBaseGlobals();
+  const { VirtualLayerEditors } = await import("../scripts/layer-editors.mjs");
+
+  const ed = new VirtualLayerEditors({ active: true });
+  const openEntry = {
+    id: "ml1", key: "0_0:l:0", levelId: "lvl1",
+    doc: { _sheet: { rendered: true, close() { throw new Error("must not close open sheet"); } } },
+    placeable: { controlled: false, destroyed: false }
+  };
+  const idleEntry = {
+    id: "ml2", key: "0_0:l:1", levelId: "lvl1",
+    doc: { _sheet: null },
+    placeable: { controlled: false, destroyed: false, destroy() {} }
+  };
+  ed.lightsByKey.set(openEntry.key, openEntry);
+  ed.lightsById.set(openEntry.id, openEntry);
+  ed.lightsByKey.set(idleEntry.key, idleEntry);
+  ed.lightsById.set(idleEntry.id, idleEntry);
+
+  ed._clearLights({ keepProtected: true });
+  assert.equal(ed.lightsByKey.has(openEntry.key), true, "light with open sheet must survive zoom-out clear");
+  assert.equal(ed.lightsByKey.has(idleEntry.key), false, "idle light should be unmounted on zoom-out");
+});

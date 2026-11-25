@@ -174,7 +174,20 @@ export function wrapFoundryMethod(className, method, wrapperFn, opts = {}) {
       activePatches.set(fullPath, { via: "libWrapper", active: true });
       return { original, fullPath, viaLibWrapper: true };
     } catch (err) {
-      console.warn(`${MODULE_ID} | libWrapper.register failed for ${fullPath}, falling back to direct wrap:`, err);
+      // Never direct-monkey-patch over an active libWrapper target (breaks other modules' libWrapper chain)
+      console.warn(`${MODULE_ID} | libWrapper.register failed for ${fullPath}; skipping patch to preserve module compatibility:`, err);
+      return null;
+    }
+  }
+
+  // Avoid double-wrapping inherited methods already wrapped on a parent prototype in direct-wrap mode
+  if (!Object.prototype.hasOwnProperty.call(targetObj, method)) {
+    let proto = Object.getPrototypeOf(targetObj);
+    while (proto) {
+      if (DIRECT_WRAPPED.get(proto)?.has(method)) {
+        return { original, fullPath, viaLibWrapper: false };
+      }
+      proto = Object.getPrototypeOf(proto);
     }
   }
 

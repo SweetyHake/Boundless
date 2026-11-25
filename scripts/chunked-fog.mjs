@@ -551,7 +551,6 @@ export class ChunkedFogManager {
     }
 
     if (sharedPolys.length) {
-      this._lastLocalRevealMs = performance.now();
       this._applyPolygons(sharedPolys, { target: "shared", markDirty: true });
       if (broadcast && this.isSharedMode) {
         game.socket?.emit(SOCKET_NAME, {
@@ -906,10 +905,9 @@ export class ChunkedFogManager {
     }
     const levelPatch = sharedFogChanges[this.levelId];
     if (!levelPatch || typeof levelPatch !== "object") return;
-    // In SHARED mode, if this player just revealed fog locally within the last 5s, merge additively so an older
-    // in-flight GM snapshot doesn't snap back freshly walked edges (deletions still clear explicitly).
-    const recentLocalReveal = !game.user?.isGM && this._lastLocalRevealMs > 0 && (performance.now() - this._lastLocalRevealMs) < 5000;
-    this._mergeChunkMap(levelPatch, { intoShared: true, replace: !recentLocalReveal });
+    // Always replace with authoritative GM sharedFog so fogBrush erasures take effect cleanly;
+    // for non-GM clients, re-apply current active vision on top after decode so live steps don't snap back.
+    this._mergeChunkMap(levelPatch, { intoShared: true, replace: true, reapplyVision: !game.user?.isGM });
   }
 
   onSceneFogResetChanged(scene, fogResetAtChanges) {
@@ -939,7 +937,6 @@ export class ChunkedFogManager {
     const strokes = Array.isArray(brushPayload.strokes) ? brushPayload.strokes : fullBrush?.strokes;
     if (levelId && levelId !== this.levelId) return;
     if (!Array.isArray(strokes) || !strokes.length) return;
-    this._lastLocalRevealMs = 0;
     const shouldPersist = !this.isSharedMode;
     this._applyBrushStrokes(strokes, { markDirty: shouldPersist });
     if (!shouldPersist) this._scheduleLocalCacheSave();
@@ -1107,7 +1104,7 @@ export class ChunkedFogManager {
     }
   }
 
-  _mergeChunkMap(mapObj, { intoShared = false, intoPrivate = false, replace = false } = {}) {
+  _mergeChunkMap(mapObj, { intoShared = false, intoPrivate = false, replace = false, reapplyVision = false } = {}) {
     if (!mapObj || typeof mapObj !== "object") return;
     const mountSceneId = this.sceneId;
     const mountLevelId = this.levelId;
@@ -1203,6 +1200,10 @@ export class ChunkedFogManager {
         chunk.texture.baseTexture.update();
         this.updateViewportCulling();
         finishPending();
+        if (reapplyVision && this.enabled && this._fogGen === gen && this.sceneId === mountSceneId && this.levelId === mountLevelId) {
+          this._lastPolySigs.clear();
+          this.revealFromActiveVision({ broadcast: false });
+        }
       };
       img.onerror = finishPending;
       img.src = dataUrl;
@@ -1215,17 +1216,21 @@ export class ChunkedFogManager {
     const resetAt = Number(scene?.flags?.[MODULE_ID]?.fogResetAt?.[this.levelId]) || 0;
     const sceneResetId = scene?.flags?.[MODULE_ID]?.fogResetId?.[this.levelId] || "";
 
-    // Discard stale user-flag exploration written before the latest GM fog reset (e.g. Assistant GM or in-flight race)
+    // Discard stale user-flag exploration written before the latest GM fog reset (e.g. Assistant GM or in-flight race).
+    // Prefer exact sceneResetId comparison (immune to GM vs player clock skew); only fall back to timestamp when resetId is absent.
     if (personalFromUser && (sceneResetId || resetAt > 0)) {
       const meta = game.user?.flags?.[MODULE_ID]?.fogMeta?.[this.sceneId]?.[this.levelId];
-      const staleById = Boolean(sceneResetId && meta?.resetId !== sceneResetId);
-      const staleByTime = Boolean(resetAt > 0 && (Number(meta?.savedAt) || 0) < resetAt);
-      if (staleById || staleByTime) {
-        personalFromUser = null;
-        game.user?.update?.({
-          [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null,
-          [`flags.${MODULE_ID}.fogMeta.${this.sceneId}.-=${this.levelId}`]: null
-        })?.catch?.(() => {});
+      if (meta && typeof meta === "object") {
+        const isStale = sceneResetId
+          ? (meta.resetId !== sceneResetId)
+          : (resetAt > 0 && (Number(meta.savedAt) || 0) < resetAt);
+        if (isStale) {
+          personalFromUser = null;
+          game.user?.update?.({
+            [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null,
+            [`flags.${MODULE_ID}.fogMeta.${this.sceneId}.-=${this.levelId}`]: null
+          })?.catch?.(() => {});
+        }
       }
     }
 
@@ -1240,7 +1245,7 @@ export class ChunkedFogManager {
       if (personalFromUser) {
         this._mergeChunkMap(personalFromUser, { intoPrivate: true });
       }
-      // Fallback to localStorage cache if user flags were not saved yet (respecting GM fogResetAt timestamp)
+      // Fallback to localStorage cache if user flags were not saved yet (respecting GM fogResetId / fogResetAt)
       if (!personalFromUser && this._storageKey) {
         try {
           const raw = localStorage.getItem(this._storageKey);
@@ -1250,7 +1255,10 @@ export class ChunkedFogManager {
             const savedAt = isWrapped ? (Number(parsed.savedAt) || 0) : 0;
             const cachedResetId = isWrapped ? (parsed.resetId || "") : "";
             const chunkMap = isWrapped ? parsed.chunks : parsed;
-            if ((sceneResetId && cachedResetId !== sceneResetId) || (resetAt > 0 && savedAt < resetAt)) {
+            const cacheStale = sceneResetId
+              ? (cachedResetId !== sceneResetId)
+              : (resetAt > 0 && savedAt < resetAt);
+            if (cacheStale) {
               localStorage.removeItem(this._storageKey);
             } else if (chunkMap) {
               this._mergeChunkMap(chunkMap, { intoPrivate: true });
@@ -1275,15 +1283,21 @@ export class ChunkedFogManager {
       this._brushFlushTimer = null;
     }
     this._brushPendingStrokes = [];
-    this._lastLocalRevealMs = 0;
     this._fogGen++;
     this._chunkLoadSeq.clear();
     this._pendingChunkLoads.clear();
     this._dirtyShared.clear();
     this._dirtyPrivate.clear();
     this._lastPolySigs.clear();
-    if (this.sceneId && this.levelId) {
-      this._remoteRevealQueues.delete(`${this.sceneId}::${this.levelId}`);
+    if (this.sceneId) {
+      if (allLevels) {
+        const prefix = `${this.sceneId}::`;
+        for (const qk of Array.from(this._remoteRevealQueues.keys())) {
+          if (qk.startsWith(prefix)) this._remoteRevealQueues.delete(qk);
+        }
+      } else if (this.levelId) {
+        this._remoteRevealQueues.delete(`${this.sceneId}::${this.levelId}`);
+      }
     }
 
     for (const chunk of this.chunks.values()) {

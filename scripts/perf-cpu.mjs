@@ -436,7 +436,7 @@ function patchVisibilityAndLos() {
       pruneOutOfSight();
     }
     return res;
-  });
+  }, { type: "WRAPPER" });
 
   const ok2 = wrapFoundryMethod("DetectionMode", "_testLOS", function (wrapped, visionSource, mode, target, test) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !this.walls) {
@@ -579,7 +579,7 @@ function patchFogAndOcclusion() {
       } catch {}
     }
     return wrapped(...args);
-  });
+  }, { type: "WRAPPER" });
 
   const regOcc1 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOcclusionMask", _occMaskThrottle.wrapper);
   const regOcc2 = wrapFoundryMethod("CanvasOcclusionMask", "_updateOccludedObjects", _occObjThrottle.wrapper);
@@ -607,7 +607,7 @@ function patchFogAndOcclusion() {
       _losCache.clear();
     }
     return res;
-  });
+  }, { type: "WRAPPER" });
 
   const regPerc = wrapFoundryMethod("PerceptionManager", "update", function (wrapped, flags) {
     if (
@@ -631,7 +631,7 @@ function patchFogAndOcclusion() {
     _visGuardWasVisible = this.visible;
     try { return wrapped(); }
     finally { _visGuardToken = null; }
-  });
+  }, { type: "WRAPPER" });
 
   return [Boolean(regFog), Boolean(regSave), Boolean(regOcc1), Boolean(regOcc2), Boolean(regOccSurf), Boolean(regPerc), Boolean(regVis)];
 }
@@ -654,7 +654,7 @@ function clearDragPending() {
   _dragQ.pending = null;
 }
 
-function flushDragDestination(forceSync = false) {
+function flushDragDestination(forceSync = false, overrideEvent = null) {
   if (_dragQ.timerId !== null && forceSync) {
     clearTimeout(_dragQ.timerId);
     _dragQ.timerId = null;
@@ -663,21 +663,17 @@ function flushDragDestination(forceSync = false) {
   if (!pending) return;
   _dragQ.pending = null;
   _dragQ.last = performance.now();
-  const { token, point, snap, event, wrapped } = pending;
+  const { token, point, snap } = pending;
   if (!token || token.destroyed || !globalThis.canvas?.ready) return;
   if (token.layer?._draggedToken && token.layer._draggedToken !== token) return;
   if (!token.mouseInteractionManager?.interactionData?.contexts) return;
+  const ovDest = overrideEvent?.interactionData?.destination;
+  const finalPoint = (Number.isFinite(ovDest?.x) && Number.isFinite(ovDest?.y)) ? { x: ovDest.x, y: ovDest.y } : point;
+  const finalSnap = overrideEvent ? !overrideEvent.shiftKey : snap;
   perfStats.dragDestFlushed++;
   const t0 = performance.now();
-  try {
-    if (typeof wrapped === "function" && event?.interactionData?.destination) {
-      event.interactionData.destination.x = point.x;
-      event.interactionData.destination.y = point.y;
-      wrapped.call(token, event);
-    } else {
-      token._updateDragDestination(point, { snap });
-    }
-  } catch (err) { console.error(`${MODULE_ID} | drag flush error:`, err); }
+  try { token._updateDragDestination(finalPoint, { snap: finalSnap }); }
+  catch (err) { console.error(`${MODULE_ID} | drag flush error:`, err); }
   _dragRecalcMs = performance.now() - t0;
 }
 
@@ -700,7 +696,7 @@ function patchDragAndMovement() {
     }
 
     try { canvas._onDragCanvasPan(event); } catch {}
-    _dragQ.pending = { token: this, point: { x: dest.x, y: dest.y }, snap: !event.shiftKey, event, wrapped };
+    _dragQ.pending = { token: this, point: { x: dest.x, y: dest.y }, snap: !event.shiftKey };
     perfStats.dragDestSkipped++;
     if (_dragQ.timerId === null) {
       const delay = Math.max(1, Math.ceil(ms - elapsed));
@@ -712,31 +708,31 @@ function patchDragAndMovement() {
   });
 
   // Flush BEFORE drop / waypoint commits so the final mouse cell is always persisted accurately
-  const okDrop = wrapFoundryMethod("Token", "_onDragLeftDrop", function (wrapped, ...args) {
-    flushDragDestination(true);
-    return wrapped(...args);
-  });
+  const okDrop = wrapFoundryMethod("Token", "_onDragLeftDrop", function (wrapped, event, ...rest) {
+    flushDragDestination(true, event);
+    return wrapped(event, ...rest);
+  }, { type: "WRAPPER" });
 
   const okWaypoint = wrapFoundryMethod("Token", "_addDragWaypoint", function (wrapped, ...args) {
     flushDragDestination(true);
     return wrapped(...args);
-  });
+  }, { type: "WRAPPER" });
 
   const okRemoveWp = wrapFoundryMethod("Token", "_removeDragWaypoint", function (wrapped, ...args) {
     clearDragPending();
     return wrapped(...args);
-  });
+  }, { type: "WRAPPER" });
 
   const okElev = wrapFoundryMethod("Token", "_changeDragElevation", function (wrapped, ...args) {
     flushDragDestination(true);
     return wrapped(...args);
-  });
+  }, { type: "WRAPPER" });
 
   // On cancel / finalize, simply cancel any stale pending timer without running extra recalc
   const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
     clearDragPending();
     return wrapped(...args);
-  });
+  }, { type: "WRAPPER" });
 
   const cloneMeasureResult = (r) => {
     if (!r || typeof r !== "object") return r;
@@ -836,13 +832,14 @@ function patchMiscCpuGuards() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
     const docName = this.document?.name ?? "";
     const key = `${docName}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}`;
-    if (this.__blNpKey === key && this.__blNpObj === this.nameplate && this.nameplate?.text === docName) {
+    if (this.__blNpKey === key && this.__blNpObj === this.nameplate && this.nameplate?.text === this.__blNpText) {
       perfStats.textSkipped++;
       return;
     }
     const res = wrapped();
     this.__blNpKey = key;
     this.__blNpObj = this.nameplate;
+    this.__blNpText = this.nameplate?.text;
     return res;
   });
 
@@ -933,19 +930,35 @@ function patchMiscCpuGuards() {
     const darkLevel = Number(((env?.darknessLevel ?? 0)).toFixed(4));
     const globalLightActive = env?.globalLightSource?.active ? 1 : 0;
     const darkSrcCount = globalThis.canvas?.effects?.darknessSources?.size || 0;
-    const isPriorityOrDarkness = Boolean(this.requiresEdges === true || (this.data?.priority ?? 0) > 0 || this.constructor?.name?.includes?.("Darkness"));
+    const isPriorityOrDarkness = Boolean(
+      this.requiresEdges === true
+      || (this.data?.priority ?? 0) > 0
+      || (data?.priority ?? 0) > 0
+      || this.constructor?.name?.includes?.("Darkness")
+    );
     const stateSig = quickStateSig(this);
-    const curV = `${_geometryVersion}|${_edgeVersion}|${_priorityEnvVersion}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${stateSig}`;
+    // Do not include _priorityEnvVersion in priority/darkness sources' own key so multiple darkness/priority sources never cascade-invalidate each other
+    const prioPart = isPriorityOrDarkness ? "" : `|${_priorityEnvVersion}`;
+    const curV = `${_geometryVersion}|${_edgeVersion}${prioPart}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${stateSig}`;
     const hasValidGeom = !this.attached || this.data?.disabled || isCompatibleSourceGeom(this._geometry) || Boolean(this._geometry && !this._geometry.destroyed);
     if (!options?.reset && this.shape && hasValidGeom && dataSame && this.__blSweepV === curV) {
       perfStats.sweepSkipped++;
       return this;
     }
     if (this.requiresEdges === true && (!dataSame || options?.reset)) _edgeVersion++;
-    if (isPriorityOrDarkness) _priorityEnvVersion++;
+    const envChanged = this.__blLastDark !== darkLevel || this.__blLastGlobal !== globalLightActive;
+    if (isPriorityOrDarkness && (!dataSame || options?.reset || envChanged)) _priorityEnvVersion++;
     perfStats.sweepRun++;
     const result = wrapped(data, options);
-    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${_priorityEnvVersion}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
+    this.__blLastDark = darkLevel;
+    this.__blLastGlobal = globalLightActive;
+    const postIsPrio = Boolean(
+      this.requiresEdges === true
+      || (this.data?.priority ?? 0) > 0
+      || this.constructor?.name?.includes?.("Darkness")
+    );
+    const postPrioPart = postIsPrio ? "" : `|${_priorityEnvVersion}`;
+    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}${postPrioPart}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
     return result;
   };
 
@@ -1380,7 +1393,7 @@ function patchMiscCpuGuards() {
     _expectedNonVisionCounts = null;
     _attachedVisionMeshes.clear();
     return wrapped();
-  });
+  }, { type: "WRAPPER" });
 
   const okPartialLight = wrapFoundryMethod("EffectsCanvasGroup", "refreshLighting", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || globalThis.Boundless?.active) {
@@ -1640,7 +1653,7 @@ export function installCpuPerfEngine() {
       if (h !== "lightingRefresh" && h !== "visibilityRefresh") _losCache.clear();
     });
   }
-  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
+  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "controlToken", "sightRefresh", "visibilityRefresh", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
   }
   for (const h of ["updateActor", "deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry", "updateScene", "updateMacro", "updateRollTable", "updateUser"]) {

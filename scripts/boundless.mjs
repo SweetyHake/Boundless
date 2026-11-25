@@ -788,6 +788,9 @@ class MegaWorld1000 {
     // If the currently viewed level (and its visible sub-levels) have NO Boundless layers, leave Foundry 100% native!
     if (layers.length === 0) {
       this.unmount();
+      this._mounting = false;
+      applyLightingRenderScale();
+      this._runStandardAutoPerf?.();
       console.log(`${MODULE_ID} | Active level "${canvas.level?.name}" has no Boundless layers; running native Foundry rendering.`);
       return;
     }

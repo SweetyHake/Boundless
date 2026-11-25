@@ -630,7 +630,12 @@ function renderBatchedTokenPasses(renderer, visibleTokens) {
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].voidMesh, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].detectionFilterMesh, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].effects, renderer);
+  for (let i = 0; i < n; i++) {
+    const t = visibleTokens[i];
+    const e = t.effects;
+    const bZ = t.border?.zIndex ?? 0;
+    if (e && !((e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0)) renderChildSafe(e, renderer);
+  }
   for (let i = 0; i < n; i++) {
     const t = visibleTokens[i];
     renderChildSafe(t.targetArrows, renderer);
@@ -652,6 +657,13 @@ function renderBatchedTokenPasses(renderer, visibleTokens) {
   for (let i = 0; i < n; i++) {
     const b = visibleTokens[i].border;
     if (b && (b.zIndex ?? 0) > 0) renderChildSafe(b, renderer);
+  }
+  // Render elevated effects (e.g. custom-dnd5e Radial Status Effects with effects.zIndex > border.zIndex) above borders
+  for (let i = 0; i < n; i++) {
+    const t = visibleTokens[i];
+    const e = t.effects;
+    const bZ = t.border?.zIndex ?? 0;
+    if (e && (e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0) renderChildSafe(e, renderer);
   }
 }
 
@@ -866,8 +878,17 @@ function patchTokenUiCaching() {
       !this.effects.destroyed &&
       !this.isPreview &&
       !this.effects.overlay &&
+      !this.effects.filters?.length &&
+      !this.effects.bg?.filters?.length &&
+      !this.effects.bg?.customDnd5eBgParams &&
       this.effects.children?.length >= 5 &&
-      this.effects.children.every(ch => ch === this.effects.bg || (ch instanceof PIXI.Sprite && !ch.children?.length && (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")))
+      this.effects.children.every(ch => ch === this.effects.bg || (
+        ch instanceof PIXI.Sprite
+        && !ch.children?.length
+        && !ch.filters?.length
+        && !ch.customDnd5eBaseScale
+        && (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")
+      ))
     ) {
       this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
       this.effects.cacheAsBitmap = true;

@@ -611,6 +611,11 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
                 hitDoc.sheet.render(true);
                 return;
               }
+            } else if (hitDoc.flags?.["item-piles"]?.data?.enabled) {
+              Promise.resolve(streamer.materializeDoc?.(hitDoc)).then((tok) => {
+                if (tok && !tok.destroyed) tok._onClickLeft2?.(event);
+              });
+              return;
             } else {
               const sheet = hitDoc.actor?.sheet;
               if (sheet?.render) {

@@ -140,20 +140,30 @@ export async function loadLevelPolysFromDB(worldId, sceneId, levelIds) {
                 const [lightId, sig, rawOffsets, hasNearbyWall] = row;
                 if (typeof lightId !== "string" || typeof sig !== "string") continue;
                 let offsets = null;
-                if (rawOffsets instanceof Float32Array) {
-                  offsets = rawOffsets;
-                } else if (ArrayBuffer.isView(rawOffsets)) {
-                  const len = Math.floor(rawOffsets.byteLength / 4);
-                  if (len > 0) {
-                    if ((rawOffsets.byteOffset & 3) === 0) {
-                      offsets = new Float32Array(rawOffsets.buffer, rawOffsets.byteOffset, len);
-                    } else {
-                      const copy = rawOffsets.buffer.slice(rawOffsets.byteOffset, rawOffsets.byteOffset + len * 4);
-                      offsets = new Float32Array(copy);
+                if (rawOffsets !== null && rawOffsets !== undefined) {
+                  if (rawOffsets instanceof Float32Array) {
+                    offsets = rawOffsets;
+                  } else if (Array.isArray(rawOffsets)) {
+                    offsets = Float32Array.from(rawOffsets);
+                  } else if (ArrayBuffer.isView(rawOffsets) && rawOffsets.BYTES_PER_ELEMENT === 4 && !(rawOffsets instanceof Int32Array) && !(rawOffsets instanceof Uint32Array)) {
+                    const len = Math.floor(rawOffsets.byteLength / 4);
+                    if (len > 0) {
+                      if ((rawOffsets.byteOffset & 3) === 0) {
+                        offsets = new Float32Array(rawOffsets.buffer, rawOffsets.byteOffset, len);
+                      } else {
+                        const copy = rawOffsets.buffer.slice(rawOffsets.byteOffset, rawOffsets.byteOffset + len * 4);
+                        offsets = new Float32Array(copy);
+                      }
                     }
+                  } else {
+                    continue;
                   }
-                } else if (Array.isArray(rawOffsets)) {
-                  offsets = Float32Array.from(rawOffsets);
+                  if (!offsets || offsets.length < 6 || (offsets.length & 1) !== 0) continue;
+                  let allFinite = true;
+                  for (let oi = 0; oi < offsets.length; oi++) {
+                    if (!Number.isFinite(offsets[oi])) { allFinite = false; break; }
+                  }
+                  if (!allFinite) continue;
                 }
                 out.set(lightId, { sig, offsets, hasNearbyWall: Boolean(hasNearbyWall) });
               }
@@ -187,26 +197,31 @@ export async function loadLevelPolysFromDB(worldId, sceneId, levelIds) {
   });
 }
 
+let _clearGen = 0;
+
 /**
  * Persist computed light shadow polygons per level to IndexedDB and prune old records beyond MAX_LEVEL_RECORDS.
  * `entriesByLevel` is Map<levelId, Array<[lightId, sig, Float32Array | null, boolean]>>.
  */
 export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { maxRecords = MAX_LEVEL_RECORDS } = {}) {
   if (!sceneId || !(entriesByLevel instanceof Map) || !entriesByLevel.size) return false;
+  const startGen = _clearGen;
   const db = await openPolyCacheDB();
-  if (!db) return false;
+  if (!db || _clearGen !== startGen) return false;
 
   const now = Date.now();
   const writeOnce = (targetDb) => new Promise((resolve) => {
+    if (_clearGen !== startGen) { resolve({ saved: false, quotaHit: false }); return; }
     let quotaHit = false;
     let settled = false;
+    let tx = null;
     const done = (res) => {
       if (settled) return;
       settled = true;
       resolve(res);
     };
     try {
-      const tx = targetDb.transaction(STORE_NAME, "readwrite");
+      tx = targetDb.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
       for (const [levelId, entries] of entriesByLevel) {
         if (!levelId || !Array.isArray(entries) || !entries.length) continue;
@@ -223,21 +238,23 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
       tx.onerror = (ev) => {
         // Per W3C IndexedDB spec, during tx.onerror the error lives on ev.target.error while tx.error is still null.
         const err = ev?.target?.error || tx.error;
+        try { ev?.preventDefault?.(); } catch {}
         if (err?.name === "QuotaExceededError") {
           quotaHit = true;
         } else {
-          try { ev?.preventDefault?.(); } catch {}
           handleDbTxError(err);
         }
+        try { tx.abort?.(); } catch {}
         done({ saved: false, quotaHit });
       };
       tx.onabort = (ev) => {
         const err = ev?.target?.error || tx.error;
         if (err?.name === "QuotaExceededError") quotaHit = true;
-        else handleDbTxError(err);
+        else if (err) handleDbTxError(err);
         done({ saved: false, quotaHit });
       };
     } catch (err) {
+      try { tx?.abort?.(); } catch {}
       if (err?.name === "QuotaExceededError") quotaHit = true;
       else handleDbTxError(err);
       done({ saved: false, quotaHit });
@@ -246,18 +263,18 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
 
   let { saved, quotaHit } = await writeOnce(db);
 
-  if (quotaHit) {
+  if (quotaHit && _clearGen === startGen) {
     const freshDb = await openPolyCacheDB();
-    if (freshDb) {
+    if (freshDb && _clearGen === startGen) {
       const evicted = await _pruneHalfRecords(freshDb);
-      if (evicted > 0) {
+      if (evicted > 0 && _clearGen === startGen) {
         const retry = await writeOnce(freshDb);
         saved = retry.saved;
       }
     }
-  } else if (saved && maxRecords > 0) {
+  } else if (saved && maxRecords > 0 && _clearGen === startGen) {
     const freshDb = await openPolyCacheDB();
-    if (freshDb) await _pruneOldRecords(freshDb, maxRecords);
+    if (freshDb && _clearGen === startGen) await _pruneOldRecords(freshDb, maxRecords);
   }
   return saved;
 }
@@ -290,11 +307,20 @@ function _pruneHalfRecords(db) {
       };
       countReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       tx.oncomplete = () => resolve(deleted);
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(deleted); };
-      tx.onabort = () => resolve(deleted);
+      tx.onerror = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        try { ev?.preventDefault?.(); } catch {}
+        handleDbTxError(err);
+        resolve(0);
+      };
+      tx.onabort = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        if (err) handleDbTxError(err);
+        resolve(0);
+      };
     } catch (err) {
       handleDbTxError(err);
-      resolve(deleted);
+      resolve(0);
     }
   });
 }
@@ -326,8 +352,17 @@ function _pruneOldRecords(db, maxRecords) {
       };
       countReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       tx.oncomplete = () => resolve();
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(); };
-      tx.onabort = () => resolve();
+      tx.onerror = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        try { ev?.preventDefault?.(); } catch {}
+        handleDbTxError(err);
+        resolve();
+      };
+      tx.onabort = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        if (err) handleDbTxError(err);
+        resolve();
+      };
     } catch (err) {
       handleDbTxError(err);
       resolve();
@@ -339,6 +374,7 @@ function _pruneOldRecords(db, maxRecords) {
  * Clear all persisted light polygon cache entries from IndexedDB (or only those matching `sceneId`, optionally scoped by `worldId`).
  */
 export async function clearPolyCacheDB(sceneId = null, worldId = null) {
+  _clearGen++;
   const db = await openPolyCacheDB();
   if (!db) return false;
 
@@ -363,7 +399,7 @@ export async function clearPolyCacheDB(sceneId = null, worldId = null) {
         };
         cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
-      tx.oncomplete = () => resolve(true);
+      tx.oncomplete = () => { _clearGen++; resolve(true); };
       tx.onerror = (ev) => {
         const err = ev?.target?.error || tx.error;
         try { ev?.preventDefault?.(); } catch {}

@@ -8,6 +8,7 @@ import {
 import { MODULE_ID, loc, escapeHtml } from "./utils.mjs";
 
 const activeBakeScenes = new Set();
+const openBakeDialogs = new Set();
 
 function resolveSceneFromContextEl(li) {
   const el = li instanceof HTMLElement ? li : li?.[0];
@@ -50,6 +51,8 @@ async function runWithProgressDialog(titleKey, runner, sceneId = null) {
       if (!finished) abortCtrl.abort();
     }, { once: true });
     await progressDialog.render(true);
+    // Remove default DialogV2 autofocus from the sole Cancel button so Enter/Space doesn't accidentally abort baking
+    try { progressDialog.element?.querySelector?.('button[data-action="cancel"]')?.blur?.(); } catch {}
 
     const onProgress = ({ pct, text }) => {
       const rootEl = progressDialog?.element;
@@ -77,6 +80,8 @@ async function runWithProgressDialog(titleKey, runner, sceneId = null) {
 
 export async function openOptimizeSceneDialog(controller, scene) {
   if (!scene || !game.user?.isGM) return;
+  if (activeBakeScenes.has(scene.id) || openBakeDialogs.has(scene.id)) return;
+  openBakeDialogs.add(scene.id);
   const DialogV2 = foundry.applications.api.DialogV2;
 
   const desc = game.i18n.format("BOUNDLESS.Optimize.DialogBody", {
@@ -96,22 +101,27 @@ export async function openOptimizeSceneDialog(controller, scene) {
     </div>
   `;
 
-  const opts = await DialogV2.prompt({
-    window: { title: loc("BOUNDLESS.Optimize.DialogTitle"), icon: "fa-solid fa-bolt" },
-    position: { width: 420 },
-    content,
-    ok: {
-      label: loc("BOUNDLESS.Optimize.StartButton"),
-      icon: "fa-solid fa-bolt",
-      callback: (_event, button) => ({
-        createCopy: Boolean(button.form.elements.createCopy?.checked)
-      })
-    },
-    rejectClose: false
-  });
+  let opts = null;
+  try {
+    opts = await DialogV2.prompt({
+      window: { title: loc("BOUNDLESS.Optimize.DialogTitle"), icon: "fa-solid fa-bolt" },
+      position: { width: 420 },
+      content,
+      ok: {
+        label: loc("BOUNDLESS.Optimize.StartButton"),
+        icon: "fa-solid fa-bolt",
+        callback: (_event, button) => ({
+          createCopy: Boolean(button.form.elements.createCopy?.checked)
+        })
+      },
+      rejectClose: false
+    });
+  } finally {
+    openBakeDialogs.delete(scene.id);
+  }
   if (!opts) return;
   const liveScene = game.scenes?.get?.(scene.id);
-  if (!liveScene) return;
+  if (!liveScene || isSceneBoundlessEditable(liveScene)) return;
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Optimize.ProgressTitle", ({ signal, onProgress }) =>
     bakeSceneToBoundless(controller, liveScene, {
@@ -144,6 +154,8 @@ export async function openOptimizeSceneDialog(controller, scene) {
 
 export async function openBakeEditsDialog(controller, scene) {
   if (!scene || !game.user?.isGM) return;
+  if (activeBakeScenes.has(scene.id) || openBakeDialogs.has(scene.id)) return;
+  openBakeDialogs.add(scene.id);
   const DialogV2 = foundry.applications.api.DialogV2;
 
   const desc = game.i18n.format("BOUNDLESS.BakeEdits.DialogBody", {
@@ -163,19 +175,24 @@ export async function openBakeEditsDialog(controller, scene) {
     </div>
   `;
 
-  const opts = await DialogV2.prompt({
-    window: { title: loc("BOUNDLESS.BakeEdits.DialogTitle"), icon: "fa-solid fa-floppy-disk" },
-    position: { width: 420 },
-    content,
-    ok: {
-      label: loc("BOUNDLESS.BakeEdits.StartButton"),
-      icon: "fa-solid fa-floppy-disk",
-      callback: (_event, button) => ({
-        absorbNative: Boolean(button.form.elements.absorbNative?.checked)
-      })
-    },
-    rejectClose: false
-  });
+  let opts = null;
+  try {
+    opts = await DialogV2.prompt({
+      window: { title: loc("BOUNDLESS.BakeEdits.DialogTitle"), icon: "fa-solid fa-floppy-disk" },
+      position: { width: 420 },
+      content,
+      ok: {
+        label: loc("BOUNDLESS.BakeEdits.StartButton"),
+        icon: "fa-solid fa-floppy-disk",
+        callback: (_event, button) => ({
+          absorbNative: Boolean(button.form.elements.absorbNative?.checked)
+        })
+      },
+      rejectClose: false
+    });
+  } finally {
+    openBakeDialogs.delete(scene.id);
+  }
   if (!opts) return;
   const liveScene = game.scenes?.get?.(scene.id);
   if (!liveScene || !isSceneBoundlessEditable(liveScene)) return;
@@ -210,6 +227,8 @@ export async function openBakeEditsDialog(controller, scene) {
 
 export async function openUnbakeSceneDialog(controller, scene) {
   if (!scene || !game.user?.isGM) return;
+  if (activeBakeScenes.has(scene.id) || openBakeDialogs.has(scene.id)) return;
+  openBakeDialogs.add(scene.id);
   const DialogV2 = foundry.applications.api.DialogV2;
 
   const desc = game.i18n.format("BOUNDLESS.Unbake.DialogBody", {
@@ -236,20 +255,25 @@ export async function openUnbakeSceneDialog(controller, scene) {
     </div>
   `;
 
-  const opts = await DialogV2.prompt({
-    window: { title: loc("BOUNDLESS.Unbake.DialogTitle"), icon: "fa-solid fa-box-open" },
-    position: { width: 420 },
-    content,
-    ok: {
-      label: loc("BOUNDLESS.Unbake.StartButton"),
-      icon: "fa-solid fa-box-open",
-      callback: (_event, button) => ({
-        createCopy: Boolean(button.form.elements.createCopy?.checked),
-        restoreImages: Boolean(button.form.elements.restoreImages?.checked)
-      })
-    },
-    rejectClose: false
-  });
+  let opts = null;
+  try {
+    opts = await DialogV2.prompt({
+      window: { title: loc("BOUNDLESS.Unbake.DialogTitle"), icon: "fa-solid fa-box-open" },
+      position: { width: 420 },
+      content,
+      ok: {
+        label: loc("BOUNDLESS.Unbake.StartButton"),
+        icon: "fa-solid fa-box-open",
+        callback: (_event, button) => ({
+          createCopy: Boolean(button.form.elements.createCopy?.checked),
+          restoreImages: Boolean(button.form.elements.restoreImages?.checked)
+        })
+      },
+      rejectClose: false
+    });
+  } finally {
+    openBakeDialogs.delete(scene.id);
+  }
   if (!opts) return;
   const liveScene = game.scenes?.get?.(scene.id);
   if (!liveScene || !isSceneBoundlessEditable(liveScene)) return;
@@ -305,16 +329,24 @@ export function registerConfigUI(controller) {
       });
     };
 
+    const isChunkedOrSuperGrid = (scene) => {
+      const cfg = scene?.flags?.[MODULE_ID];
+      const url = cfg?.manifestUrl || (cfg?.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : null);
+      const cached = url ? controller?.manifestCache?.get?.(url) : null;
+      const man = cached || ((canvas?.scene?.id === scene?.id) ? controller?.manifest : null);
+      return Boolean(man?.chunks?.baseUrl || man?.superGrid);
+    };
+
     const canOptimize = (li) => {
       if (!game.user?.isGM) return false;
       const scene = resolveSceneFromContextEl(li);
-      return Boolean(scene && !activeBakeScenes.has(scene.id) && !isSceneBoundlessEditable(scene));
+      return Boolean(scene && !activeBakeScenes.has(scene.id) && !openBakeDialogs.has(scene.id) && !isSceneBoundlessEditable(scene));
     };
 
     const canManageBoundless = (li) => {
       if (!game.user?.isGM) return false;
       const scene = resolveSceneFromContextEl(li);
-      return Boolean(scene && !activeBakeScenes.has(scene.id) && isSceneBoundlessEditable(scene));
+      return Boolean(scene && !activeBakeScenes.has(scene.id) && !openBakeDialogs.has(scene.id) && isSceneBoundlessEditable(scene) && !isChunkedOrSuperGrid(scene));
     };
 
     pushOption(

@@ -908,6 +908,7 @@ export const overlayMethods = {
     m.occlusionMode = resolveOcclusionMode(tSpec.occlusionMode, defaultOcc);
     const baseAlpha = tSpec.alpha ?? 1.0;
     const hiddenMult = tSpec.hidden ? 0.5 : 1.0;
+    m.hidden = Boolean(tSpec.hidden);
     m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && !(m.occlusionMode & CONST.OCCLUSION_MODES.SURFACE));
     m.restrictsLight = Boolean(tSpec.restrictsLight);
     m.restrictsWeather = Boolean(tSpec.restrictsWeather);

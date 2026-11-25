@@ -588,11 +588,12 @@ export const editsMethods = {
     let poi = target;
     if (typeof target === "string") {
       const needle = target.trim().toLowerCase();
-      const all = this.poiManager.resolvePois(canvas.scene, this.manifest);
+      const isGM = Boolean(game.user?.isGM);
+      const all = (this.poiManager.resolvePois(canvas.scene, this.manifest) || []).filter(p => isGM || !p?.hidden);
       poi = all.find(p => p.id === target || p.name?.toLowerCase() === needle)
         || all.find(p => p.name?.toLowerCase().includes(needle));
     }
-    if (!poi) return false;
+    if (!poi || (poi.hidden && !game.user?.isGM)) return false;
     return this.poiManager.flyTo(poi, options);
   },
 

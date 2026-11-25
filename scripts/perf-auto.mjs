@@ -92,7 +92,10 @@ export function restoreAllStandardCulling() {
   if (!_hasStandardCulling) return;
   _hasStandardCulling = false;
   for (const tile of c.tiles?.placeables ?? []) {
-    if (tile.mesh && !tile.mesh.destroyed) tile.mesh.renderable = true;
+    if (tile.mesh && !tile.mesh.destroyed && tile.mesh._blStdCulled) {
+      tile.mesh.renderable = true;
+      tile.mesh._blStdCulled = false;
+    }
   }
   for (const al of c.lighting?.placeables ?? []) {
     const icon = al.controls ?? al.controlIcon;
@@ -152,7 +155,10 @@ export function updateStandardSceneCulling() {
       const mesh = t.mesh;
       if (!mesh || mesh.destroyed) continue;
       if (tilesHi || t.controlled || t.hover || t.isPreview) {
-        mesh.renderable = true;
+        if (mesh._blStdCulled) {
+          mesh.renderable = true;
+          mesh._blStdCulled = false;
+        }
         continue;
       }
       const cb = mesh.canvasBounds;
@@ -177,12 +183,25 @@ export function updateStandardSceneCulling() {
         const diagPad = doc.rotation ? Math.max(halfW, halfH) : 0;
         inView = rectsIntersect(cx - halfW - diagPad, cy - halfH - diagPad, cx + halfW + diagPad, cy + halfH + diagPad, vp);
       }
-      mesh.renderable = inView;
-      if (!inView) culledTiles++;
+      if (!inView) {
+        // Only cull meshes currently renderable so third-party hides (fa-nexus previews, burn-living-map machines) stay untouched
+        if (mesh.renderable) {
+          mesh.renderable = false;
+          mesh._blStdCulled = true;
+        }
+        culledTiles++;
+      } else if (mesh._blStdCulled) {
+        mesh.renderable = true;
+        mesh._blStdCulled = false;
+      }
     }
   } else {
     for (let i = 0; i < tiles.length; i++) {
-      if (tiles[i].mesh && !tiles[i].mesh.destroyed) tiles[i].mesh.renderable = true;
+      const mesh = tiles[i].mesh;
+      if (mesh && !mesh.destroyed && mesh._blStdCulled) {
+        mesh.renderable = true;
+        mesh._blStdCulled = false;
+      }
     }
   }
 
@@ -716,7 +735,15 @@ export function installAutoPerfEngine(controller) {
   if (_autoInstalled) return;
   _autoInstalled = true;
   _controllerRef = controller;
-  if (controller) controller._restoreStandardCulling = restoreAllStandardCulling;
+  if (controller) {
+    controller._restoreStandardCulling = restoreAllStandardCulling;
+    controller._runStandardAutoPerf = () => {
+      syncDecorativeTileShaders(true);
+      updateStandardSceneCulling();
+      scheduleVramCleanup();
+      scheduleStandardLevelPrewarm();
+    };
+  }
 
   if (globalThis.game?.settings?.get?.("core", "noCanvas")) return;
 

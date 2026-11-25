@@ -20,7 +20,18 @@ import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTi
  */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const nextFrame = () => new Promise((r) => requestAnimationFrame(r));
+const nextFrame = () => new Promise((r) => {
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(tid);
+    r();
+  };
+  const tid = setTimeout(finish, 100);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(finish);
+});
+let _benchmarkRunning = false;
 
 function median(arr) {
   if (!arr.length) return 0;
@@ -286,6 +297,8 @@ async function runRealMouseDrag(tok, steps = 28) {
       prev = now;
     }
   } finally {
+    try { view.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
+    try { view.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
     try { tok.mouseInteractionManager?.cancel?.(); } catch {}
     try { tok._finalizeDragLeft?.(); } catch {}
     await nextFrame();
@@ -575,6 +588,7 @@ export async function benchmarkCurrentScene(opts = {}) {
             edges.delete("bl-bench-door.0");
             if (!activeLs.destroyed && globalThis.canvas?.scene?.id === scene.id) {
               try { activeLs.initialize(); } catch {}
+              try { canvas.perception?.update?.({ refreshLighting: true, refreshVision: true }); } catch {}
             }
           }
           if (isOn && !warmup) onShapesChanged = Math.max(onShapesChanged, changed);
@@ -623,6 +637,7 @@ export async function benchmarkCurrentScene(opts = {}) {
                     try { activeLights[j].initialize(); } catch {}
                   }
                 }
+                try { canvas.perception?.update?.({ refreshLighting: true, refreshVision: true }); } catch {}
               }
             }
             return { ms: (performance.now() - t0) / steps };
@@ -846,7 +861,16 @@ function selectDiverseScenes(maxCount = 5) {
  * Run the full A/B benchmark across one or multiple scenes and print a clean console report.
  */
 export async function runPerfBenchmark(opts = {}) {
+  if (_benchmarkRunning) {
+    throw new Error("A Boundless benchmark is already running.");
+  }
+  _benchmarkRunning = true;
   const origSceneId = globalThis.canvas?.scene?.id;
+  const origCam = globalThis.canvas?.stage ? {
+    x: canvas.stage.pivot?.x,
+    y: canvas.stage.pivot?.y,
+    scale: canvas.stage.scale?.x
+  } : null;
   const sceneIds = opts.allMaps
     ? selectDiverseScenes(opts.maxMaps || 5)
     : (Array.isArray(opts.sceneIds) && opts.sceneIds.length
@@ -871,8 +895,14 @@ export async function runPerfBenchmark(opts = {}) {
     }
   } finally {
     if (origSceneId && canvas.scene?.id !== origSceneId) {
-      try { await game.scenes.get(origSceneId)?.view(); } catch {}
+      try {
+        await game.scenes.get(origSceneId)?.view();
+        if (origCam && Number.isFinite(origCam.x) && Number.isFinite(origCam.y)) {
+          canvas.pan?.(origCam);
+        }
+      } catch {}
     }
+    _benchmarkRunning = false;
   }
 
   const regressions = allRows.filter((r) => r.status === "REGRESSION");
