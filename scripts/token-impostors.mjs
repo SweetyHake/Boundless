@@ -2,6 +2,7 @@ import {
   MODULE_ID,
   isTextureUsable,
   resolveFoundryRoute,
+  hasTokenPermissionLazy,
   getLevelBaseElevation as getFiniteLevelBaseElevation,
   getLevelRoofElevation as getFiniteLevelRoofElevation
 } from "./utils.mjs";
@@ -235,6 +236,8 @@ function getTokenRenderSpec(doc) {
   const ringPack = ringEnabled
     ? String(srcObj.flags?.["multiple-rings"]?.ringAppearance ?? doc.flags?.["multiple-rings"]?.ringAppearance ?? "").trim()
     : "";
+  const liveRingName = ringEnabled ? String(doc._object?.ring?.ringName || "") : "";
+  const liveBkgName = ringEnabled ? String(doc._object?.ring?.bkgName || "") : "";
   const ringInfo = ringEnabled ? getFoundryRingAssetInfo(sizeUnits, ringPack, doc._object?.ring) : null;
   const subjectScaleAdj = ringInfo?.subjectScaleAdjustment || 1.5;
 
@@ -254,8 +257,9 @@ function getTokenRenderSpec(doc) {
   const ringColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.ring, ringInfo?.defaultRingCss || "") : "";
   const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, ringInfo?.defaultBkgCss || "") : "";
 
+  const liveRingSuffix = (liveRingName || liveBkgName) ? `|${liveRingName}:${liveBkgName}` : "";
   const slotKey = ringEnabled
-    ? `R${hasDistinctSubject ? "P" : "C"}|${ringPack}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
+    ? `R${hasDistinctSubject ? "P" : "C"}|${ringPack}${liveRingSuffix}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
     : `T|${artSrc}`;
 
   return {
@@ -263,6 +267,8 @@ function getTokenRenderSpec(doc) {
     artSrc,
     ringEnabled,
     ringPack,
+    liveRingName,
+    liveBkgName,
     hasDistinctSubject,
     sizeUnits,
     subjectScaleAdj,
@@ -285,13 +291,9 @@ function isPartyTokenDoc(doc) {
 }
 
 function isOwnedByCurrentUserSafe(doc) {
-  const base = doc?.baseActor;
-  if (!base) return false;
-  if (base.isOwner) return true;
-  if (typeof base.testUserPermission === "function" && game.user) {
-    try { return base.testUserPermission(game.user, "OWNER"); } catch {}
-  }
-  return false;
+  if (!doc || !game.user) return false;
+  if (game.user.isGM) return true;
+  return hasTokenPermissionLazy(doc, game.user, "OWNER");
 }
 
 function isTokenInvisibleSafe(doc) {
@@ -903,7 +905,10 @@ export class TokenImpostorLayer {
       ctx.clearRect(cellX, cellY, CELL_PX, CELL_PX);
 
       if (slot.spec.ringEnabled) {
-        const ringInfo = getFoundryRingAssetInfo(slot.spec.sizeUnits, slot.spec.ringPack || "");
+        const liveRingHint = (slot.spec.liveRingName || slot.spec.liveBkgName)
+          ? { ringName: slot.spec.liveRingName, bkgName: slot.spec.liveBkgName }
+          : null;
+        const ringInfo = getFoundryRingAssetInfo(slot.spec.sizeUnits, slot.spec.ringPack || "", liveRingHint);
         const cx = dstX + CONTENT_PX * 0.5;
         const cy = dstY + CONTENT_PX * 0.5;
         const subScale = slot.spec.subjectScale || 1;
@@ -1294,10 +1299,16 @@ export class TokenImpostorLayer {
     const { w, h, cx, cy } = getTokenDocBounds(doc, grid);
     const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0);
 
-    // Roof check: suppress impostor if sitting under a baked pyramid roof when native roofMesh isn't mounted
+    // Roof & multi-level floor check: suppress impostor if under a baked roof or occluded by an opaque upper level
     const lid = doc._source?.level || doc.level || canvas.level?.id;
     if (this.controller?.isPointUnderBakedRoof?.(lid, cx, cy, elev)) {
       return { alpha: 0, needsVision, isParty };
+    }
+    if (lid && lid !== canvas.level?.id) {
+      const tokLayer = this.controller?.levelLayers?.get?.(lid);
+      if (tokLayer && this.controller?._isRectOccludedByUpperLevels?.(tokLayer, cx - w * 0.4, cy - h * 0.4, w * 0.8, h * 0.8)) {
+        return { alpha: 0, needsVision, isParty };
+      }
     }
 
     // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW or Invisible enemies!)

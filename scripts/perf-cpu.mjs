@@ -283,16 +283,17 @@ function collectVisionRanges() {
   let sawUnboundedLightPerception = false;
   for (const vs of canvas.effects?.visionSources ?? []) {
     if (!vs.active) continue;
-    let maxR = Math.max(vs.data?.radius ?? 0, vs.data?.externalRadius ?? 0);
+    let maxR = Math.max(vs.data?.radius ?? 0, vs.data?.lightRadius ?? 0, vs.data?.externalRadius ?? 0);
     const modes = vs.object?.document?.detectionModes;
     if (modes) {
       for (const [id, m] of Object.entries(modes)) {
         if (m?.enabled === false) continue;
-        const range = m?.range ?? 0;
-        if (range === Infinity) {
+        const rawRange = m?.range;
+        if (rawRange === null || rawRange === Infinity) {
           if (id === "lightPerception") { sawUnboundedLightPerception = true; continue; }
           return null;
         }
+        const range = Number(rawRange) || 0;
         if (range > 0 && typeof vs.object?.getLightRadius === "function") {
           const px = vs.object.getLightRadius(range);
           if (px > maxR) maxR = px;
@@ -1320,8 +1321,27 @@ function patchMiscCpuGuards() {
     return sig;
   };
 
+  let _expectedNonVisionCounts = null;
+  const countNonVisionChildren = (effects) => {
+    let attachedIl = 0;
+    let attachedCo = 0;
+    const ilLights = effects.illumination?.lights;
+    const co = effects.coloration;
+    for (const m of _attachedVisionMeshes) {
+      if (!m || m.destroyed) continue;
+      if (m.parent === ilLights) attachedIl++;
+      else if (m.parent === co) attachedCo++;
+    }
+    return {
+      bg: effects.background?.lighting?.children?.length ?? 0,
+      il: (ilLights?.children?.length ?? 0) - attachedIl,
+      co: (co?.children?.length ?? 0) - attachedCo
+    };
+  };
+
   const okClearFx = wrapFoundryMethod("EffectsCanvasGroup", "clearEffects", function (wrapped) {
     _lastLightSig = null;
+    _expectedNonVisionCounts = null;
     _attachedVisionMeshes.clear();
     return wrapped();
   });
@@ -1329,11 +1349,19 @@ function patchMiscCpuGuards() {
   const okPartialLight = wrapFoundryMethod("EffectsCanvasGroup", "refreshLighting", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || globalThis.Boundless?.active) {
       _lastLightSig = null;
+      _expectedNonVisionCounts = null;
       _attachedVisionMeshes.clear();
       return wrapped();
     }
     const sig = computeLightsOnlySig(this);
-    if (sig && sig === _lastLightSig && this.background?.vision && this.illumination?.lights && this.coloration) {
+    const counts = sig && _expectedNonVisionCounts ? countNonVisionChildren(this) : null;
+    const countsMatch = Boolean(
+      counts &&
+      counts.bg === _expectedNonVisionCounts.bg &&
+      counts.il === _expectedNonVisionCounts.il &&
+      counts.co === _expectedNonVisionCounts.co
+    );
+    if (sig && sig === _lastLightSig && countsMatch && this.background?.vision && this.illumination?.lights && this.coloration) {
       try {
         const { background, illumination, coloration } = this;
         if (illumination.filter) illumination.filter.uniforms.replacementColor = canvas.colors.background.rgb;
@@ -1384,9 +1412,19 @@ function patchMiscCpuGuards() {
           || (lightingOptions.coloration?.postProcessingModes?.length > 0);
         perfStats.lightingPartialRebuilds++;
         Hooks.callAll("lightingRefresh", this);
+        // If a third-party lightingRefresh hook injected custom children, force a clean full rebuild next time
+        const afterCounts = countNonVisionChildren(this);
+        if (
+          afterCounts.bg !== _expectedNonVisionCounts.bg ||
+          afterCounts.il !== _expectedNonVisionCounts.il ||
+          afterCounts.co !== _expectedNonVisionCounts.co
+        ) {
+          _expectedNonVisionCounts = null;
+        }
         return;
       } catch {
         _lastLightSig = null;
+        _expectedNonVisionCounts = null;
         _attachedVisionMeshes.clear();
       }
     }
@@ -1399,7 +1437,9 @@ function patchMiscCpuGuards() {
       if (il && il.parent) _attachedVisionMeshes.add(il);
       if (co && co.parent) _attachedVisionMeshes.add(co);
     }
-    _lastLightSig = sig;
+    // Recompute signature AFTER wrapped() so lights whose layer.reset just cleared can hit partial rebuild on the next tick
+    _lastLightSig = computeLightsOnlySig(this);
+    _expectedNonVisionCounts = _lastLightSig ? countNonVisionChildren(this) : null;
     return res;
   });
 

@@ -522,6 +522,9 @@ export class ChunkedFogManager {
 
     for (const vs of canvas.effects.visionSources) {
       if (!vs?.active) continue;
+      // In Foundry v14 multi-level scenes, visionSources contains tokens from all visible levels; only burn the viewed level's fog
+      const vsLevelId = vs.level?.id ?? vs.data?.level ?? vs.object?.document?.level;
+      if (vsLevelId && vsLevelId !== this.levelId) continue;
       if (skipBulkGmPrivate && !vs.object?.document?.hasPlayerOwner) continue;
       const poly = vs.los || vs.shape;
       const pts = poly?.points;
@@ -676,7 +679,9 @@ export class ChunkedFogManager {
       }
       targetLevelId = payload.levelId;
     } else {
-      targetLevelId = targetScene.initialLevel?.id || "default";
+      targetLevelId = (typeof targetScene.initialLevel === "string" ? targetScene.initialLevel : targetScene.initialLevel?.id)
+        || targetScene.firstLevel?.id
+        || "default";
     }
     const queueKey = `${sceneId}::${targetLevelId}`;
 
@@ -837,8 +842,9 @@ export class ChunkedFogManager {
     }
   }
 
-  onSceneFogFlagsChanged(scene, sharedFogChanges) {
-    if (!this.enabled || !this.isSharedMode || this._isSavingShared(this.levelId)) return;
+  onSceneFogFlagsChanged(scene, sharedFogChanges, userId = null) {
+    if (!this.enabled || !this.isSharedMode) return;
+    if (this._isSavingShared(this.levelId) && (!userId || userId === game.user?.id)) return;
     if (sharedFogChanges === null) {
       this._clearAllSharedChunksLocal();
       return;

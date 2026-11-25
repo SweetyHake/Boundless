@@ -1086,19 +1086,25 @@ function resolveTileItem(tid, raw, tileEditsObj, defaultElev) {
 
 function indexTileIntoSectors(tileSpec, tid, ensureSec, simGrid, simSectorPx) {
   const rot = tileSpec.rot || 0;
-  const ax = tileSpec.anchorX !== undefined ? tileSpec.anchorX : 0.5;
-  const ay = tileSpec.anchorY !== undefined ? tileSpec.anchorY : 0.5;
-  const pivX = tileSpec.anchorX === undefined ? (tileSpec.x + tileSpec.w * 0.5) : tileSpec.x;
-  const pivY = tileSpec.anchorY === undefined ? (tileSpec.y + tileSpec.h * 0.5) : tileSpec.y;
+  const rawAx = tileSpec.anchorX !== undefined ? tileSpec.anchorX : 0.5;
+  const rawAy = tileSpec.anchorY !== undefined ? tileSpec.anchorY : 0.5;
+  const sxVal = (Number.isFinite(tileSpec.scaleX) && tileSpec.scaleX !== 0) ? tileSpec.scaleX : 1;
+  const syVal = (Number.isFinite(tileSpec.scaleY) && tileSpec.scaleY !== 0) ? tileSpec.scaleY : 1;
+  const effAx = sxVal < 0 ? (1 - rawAx) : rawAx;
+  const effAy = syVal < 0 ? (1 - rawAy) : rawAy;
+  const effW = Math.abs(tileSpec.w || 0) * Math.abs(sxVal);
+  const effH = Math.abs(tileSpec.h || 0) * Math.abs(syVal);
+  const pivX = tileSpec.anchorX === undefined ? (tileSpec.x + (tileSpec.w || 0) * 0.5) : tileSpec.x;
+  const pivY = tileSpec.anchorY === undefined ? (tileSpec.y + (tileSpec.h || 0) * 0.5) : tileSpec.y;
   const rad = (rot * Math.PI) / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
-  const dx = (0.5 - ax) * tileSpec.w;
-  const dy = (0.5 - ay) * tileSpec.h;
+  const dx = (0.5 - effAx) * effW;
+  const dy = (0.5 - effAy) * effH;
   const cx = pivX + (cos * dx - sin * dy);
   const cy = pivY + (sin * dx + cos * dy);
-  const rx = (tileSpec.w * Math.abs(cos) + tileSpec.h * Math.abs(sin)) * 0.5;
-  const ry = (tileSpec.w * Math.abs(sin) + tileSpec.h * Math.abs(cos)) * 0.5;
+  const rx = (effW * Math.abs(cos) + effH * Math.abs(sin)) * 0.5;
+  const ry = (effW * Math.abs(sin) + effH * Math.abs(cos)) * 0.5;
   const sx0 = Math.max(0, Math.min(simGrid - 1, Math.floor((cx - rx) / simSectorPx)));
   const sy0 = Math.max(0, Math.min(simGrid - 1, Math.floor((cy - ry) / simSectorPx)));
   const sx1 = Math.max(0, Math.min(simGrid - 1, Math.floor((cx + rx) / simSectorPx)));

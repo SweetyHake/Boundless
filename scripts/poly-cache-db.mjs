@@ -169,8 +169,17 @@ export async function loadLevelPolysFromDB(worldId, sceneId, levelIds) {
         };
       }
       tx.oncomplete = finish;
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} finish(); };
-      tx.onabort = finish;
+      tx.onerror = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        handleDbTxError(err);
+        try { ev?.preventDefault?.(); } catch {}
+        finish();
+      };
+      tx.onabort = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        handleDbTxError(err);
+        finish();
+      };
     } catch (err) {
       handleDbTxError(err);
       finish();
@@ -190,6 +199,12 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
   const now = Date.now();
   const writeOnce = (targetDb) => new Promise((resolve) => {
     let quotaHit = false;
+    let settled = false;
+    const done = (res) => {
+      if (settled) return;
+      settled = true;
+      resolve(res);
+    };
     try {
       const tx = targetDb.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
@@ -204,24 +219,28 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
           entries
         });
       }
-      tx.oncomplete = () => resolve({ saved: true, quotaHit: false });
+      tx.oncomplete = () => done({ saved: true, quotaHit: false });
       tx.onerror = (ev) => {
-        try { ev?.preventDefault?.(); } catch {}
-        const err = tx.error;
-        if (err?.name === "QuotaExceededError") quotaHit = true;
-        else handleDbTxError(err);
-        resolve({ saved: false, quotaHit });
+        // Per W3C IndexedDB spec, during tx.onerror the error lives on ev.target.error while tx.error is still null.
+        const err = ev?.target?.error || tx.error;
+        if (err?.name === "QuotaExceededError") {
+          quotaHit = true;
+        } else {
+          try { ev?.preventDefault?.(); } catch {}
+          handleDbTxError(err);
+        }
+        done({ saved: false, quotaHit });
       };
-      tx.onabort = () => {
-        const err = tx.error;
+      tx.onabort = (ev) => {
+        const err = ev?.target?.error || tx.error;
         if (err?.name === "QuotaExceededError") quotaHit = true;
         else handleDbTxError(err);
-        resolve({ saved: false, quotaHit });
+        done({ saved: false, quotaHit });
       };
     } catch (err) {
       if (err?.name === "QuotaExceededError") quotaHit = true;
       else handleDbTxError(err);
-      resolve({ saved: false, quotaHit });
+      done({ saved: false, quotaHit });
     }
   });
 
@@ -345,8 +364,17 @@ export async function clearPolyCacheDB(sceneId = null, worldId = null) {
         cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
       tx.oncomplete = () => resolve(true);
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} handleDbTxError(tx.error); resolve(false); };
-      tx.onabort = () => { handleDbTxError(tx.error); resolve(false); };
+      tx.onerror = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        try { ev?.preventDefault?.(); } catch {}
+        handleDbTxError(err);
+        resolve(false);
+      };
+      tx.onabort = (ev) => {
+        const err = ev?.target?.error || tx.error;
+        handleDbTxError(err);
+        resolve(false);
+      };
     } catch (err) {
       handleDbTxError(err);
       resolve(false);

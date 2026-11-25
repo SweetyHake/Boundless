@@ -169,10 +169,17 @@ export const overlayMethods = {
     if (!targetLayer) return;
 
     const isSuperGrid = Boolean(targetLayer.spec?.superGrid);
-    const originX = isSuperGrid ? 0 : (targetLayer.bounds?.x || 0);
-    const originY = isSuperGrid ? 0 : (targetLayer.bounds?.y || 0);
     const regionW = isSuperGrid ? (targetLayer.spec.superGrid.regionPx || 100000) : (targetLayer.bounds?.w || 100000);
     const regionH = isSuperGrid ? (targetLayer.spec.superGrid.regionPx || 100000) : (targetLayer.bounds?.h || 100000);
+    let originX = isSuperGrid ? 0 : (targetLayer.bounds?.x || 0);
+    let originY = isSuperGrid ? 0 : (targetLayer.bounds?.y || 0);
+    if (isSuperGrid && !targetLayer.spec._superGridBase && !targetLayer.spec.roofMaskUrl) {
+      const firstRoof = ovList.find(o => o?.roof && !o.walls?.includes("anchor_") && Number.isFinite(o.cx) && Number.isFinite(o.cy));
+      if (firstRoof) {
+        originX = Math.floor(firstRoof.cx / regionW) * regionW;
+        originY = Math.floor(firstRoof.cy / regionH) * regionH;
+      }
+    }
     const roofElevation = getLevelRoofElevation(targetLayer.level);
 
     return this._bakeRoofMaskFromList(ovList, {

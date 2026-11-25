@@ -79,6 +79,7 @@ export class MegaAudioStreamer {
       const visitedSectors = new Set();
 
       for (const a of anchors) {
+        if (a.levelId && a.levelId !== lid) continue;
         const sx0 = Math.max(0, Math.floor(a.x0 / simSectorPx));
         const sy0 = Math.max(0, Math.floor(a.y0 / simSectorPx));
         const sx1 = Math.min(simGrid - 1, Math.floor(a.x1 / simSectorPx));
@@ -140,6 +141,7 @@ export class MegaAudioStreamer {
           let inAnchor = false;
           for (let ai = 0; ai < anchors.length; ai++) {
             const a = anchors[ai];
+            if (a.levelId && a.levelId !== lid) continue;
             if (item.x + rPx >= a.x0 && item.x - rPx <= a.x1 && item.y + rPx >= a.y0 && item.y - rPx <= a.y1) {
               inAnchor = true;
               break;

@@ -329,7 +329,8 @@ export function updateStandardLightMeshCulling(vp = null) {
       const bg = ls.layers?.background?.mesh;
       const il = ls.layers?.illumination?.mesh;
       const co = ls.layers?.coloration?.mesh;
-      if (!cullLs) {
+      const animating = Boolean(ls.object?.movementAnimationPromise || ls.object?.animationContexts?.size > 0);
+      if (!cullLs || animating) {
         if (bg && !bg.destroyed) bg.renderable = true;
         if (il && !il.destroyed) il.renderable = true;
         if (co && !co.destroyed) co.renderable = true;
@@ -354,7 +355,8 @@ export function updateStandardLightMeshCulling(vp = null) {
       if (!ds || ds.isPreview) continue;
       const dk = ds.layers?.darkness?.mesh;
       if (!dk || dk.destroyed) continue;
-      if (!cullDs) {
+      const animating = Boolean(ds.object?.movementAnimationPromise || ds.object?.animationContexts?.size > 0);
+      if (!cullDs || animating) {
         dk.renderable = true;
         continue;
       }
@@ -408,6 +410,7 @@ export function syncSingleDecorativeTile(t, allow) {
     !hasDocOcc &&
     !hasDocRestrict &&
     !m.occlusionMode &&
+    !m.hoverFade &&
     !m.restrictsLight &&
     !m.restrictsWeather &&
     !t.isVideo;

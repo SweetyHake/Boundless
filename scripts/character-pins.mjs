@@ -1,4 +1,4 @@
-import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform, isTextureUsable } from "./utils.mjs";
+import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform, isTextureUsable, resolveFoundryRoute } from "./utils.mjs";
 
 const CHAR_PIN_FADE_START = 0.38; // Begin showing world-space character portrait below this scale
 const CHAR_PIN_FADE_FULL = 0.20;  // 100% opaque at or below this scale
@@ -30,7 +30,7 @@ function loadImageElement(src) {
     img.crossOrigin = "anonymous";
     img.onload = () => resolve(img);
     img.onerror = (err) => reject(err);
-    img.src = src;
+    img.src = resolveFoundryRoute(src);
   });
 }
 
@@ -520,7 +520,7 @@ export class CharacterPinManager {
     edgeEl.innerHTML = `
       <span class="boundless-char-edge-arrow"></span>
       <span class="boundless-char-edge-ring">
-        <img class="boundless-char-edge-img" src="${escapeHtml(portraitSrc)}" alt="${escapeHtml(name)}" draggable="false">
+        <img class="boundless-char-edge-img" src="${escapeHtml(resolveFoundryRoute(portraitSrc))}" alt="${escapeHtml(name)}" draggable="false">
       </span>
       <span class="boundless-char-edge-level-badge" style="display:none;"><i class="fa-solid fa-layer-group"></i></span>
       <span class="boundless-char-edge-tip">
@@ -837,11 +837,11 @@ export class CharacterPinManager {
       }
       return;
     }
-    if ("texture" in changes || "ring" in changes || "name" in changes || "hidden" in changes || "actorId" in changes || "actorLink" in changes || "delta" in changes) {
+    if ("texture" in changes || "ring" in changes || "name" in changes || "hidden" in changes || "actorId" in changes || "actorLink" in changes || "delta" in changes || "level" in changes) {
       this.scheduleRebuild();
       return;
     }
-    if ("x" in changes || "y" in changes || "level" in changes || "width" in changes || "height" in changes) {
+    if ("x" in changes || "y" in changes || "width" in changes || "height" in changes) {
       this._scheduleViewportUpdate();
     }
   }

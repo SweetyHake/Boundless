@@ -1246,18 +1246,21 @@ export const pyramidMethods = {
   },
 
   hasReadyOtherZCovering(e, bucket = null) {
+    const ch = e.channel || "bg";
+    const isTranslucent = ch === "fg" || Boolean(e.layer?.isUpper);
     if (bucket) {
       for (let i = 0; i < bucket.length; i++) {
         const other = bucket[i];
-        if (other.z < e.z && this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
+        const zMatch = isTranslucent ? (other.z !== e.z) : (other.z < e.z);
+        if (zMatch && this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
           return true;
         }
       }
       return false;
     }
-    const ch = e.channel || "bg";
     for (const [, other] of this.tilesByKey) {
-      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+      const zMatch = isTranslucent ? (other.z !== e.z) : (other.z < e.z);
+      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.ready && !other.awaitingSwap && other.z > 0 && zMatch && other.mesh?.visible && other.alpha >= 0.9 &&
           this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
         return true;
       }
@@ -1392,7 +1395,7 @@ export const pyramidMethods = {
     // Keep CanvasDepthMask synced whenever any mounted roof fades in/out (hoverFade, ALT, token inside, or v14 Region Surface)
     // Also dynamically reveal interior z=6 tiles + wallsMesh on z=5 when a roof is occluded so ALT / tokens / Regions expose real interiors instead of baked pyramid roofs
     const occSurfaces = canvas.masks?.occlusion?.occludedSurfaces;
-    const nextRevealSpecs = new Map();
+    let nextRevealSpecs = null;
     let occH1 = 2166136261 >>> 0;
     let occH2 = (occSurfaces?.size ?? 0) | 0;
     let occCount = 0;
@@ -1450,6 +1453,7 @@ export const pyramidMethods = {
                 for (let ty = ty0; ty <= ty1; ty++) {
                   for (let tx = tx0; tx <= tx1; tx++) {
                     const spec = this.resolvePyramidTile(layer, revealZ, tx, ty);
+                    if (!nextRevealSpecs) nextRevealSpecs = new Map();
                     nextRevealSpecs.set(spec.key, { layer, spec });
                   }
                 }
@@ -1462,15 +1466,17 @@ export const pyramidMethods = {
       }
     }
     // Track light-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
-    let vtIdx = 0;
-    for (const vt of this.activeVirtualTiles.values()) {
-      vtIdx++;
-      const m = vt?.mesh;
-      if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-      const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
-      occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
-      occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
-      occCount++;
+    if (this.activeVirtualTiles.size > 0) {
+      let vtIdx = 0;
+      for (const vt of this.activeVirtualTiles.values()) {
+        vtIdx++;
+        const m = vt?.mesh;
+        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
+        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+        occCount++;
+      }
     }
     const nativeTiles = canvas.tiles?.placeables;
     if (nativeTiles?.length) {
@@ -1492,9 +1498,9 @@ export const pyramidMethods = {
     }
 
     // Reconcile localized z=6 interior reveal tiles on z=5
-    if (nextRevealSpecs.size > 0 || this._revealTileKeys.size > 0) {
+    if ((nextRevealSpecs && nextRevealSpecs.size > 0) || this._revealTileKeys.size > 0) {
       for (const oldKey of this._revealTileKeys) {
-        if (nextRevealSpecs.has(oldKey)) continue;
+        if (nextRevealSpecs?.has(oldKey)) continue;
         const e = this.tilesByKey.get(oldKey);
         if (e) {
           e.isReveal = false;
@@ -1514,21 +1520,23 @@ export const pyramidMethods = {
         }
         this._revealTileKeys.delete(oldKey);
       }
-      for (const [key, { layer, spec }] of nextRevealSpecs) {
-        this._revealTileKeys.add(key);
-        const existing = this.tilesByKey.get(key);
-        if (existing) {
-          existing.isReveal = true;
-          existing.desired = true;
-          existing.fadingOut = false;
-          if (existing.ready && existing.alpha < 1.0) {
-            existing.alpha = 1.0;
-            if (existing.mesh) existing.mesh.unoccludedAlpha = 1.0;
+      if (nextRevealSpecs) {
+        for (const [key, { layer, spec }] of nextRevealSpecs) {
+          this._revealTileKeys.add(key);
+          const existing = this.tilesByKey.get(key);
+          if (existing) {
+            existing.isReveal = true;
+            existing.desired = true;
+            existing.fadingOut = false;
+            if (existing.ready && existing.alpha < 1.0) {
+              existing.alpha = 1.0;
+              if (existing.mesh) existing.mesh.unoccludedAlpha = 1.0;
+            }
+          } else {
+            this.ensureTile(layer, spec, false);
+            const created = this.tilesByKey.get(key);
+            if (created) created.isReveal = true;
           }
-        } else {
-          this.ensureTile(layer, spec, false);
-          const created = this.tilesByKey.get(key);
-          if (created) created.isReveal = true;
         }
       }
     }

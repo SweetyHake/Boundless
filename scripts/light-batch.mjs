@@ -90,10 +90,68 @@ function buildFallbackOuterBounds(worldPx, EdgeCls) {
   ];
 }
 
-function buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn = null) {
+function indexEdgeByAabb(sectorEdges, fallbackSk, edge, simSectorPx) {
+  if (simSectorPx > 0) {
+    const sx0 = Math.max(0, Math.floor(Math.min(edge.a.x, edge.b.x) / simSectorPx));
+    const sy0 = Math.max(0, Math.floor(Math.min(edge.a.y, edge.b.y) / simSectorPx));
+    const sx1 = Math.max(0, Math.floor(Math.max(edge.a.x, edge.b.x) / simSectorPx));
+    const sy1 = Math.max(0, Math.floor(Math.max(edge.a.y, edge.b.y) / simSectorPx));
+    if ((sx1 - sx0) <= 16 && (sy1 - sy0) <= 16) {
+      for (let sy = sy0; sy <= sy1; sy++) {
+        for (let sx = sx0; sx <= sx1; sx++) {
+          const tSk = `${sx}_${sy}`;
+          let arr = sectorEdges.get(tSk);
+          if (!arr) { arr = []; sectorEdges.set(tSk, arr); }
+          arr.push(edge);
+        }
+      }
+      return;
+    }
+  }
+  let arr = sectorEdges.get(fallbackSk);
+  if (!arr) { arr = []; sectorEdges.set(fallbackSk, arr); }
+  arr.push(edge);
+}
+
+function collectEdgesInRadius(sectorEdges, nativeEdges, lx, ly, dimPx, simSectorPx, fallbackSx, fallbackSy) {
+  const out = nativeEdges.length ? nativeEdges.slice() : [];
+  let sx0, sy0, sx1, sy1;
+  if (simSectorPx > 0) {
+    sx0 = Math.max(0, Math.floor((lx - dimPx) / simSectorPx));
+    sy0 = Math.max(0, Math.floor((ly - dimPx) / simSectorPx));
+    sx1 = Math.max(sx0, Math.floor((lx + dimPx) / simSectorPx));
+    sy1 = Math.max(sy0, Math.floor((ly + dimPx) / simSectorPx));
+    if ((sx1 - sx0) > 24 || (sy1 - sy0) > 24) {
+      const cx = Math.floor(lx / simSectorPx);
+      const cy = Math.floor(ly / simSectorPx);
+      sx0 = Math.max(0, cx - 12); sy0 = Math.max(0, cy - 12);
+      sx1 = cx + 12; sy1 = cy + 12;
+    }
+  } else {
+    sx0 = fallbackSx - 1; sy0 = fallbackSy - 1;
+    sx1 = fallbackSx + 1; sy1 = fallbackSy + 1;
+  }
+  const seen = (sx1 > sx0 || sy1 > sy0) ? new Set() : null;
+  for (let sy = sy0; sy <= sy1; sy++) {
+    for (let sx = sx0; sx <= sx1; sx++) {
+      const arr = sectorEdges.get(`${sx}_${sy}`);
+      if (!arr) continue;
+      for (let i = 0; i < arr.length; i++) {
+        const e = arr[i];
+        if (seen) {
+          if (seen.has(e)) continue;
+          seen.add(e);
+        }
+        out.push(e);
+      }
+    }
+  }
+  return out;
+}
+
+function buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn = null, simSectorPx = 0) {
   const sectorEdges = new Map();
   for (const [sk, sec] of Object.entries(sectors || {})) {
-    const arr = [];
     if (sec?.w) {
       for (let wi = 0; wi < sec.w.length; wi++) {
         const seg = resolveWallFn
@@ -107,11 +165,12 @@ function buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn = 
         if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
         const [x1, y1, x2, y2] = seg.c;
         const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-        arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+        const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
           id: `bw_${levelId}_${sk}_${wi}`, type: "wall",
           move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
           ...(threshold ? { threshold } : {})
-        }));
+        });
+        indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
       }
     }
     if (sec?.d) {
@@ -129,14 +188,14 @@ function buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn = 
         if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
         const [x1, y1, x2, y2] = seg.c;
         const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-        arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+        const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
           id: `bd_${levelId}_${sk}_${di}`, type: "wall",
           move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
           ...(threshold ? { threshold } : {})
-        }));
+        });
+        indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
       }
     }
-    if (arr.length) sectorEdges.set(sk, arr);
   }
   return sectorEdges;
 }
@@ -254,21 +313,15 @@ export function computeLevelBakedPolys(spec, pxPerFt, { level = null, maxLights 
   if (totalLights === 0) return null;
 
   const levelId = level?.id || "baked";
-  const sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, null);
+  const simSectorPx = spec.simSectorPx || ((spec.worldPx && spec.simGrid) ? (spec.worldPx / spec.simGrid) : 0);
+  const sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, null, simSectorPx);
   const { localEdgeStore, fakeLevel } = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
   const polys = {};
 
   for (const [sk, sec] of Object.entries(sectors)) {
     if (!sec?.l?.length) continue;
     const [sx, sy] = sk.split("_").map(Number);
-    const localEdges = [];
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
-        if (arr) for (const e of arr) localEdges.push(e);
-      }
-    }
-    localEdgeStore._list = localEdges;
+    const localEdges = collectEdgesInRadius(sectorEdges, [], (sx + 0.5) * (simSectorPx || 1), (sy + 0.5) * (simSectorPx || 1), simSectorPx || 1, 0, sx, sy);
 
     for (let li = 0; li < sec.l.length; li++) {
       const raw = sec.l[li];
@@ -281,7 +334,12 @@ export function computeLevelBakedPolys(spec, pxPerFt, { level = null, maxLights 
       const useWalls = extra?.walls !== false;
       if (dimPx <= 0 || angle <= 0) continue;
 
-      const { offsets } = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, localEdges, fakeLevel, CSP);
+      const lightEdges = (simSectorPx > 0 && (dimPx > simSectorPx || Math.floor(lx / simSectorPx) !== sx || Math.floor(ly / simSectorPx) !== sy))
+        ? collectEdgesInRadius(sectorEdges, [], lx, ly, dimPx, simSectorPx, sx, sy)
+        : localEdges;
+      localEdgeStore._list = lightEdges;
+
+      const { offsets } = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, lightEdges, fakeLevel, CSP);
       if (offsets && offsets.length >= 6) {
         const compact = new Array(offsets.length);
         for (let i = 0; i < offsets.length; i++) {
@@ -849,6 +907,9 @@ export class MegaLightBatch {
       h = Math.imul(h ^ Math.round(e.b.x), 16777619) >>> 0;
       h = Math.imul(h ^ Math.round(e.b.y), 16777619) >>> 0;
       h = Math.imul(h ^ (e.light || 0), 16777619) >>> 0;
+      h = Math.imul(h ^ (e.direction || 0), 16777619) >>> 0;
+      h = Math.imul(h ^ (e.threshold?.light ? Math.round(e.threshold.light * 10) : 0), 16777619) >>> 0;
+      h = Math.imul(h ^ (e.threshold?.attenuation ? 1 : 0), 16777619) >>> 0;
     }
     return `${nativeEdges.length}:${h.toString(36)}`;
   }
@@ -1366,9 +1427,10 @@ export class MegaLightBatch {
       let sectorEdges = null;
       let localEdgeStore = null;
       let fakeLevel = null;
+      const simSectorPx = layerEntry.simSectorPx || spec.simSectorPx || ((spec.worldPx && spec.simGrid) ? (spec.worldPx / spec.simGrid) : 0);
       const ensureLevelEdgeContext = () => {
         if (sectorEdges) return;
-        sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn);
+        sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn, simSectorPx);
         const built = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
         localEdgeStore = built.localEdgeStore;
         fakeLevel = built.fakeLevel;
@@ -1379,17 +1441,23 @@ export class MegaLightBatch {
         const [sx, sy] = sk.split("_").map(Number);
         let localEdges = null;
         const ensureLocalEdges = () => {
-          if (localEdges) return localEdges;
-          ensureLevelEdgeContext();
-          localEdges = nativeEdges.length ? nativeEdges.slice() : [];
-          for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-              const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
-              if (arr) for (const e of arr) localEdges.push(e);
-            }
+          if (localEdges) {
+            localEdgeStore._list = localEdges;
+            return localEdges;
           }
+          ensureLevelEdgeContext();
+          localEdges = collectEdgesInRadius(sectorEdges, nativeEdges, 0, 0, 0, 0, sx, sy);
           localEdgeStore._list = localEdges;
           return localEdges;
+        };
+        const getEdgesForLight = (lxVal, lyVal, dimVal) => {
+          if (simSectorPx > 0 && (dimVal > simSectorPx || Math.floor(lxVal / simSectorPx) !== sx || Math.floor(lyVal / simSectorPx) !== sy)) {
+            ensureLevelEdgeContext();
+            const customEdges = collectEdgesInRadius(sectorEdges, nativeEdges, lxVal, lyVal, dimVal, simSectorPx, sx, sy);
+            localEdgeStore._list = customEdges;
+            return customEdges;
+          }
+          return ensureLocalEdges();
         };
 
         const idxStart = indicesArr.length;
@@ -1452,8 +1520,9 @@ export class MegaLightBatch {
             const pre = bp.polys[`${sk}_${li}`];
             if (Array.isArray(pre) && pre.length >= 6) {
               offsets = Float32Array.from(pre);
-              if (useWalls && angle < 360 && ROTATE_ANIM_TYPES.has(anim)) {
-                const edges = ensureLocalEdges();
+              const animNorm = String(anim || "").trim().toLowerCase();
+              if (useWalls && angle < 360 && ROTATE_ANIM_TYPES.has(animNorm)) {
+                const edges = getEdgesForLight(lx, ly, dimPx);
                 for (let ei = 0; ei < edges.length; ei++) {
                   const e = edges[ei];
                   if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
@@ -1474,12 +1543,13 @@ export class MegaLightBatch {
             this.lastPolyCacheMisses++;
             deferredJobs.push({
               lightId, polySig, lx, ly, dimPx, angle, rotation, useWalls,
-              ensureLocalEdges, getFakeLevel: () => { ensureLevelEdgeContext(); return fakeLevel; }
+              ensureLocalEdges: () => getEdgesForLight(lx, ly, dimPx),
+              getFakeLevel: () => { ensureLevelEdgeContext(); return fakeLevel; }
             });
           } else {
             this.lastPolyCacheMisses++;
             syncComputedCount++;
-            const edges = ensureLocalEdges();
+            const edges = getEdgesForLight(lx, ly, dimPx);
             const computed = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, edges, fakeLevel, CSP);
             offsets = computed.offsets;
             hasNearbyWall = computed.hasNearbyWall;
@@ -1512,9 +1582,11 @@ export class MegaLightBatch {
           const topElev = getLevelRoofElevation(level);
           let isIndoor = false;
           if (elevation < topElev && hasSpecOverlays(spec.overlays)) {
+            const lsx = simSectorPx > 0 ? Math.floor(lx / simSectorPx) : sx;
+            const lsy = simSectorPx > 0 ? Math.floor(ly / simSectorPx) : sy;
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
               for (let dx = -1; dx <= 1 && !isIndoor; dx++) {
-                const oList = sectors[`${sx + dx}_${sy + dy}`]?.o;
+                const oList = sectors[`${lsx + dx}_${lsy + dy}`]?.o;
                 if (!oList?.length) continue;
                 for (const oid of oList) {
                   if (isPointUnderRoofSpec(lx, ly, spec.overlays[oid])) {
@@ -1710,12 +1782,13 @@ export class MegaLightBatch {
       !hasEditsOnLevel
     );
 
+    const simSectorPx = layerEntry.simSectorPx || spec.simSectorPx || ((spec.worldPx && spec.simGrid) ? (spec.worldPx / spec.simGrid) : 0);
     let sectorEdges = null;
     let localEdgeStore = null;
     let fakeLevel = null;
     const ensureEdgeCtx = () => {
       if (sectorEdges) return;
-      sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn);
+      sectorEdges = buildSectorEdgeMap(sectors, levelId, pxPerFt, EdgeCls, resolveWallFn, simSectorPx);
       const built = createLocalFakeLevel(level, spec.worldPx || 100000, levelId, EdgeCls);
       localEdgeStore = built.localEdgeStore;
       fakeLevel = built.fakeLevel;
@@ -1733,17 +1806,23 @@ export class MegaLightBatch {
       const [sx, sy] = sk.split("_").map(Number);
       let localEdges = null;
       const ensureLocalEdges = () => {
-        if (localEdges) return localEdges;
-        ensureEdgeCtx();
-        localEdges = nativeEdges.length ? nativeEdges.slice() : [];
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const arr = sectorEdges.get(`${sx + dx}_${sy + dy}`);
-            if (arr) for (const e of arr) localEdges.push(e);
-          }
+        if (localEdges) {
+          localEdgeStore._list = localEdges;
+          return localEdges;
         }
+        ensureEdgeCtx();
+        localEdges = collectEdgesInRadius(sectorEdges, nativeEdges, 0, 0, 0, 0, sx, sy);
         localEdgeStore._list = localEdges;
         return localEdges;
+      };
+      const getEdgesForLight = (lxVal, lyVal, dimVal) => {
+        if (simSectorPx > 0 && (dimVal > simSectorPx || Math.floor(lxVal / simSectorPx) !== sx || Math.floor(lyVal / simSectorPx) !== sy)) {
+          ensureEdgeCtx();
+          const customEdges = collectEdgesInRadius(sectorEdges, nativeEdges, lxVal, lyVal, dimVal, simSectorPx, sx, sy);
+          localEdgeStore._list = customEdges;
+          return customEdges;
+        }
+        return ensureLocalEdges();
       };
 
       for (let li = 0; li < sec.l.length; li++) {
@@ -1756,6 +1835,7 @@ export class MegaLightBatch {
           ? resolveLightFn(levelId, sk, li, raw, level)
           : {
               x: raw[0], y: raw[1], dim: raw[2], bright: raw[3],
+              anim: raw[6] || "",
               hidden: Boolean(extra?.hidden),
               walls: extra?.walls !== false,
               angle: extra?.angle ?? 360,
@@ -1780,12 +1860,29 @@ export class MegaLightBatch {
         if (canUseSpecBakedPolys) {
           const pre = bp.polys[`${sk}_${li}`];
           const offsets = (Array.isArray(pre) && pre.length >= 6) ? Float32Array.from(pre) : null;
-          this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall: Boolean(offsets && useWalls) });
+          let hasNearbyWall = false;
+          if (offsets) {
+            const animNorm = String(resolved.anim || "").trim().toLowerCase();
+            if (useWalls && angle < 360 && ROTATE_ANIM_TYPES.has(animNorm)) {
+              const edges = getEdgesForLight(lx, ly, dimPx);
+              for (let ei = 0; ei < edges.length; ei++) {
+                const e = edges[ei];
+                if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+                    Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+                  hasNearbyWall = true;
+                  break;
+                }
+              }
+            } else {
+              hasNearbyWall = useWalls;
+            }
+          }
+          this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
           skipped++;
           continue;
         }
 
-        const edges = ensureLocalEdges();
+        const edges = getEdgesForLight(lx, ly, dimPx);
         const { offsets, hasNearbyWall } = computeSingleLightPoly(lx, ly, dimPx, angle, rotation, useWalls, edges, fakeLevel, CSP);
         this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
         computed++;
@@ -1950,11 +2047,11 @@ export class MegaLightBatch {
     }
 
     const pxPerFt = this._buildPxPerFt || 20;
+    const simSectorPx = layer.simSectorPx || layer.spec?.simSectorPx || ((layer.worldPx && layer.simGrid) ? (layer.worldPx / layer.simGrid) : 0);
     const sectorEdges = new Map();
     for (const sk of neededWallSectors) {
       const sec = sectors[sk] || allLevelSectors[sk];
       if (!sec) continue;
-      const arr = [];
       if (sec.w) {
         for (let wi = 0; wi < sec.w.length; wi++) {
           const seg = this._resolveWallFn
@@ -1963,11 +2060,12 @@ export class MegaLightBatch {
           if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
           const [x1, y1, x2, y2] = seg.c;
           const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-          arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+          const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
             id: `cw_${levelId}_${sk}_${wi}`, type: "wall",
             move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
             ...(threshold ? { threshold } : {})
-          }));
+          });
+          indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
         }
       }
       if (sec.d) {
@@ -1978,14 +2076,14 @@ export class MegaLightBatch {
           if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
           const [x1, y1, x2, y2] = seg.c;
           const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-          arr.push(new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+          const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
             id: `cd_${levelId}_${sk}_${di}`, type: "wall",
             move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
             ...(threshold ? { threshold } : {})
-          }));
+          });
+          indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
         }
       }
-      if (arr.length) sectorEdges.set(sk, arr);
     }
 
     const b = chunkData.bounds || { x: 0, y: 0, w: layer.worldPx || 100000, h: layer.worldPx || 100000 };
@@ -2025,6 +2123,7 @@ export class MegaLightBatch {
       chunkKey,
       levelId,
       level,
+      simSectorPx,
       sectors,
       allLevelSectors,
       overlays,
@@ -2080,14 +2179,7 @@ export class MegaLightBatch {
       while (job.secIdx < job.sectorEntries.length && (performance.now() - startMs) < budgetMs) {
         const [sk, sec] = job.sectorEntries[job.secIdx++];
         const [sx, sy] = sk.split("_").map(Number);
-        const localEdges = job.nativeEdges.length ? job.nativeEdges.slice() : [];
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const arr = job.sectorEdges.get(`${sx + dx}_${sy + dy}`);
-            if (arr) for (const e of arr) localEdges.push(e);
-          }
-        }
-        job.localEdgeStore._list = localEdges;
+        const localEdges = collectEdgesInRadius(job.sectorEdges, job.nativeEdges, 0, 0, 0, 0, sx, sy);
 
         const idxStart = job.indicesArr.length;
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2134,9 +2226,13 @@ export class MegaLightBatch {
           let prebaked = null;
           const canUsePrebaked = !job.hasEditsOnLevel && job.nativeEdges.length === 0 && useWalls && angle >= 360;
           if (canUsePrebaked) prebaked = job.bakedPolys?.[`${sk}_${li}`] || null;
+          const lightEdges = (job.simSectorPx > 0 && (dimPx > job.simSectorPx || Math.floor(lx / job.simSectorPx) !== sx || Math.floor(ly / job.simSectorPx) !== sy))
+            ? collectEdgesInRadius(job.sectorEdges, job.nativeEdges, lx, ly, dimPx, job.simSectorPx, sx, sy)
+            : localEdges;
+          job.localEdgeStore._list = lightEdges;
           if (!(Array.isArray(prebaked) && prebaked.length >= 6) && useWalls) {
-            for (let ei = 0; ei < localEdges.length; ei++) {
-              const e = localEdges[ei];
+            for (let ei = 0; ei < lightEdges.length; ei++) {
+              const e = lightEdges[ei];
               if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
                   Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
                 hasNearbyWall = true;
@@ -2210,9 +2306,11 @@ export class MegaLightBatch {
 
           let isIndoor = false;
           if (elevation < topElev && job.overlays) {
+            const lsx = job.simSectorPx > 0 ? Math.floor(lx / job.simSectorPx) : sx;
+            const lsy = job.simSectorPx > 0 ? Math.floor(ly / job.simSectorPx) : sy;
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
               for (let dx = -1; dx <= 1 && !isIndoor; dx++) {
-                const oList = (job.sectors[`${sx + dx}_${sy + dy}`] || job.allLevelSectors[`${sx + dx}_${sy + dy}`])?.o;
+                const oList = (job.sectors[`${lsx + dx}_${lsy + dy}`] || job.allLevelSectors[`${lsx + dx}_${lsy + dy}`])?.o;
                 if (!oList?.length) continue;
                 for (const oid of oList) {
                   if (isPointUnderRoofSpec(lx, ly, job.overlays[oid])) {
@@ -2394,7 +2492,7 @@ export class MegaLightBatch {
 
     for (const lid of batch.lightIds) {
       const meta = this.lightMetaById.get(lid);
-      if (meta) {
+      if (meta && meta.batch === batch) {
         if (meta.weight > 0.001) this.activeLightsCount = Math.max(0, this.activeLightsCount - 1);
         this.totalLights = Math.max(0, this.totalLights - 1);
         this.lightMetaById.delete(lid);

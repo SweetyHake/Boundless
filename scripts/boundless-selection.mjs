@@ -240,8 +240,8 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
             for (let i = 0; i < placeables.length; i++) {
               const t = placeables[i];
               if (!t || t.destroyed) continue;
-              // Skip blind NPCs that have no vision source and no sight enabled
-              const hasSight = Boolean(t.vision?.active || t.document?._source?.sight?.enabled || t.document?.sight?.enabled);
+              // Skip blind NPCs that have no vision source instance and no sight enabled
+              const hasSight = Boolean(t.vision || t.document?._source?.sight?.enabled || t.document?.sight?.enabled);
               if (hasSight) {
                 try { origInitVision.call(t); } catch {}
               }
@@ -464,7 +464,8 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
           const inMacroOverview =
             (isVirtualWalls && controller.wallEditor.macroGfx?.visible) ||
             (isVirtualLights && controller.layerEditors.lightMacroGfx?.visible) ||
-            (isVirtualSounds && controller.layerEditors.soundMacroGfx?.visible);
+            (isVirtualSounds && controller.layerEditors.soundMacroGfx?.visible) ||
+            (isVirtualTiles && (controller.layerEditors._getViewedLayer?.()?.spec?.tiles?.length > 0) && getEffectiveScale(vp.scale) < 0.18);
           if (inMacroOverview) {
             notifyKey("BOUNDLESS.Selection.ZoomInVirtualLayer", {}, "info");
             return true;

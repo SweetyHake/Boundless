@@ -2,6 +2,7 @@ import {
   MODULE_ID,
   getEffectiveScale,
   getExistingSheet,
+  getLevelBaseElevation,
   isSheetActiveOrRendering,
   makeVirtualWallId,
   attachVirtualCollectionProxy
@@ -573,7 +574,7 @@ export class VirtualWallEditor {
             return;
           }
           const lvl = canvas.scene?.levels?.get?.(seg.levelId);
-          const lvlElev = Number.isFinite(lvl?.elevation?.bottom) ? lvl.elevation.bottom : 0;
+          const lvlElev = getLevelBaseElevation(lvl);
           if (lvlElev !== 0 && this.doorMeshes?.size) {
             for (const m of this.doorMeshes) {
               if (m.elevation < lvlElev) {

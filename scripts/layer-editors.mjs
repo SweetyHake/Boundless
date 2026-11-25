@@ -672,6 +672,7 @@ export class VirtualLayerEditors {
     if (!scene || !updates.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const u of updates) {
       const id = u._id ?? u.id;
@@ -710,9 +711,16 @@ export class VirtualLayerEditors {
       };
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, nextState);
-      entry.editsRev = this.controller.lightEditsRev || 0;
       entry.sig = JSON.stringify({ levelId: entry.levelId, sk: entry.sk, idx: entry.idx, lKey: entry.key, ...nextState });
+      updatedEntries.push({ entry, shapeTypeChanged });
+      docs.push(entry.doc);
+    }
 
+    const finalRev = this.controller.lightEditsRev || 0;
+    for (const { entry } of updatedEntries) {
+      entry.editsRev = finalRev;
+    }
+    for (const { entry, shapeTypeChanged } of updatedEntries) {
       if (entry.placeable && !entry.placeable.destroyed) {
         if (shapeTypeChanged) {
           try { await entry.placeable.draw(); } catch {}
@@ -723,7 +731,6 @@ export class VirtualLayerEditors {
           entry.placeable._updateQuadtree?.();
         }
       }
-      docs.push(entry.doc);
     }
 
     if (Object.keys(flagUpdate).length) {
@@ -738,6 +745,7 @@ export class VirtualLayerEditors {
     if (!scene || !ids.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const id of ids) {
       const entry = this.lightsById.get(id);
@@ -1053,6 +1061,11 @@ export class VirtualLayerEditors {
       docs.push(entry.doc);
     }
 
+    const finalSoundRev = this.controller.soundEditsRev || 0;
+    for (const entry of updatedEntries) {
+      entry.editsRev = finalSoundRev;
+    }
+
     if (Object.keys(flagUpdate).length) {
       this.controller.applyVirtualSoundChangesLocal();
       for (const entry of updatedEntries) {
@@ -1071,6 +1084,7 @@ export class VirtualLayerEditors {
     if (!scene || !ids.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const id of ids) {
       const entry = this.soundsById.get(id);
@@ -1290,20 +1304,26 @@ export class VirtualLayerEditors {
     for (const tid of tids) {
       const item = this.controller.resolveVirtualTile(lid, tid, specTiles[tid], level);
       if (!item || !item.src) continue;
-      const ax = item.anchorX ?? 0.5;
-      const ay = item.anchorY ?? 0.5;
+      const rawAx = item.anchorX ?? 0.5;
+      const rawAy = item.anchorY ?? 0.5;
+      const sxVal = (Number.isFinite(item.scaleX) && item.scaleX !== 0) ? item.scaleX : 1;
+      const syVal = (Number.isFinite(item.scaleY) && item.scaleY !== 0) ? item.scaleY : 1;
+      const effAx = sxVal < 0 ? (1 - rawAx) : rawAx;
+      const effAy = syVal < 0 ? (1 - rawAy) : rawAy;
       const w = item.w || 0;
       const h = item.h || 0;
+      const effW = Math.abs(w) * Math.abs(sxVal);
+      const effH = Math.abs(h) * Math.abs(syVal);
       const pivX = item.anchorX === undefined ? (item.x + w * 0.5) : item.x;
       const pivY = item.anchorY === undefined ? (item.y + h * 0.5) : item.y;
       const rad = ((item.rot || 0) * Math.PI) / 180;
       const cos = Math.cos(rad);
       const sin = Math.sin(rad);
-      const dx = (0.5 - ax) * w;
-      const dy = (0.5 - ay) * h;
+      const dx = (0.5 - effAx) * effW;
+      const dy = (0.5 - effAy) * effH;
       const cx = pivX + (cos * dx - sin * dy);
       const cy = pivY + (sin * dx + cos * dy);
-      const halfDiag = Math.hypot(w, h) * 0.5;
+      const halfDiag = Math.hypot(effW, effH) * 0.5;
       if (cx + halfDiag < curVp.x0 - pad || cx - halfDiag > curVp.x1 + pad || cy + halfDiag < curVp.y0 - pad || cy - halfDiag > curVp.y1 + pad) continue;
       items.push(item);
       if (items.length >= MAX_TILES_IN_VIEW) break;
@@ -1405,6 +1425,7 @@ export class VirtualLayerEditors {
     if (!scene || !updates.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const u of updates) {
       const id = u._id ?? u.id;
@@ -1448,9 +1469,17 @@ export class VirtualLayerEditors {
       const entryLayer = this.controller.levelLayers?.get(entry.levelId) || this._getViewedLayer();
       const resolvedNow = this.controller.resolveVirtualTile(entry.levelId, entry.tid, entryLayer?.spec?.tiles?.[entry.tid], entryLayer?.level);
       entry.sig = JSON.stringify(resolvedNow || nextState);
+      updatedEntries.push({ entry, srcChanged: nextSrc !== prevSrc });
+      docs.push(entry.doc);
+    }
 
+    const finalTileRev = this.controller.tileEditsRev || 0;
+    for (const { entry } of updatedEntries) {
+      entry.editsRev = finalTileRev;
+    }
+    for (const { entry, srcChanged } of updatedEntries) {
       if (entry.placeable && !entry.placeable.destroyed) {
-        if (nextSrc !== prevSrc) {
+        if (srcChanged) {
           try { await entry.placeable.draw(); } catch {}
         }
         if (entry.placeable.destroyed) {
@@ -1461,7 +1490,6 @@ export class VirtualLayerEditors {
           entry.placeable._updateQuadtree?.();
         }
       }
-      docs.push(entry.doc);
     }
 
     if (Object.keys(flagUpdate).length) {
@@ -1476,6 +1504,7 @@ export class VirtualLayerEditors {
     if (!scene || !ids.length) return [];
     const flagUpdate = {};
     const docs = [];
+    const updatedEntries = [];
 
     for (const id of ids) {
       const entry = this.tilesById.get(id);

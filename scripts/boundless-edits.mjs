@@ -343,7 +343,7 @@ export const editsMethods = {
     this._markDepthDirty({ syncElev: true });
   },
 
-  onSceneUpdate(scene, changes) {
+  onSceneUpdate(scene, changes, userId = null) {
     if (!globalThis.canvas?.ready || scene?.id !== globalThis.canvas.scene?.id) return;
 
     const flagChanges = changes?.flags?.[MODULE_ID];
@@ -355,7 +355,15 @@ export const editsMethods = {
       return;
     }
 
-    if (!this.active || this._mounting) return;
+    if (this._mounting) {
+      this._pendingSceneUpdates ??= [];
+      if (this._pendingSceneUpdates.length < 32) {
+        this._pendingSceneUpdates.push({ changes, userId });
+      }
+      return;
+    }
+
+    if (!this.active) return;
 
     // React to native Foundry v14 Scene fog mode (DISABLED / INDIVIDUAL / SHARED) & tokenVision changes
     if (changes?.fog || "tokenVision" in (changes || {})) {
@@ -475,7 +483,7 @@ export const editsMethods = {
       this.fogManager.mount(scene);
     } else {
       if ("sharedFog" in flagChanges || "-=sharedFog" in flagChanges) {
-        this.fogManager.onSceneFogFlagsChanged(scene, flagChanges.sharedFog ?? null);
+        this.fogManager.onSceneFogFlagsChanged(scene, flagChanges.sharedFog ?? null, userId);
       }
       if (flagChanges.fogResetAt && typeof flagChanges.fogResetAt === "object") {
         this.fogManager.onSceneFogResetChanged(scene, flagChanges.fogResetAt);
@@ -857,7 +865,11 @@ export const editsMethods = {
 
     const inlineManifest = { worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors };
     const existingCfg = foundry.utils.deepClone(level.flags?.[MODULE_ID] || {});
-    await level.update({ [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true, inlineManifest } });
+    delete existingCfg.inlineManifest;
+    await level.update({
+      [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true },
+      [`flags.${MODULE_ID}.==inlineManifest`]: inlineManifest
+    });
 
     // Clear stale index-keyed edits & doorStates for this re-baked level on targetScene
     const prevSceneFlags = targetScene.flags?.[MODULE_ID] || {};

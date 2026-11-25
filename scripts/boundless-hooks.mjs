@@ -114,6 +114,9 @@ export function registerBoundlessHooks(controller) {
       const onPerfChange = () => {
         syncPerfConfigFromSettings();
         refreshGpuPerfSettings();
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleLevelPrewarm) {
+          controller._cancelIdleLevelPrewarm?.();
+        }
         if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
           updateStandardSceneCulling();
         } else {
@@ -252,8 +255,8 @@ export function registerBoundlessHooks(controller) {
     controller.mount(c.scene);
   });
 
-  Hooks.on("updateScene", (scene, changes) => {
-    controller.onSceneUpdate(scene, changes);
+  Hooks.on("updateScene", (scene, changes, _opts, userId) => {
+    controller.onSceneUpdate(scene, changes, userId);
   });
 
   Hooks.on("updateLevel", (level, changes) => {
@@ -406,6 +409,9 @@ export function registerBoundlessHooks(controller) {
     if (!isRuntimeReady() || tok?.document?.parent?.id !== canvas.scene?.id) return;
     if (flags?.refreshPosition || flags?.refreshElevation) {
       controller._roofTokenOccDirty = true;
+    }
+    if ((flags?.refreshPosition || flags?.refreshSize) && tok.controlled && controller.selectionOverlay?.gfx?.visible) {
+      queueTokenBatchFlush({ selection: true });
     }
   });
 

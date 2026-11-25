@@ -51,7 +51,7 @@ function isAlwaysMountedTokenDoc(doc) {
   if (doc.actorLink) return true;
   const base = doc.baseActor;
   if (base?.hasPlayerOwner || base?.type === "character") return true;
-  if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && base?.testUserPermission?.(game.user, "OBSERVER")) return true;
+  if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && hasTokenPermissionLazy(doc, game.user, "OBSERVER")) return true;
   if (doc.flags?.[MODULE_ID]?.pinned) return true;
   if (doc.combatant) return true;
   if (game.combat?.combatants?.some?.(c => c.tokenId === doc.id && c.sceneId === doc.parent?.id)) return true;
@@ -624,9 +624,8 @@ export class TokenStreamer {
       if (!tok || tok.destroyed || tok.isPreview || this.isTokenDrawing(tok)) continue;
       const doc = tok.document;
       if (!doc) continue;
-      const b = getTokenDocBounds(doc, grid);
-      const w = b.w;
-      const h = b.h;
+      const w = tok.w || ((Number(doc._source?.width ?? doc.width) || 1) * grid);
+      const h = tok.h || ((Number(doc._source?.height ?? doc.height) || 1) * grid);
       const tx = doc?._source?.x ?? doc?.x ?? tok.x ?? 0;
       const ty = doc?._source?.y ?? doc?.y ?? tok.y ?? 0;
       const docOnScreen = tx + w >= cullX0 && tx <= cullX1 && ty + h >= cullY0 && ty <= cullY1;

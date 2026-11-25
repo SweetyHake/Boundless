@@ -10,6 +10,7 @@ import { LRUTextureManager } from "./texture-manager.mjs";
 import { MegaLightBatch } from "./light-batch.mjs";
 import { registerConfigUI } from "./config-ui.mjs";
 import { PERF_CONFIG, perfStats, resetPerfStats, getPerfStatus } from "./perf-patcher.mjs";
+import { applyLightingRenderScale, restoreFilterResolution } from "./perf-gpu.mjs";
 import { invalidateCpuGeometry } from "./perf-cpu.mjs";
 import { runPerfBenchmark } from "./perf-benchmark.mjs";
 import { WORLD_MIN_SCALE, pyramidMethods } from "./boundless-pyramid.mjs";
@@ -26,6 +27,7 @@ import {
 import {
   MODULE_ID,
   isTextureUsable,
+  resolveFoundryRoute,
   getLevelBaseElevation,
   getLevelBottomElevation,
   isLevelAbove
@@ -337,8 +339,9 @@ class MegaWorld1000 {
       }
       return cached;
     }
-    const sep = url.includes("?") ? "&" : "?";
-    const resp = await fetch(`${url}${sep}v=${Date.now()}`);
+    const routed = resolveFoundryRoute(url);
+    const sep = routed.includes("?") ? "&" : "?";
+    const resp = await fetch(`${routed}${sep}v=${Date.now()}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status} loading manifest ${url}`);
     let data = await resp.json();
     // Chunked world manifests (`boundless-chunked-v1`) stream sectors/overlays lazily per-chunk; never expand all 36 provinces into RAM upfront!
@@ -512,6 +515,8 @@ class MegaWorld1000 {
     const prewarmGen = ++this._idleLevelPrewarmGen;
     const isStale = () =>
       !this.active ||
+      !PERF_CONFIG.perfEnabled ||
+      !PERF_CONFIG.perfIdleLevelPrewarm ||
       this._mountGen !== mountGen ||
       this._idleLevelPrewarmGen !== prewarmGen ||
       canvas.scene?.id !== scene.id;
@@ -608,6 +613,8 @@ class MegaWorld1000 {
 
   _capFilterResolution(filter, maxRes = 1.0) {
     if (!filter || filter.destroyed || this._patchedFilters.has(filter)) return;
+    // Unwrap perf-gpu's scaled getter first so origDesc always captures Foundry's true descriptor
+    restoreFilterResolution(filter);
     const rendererRes = canvas.app?.renderer?.resolution || 1;
     let effectiveRes = rendererRes;
     try { effectiveRes = filter.resolution ?? rendererRes; } catch { return; }
@@ -1004,6 +1011,14 @@ class MegaWorld1000 {
     this.selectionOverlay.mount();
 
     this._mounting = false;
+    if (this._pendingSceneUpdates?.length) {
+      const queued = this._pendingSceneUpdates.splice(0);
+      for (const q of queued) {
+        if (!this.active) break;
+        this.onSceneUpdate(scene, q.changes, q.userId);
+      }
+      if (!this.active) return;
+    }
     this.updateAll(true);
     this.syncZoomLimits({ animate: false });
     this._depthElevSyncNeeded = true;
@@ -1070,6 +1085,7 @@ class MegaWorld1000 {
     this.active = false;
     this._mountedSceneId = null;
     this._mounting = false;
+    this._pendingSceneUpdates = [];
     this._mountGen++;
     this._prewarmGen++;
     this._cancelIdleLevelPrewarm();
@@ -1153,6 +1169,9 @@ class MegaWorld1000 {
       }
     }
     this._patchedFilters.clear();
+    if (!this.active && canvas?.ready) {
+      applyLightingRenderScale();
+    }
 
     if (this._origSmaaEnabled !== null) {
       const smaa = canvas.stage?.filters?.find(f => f?.constructor?.name === "SMAAFilter");

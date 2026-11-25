@@ -187,9 +187,13 @@ export class ChunkStreamer {
       const cy = Math.floor(worldY / cw);
       if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
       const ck = `${cx}_${cy}`;
-      if ((populated.size === 0 || populated.has(ck)) && this._canFetchChunk(st, ck, now)) {
-        st.prewarmKeys?.add?.(ck);
-        this._fetchChunk(st, ck);
+      if (populated.size === 0 || populated.has(ck)) {
+        if (st.pending.has(ck)) {
+          st.prewarmKeys?.add?.(ck);
+        } else if (this._canFetchChunk(st, ck, now)) {
+          st.prewarmKeys?.add?.(ck);
+          this._fetchChunk(st, ck);
+        }
       }
     }
   }
@@ -264,8 +268,8 @@ export class ChunkStreamer {
           st.pending.delete(ck);
           st.prewarmKeys?.delete?.(ck);
         }
-        st.failed?.delete?.(ck);
         if (!isCurrent || gen !== this._gen || !this.states.has(st.layer.level.id)) return;
+        st.failed?.delete?.(ck);
         this._mountChunkData(st, ck, data);
       })
       .catch(err => {

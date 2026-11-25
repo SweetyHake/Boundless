@@ -3,7 +3,8 @@ import {
   MODULE_ID,
   getEffectiveScale,
   getLevelRoofElevation,
-  buildEdgeThresholdPx
+  buildEdgeThresholdPx,
+  resolveFoundryRoute
 } from "./utils.mjs";
 
 export const SOCKET_NAME = `module.${MODULE_ID}`;
@@ -454,15 +455,54 @@ export const lightingMethods = {
           }
         }
 
+        // Pre-index moved virtual walls (wallEdits dragged outside their original home sector) per visible level
+        const movedWallsByLevelSk = new Map();
+        for (const layer of this.visibleLevelLayers) {
+          const lid = layer.level?.id;
+          const lvlEdits = lid ? this.wallEdits?.get?.(lid) : null;
+          const sectors = layer.spec?.sectors;
+          const simSectorPx = layer.simSectorPx;
+          const simGrid = layer.simGrid;
+          if (!lvlEdits?.size || !sectors || !simSectorPx || !simGrid) continue;
+          const bySk = new Map();
+          for (const [wKey, ov] of lvlEdits) {
+            if (!ov) continue;
+            const parts = wKey.split(":");
+            if (parts.length !== 3) continue;
+            const [origSk, kind, idxStr] = parts;
+            const idx = Number(idxStr);
+            const raw = sectors[origSk]?.[kind]?.[idx];
+            if (!raw) continue;
+            const seg = this.resolveVirtualWall(lid, kind, origSk, idx, raw);
+            if (!seg || !Array.isArray(seg.c) || seg.c.length < 4) continue;
+            const [x1, y1, x2, y2] = seg.c;
+            const sx0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(x1, x2) / simSectorPx)));
+            const sy0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(y1, y2) / simSectorPx)));
+            const sx1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(x1, x2) / simSectorPx)));
+            const sy1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(y1, y2) / simSectorPx)));
+            for (let sy = sy0; sy <= sy1; sy++) {
+              for (let sx = sx0; sx <= sx1; sx++) {
+                const tSk = `${sx}_${sy}`;
+                if (tSk === origSk) continue;
+                let list = bySk.get(tSk);
+                if (!list) { list = []; bySk.set(tSk, list); }
+                list.push({ kind, origSk, idx, seg });
+              }
+            }
+          }
+          if (bySk.size) movedWallsByLevelSk.set(lid, bySk);
+        }
+
         for (const [fullKey, { layer, sk }] of neededSim) {
           if (this.simSectors.has(fullKey)) continue;
           const sec = layer.spec.sectors[sk];
-          if (!sec) continue;
           const level = layer.level;
           const lid = level.id;
+          const movedList = movedWallsByLevelSk.get(lid)?.get(sk);
+          if (!sec && !movedList?.length) continue;
           const edgeIds = [];
 
-          if (sec.w) {
+          if (sec?.w) {
             for (let wi = 0; wi < sec.w.length; wi++) {
               const seg = this.resolveVirtualWall(lid, "w", sk, wi, sec.w[wi]);
               if (!seg) continue;
@@ -483,7 +523,7 @@ export const lightingMethods = {
             }
           }
 
-          if (sec.d) {
+          if (sec?.d) {
             for (let di = 0; di < sec.d.length; di++) {
               const seg = this.resolveVirtualWall(lid, "d", sk, di, sec.d[di]);
               if (!seg) continue;
@@ -492,6 +532,28 @@ export const lightingMethods = {
               const eid = `md_${dKey}`;
               const isOpen = seg.door ? (this.getCurrentDoorState(dKey, seg.ds) === 1) : false;
               if (!isOpen) {
+                const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
+                const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
+                  id: eid, type: "wall",
+                  move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
+                  ...(threshold ? { threshold } : {})
+                });
+                level.edges.set(eid, edge);
+              }
+              edgeIds.push(eid);
+            }
+          }
+
+          if (movedList?.length) {
+            for (let mi = 0; mi < movedList.length; mi++) {
+              const { kind, origSk, idx, seg } = movedList[mi];
+              const dKey = seg.door
+                ? (kind === "w" ? `${lid}::${origSk}_w${idx}` : `${lid}::${origSk}_${idx}`)
+                : null;
+              const isOpen = dKey ? (this.getCurrentDoorState(dKey, seg.ds) === 1) : false;
+              const eid = `mmv_${lid}_${sk}_${kind}_${origSk}_${idx}`;
+              if (!isOpen) {
+                const [x1, y1, x2, y2] = seg.c;
                 const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
                 const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
                   id: eid, type: "wall",
@@ -1076,30 +1138,115 @@ export const lightingMethods = {
     return true;
   },
 
+  async _handleRemoteDoorRequest(payload) {
+    const dKey = payload?.dKey;
+    const sceneId = payload?.sceneId;
+    if (typeof dKey !== "string" || !dKey.includes("::") || !sceneId) return;
+    const targetScene = game.scenes?.get?.(sceneId);
+    if (!targetScene) return;
+
+    const sep = dKey.indexOf("::");
+    const levelId = dKey.slice(0, sep);
+    const rest = dKey.slice(sep + 2);
+    const parts = rest.split("_");
+    if (parts.length !== 3) return;
+    const sx = Number(parts[0]), sy = Number(parts[1]);
+    const isConvertedWall = parts[2].startsWith("w");
+    const idx = Number(isConvertedWall ? parts[2].slice(1) : parts[2]);
+    if (!Number.isInteger(sx) || !Number.isInteger(sy) || !Number.isInteger(idx) || sx < 0 || sy < 0 || idx < 0) return;
+
+    const lvl = targetScene.levels?.get?.(levelId);
+    if (targetScene.levels?.size && !lvl) return;
+
+    const sk = `${sx}_${sy}`;
+    const kind = isConvertedWall ? "w" : "d";
+    const wKey = `${sk}:${kind}:${idx}`;
+    const wallEdit = targetScene.flags?.[MODULE_ID]?.wallEdits?.[levelId]?.[wKey];
+    if (wallEdit === null) return;
+
+    let doorType = 0;
+    let defaultDs = 0;
+    if (wallEdit && typeof wallEdit === "object") {
+      doorType = Number(wallEdit.door) || 0;
+      defaultDs = this._normalizeDoorState(wallEdit.ds, 0);
+    } else if (!isConvertedWall) {
+      // Resolve raw door entry from inlineManifest, cached/fetched manifest, or chunk JSON
+      let spec = lvl?.flags?.[MODULE_ID]?.inlineManifest || null;
+      if (!spec) {
+        const sceneCfg = targetScene.flags?.[MODULE_ID] || {};
+        const lvlCfg = lvl?.flags?.[MODULE_ID] || {};
+        const url = lvlCfg.manifestUrl || sceneCfg.manifestUrl;
+        if (url && typeof this._fetchManifest === "function") {
+          try {
+            const m = await this._fetchManifest(url);
+            spec = m?.levels?.[levelId] || m || null;
+          } catch {}
+        }
+      }
+      let raw = spec?.sectors?.[sk]?.d?.[idx];
+      if (!raw && spec?.chunks?.baseUrl && spec.chunks.chunkWorldPx > 0) {
+        const simSectorPx = spec.simSectorPx || ((spec.worldPx || 100000) / Math.max(1, spec.simGrid || 1));
+        const cx = Math.floor((sx * simSectorPx) / spec.chunks.chunkWorldPx);
+        const cy = Math.floor((sy * simSectorPx) / spec.chunks.chunkWorldPx);
+        if (cx >= 0 && cy >= 0) {
+          try {
+            const resp = await fetch(resolveFoundryRoute(`${spec.chunks.baseUrl}/${cx}_${cy}.json`));
+            if (resp?.ok) {
+              const cData = await resp.json();
+              raw = cData?.sectors?.[sk]?.d?.[idx];
+            }
+          } catch {}
+        }
+      }
+      if (!raw) return;
+      doorType = Number(raw[4]) || 1;
+      defaultDs = this._normalizeDoorState(raw[5], 0);
+    }
+
+    if (!doorType || doorType === 2) return;
+    const persisted = targetScene.flags?.[MODULE_ID]?.doorStates?.[dKey];
+    const curDs = persisted !== undefined ? this._normalizeDoorState(persisted, defaultDs) : defaultDs;
+    const targetDs = payload.ds !== undefined
+      ? this._normalizeDoorState(payload.ds, defaultDs)
+      : (payload.isOpen ? 1 : 0);
+    if (curDs === 2 || targetDs === 2 || curDs === targetDs) return;
+
+    try {
+      await targetScene.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: targetDs });
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to persist remote player door request:`, err);
+    }
+  },
+
   async _onSocketMessage(payload) {
-    if (!payload || typeof payload !== "object" || !this.active || payload.sceneId !== canvas.scene?.id) return;
+    if (!payload || typeof payload !== "object") return;
     if (payload.senderId === game.user?.id) return;
 
-    if (this.fogManager.handleSocketMessage(payload)) return;
+    // Delegate fog first so activeGM can persist cross-scene / cross-level SHARED fog reveals even on other scenes
+    if (this.fogManager?.handleSocketMessage?.(payload)) return;
 
     // Never mutate door state / level.edges from unauthenticated client `doorState` socket messages
     // (authoritative GM->client state propagates strictly via server-validated Scene flags in `onSceneUpdate`).
     if (payload.type !== "doorRequest") return;
 
     // Only the single active GM persists player door requests via authoritative `scene.update`
-    if (game.users.activeGM?.id !== game.user?.id) return;
-    const info = this._resolveDoorByKey(payload.dKey);
-    if (!info) return;
+    if (game.users?.activeGM?.id !== game.user?.id) return;
 
-    const targetDs = payload.ds !== undefined
-      ? this._normalizeDoorState(payload.ds, info.defaultDs)
-      : (payload.isOpen ? 1 : 0);
-
-    const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
-    if (info.doorType === 2 || curDs === 2 || targetDs === 2) {
-      return;
+    if (this.active && payload.sceneId === canvas.scene?.id) {
+      const info = this._resolveDoorByKey(payload.dKey);
+      if (info) {
+        const targetDs = payload.ds !== undefined
+          ? this._normalizeDoorState(payload.ds, info.defaultDs)
+          : (payload.isOpen ? 1 : 0);
+        const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
+        if (info.doorType === 2 || curDs === 2 || targetDs === 2) return;
+        this.requestDoorState(info.dKey, targetDs, { playSound: true });
+        return;
+      }
     }
-    this.requestDoorState(info.dKey, targetDs, { playSound: true });
+
+    // Cross-scene, cross-level, or unloaded-chunk door request fallback for activeGM
+    await this._handleRemoteDoorRequest(payload);
   },
 
   requestDoorState(dKey, targetDs, { playSound = true } = {}) {

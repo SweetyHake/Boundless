@@ -578,7 +578,7 @@ function renderChildSafe(child, renderer) {
   child.render(renderer);
 }
 
-function isStandardTokenChild(t, c) {
+export function isStandardTokenChild(t, c) {
   return (
     c === t.turnMarker ||
     c === t.border ||
@@ -589,7 +589,8 @@ function isStandardTokenChild(t, c) {
     c === t.targetArrows ||
     c === t.targetPips ||
     c === t.nameplate ||
-    c === t.tooltip
+    c === t.tooltip ||
+    c === t.levelIndicator
   );
 }
 
@@ -634,6 +635,7 @@ function renderBatchedTokenPasses(renderer, visibleTokens) {
   }
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].nameplate, renderer);
   for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].tooltip, renderer);
+  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].levelIndicator, renderer);
 
   for (let i = 0; i < n; i++) {
     const t = visibleTokens[i];
@@ -836,6 +838,7 @@ function patchTokenUiCaching() {
       PERF_CONFIG.perfEnabled &&
       PERF_CONFIG.perfTokenUiCache &&
       !isPrimePerfActive() &&
+      this.bars?.visible &&
       bar && !bar.destroyed && bar.visible && !this.isPreview &&
       (this.bars?.children?.length ?? 0) <= 2
     ) {
@@ -860,8 +863,8 @@ function patchTokenUiCaching() {
       !this.effects.destroyed &&
       !this.isPreview &&
       !this.effects.overlay &&
-      this.effects.children?.length >= 4 &&
-      this.effects.children.every(ch => ch instanceof PIXI.Sprite && !ch.children?.length)
+      this.effects.children?.length >= 5 &&
+      this.effects.children.every(ch => ch === this.effects.bg || (ch instanceof PIXI.Sprite && !ch.children?.length))
     ) {
       this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
       this.effects.cacheAsBitmap = true;
@@ -1075,9 +1078,29 @@ export function resolveLightingScalePreset(mode, perfMode = 2) {
 
 const _origFilterResDescs = new WeakMap();
 
+export function restoreFilterResolution(filter) {
+  if (!filter) return false;
+  const saved = _origFilterResDescs.get(filter);
+  if (!saved) {
+    delete filter._blResMult;
+    return false;
+  }
+  try {
+    if (saved.hadOwn && saved.desc) {
+      Object.defineProperty(filter, "resolution", saved.desc);
+    } else {
+      delete filter.resolution;
+    }
+  } catch {}
+  _origFilterResDescs.delete(filter);
+  delete filter._blResMult;
+  return true;
+}
+
 export function applyLightingRenderScale() {
   if (isPrimePerfActive()) return;
   if (!globalThis.canvas?.ready) return;
+  if (globalThis.Boundless?._mounting) return;
   const effects = globalThis.canvas?.effects;
   if (!effects) return;
 
@@ -1092,16 +1115,7 @@ export function applyLightingRenderScale() {
     if (globalThis.Boundless?._patchedFilters?.has?.(filter)) return;
     try {
       if (mult >= 0.999) {
-        const saved = _origFilterResDescs.get(filter);
-        if (saved) {
-          if (saved.hadOwn && saved.desc) {
-            Object.defineProperty(filter, "resolution", saved.desc);
-          } else {
-            delete filter.resolution;
-          }
-          _origFilterResDescs.delete(filter);
-        }
-        delete filter._blResMult;
+        restoreFilterResolution(filter);
         return;
       }
       if (filter._blResMult === mult && _origFilterResDescs.has(filter)) return;

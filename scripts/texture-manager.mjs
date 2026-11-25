@@ -47,6 +47,7 @@ export class LRUTextureManager {
   totalBytes = 0;
   pinned = new Set();       // Static icons + z0..z1 low-level pyramid stay resident
   missingSrcs = new Set();  // Negative cache for HTTP 404/410 sparse tiles (avoids fallback retries)
+  _fallbackFailures = new Map(); // src -> consecutive fallback failure count
   workerOwned = new Map();  // src -> { tex: PIXI.Texture, bitmap: ImageBitmap }
   workerPool = new TileWorkerPool();
   _gen = 0;
@@ -119,6 +120,7 @@ export class LRUTextureManager {
         return null;
       }
       if (tex?.baseTexture) {
+        this._fallbackFailures.delete(src);
         const prevOwned = this.workerOwned.get(src);
         if (prevOwned) {
           this.workerOwned.delete(src);
@@ -127,9 +129,28 @@ export class LRUTextureManager {
         }
         this._configureBaseTexture(tex, mipmap);
         this._trackLru(src, tex);
+        return tex;
       }
-      return tex;
-    }).catch(() => null);
+      const fails = (this._fallbackFailures.get(src) || 0) + 1;
+      if (fails >= 2) {
+        this._fallbackFailures.delete(src);
+        this.missingSrcs.add(src);
+      } else {
+        this._fallbackFailures.set(src, fails);
+      }
+      return null;
+    }).catch(() => {
+      if (gen === this._gen) {
+        const fails = (this._fallbackFailures.get(src) || 0) + 1;
+        if (fails >= 2) {
+          this._fallbackFailures.delete(src);
+          this.missingSrcs.add(src);
+        } else {
+          this._fallbackFailures.set(src, fails);
+        }
+      }
+      return null;
+    });
   }
 
   load(src, { mipmap = true, isPinned = false, priority = 1, maxDim = 0 } = {}) {
@@ -274,6 +295,7 @@ export class LRUTextureManager {
       this.totalBytes = 0;
     }
     this.missingSrcs.clear();
+    this._fallbackFailures.clear();
     this.promises.clear();
   }
 

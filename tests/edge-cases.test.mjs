@@ -1576,3 +1576,225 @@ test("resolveFoundryClass skips deprecated foundry.canvas.tokens and resolves Ro
   assert.equal(resolved?.path, "foundry.dice.Roll");
   assert.equal(deprecatedTokensTouched, false, "must never enumerate deprecated foundry.canvas.tokens");
 });
+
+test("isStandardTokenChild recognizes Foundry v14 levelIndicator so Token UI culling stays active", async () => {
+  const { isStandardTokenChild } = await import("../scripts/perf-gpu.mjs");
+  const lvlInd = { name: "levelIndicator" };
+  const aura = { name: "customAura" };
+  const tok = {
+    turnMarker: {}, border: {}, voidMesh: {}, detectionFilterMesh: {},
+    bars: {}, effects: {}, targetArrows: {}, targetPips: {},
+    nameplate: {}, tooltip: {}, levelIndicator: lvlInd
+  };
+  assert.equal(isStandardTokenChild(tok, lvlInd), true, "v14 levelIndicator must be treated as a standard token child");
+  assert.equal(isStandardTokenChild(tok, aura), false, "custom third-party children must still be detected");
+});
+
+test("applyLightingRenderScale defers during Boundless._mounting and restoreFilterResolution cleanly unwraps", async () => {
+  installBaseGlobals();
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const { applyLightingRenderScale, restoreFilterResolution } = await import("../scripts/perf-gpu.mjs");
+
+  const prevBoundless = globalThis.Boundless;
+  const prevScale = PERF_CONFIG.perfLightingScale;
+  const prevEnabled = PERF_CONFIG.perfEnabled;
+  try {
+    const f = { destroyed: false };
+    Object.defineProperty(f, "resolution", { configurable: true, enumerable: true, get() { return 2; }, set() {} });
+    globalThis.canvas = {
+      ready: true,
+      performance: { mode: 2 },
+      app: { renderer: { resolution: 2, renderTexture: { current: null } } },
+      effects: { illumination: { filter: f }, coloration: {}, darkness: {} }
+    };
+    PERF_CONFIG.perfEnabled = true;
+    PERF_CONFIG.perfLightingScale = "balanced";
+
+    globalThis.Boundless = { _mounting: true };
+    applyLightingRenderScale();
+    assert.equal(f.resolution, 2, "must not patch filter while Boundless is mid-mount");
+
+    globalThis.Boundless = { _mounting: false };
+    applyLightingRenderScale();
+    assert.equal(f.resolution, 1.1);
+
+    assert.equal(restoreFilterResolution(f), true);
+    assert.equal(f.resolution, 2, "restoreFilterResolution must restore Foundry's original getter");
+    assert.equal(f._blResMult, undefined);
+  } finally {
+    globalThis.Boundless = prevBoundless;
+    PERF_CONFIG.perfLightingScale = prevScale;
+    PERF_CONFIG.perfEnabled = prevEnabled;
+  }
+});
+
+test("pyramidMethods.hasReadyOtherZCovering handles zoom-out (other.z > e.z) on translucent fg and isUpper channels", async () => {
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+  const baseTile = { levelId: "l1", channel: "bg", z: 3, x0: 0, y0: 0, sizePx: 1000, layer: { isUpper: false } };
+  const fgTile = { levelId: "l1", channel: "fg", z: 3, x0: 0, y0: 0, sizePx: 1000, layer: { isUpper: false } };
+  const upperTile = { levelId: "l1", channel: "bg", z: 3, x0: 0, y0: 0, sizePx: 1000, layer: { isUpper: true } };
+  const higherZ = [{ z: 4, x0: 0, y0: 0, sizePx: 500 }];
+
+  assert.equal(pyramidMethods.hasReadyOtherZCovering(baseTile, higherZ), false, "opaque bg only checks lower-Z ancestors");
+  assert.equal(pyramidMethods.hasReadyOtherZCovering(fgTile, higherZ), true, "translucent fg must detect higher-Z tiles on zoom-out");
+  assert.equal(pyramidMethods.hasReadyOtherZCovering(upperTile, higherZ), true, "translucent isUpper must detect higher-Z tiles on zoom-out");
+});
+
+test("MegaAudioStreamer scopes token/preview anchors strictly to their own levelId", async () => {
+  installBaseGlobals();
+  const { MegaAudioStreamer } = await import("../scripts/audio-streamer.mjs");
+  const created = [];
+  globalThis.foundry = {
+    canvas: {
+      sources: {
+        PointSoundSource: class {
+          constructor() { this.attached = true; this.shape = {}; created.push(this); }
+          initialize(cfg) { this.cfg = cfg; return this; }
+          add() {}
+          destroy() { this.destroyed = true; }
+        }
+      }
+    }
+  };
+  globalThis.canvas = {
+    ready: true,
+    dimensions: { size: 100, distance: 5 },
+    environment: { darknessLevel: 0 },
+    tokens: { placeables: [{ controlled: true, document: { id: "t1", level: "lvlA", x: 100, y: 100, width: 1, height: 1 }, center: { x: 150, y: 150 }, destroyed: false }] },
+    sounds: { livePreview: null, sources: new Map() }
+  };
+
+  const layerA = { level: { id: "lvlA", elevation: { base: 0 } }, simGrid: 2, simSectorPx: 1000, spec: { sectors: { "0_0": { s: [[150, 150, 20, "a.ogg", 0.5, false, true, 0, 1, 5]] } } } };
+  const layerB = { level: { id: "lvlB", elevation: { base: 10 } }, simGrid: 2, simSectorPx: 1000, spec: { sectors: { "0_0": { s: [[150, 150, 20, "b.ogg", 0.5, false, true, 0, 1, 15]] } } } };
+
+  const streamer = new MegaAudioStreamer();
+  // Use macro scale (< 0.15) so viewport anchor is inactive and only the lvlA token anchor drives streaming
+  streamer.update([layerA, layerB], { x0: 0, y0: 0, x1: 500, y1: 500, scale: 0.05 });
+  assert.equal(streamer.activeSources.size, 1, "lvlA token anchor must NOT mount sounds on lvlB");
+  assert.equal(created[0].cfg.path, "a.ogg");
+});
+
+test("ChunkedFogManager filters multi-level visionSources and allows concurrent multi-GM sharedFog updates", async () => {
+  installBaseGlobals();
+  globalThis.CONST.FOG_EXPLORATION_MODES = { DISABLED: 0, INDIVIDUAL: 1, SHARED: 2 };
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  const fog = new ChunkedFogManager();
+  fog.enabled = true;
+  fog.container = {};
+  fog.sceneId = "sc1";
+  fog.levelId = "lvl1";
+  fog.mode = globalThis.CONST.FOG_EXPLORATION_MODES.SHARED;
+
+  const appliedPolys = [];
+  fog._applyPolygons = (polys) => { appliedPolys.push(...polys); return true; };
+
+  globalThis.canvas = {
+    effects: {
+      visionSources: new Set([
+        { active: true, sourceId: "v1", level: { id: "lvl1" }, los: { points: [0, 0, 100, 0, 100, 100] }, object: { document: { level: "lvl1", hasPlayerOwner: true } } },
+        { active: true, sourceId: "v2", level: { id: "lvl2" }, los: { points: [500, 500, 600, 500, 600, 600] }, object: { document: { level: "lvl2", hasPlayerOwner: true } } }
+      ])
+    },
+    tokens: { controlled: [] }
+  };
+
+  fog.revealFromActiveVision({ broadcast: false });
+  assert.equal(appliedPolys.length, 1, "must ignore vision polygons from lvl2 while viewing lvl1");
+  assert.equal(appliedPolys[0][0], 0);
+
+  // Multi-GM concurrent sharedFog: suppress own echo while saving, accept another GM's patch!
+  let mergedCount = 0;
+  fog._mergeChunkMap = () => { mergedCount++; };
+  fog._incSavingShared("lvl1");
+  fog.onSceneFogFlagsChanged({}, { lvl1: { "0_0": "data:image/png;base64,AA" } }, "gm1");
+  assert.equal(mergedCount, 0, "own in-flight save echo must be suppressed");
+  fog.onSceneFogFlagsChanged({}, { lvl1: { "0_0": "data:image/png;base64,BB" } }, "gm2");
+  assert.equal(mergedCount, 1, "another GM's sharedFog update must NOT be dropped during local save");
+  fog._decSavingShared("lvl1");
+});
+
+test("lightingMethods._onSocketMessage handles cross-scene fogReveal and doorRequest on activeGM while enforcing lock/secret guards", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+
+  const sceneUpdates = [];
+  let fogHandled = 0;
+  const remoteScene = {
+    id: "otherScene",
+    levels: new Map([["lvl1", { id: "lvl1", flags: { boundless: { inlineManifest: { sectors: { "0_0": { d: [[0, 0, 100, 0, 1, 0], [0, 0, 100, 0, 2, 0], [0, 0, 100, 0, 1, 2]] } } } } } }]]),
+    flags: { boundless: { doorStates: {} } },
+    async update(patch) { sceneUpdates.push(patch); }
+  };
+  globalThis.game.scenes = new Map([["otherScene", remoteScene]]);
+  globalThis.canvas = { scene: { id: "gmCurrentScene" } };
+
+  const ctrl = {
+    ...lightingMethods,
+    active: false, // GM is on a standard non-Boundless scene!
+    fogManager: {
+      handleSocketMessage(payload) {
+        if (payload.type === "fogReveal") { fogHandled++; return true; }
+        return false;
+      }
+    }
+  };
+
+  await ctrl._onSocketMessage({ type: "fogReveal", sceneId: "otherScene", senderId: "player1", polygons: [[0, 0, 10, 0, 10, 10]] });
+  assert.equal(fogHandled, 1, "cross-scene fogReveal must reach fogManager even when GM is on an inactive/other scene");
+
+  // Normal unlocked door -> persisted via remoteScene.update
+  await ctrl._onSocketMessage({ type: "doorRequest", sceneId: "otherScene", senderId: "player1", dKey: "lvl1::0_0_0", ds: 1 });
+  assert.equal(sceneUpdates.length, 1);
+  assert.equal(sceneUpdates[0]["flags.boundless.doorStates.lvl1::0_0_0"], 1);
+
+  // Secret door (idx 1) and locked door (idx 2) -> rejected
+  await ctrl._onSocketMessage({ type: "doorRequest", sceneId: "otherScene", senderId: "player1", dKey: "lvl1::0_0_1", ds: 1 });
+  await ctrl._onSocketMessage({ type: "doorRequest", sceneId: "otherScene", senderId: "player1", dKey: "lvl1::0_0_2", ds: 1 });
+  assert.equal(sceneUpdates.length, 1, "secret and locked doors on remote scenes must remain protected");
+});
+
+test("MegaLightBatch.detachChunk preserves shared-sector resident metadata and _buildNativeEdgesSig tracks direction & threshold", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+  const lb = new MegaLightBatch();
+
+  const batchA = { lightIds: ["lvl1::0_0_0"], weightArray: new Float32Array(4), illumMesh: null, colorMesh: null, geometry: null };
+  const batchB = { lightIds: ["lvl1::0_0_0"], weightArray: new Float32Array(4), illumMesh: null, colorMesh: null, geometry: null };
+  const metaB = { id: "lvl1::0_0_0", weight: 1, batch: batchB };
+  lb.chunkBatches.set("lvl1::0_0", batchA);
+  lb.chunkBatches.set("lvl1::1_0", batchB);
+  lb.lightMetaById.set("lvl1::0_0_0", metaB);
+  lb.totalLights = 1;
+  lb.activeLightsCount = 1;
+
+  lb.detachChunk("lvl1", "0_0");
+  assert.equal(lb.lightMetaById.get("lvl1::0_0_0"), metaB, "evicting chunk A must not delete chunk B's live lightMetaById");
+  assert.equal(lb.totalLights, 1);
+
+  const e1 = { a: { x: 0, y: 0 }, b: { x: 100, y: 0 }, light: 20, direction: 0, threshold: { light: 0, attenuation: false } };
+  const e2 = { a: { x: 0, y: 0 }, b: { x: 100, y: 0 }, light: 20, direction: 1, threshold: { light: 0, attenuation: false } };
+  const e3 = { a: { x: 0, y: 0 }, b: { x: 100, y: 0 }, light: 20, direction: 0, threshold: { light: 10, attenuation: true } };
+  assert.notEqual(lb._buildNativeEdgesSig([e1]), lb._buildNativeEdgesSig([e2]), "direction change must change native edges sig");
+  assert.notEqual(lb._buildNativeEdgesSig([e1]), lb._buildNativeEdgesSig([e3]), "threshold.light change must change native edges sig");
+});
+
+test("LRUTextureManager._loadFallback caches repeated missing URLs in missingSrcs to prevent 404 storms", async () => {
+  installBaseGlobals();
+  let loadCalls = 0;
+  globalThis.foundry = {
+    canvas: {
+      loadTexture: async () => { loadCalls++; throw new Error("404"); }
+    }
+  };
+  const { LRUTextureManager } = await import("../scripts/texture-manager.mjs");
+  const tm = new LRUTextureManager();
+
+  await tm.load("missing-prop.svg");
+  await tm.load("missing-prop.svg");
+  await tm.load("missing-prop.svg");
+  assert.equal(loadCalls, 2, "must cache missing non-worker asset after 2 consecutive failures");
+  assert.equal(tm.missingSrcs.has("missing-prop.svg"), true);
+  tm.clear(true);
+  assert.equal(tm.missingSrcs.size, 0);
+});
