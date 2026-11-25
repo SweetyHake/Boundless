@@ -42,7 +42,7 @@ function openPolyCacheDB() {
   if (!idb) return Promise.resolve(null);
   if (_dbPromise) return _dbPromise;
 
-  _dbPromise = new Promise((resolve) => {
+  const p = new Promise((resolve) => {
     let settled = false;
     const finish = (val) => {
       if (settled) return false;
@@ -59,10 +59,17 @@ function openPolyCacheDB() {
             const store = db.createObjectStore(STORE_NAME, { keyPath: "key" });
             store.createIndex("updatedAt", "updatedAt", { unique: false });
           }
-        } catch {}
+        } catch {
+          try { req.transaction?.abort(); } catch {}
+        }
       };
       req.onsuccess = () => {
         const db = req.result;
+        if (_dbPromise !== p) {
+          try { db.close(); } catch {}
+          finish(null);
+          return;
+        }
         if (!finish(db)) {
           try { db.close(); } catch {}
           return;
@@ -70,7 +77,7 @@ function openPolyCacheDB() {
         _openDb = db;
         const drop = () => {
           if (_openDb === db) _openDb = null;
-          _dbPromise = null;
+          if (_dbPromise === p) _dbPromise = null;
         };
         db.onversionchange = () => {
           try { db.close(); } catch {}
@@ -81,19 +88,20 @@ function openPolyCacheDB() {
       };
       req.onerror = (ev) => {
         try { ev?.preventDefault?.(); } catch {}
-        _dbPromise = null;
+        if (_dbPromise === p) _dbPromise = null;
         finish(null);
       };
       req.onblocked = () => {
-        _dbPromise = null;
+        if (_dbPromise === p) _dbPromise = null;
         finish(null);
       };
     } catch {
-      _dbPromise = null;
+      if (_dbPromise === p) _dbPromise = null;
       finish(null);
     }
   });
-  return _dbPromise;
+  _dbPromise = p;
+  return p;
 }
 
 /**
@@ -180,13 +188,14 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
   if (!db) return false;
 
   const now = Date.now();
+  let quotaHit = false;
   const saved = await new Promise((resolve) => {
     try {
       const tx = db.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
       for (const [levelId, entries] of entriesByLevel) {
         if (!levelId || !Array.isArray(entries) || !entries.length) continue;
-        const putReq = store.put({
+        store.put({
           key: makePolyCacheRecordKey(worldId, sceneId, levelId),
           worldId: worldId || "world",
           sceneId,
@@ -194,19 +203,34 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
           updatedAt: now,
           entries
         });
-        putReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
       tx.oncomplete = () => resolve(true);
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(false); };
-      tx.onabort = () => resolve(false);
+      tx.onerror = (ev) => {
+        try { ev?.preventDefault?.(); } catch {}
+        const err = tx.error;
+        if (err?.name === "QuotaExceededError") quotaHit = true;
+        else handleDbTxError(err);
+        resolve(false);
+      };
+      tx.onabort = () => {
+        const err = tx.error;
+        if (err?.name === "QuotaExceededError") quotaHit = true;
+        else handleDbTxError(err);
+        resolve(false);
+      };
     } catch (err) {
-      handleDbTxError(err);
+      if (err?.name === "QuotaExceededError") quotaHit = true;
+      else handleDbTxError(err);
       resolve(false);
     }
   });
 
-  if (saved && maxRecords > 0) {
-    await _pruneOldRecords(db, maxRecords);
+  if (quotaHit && maxRecords > 0) {
+    const freshDb = await openPolyCacheDB();
+    if (freshDb) await _pruneOldRecords(freshDb, Math.max(4, Math.floor(maxRecords / 2)));
+  } else if (saved && maxRecords > 0) {
+    const freshDb = await openPolyCacheDB();
+    if (freshDb) await _pruneOldRecords(freshDb, maxRecords);
   }
   return saved;
 }
@@ -248,9 +272,9 @@ function _pruneOldRecords(db, maxRecords) {
 }
 
 /**
- * Clear all persisted light polygon cache entries from IndexedDB (or only those matching `sceneId`).
+ * Clear all persisted light polygon cache entries from IndexedDB (or only those matching `sceneId`, optionally scoped by `worldId`).
  */
-export async function clearPolyCacheDB(sceneId = null) {
+export async function clearPolyCacheDB(sceneId = null, worldId = null) {
   const db = await openPolyCacheDB();
   if (!db) return false;
 
@@ -258,7 +282,7 @@ export async function clearPolyCacheDB(sceneId = null) {
     try {
       const tx = db.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
-      if (!sceneId) {
+      if (!sceneId && !worldId) {
         store.clear();
       } else {
         const cursorReq = store.openCursor();
@@ -266,15 +290,18 @@ export async function clearPolyCacheDB(sceneId = null) {
           try {
             const cursor = cursorReq.result;
             if (!cursor) return;
-            if (cursor.value?.sceneId === sceneId) cursor.delete();
+            const v = cursor.value;
+            const sceneMatch = !sceneId || v?.sceneId === sceneId;
+            const worldMatch = !worldId || v?.worldId === worldId;
+            if (sceneMatch && worldMatch) cursor.delete();
             cursor.continue();
           } catch {}
         };
         cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       }
       tx.oncomplete = () => resolve(true);
-      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(false); };
-      tx.onabort = () => resolve(false);
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} handleDbTxError(tx.error); resolve(false); };
+      tx.onabort = () => { handleDbTxError(tx.error); resolve(false); };
     } catch (err) {
       handleDbTxError(err);
       resolve(false);

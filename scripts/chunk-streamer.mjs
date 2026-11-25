@@ -43,6 +43,9 @@ export class ChunkStreamer {
         loaded: new Map(),  // ck -> { key, sectorKeys, overlayIds, lastUsedMs }
         pending: new Map(), // ck -> { promise, abort }
         failed: new Map(),  // ck -> retryAfterMs (Infinity for 404/410)
+        sectorRefs: new Map(),  // sk -> count of loaded chunks referencing sk
+        overlayRefs: new Map(), // oid -> count of loaded chunks referencing oid
+        prewarmKeys: new Set(),
         lastKey: ""
       });
     }
@@ -83,9 +86,10 @@ export class ChunkStreamer {
     const cw = cfg.chunkWorldPx;
     const cols = cfg.cols || Math.ceil((layer.worldPx || cw) / cw);
     const rows = cfg.rows || Math.ceil((layer.worldPx || cw) / cw);
-    const needed = new Set();
+    const tokenChunks = new Set();
+    const vpChunks = new Set();
 
-    const addBox = (x0, y0, x1, y1) => {
+    const addBox = (dest, x0, y0, x1, y1) => {
       const cx0 = Math.max(0, Math.floor(x0 / cw));
       const cy0 = Math.max(0, Math.floor(y0 / cw));
       const cx1 = Math.min(cols - 1, Math.floor(x1 / cw));
@@ -93,12 +97,12 @@ export class ChunkStreamer {
       for (let cy = cy0; cy <= cy1; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
           const ck = `${cx}_${cy}`;
-          if (populated.size === 0 || populated.has(ck)) needed.add(ck);
+          if (populated.size === 0 || populated.has(ck)) dest.add(ck);
         }
       }
     };
 
-    // 1. Always keep chunks loaded around active tokens on this level
+    // 1. Always keep chunks loaded around active tokens on this level (highest priority)
     const tokens = canvas?.tokens?.placeables;
     if (Array.isArray(tokens)) {
       const lid = layer.level.id;
@@ -109,18 +113,55 @@ export class ChunkStreamer {
         if (tLid && tLid !== lid) continue;
         const tx = tok.center?.x ?? tok.document?.x ?? 0;
         const ty = tok.center?.y ?? tok.document?.y ?? 0;
-        addBox(tx - CHUNK_TOKEN_PAD_PX, ty - CHUNK_TOKEN_PAD_PX, tx + CHUNK_TOKEN_PAD_PX, ty + CHUNK_TOKEN_PAD_PX);
+        addBox(tokenChunks, tx - CHUNK_TOKEN_PAD_PX, ty - CHUNK_TOKEN_PAD_PX, tx + CHUNK_TOKEN_PAD_PX, ty + CHUNK_TOKEN_PAD_PX);
       }
     }
 
     // 2. Load chunks visible in viewport when zoomed below orbital scale
     if (vp && getEffectiveScale(vp.scale) >= CHUNK_STREAM_MIN_SCALE) {
       addBox(
+        vpChunks,
         vp.x0 - CHUNK_VP_PAD_PX,
         vp.y0 - CHUNK_VP_PAD_PX,
         vp.x1 + CHUNK_VP_PAD_PX,
         vp.y1 + CHUNK_VP_PAD_PX
       );
+    }
+
+    // Enforce MAX_LOADED_CHUNKS budget: prioritize token chunks first, then nearest viewport chunks to camera center
+    const needed = new Set();
+    const camX = vp ? (vp.x0 + vp.x1) * 0.5 : 0;
+    const camY = vp ? (vp.y0 + vp.y1) * 0.5 : 0;
+    const sortByCamDist = (set) => {
+      const arr = [];
+      for (const ck of set) {
+        const sep = ck.indexOf("_");
+        const cx = Number(ck.slice(0, sep));
+        const cy = Number(ck.slice(sep + 1));
+        const dx = (cx + 0.5) * cw - camX;
+        const dy = (cy + 0.5) * cw - camY;
+        arr.push({ ck, d2: dx * dx + dy * dy });
+      }
+      arr.sort((a, b) => a.d2 - b.d2);
+      return arr;
+    };
+
+    if (tokenChunks.size <= MAX_LOADED_CHUNKS) {
+      for (const ck of tokenChunks) needed.add(ck);
+    } else {
+      const sortedTok = sortByCamDist(tokenChunks);
+      for (let i = 0; i < MAX_LOADED_CHUNKS && i < sortedTok.length; i++) needed.add(sortedTok[i].ck);
+    }
+
+    if (needed.size < MAX_LOADED_CHUNKS && vpChunks.size > 0) {
+      const remainingVp = new Set();
+      for (const ck of vpChunks) {
+        if (!needed.has(ck)) remainingVp.add(ck);
+      }
+      const sortedVp = sortByCamDist(remainingVp);
+      for (let i = 0; i < sortedVp.length && needed.size < MAX_LOADED_CHUNKS; i++) {
+        needed.add(sortedVp[i].ck);
+      }
     }
 
     return needed;
@@ -147,6 +188,7 @@ export class ChunkStreamer {
       if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
       const ck = `${cx}_${cy}`;
       if ((populated.size === 0 || populated.has(ck)) && this._canFetchChunk(st, ck, now)) {
+        st.prewarmKeys?.add?.(ck);
         this._fetchChunk(st, ck);
       }
     }
@@ -161,6 +203,13 @@ export class ChunkStreamer {
       for (const [, st] of this.states) {
         const needed = this._collectNeededChunks(st, vp);
         st.lastNeeded = needed;
+        // Abort stale in-flight fetches that left the viewport/token budget (keep active flight prewarms)
+        for (const [ck, req] of Array.from(st.pending.entries())) {
+          if (!needed.has(ck) && !st.prewarmKeys?.has?.(ck)) {
+            st.pending.delete(ck);
+            try { req?.abort?.abort?.(); } catch {}
+          }
+        }
         for (const ck of needed) {
           const rec = st.loaded.get(ck);
           if (rec) {
@@ -209,12 +258,14 @@ export class ChunkStreamer {
       })
       .then(data => {
         st.pending.delete(ck);
+        st.prewarmKeys?.delete?.(ck);
         st.failed?.delete?.(ck);
         if (gen !== this._gen || !this.states.has(st.layer.level.id)) return;
         this._mountChunkData(st, ck, data);
       })
       .catch(err => {
         st.pending.delete(ck);
+        st.prewarmKeys?.delete?.(ck);
         if (err?.name === "AbortError" || gen !== this._gen) return;
         const perm = err?.status === 404 || err?.status === 410;
         st.failed?.set?.(ck, perm ? Infinity : (performance.now() + 15000));
@@ -246,6 +297,7 @@ export class ChunkStreamer {
       for (const [oid, ovSpec] of Object.entries(data.overlays)) {
         spec.overlays[oid] = ovSpec;
         overlayIds.push(oid);
+        st.overlayRefs.set(oid, (st.overlayRefs.get(oid) || 0) + 1);
       }
     }
 
@@ -254,6 +306,7 @@ export class ChunkStreamer {
       for (const [sk, sec] of Object.entries(data.sectors)) {
         spec.sectors[sk] = sec;
         sectorKeys.push(sk);
+        st.sectorRefs.set(sk, (st.sectorRefs.get(sk) || 0) + 1);
       }
     }
 
@@ -271,7 +324,11 @@ export class ChunkStreamer {
     if (!st.loaded.has(ck)) return;
 
     // Trigger non-blocking incremental GPU light baking for this chunk + refresh local overlays/sim/doors
-    this.controller?.onChunkLoaded?.(layer, ck, data);
+    try {
+      this.controller?.onChunkLoaded?.(layer, ck, data);
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Error in onChunkLoaded(${ck}):`, err);
+    }
   }
 
   /** Re-queue GPU light baking for all currently resident chunks (e.g. after GM wall/light edits). */
@@ -293,10 +350,24 @@ export class ChunkStreamer {
     const spec = layer.spec;
 
     for (let i = 0; i < rec.sectorKeys.length; i++) {
-      delete spec.sectors[rec.sectorKeys[i]];
+      const sk = rec.sectorKeys[i];
+      const nextRef = (st.sectorRefs.get(sk) || 1) - 1;
+      if (nextRef <= 0) {
+        st.sectorRefs.delete(sk);
+        delete spec.sectors[sk];
+      } else {
+        st.sectorRefs.set(sk, nextRef);
+      }
     }
     for (let i = 0; i < rec.overlayIds.length; i++) {
-      delete spec.overlays[rec.overlayIds[i]];
+      const oid = rec.overlayIds[i];
+      const nextRef = (st.overlayRefs.get(oid) || 1) - 1;
+      if (nextRef <= 0) {
+        st.overlayRefs.delete(oid);
+        delete spec.overlays[oid];
+      } else {
+        st.overlayRefs.set(oid, nextRef);
+      }
     }
     st.loaded.delete(ck);
 

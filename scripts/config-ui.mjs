@@ -7,6 +7,8 @@ import {
 } from "./scene-baker.mjs";
 import { MODULE_ID, loc, escapeHtml } from "./utils.mjs";
 
+const activeBakeScenes = new Set();
+
 function resolveSceneFromContextEl(li) {
   const el = li instanceof HTMLElement ? li : li?.[0];
   if (!el || el.dataset?.levelId) return null;
@@ -14,7 +16,11 @@ function resolveSceneFromContextEl(li) {
   return sceneId ? (game.scenes?.get?.(sceneId) ?? null) : null;
 }
 
-async function runWithProgressDialog(titleKey, runner) {
+async function runWithProgressDialog(titleKey, runner, sceneId = null) {
+  if (sceneId && activeBakeScenes.has(sceneId)) {
+    return { ok: false, err: new Error("A bake or unbake operation is already running for this scene.") };
+  }
+  if (sceneId) activeBakeScenes.add(sceneId);
   const DialogV2 = foundry.applications.api.DialogV2;
   const abortCtrl = new AbortController();
   const progressDialog = new DialogV2({
@@ -29,6 +35,8 @@ async function runWithProgressDialog(titleKey, runner) {
     `,
     buttons: [{
       action: "cancel",
+      type: "button",
+      default: false,
       label: loc("BOUNDLESS.Baker.CancelButton"),
       icon: "fa-solid fa-xmark",
       callback: () => { abortCtrl.abort(); }
@@ -61,6 +69,8 @@ async function runWithProgressDialog(titleKey, runner) {
     finished = true;
     await progressDialog.close().catch(() => {});
     return { ok: false, err };
+  } finally {
+    if (sceneId) activeBakeScenes.delete(sceneId);
   }
 }
 
@@ -111,7 +121,8 @@ export async function openOptimizeSceneDialog(controller, scene) {
       activateCopy: true,
       signal,
       onProgress
-    })
+    }),
+    scene.id
   );
 
   if (outcome.ok) {
@@ -169,7 +180,8 @@ export async function openBakeEditsDialog(controller, scene) {
       absorbNative: opts.absorbNative,
       signal,
       onProgress
-    })
+    }),
+    scene.id
   );
 
   if (outcome.ok) {
@@ -242,7 +254,8 @@ export async function openUnbakeSceneDialog(controller, scene) {
       activateCopy: true,
       signal,
       onProgress
-    })
+    }),
+    scene.id
   );
 
   if (outcome.ok) {
@@ -288,13 +301,13 @@ export function registerConfigUI(controller) {
     const canOptimize = (li) => {
       if (!game.user?.isGM) return false;
       const scene = resolveSceneFromContextEl(li);
-      return Boolean(scene && !isSceneBoundlessEditable(scene));
+      return Boolean(scene && !activeBakeScenes.has(scene.id) && !isSceneBoundlessEditable(scene));
     };
 
     const canManageBoundless = (li) => {
       if (!game.user?.isGM) return false;
       const scene = resolveSceneFromContextEl(li);
-      return isSceneBoundlessEditable(scene);
+      return Boolean(scene && !activeBakeScenes.has(scene.id) && isSceneBoundlessEditable(scene));
     };
 
     pushOption(

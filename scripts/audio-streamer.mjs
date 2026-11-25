@@ -1,4 +1,4 @@
-import { getEffectiveScale } from "./utils.mjs";
+import { getEffectiveScale, getLevelBaseElevation } from "./utils.mjs";
 
 const SOUND_PAD_WORLD_PX = 1600;
 const SOUND_VP_MIN_SCALE = 0.25;
@@ -48,7 +48,11 @@ export class MegaAudioStreamer {
     }
     for (const tok of canvas.tokens?.placeables || []) {
       if (!tok || tok.destroyed || !tok.center) continue;
-      const isActiveListener = tok.controlled || (!game.user?.isGM && tok.isOwner) || Boolean(tok.document?.hasPlayerOwner);
+      const isActiveListener = tok.controlled || (
+        game.user?.isGM
+          ? Boolean(tok.document?.hasPlayerOwner)
+          : (tok.isOwner || Boolean(tok.actor?.testUserPermission?.(game.user, "OBSERVER")))
+      );
       if (!isActiveListener) continue;
       anchors.push({
         x0: tok.center.x - SOUND_PAD_WORLD_PX,
@@ -67,7 +71,9 @@ export class MegaAudioStreamer {
       const sectors = layer.spec?.sectors;
       if (!sectors) continue;
       const { simGrid, simSectorPx, level } = layer;
-      const lid = level.id;
+      const lid = level?.id;
+      if (!lid || !Number.isFinite(simSectorPx) || simSectorPx <= 0 || !Number.isFinite(simGrid) || simGrid <= 0) continue;
+      const visitedSectors = new Set();
 
       for (const a of anchors) {
         if (a.levelId && a.levelId !== lid) continue;
@@ -78,6 +84,8 @@ export class MegaAudioStreamer {
         for (let sy = sy0; sy <= sy1; sy++) {
           for (let sx = sx0; sx <= sx1; sx++) {
             const sk = `${sx}_${sy}`;
+            if (visitedSectors.has(sk)) continue;
+            visitedSectors.add(sk);
             const list = sectors[sk]?.s;
             if (!list?.length) continue;
             for (let si = 0; si < list.length; si++) {
@@ -88,7 +96,7 @@ export class MegaAudioStreamer {
                     x: raw[0], y: raw[1], radius: raw[2] || 20, path: raw[3],
                     volume: raw[4] ?? 0.6, walls: raw[5] !== false, easing: raw[6] !== false,
                     darkMin: raw[7] ?? 0, darkMax: raw[8] ?? 1,
-                    elevation: Number.isFinite(raw[9]) ? raw[9] : ((level.elevation?.base ?? 0) + 5),
+                    elevation: Number.isFinite(raw[9]) ? raw[9] : (getLevelBaseElevation(level) + 5),
                     hidden: Boolean(raw[10]?.hidden)
                   };
               if (!item || !item.path || item.hidden) continue;
@@ -109,9 +117,9 @@ export class MegaAudioStreamer {
     }
     const key = keyParts.sort().join("|");
     if (key === this.lastKey) return;
-    this.lastKey = key;
 
     let changed = false;
+    let complete = true;
     if (!this._sourceSigs) this._sourceSigs = new Map();
 
     for (const [k, src] of this.activeSources) {
@@ -143,19 +151,29 @@ export class MegaAudioStreamer {
             easing: Boolean(item.easing)
           });
           if (existing.shape && !existing.attached) existing.add();
-          this._sourceSigs.set(k, itemSig);
-          changed = true;
+          if (existing.shape && existing.attached) {
+            this._sourceSigs.set(k, itemSig);
+            changed = true;
+          } else {
+            try { existing.destroy(); } catch {}
+            this.activeSources.delete(k);
+            this._sourceSigs.delete(k);
+            complete = false;
+            changed = true;
+          }
         } catch (err) {
           console.warn("boundless | Failed to update streamed sound:", item.path, err);
           try { existing.destroy(); } catch {}
           this.activeSources.delete(k);
           this._sourceSigs.delete(k);
+          complete = false;
           changed = true;
         }
         continue;
       }
+      let src = null;
       try {
-        const src = new SoundSourceCls({ sourceId: `MegaSound.${k}` });
+        src = new SoundSourceCls({ sourceId: `MegaSound.${k}` });
         src.initialize({
           x: item.x, y: item.y,
           level: layer.level.id,
@@ -168,19 +186,29 @@ export class MegaAudioStreamer {
         });
         if (src.shape) {
           src.add();
-          this.activeSources.set(k, src);
-          this._sourceSigs.set(k, itemSig);
-          changed = true;
+          if (src.attached !== false) {
+            this.activeSources.set(k, src);
+            this._sourceSigs.set(k, itemSig);
+            changed = true;
+          } else {
+            try { src.destroy(); } catch {}
+            complete = false;
+          }
         } else {
           try { src.destroy(); } catch {}
+          complete = false;
         }
       } catch (err) {
         console.warn("boundless | Failed to mount streamed sound:", item.path, err);
+        if (src) { try { src.destroy(); } catch {} }
+        complete = false;
       }
     }
 
+    this.lastKey = complete ? key : "";
+
     if (changed) {
-      canvas.perception.update({ refreshSounds: true });
+      canvas.perception?.update({ refreshSounds: true });
     }
   }
 

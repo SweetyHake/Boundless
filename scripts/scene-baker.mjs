@@ -77,10 +77,11 @@ async function uploadFileSilent(targetDir, file) {
   return res;
 }
 
-function createWorkCanvas(width, height) {
+function createWorkCanvas(width, height, { willReadFrequently = false } = {}) {
+  const ctxOpts = willReadFrequently ? { willReadFrequently: true } : undefined;
   if (typeof OffscreenCanvas !== "undefined") {
     const c = new OffscreenCanvas(width, height);
-    const ctx = c.getContext("2d");
+    const ctx = c.getContext("2d", ctxOpts);
     if (ctx) {
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
@@ -90,7 +91,7 @@ function createWorkCanvas(width, height) {
   const c = document.createElement("canvas");
   c.width = width;
   c.height = height;
-  const ctx = c.getContext("2d");
+  const ctx = c.getContext("2d", ctxOpts);
   if (ctx) {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
@@ -122,6 +123,10 @@ async function loadImageSource(src, signal = null) {
         const blob = await res.blob();
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const bmp = await createImageBitmap(blob);
+        if (signal?.aborted) {
+          try { bmp.close(); } catch {}
+          throw new DOMException("Aborted", "AbortError");
+        }
         return { source: bmp, width: bmp.width, height: bmp.height, close: () => { try { bmp.close(); } catch {} } };
       }
     } catch (err) {
@@ -256,14 +261,14 @@ async function sliceAndUploadPyramid({
   const bgScaleX = Number.isFinite(Number(texCfg.scaleX)) && Number(texCfg.scaleX) !== 0 ? Number(texCfg.scaleX) : 1;
   const bgScaleY = Number.isFinite(Number(texCfg.scaleY)) && Number(texCfg.scaleY) !== 0 ? Number(texCfg.scaleY) : 1;
   const bgRotRad = ((Number(texCfg.rotation) || 0) * Math.PI) / 180;
-  const bgAnchorX = Number.isFinite(Number(texCfg.anchorX)) ? Number(texCfg.anchorX) : 0.5;
-  const bgAnchorY = Number.isFinite(Number(texCfg.anchorY)) ? Number(texCfg.anchorY) : 0.5;
+  const bgAnchorX = (texCfg.anchorX !== null && texCfg.anchorX !== undefined && texCfg.anchorX !== "" && Number.isFinite(Number(texCfg.anchorX))) ? Number(texCfg.anchorX) : 0.5;
+  const bgAnchorY = (texCfg.anchorY !== null && texCfg.anchorY !== undefined && texCfg.anchorY !== "" && Number.isFinite(Number(texCfg.anchorY))) ? Number(texCfg.anchorY) : 0.5;
   const bgFit = texCfg.fit || "fill";
   const hasTransform = bgOffX !== 0 || bgOffY !== 0 || bgScaleX !== 1 || bgScaleY !== 1 || bgRotRad !== 0 || bgAnchorX !== 0.5 || bgAnchorY !== 0.5 || bgFit !== "fill";
 
   // Build clean <= 4096px mip proxy for lower zoom levels so z=0..2 stay sharp without aliasing
   const mipProxy = buildMipProxy(loadedImg.source, loadedImg.width, loadedImg.height, 4096);
-  const work = createWorkCanvas(TILE_PX, TILE_PX);
+  const work = createWorkCanvas(TILE_PX, TILE_PX, { willReadFrequently: skipEmptyAlpha });
   const sparseTiles = skipEmptyAlpha ? {} : null;
 
   await ensureDirectoryRecursive(pyramidDir);
@@ -353,6 +358,8 @@ async function sliceAndUploadPyramid({
       const upPromise = uploadFileSilent(zDir, file).then(() => {
         onTileProgress?.(lvl.z, true);
       });
+      // Prevent spurious UnhandledPromiseRejection if a later concurrent upload rejects before FIFO shift() awaits it
+      upPromise.catch(() => {});
       pendingUploads.push(upPromise);
       allPendingUploads.push(upPromise);
       if (pendingUploads.length >= UPLOAD_CONCURRENCY) {
@@ -479,7 +486,12 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       let fgPlan = null;
       if (hasRasterFg) {
         report(7, game.i18n.format("BOUNDLESS.Baker.StepLoadingBg", { level: `${level.name || level.id} (foreground)` }));
-        loadedFgImg = await loadImageSource(fgSrc, signal);
+        try {
+          loadedFgImg = await loadImageSource(fgSrc, signal);
+        } catch (err) {
+          loadedImg?.close?.();
+          throw err;
+        }
         fgPlan = computePyramidPlan(sceneBounds.w, sceneBounds.h, loadedFgImg.width, loadedFgImg.height, TILE_PX);
         grandTotalTiles += fgPlan.totalTiles;
       }
@@ -515,7 +527,10 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const { level, loadedImg, plan, levelPyramidDir, loadedFgImg, fgPlan, levelFgPyramidDir } = job;
 
-      if (loadedImg && plan) {
+      const hasBg = Boolean(loadedImg && plan);
+      const hasFg = Boolean(loadedFgImg && fgPlan);
+
+      if (hasBg) {
         await sliceAndUploadPyramid({
           level,
           loadedImg,
@@ -528,11 +543,13 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           allPendingUploads,
           onTileProgress
         });
+        job.loadedImg?.close?.();
+        job.loadedImg = null;
         if (clearBackground) levelsToClearBg.push(level);
       }
 
       let fgSparseTiles = null;
-      if (loadedFgImg && fgPlan) {
+      if (hasFg) {
         fgSparseTiles = await sliceAndUploadPyramid({
           level,
           loadedImg: loadedFgImg,
@@ -545,6 +562,8 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           allPendingUploads,
           onTileProgress
         });
+        job.loadedFgImg?.close?.();
+        job.loadedFgImg = null;
         if (clearBackground) levelsToClearFg.push(level);
       }
 
@@ -568,11 +587,11 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
         tiles: spatial.tiles,
         sectors: spatial.sectors
       };
-      if (loadedImg && plan) {
+      if (hasBg) {
         spec.pyramidBaseUrl = levelPyramidDir;
         spec.maxZoomZ = plan.maxZoomZ;
       }
-      if (loadedFgImg && fgPlan) {
+      if (hasFg) {
         spec.foregroundPyramidBaseUrl = levelFgPyramidDir;
         spec.foregroundMaxZoomZ = fgPlan.maxZoomZ;
         if (fgSparseTiles) spec.foregroundTiles = fgSparseTiles;
@@ -583,10 +602,22 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
 
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-    // 5. Upload pyramid_manifest.json
+    // 5. Upload pyramid_manifest.json (preserve existing unbaked levels on partial multi-level in-place re-bakes)
     report(90, game.i18n.localize("BOUNDLESS.Baker.StepManifest"));
     const singleLevelId = chosenLevels.length === 1 ? chosenLevels[0].id : null;
     const isPartialMultiLevel = targetLevels.length > 1 && chosenLevels.length < targetLevels.length;
+    let mergedLevelSpecs = levelSpecs;
+    if (isPartialMultiLevel && !singleLevelId) {
+      const existingUrl = targetScene.flags?.[MODULE_ID]?.manifestUrl;
+      if (existingUrl) {
+        try {
+          const prevManifest = await fetchManifestJson(existingUrl, signal);
+          if (prevManifest?.levels && typeof prevManifest.levels === "object") {
+            mergedLevelSpecs = { ...prevManifest.levels, ...levelSpecs };
+          }
+        } catch {}
+      }
+    }
     const manifestObj = singleLevelId
       ? {
           format: "boundless-pyramid-v1",
@@ -596,7 +627,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           format: "boundless-pyramid-v1",
           worldPx,
           tilePx: TILE_PX,
-          levels: levelSpecs
+          levels: mergedLevelSpecs
         };
 
     const manifestFile = new File(
@@ -734,6 +765,10 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
         scenePatch[`flags.${MODULE_ID}.-=levelId`] = null;
       }
       await targetScene.update(scenePatch);
+    }
+
+    if (!createCopy) {
+      await controller.lightBatch?.clearPolyCacheDB?.(targetScene.id, game.world?.id);
     }
 
     report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));
@@ -1458,6 +1493,40 @@ async function createEmbeddedBatched(scene, docName, items, { signal = null, onB
  * Stitch a Boundless WebP tile pyramid back into a single raster WebP image capped at `maxDim` px
  * so unbaked scenes restore their native `level.background.src` / `level.foreground.src` safely within WebGL limits.
  */
+export function computeStitchPyramidPlan({
+  maxZoomZ = 0,
+  worldPx = 4096,
+  tilePx = TILE_PX,
+  bounds = null,
+  maxDim = UNBAKE_MAX_IMAGE_PX
+}) {
+  const b = bounds || { x: 0, y: 0, w: worldPx, h: worldPx };
+  // Pyramid tiles are indexed from (0, 0) relative to (b.x, b.y) over `pyramidSpan = max(b.w, b.h)`
+  // (matching `computePyramidPlan`, `sliceAndUploadPyramid`, and `boundless-pyramid.mjs`), independent of scene padding!
+  const pyramidSpan = Math.max(1, Number(b.w) || 0, Number(b.h) || 0) || Math.max(1, Number(worldPx) || tilePx);
+  const safeMaxZ = Math.max(0, Number(maxZoomZ) || 0);
+  let chosenZ = 0;
+  for (let z = safeMaxZ; z >= 0; z--) {
+    const scaleZ = (tilePx * (1 << z)) / pyramidSpan;
+    const estW = Math.round(b.w * scaleZ);
+    const estH = Math.round(b.h * scaleZ);
+    if (Math.max(estW, estH) <= maxDim) {
+      chosenZ = z;
+      break;
+    }
+  }
+  const scaleZ = (tilePx * (1 << chosenZ)) / pyramidSpan;
+  const outW = Math.max(1, Math.min(maxDim, Math.round(b.w * scaleZ)));
+  const outH = Math.max(1, Math.min(maxDim, Math.round(b.h * scaleZ)));
+  const tileWorld = pyramidSpan / (1 << chosenZ);
+  const maxIdx = (1 << chosenZ) - 1;
+  const x0 = 0;
+  const y0 = 0;
+  const x1 = Math.min(maxIdx, Math.max(0, Math.floor((b.w - 0.001) / tileWorld)));
+  const y1 = Math.min(maxIdx, Math.max(0, Math.floor((b.h - 0.001) / tileWorld)));
+  return { chosenZ, pyramidSpan, scaleZ, outW, outH, tileWorld, x0, y0, x1, y1 };
+}
+
 async function stitchPyramidToWebp({
   pyramidBaseUrl,
   maxZoomZ = 0,
@@ -1469,27 +1538,13 @@ async function stitchPyramidToWebp({
   quality = 0.88,
   signal = null
 }) {
-  const b = bounds || { x: 0, y: 0, w: worldPx, h: worldPx };
-  const safeMaxZ = Math.max(0, Number(maxZoomZ) || 0);
-  let chosenZ = 0;
-  for (let z = safeMaxZ; z >= 0; z--) {
-    const scaleZ = (tilePx * (1 << z)) / worldPx;
-    const estW = Math.round(b.w * scaleZ);
-    const estH = Math.round(b.h * scaleZ);
-    if (Math.max(estW, estH) <= maxDim) {
-      chosenZ = z;
-      break;
-    }
-  }
-  const scaleZ = (tilePx * (1 << chosenZ)) / worldPx;
-  const outW = Math.max(1, Math.min(maxDim, Math.round(b.w * scaleZ)));
-  const outH = Math.max(1, Math.min(maxDim, Math.round(b.h * scaleZ)));
-  const tileWorld = worldPx / (1 << chosenZ);
-  const maxIdx = (1 << chosenZ) - 1;
-  const x0 = Math.max(0, Math.min(maxIdx, Math.floor(b.x / tileWorld)));
-  const y0 = Math.max(0, Math.min(maxIdx, Math.floor(b.y / tileWorld)));
-  const x1 = Math.max(0, Math.min(maxIdx, Math.floor((b.x + b.w - 0.001) / tileWorld)));
-  const y1 = Math.max(0, Math.min(maxIdx, Math.floor((b.y + b.h - 0.001) / tileWorld)));
+  const { chosenZ, scaleZ, outW, outH, tileWorld, x0, y0, x1, y1 } = computeStitchPyramidPlan({
+    maxZoomZ,
+    worldPx,
+    tilePx,
+    bounds,
+    maxDim
+  });
 
   const sparseSet = (() => {
     if (!sparseTiles) return null;
@@ -1517,8 +1572,8 @@ async function stitchPyramidToWebp({
       let img = null;
       try {
         img = await loadImageSource(url, signal);
-        const dx = (tx * tileWorld - b.x) * scaleZ;
-        const dy = (ty * tileWorld - b.y) * scaleZ;
+        const dx = tx * tileWorld * scaleZ;
+        const dy = ty * tileWorld * scaleZ;
         const dw = tileWorld * scaleZ;
         const dh = tileWorld * scaleZ;
         work.ctx.drawImage(img.source, dx, dy, dw, dh);
@@ -1592,6 +1647,9 @@ export async function bakeSceneEditsToManifest(controller, scene, {
 
   // 1. Handle per-level manifests and inline manifests first (including Kartograf exports where
   //    `level.flags.boundless.manifestUrl` inherits `scene.flags.boundless.enabled` without per-level `enabled: true`)
+  // Stage 1: Fetch, validate, and merge all level manifests in memory first so partial failures never corrupt persisted manifests
+  const pendingWrites = [];
+
   for (let i = 0; i < allLevels.length; i++) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const lvl = allLevels[i];
@@ -1618,8 +1676,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         nativeSpatial
       });
       attachBakedPolysIfPossible(merged.spec, scene, lvl);
-      // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
-      await lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: merged.spec });
+      pendingWrites.push({ kind: "inline", lvl, spec: merged.spec });
       totalWalls += merged.counts.walls;
       totalLights += merged.counts.lights;
       totalSounds += merged.counts.sounds;
@@ -1633,6 +1690,9 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         throw new Error("Chunked and superGrid manifests cannot be edited in place.");
       }
       const targetSpec = rawManifest.levels?.[lid] || rawManifest;
+      if (targetSpec.chunks?.baseUrl || targetSpec.superGrid) {
+        throw new Error("Chunked and superGrid manifests cannot be edited in place.");
+      }
       const nativeSpatial = collectNativeForLevel(lvl, targetSpec.simGrid || null);
       const merged = mergeEditsIntoLevelSpec(targetSpec, {
         levelId: lid,
@@ -1649,15 +1709,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         ? { ...rawManifest, levels: { ...rawManifest.levels, [lid]: merged.spec } }
         : merged.spec;
       const { dir, filename, redirected } = getDirAndFilename(lcfg.manifestUrl, `${fallbackDir}/lvl_${slugifyPathPart(lvl.name, lid.slice(0, 6))}`);
-      await ensureDirectoryRecursive(dir);
-      const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
-      await uploadFileSilent(dir, file);
-      const finalUrl = `${dir}/${filename}`;
-      controller.manifestCache?.delete?.(lcfg.manifestUrl);
-      controller.manifestCache?.delete?.(finalUrl);
-      if (redirected) {
-        await lvl.update({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
-      }
+      pendingWrites.push({ kind: "levelFile", lvl, origUrl: lcfg.manifestUrl, dir, filename, redirected, manifest: updatedManifest });
       totalWalls += merged.counts.walls;
       totalLights += merged.counts.lights;
       totalSounds += merged.counts.sounds;
@@ -1710,8 +1762,10 @@ export async function bakeSceneEditsToManifest(controller, scene, {
       updatedManifest = { ...rawManifest, levels: nextLevels };
     } else {
       const targetLvl = (sceneLevelId && scene.levels.get(sceneLevelId))
+        || scene.initialLevel
+        || scene.firstLevel
         || allLevels[0];
-      if (targetLvl && !processedByLevelManifest.has(targetLvl.id)) {
+      if (targetLvl && !processedByLevelManifest.has(targetLvl.id) && targetLvl.flags?.[MODULE_ID]?.enabled !== false) {
         const lid = targetLvl.id;
         const nativeSpatial = collectNativeForLevel(targetLvl, rawManifest.simGrid || null);
         const merged = mergeEditsIntoLevelSpec(rawManifest, {
@@ -1737,20 +1791,41 @@ export async function bakeSceneEditsToManifest(controller, scene, {
 
     if (sceneManifestTouched) {
       const { dir, filename, redirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
-      await ensureDirectoryRecursive(dir);
-      const file = new File([JSON.stringify(updatedManifest)], filename, { type: "application/json" });
-      await uploadFileSilent(dir, file);
-      const finalUrl = `${dir}/${filename}`;
-      controller.manifestCache?.delete?.(sceneManifestUrl);
-      controller.manifestCache?.delete?.(finalUrl);
-      if (redirected) {
-        scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
-      }
+      pendingWrites.push({ kind: "sceneFile", origUrl: sceneManifestUrl, dir, filename, redirected, manifest: updatedManifest });
     }
   }
 
   if (!editedLevelIds.length) {
     throw new Error("No Boundless manifest found on this scene.");
+  }
+
+  // Stage 2: Commit validated manifests now that all levels passed validation
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  for (const w of pendingWrites) {
+    if (w.kind === "inline") {
+      // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
+      await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
+    } else if (w.kind === "levelFile") {
+      await ensureDirectoryRecursive(w.dir);
+      const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
+      await uploadFileSilent(w.dir, file);
+      const finalUrl = `${w.dir}/${w.filename}`;
+      controller.manifestCache?.delete?.(w.origUrl);
+      controller.manifestCache?.delete?.(finalUrl);
+      if (w.redirected) {
+        await w.lvl.update({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+      }
+    } else if (w.kind === "sceneFile") {
+      await ensureDirectoryRecursive(w.dir);
+      const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
+      await uploadFileSilent(w.dir, file);
+      const finalUrl = `${w.dir}/${w.filename}`;
+      controller.manifestCache?.delete?.(w.origUrl);
+      controller.manifestCache?.delete?.(finalUrl);
+      if (w.redirected) {
+        scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+      }
+    }
   }
 
   // 3. Remove or prune absorbed native documents (preserving unbaked levels on multi-level scenes)
@@ -1795,7 +1870,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     await scene.update(scenePatch);
   }
 
-  await controller.lightBatch?.clearPolyCacheDB?.(scene.id);
+  await controller.lightBatch?.clearPolyCacheDB?.(scene.id, game.world?.id);
   if (canvas.scene?.id === scene.id) {
     await controller.mount(scene);
   }
@@ -1967,6 +2042,18 @@ export async function unbakeSceneFromBoundless(controller, scene, {
           }
         }
         if (Object.keys(lvlPatch).length) {
+          // Baked pyramids already incorporate `level.textures` transforms (offset/scale/rotation/anchor/fit);
+          // reset them when restoring stitched images so Foundry doesn't double-apply transforms.
+          if (dstLevel.textures) {
+            lvlPatch["textures.offsetX"] = 0;
+            lvlPatch["textures.offsetY"] = 0;
+            lvlPatch["textures.scaleX"] = 1;
+            lvlPatch["textures.scaleY"] = 1;
+            lvlPatch["textures.rotation"] = 0;
+            lvlPatch["textures.anchorX"] = 0.5;
+            lvlPatch["textures.anchorY"] = 0.5;
+            lvlPatch["textures.fit"] = "fill";
+          }
           await dstLevel.update(lvlPatch);
         }
       }
@@ -2007,6 +2094,10 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     }
     if (targetScene.flags?.[MODULE_ID]) {
       await targetScene.update({ [`flags.-=${MODULE_ID}`]: null });
+    }
+
+    if (!createCopy) {
+      await controller.lightBatch?.clearPolyCacheDB?.(targetScene.id, game.world?.id);
     }
 
     report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));

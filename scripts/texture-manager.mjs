@@ -114,8 +114,19 @@ export class LRUTextureManager {
   _loadFallback(src, mipmap, gen = this._gen) {
     this.workerPool.stats.fallbackDecoded++;
     return foundry.canvas.loadTexture(src).then(tex => {
-      if (gen !== this._gen) return null;
+      if (gen !== this._gen) {
+        if (tex && !this.lru.has(src) && !this.pinned.has(src)) {
+          PIXI?.Assets?.unload?.(src)?.catch?.(() => {});
+        }
+        return null;
+      }
       if (tex?.baseTexture) {
+        const prevOwned = this.workerOwned.get(src);
+        if (prevOwned) {
+          this.workerOwned.delete(src);
+          try { prevOwned.tex?.destroy?.(true); } catch {}
+          try { prevOwned.bitmap?.close?.(); } catch {}
+        }
         this._configureBaseTexture(tex, mipmap);
         this._trackLru(src, tex);
       }
@@ -143,8 +154,9 @@ export class LRUTextureManager {
           try { bitmap.close(); } catch {}
           return null;
         }
+        let base = null;
         try {
-          const base = new PIXI.BaseTexture(bitmap, {
+          base = new PIXI.BaseTexture(bitmap, {
             mipmap: mipmap ? PIXI.MIPMAP_MODES.ON : PIXI.MIPMAP_MODES.OFF,
             scaleMode: PIXI.SCALE_MODES.LINEAR,
             wrapMode: PIXI.WRAP_MODES.CLAMP,
@@ -162,6 +174,7 @@ export class LRUTextureManager {
           this._trackLru(src, tex);
           return tex;
         } catch {
+          try { base?.destroy?.(); } catch {}
           try { bitmap.close(); } catch {}
           if (gen !== this._gen) return null;
           return this._loadFallback(src, mipmap, gen);
@@ -240,7 +253,7 @@ export class LRUTextureManager {
     let evicted = 0;
     for (const [src] of this.lru) {
       if (!this.needsPrune() || evicted >= maxEvict) break;
-      if (this.pinned.has(src) || inUseSet.has(src)) continue;
+      if (this.pinned.has(src) || inUseSet?.has?.(src)) continue;
       this._disposeEntry(src);
       evicted++;
     }
@@ -255,6 +268,11 @@ export class LRUTextureManager {
       if (includePinned || !this.pinned.has(src)) this._disposeEntry(src);
     }
     if (includePinned) {
+      for (const [src, owned] of Array.from(this.workerOwned.entries())) {
+        this.workerOwned.delete(src);
+        try { owned.tex?.destroy?.(true); } catch {}
+        try { owned.bitmap?.close?.(); } catch {}
+      }
       this.bytesBySrc.clear();
       this.totalBytes = 0;
     }

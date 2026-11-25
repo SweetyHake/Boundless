@@ -1,4 +1,4 @@
-import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform } from "./utils.mjs";
+import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform, isTextureUsable } from "./utils.mjs";
 
 const CHAR_PIN_FADE_START = 0.38; // Begin showing world-space character portrait below this scale
 const CHAR_PIN_FADE_FULL = 0.20;  // 100% opaque at or below this scale
@@ -106,6 +106,12 @@ function getTokenWorldCenter(tokenDoc) {
   if (obj && !obj.destroyed && obj.center && Number.isFinite(obj.center.x) && Number.isFinite(obj.center.y)) {
     return { x: obj.center.x, y: obj.center.y };
   }
+  try {
+    const pt = tokenDoc?.getCenterPoint?.();
+    if (pt && Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+      return { x: pt.x, y: pt.y };
+    }
+  } catch {}
   const gridSize = canvas.grid?.size || tokenDoc?.parent?.grid?.size || 100;
   const w = (Number(tokenDoc?.width) || 1) * gridSize;
   const h = (Number(tokenDoc?.height) || 1) * gridSize;
@@ -168,12 +174,14 @@ export class CharacterPinManager {
   edgeLayerEl = null;
   entries = []; // [{ id, tokenDoc, actor, user, isSelf, colorCss, colorHex, portraitSrc, root, pulseRing, namePill, edgeEl, arrowEl, distEl, hovered }]
   enabled = true;
+  _ticker = null;
   _tickerFn = null;
   _pulsePhase = 0;
   _lastSidebarCheckMs = 0;
   _cachedLeftInset = 116;
   _cachedRightInset = 44;
   _rebuildQueued = false;
+  _vpQueued = false;
   _avatarTexCache = new Map(); // src -> Promise<PIXI.Texture | null>
   _avatarTexOwned = [];        // PIXI.Texture[] to destroy cleanly on unmount
   _lastTacticalScale = FOCUS_TARGET_SCALE;
@@ -202,7 +210,9 @@ export class CharacterPinManager {
     this.edgeLayerEl = edgeEl;
 
     this._tickerFn = (delta) => this._stepPulse(delta);
-    canvas.app?.ticker?.add?.(this._tickerFn);
+    this._ticker = canvas.app?.ticker || null;
+    this._ticker?.add?.(this._tickerFn);
+    this._tickerAdded = Boolean(this._ticker);
 
     this.rebuild(scene);
     this.updateViewport();
@@ -219,30 +229,45 @@ export class CharacterPinManager {
     });
   }
 
+  _scheduleViewportUpdate() {
+    if (!this.enabled || !this.controller?.active) return;
+    if (this._vpQueued) return;
+    this._vpQueued = true;
+    queueMicrotask(() => {
+      this._vpQueued = false;
+      if (this.enabled && this.controller?.active) this.updateViewport();
+    });
+  }
+
   _collectTrackedTargets(scene) {
     if (!scene?.tokens?.size) return [];
     const tokens = Array.from(scene.tokens);
+    const usersList = Array.from(game.users || []);
     const viewedLevelId = canvas.level?.id || null;
     const isGM = Boolean(game.user?.isGM);
     const results = [];
     const seenTokenIds = new Set();
 
-    const findBestTokenForActor = (actorId) => {
-      let fallback = null;
-      for (const tok of tokens) {
-        if (tok.actorId !== actorId) continue;
-        if (!isGM && tok.hidden) continue;
-        if (viewedLevelId && tok.level === viewedLevelId) return tok;
-        if (!fallback) fallback = tok;
+    // Single O(T) pass to index best token per actorId (viewed level preferred)
+    const bestTokenByActorId = new Map();
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (!tok?.actorId) continue;
+      if (!isGM && tok.hidden) continue;
+      const prev = bestTokenByActorId.get(tok.actorId);
+      if (!prev) {
+        bestTokenByActorId.set(tok.actorId, tok);
+      } else if (viewedLevelId && tok.level === viewedLevelId && prev.level !== viewedLevelId) {
+        bestTokenByActorId.set(tok.actorId, tok);
       }
-      return fallback;
-    };
+    }
 
     const pushEntry = (tokenDoc, user, isSelf) => {
       if (!tokenDoc || seenTokenIds.has(tokenDoc.id)) return;
       seenTokenIds.add(tokenDoc.id);
       const actor = tokenDoc.baseActor || (!tokenDoc.isLazyDelta ? tokenDoc.actor : null) || null;
       const rawColor = user?.color?.css || (typeof user?.color === "string" ? user.color : null) || (isSelf ? "#f5c96b" : "#58d5ff");
+      const parsedColor = foundry.utils.Color.from(rawColor);
       results.push({
         id: tokenDoc.id,
         tokenDoc,
@@ -251,21 +276,22 @@ export class CharacterPinManager {
         isSelf,
         name: tokenDoc.name || actor?.name || loc("BOUNDLESS.CharPin.FallbackName", "Персонаж"),
         colorCss: rawColor,
-        colorHex: foundry.utils.Color.from(rawColor).valueOf(),
+        colorHex: parsedColor?.valid ? parsedColor.valueOf() : (isSelf ? 0xf5c96b : 0x58d5ff),
         portraitSrc: resolvePortraitSrc(tokenDoc, actor)
       });
     };
 
     // 1. Always prioritize the current user's assigned character (`game.user.character`)
     if (game.user?.character) {
-      const tok = findBestTokenForActor(game.user.character.id);
+      const tok = bestTokenByActorId.get(game.user.character.id);
       if (tok) pushEntry(tok, game.user, true);
     }
 
     // 2. For non-GM players without an assigned character, fall back to their first owned PC token on scene
     if (!isGM && results.length === 0) {
       let ownFallback = null;
-      for (const tok of tokens) {
+      for (let i = 0; i < tokens.length; i++) {
+        const tok = tokens[i];
         if (tok.hidden) continue;
         if (!hasTokenOwnerPermissionLazy(tok, game.user)) continue;
         if (viewedLevelId && tok.level === viewedLevelId) {
@@ -279,19 +305,28 @@ export class CharacterPinManager {
 
     // 3. For GM: also show every player's assigned character present on the scene
     if (isGM) {
-      for (const u of (game.users || [])) {
+      for (let i = 0; i < usersList.length; i++) {
+        const u = usersList[i];
         if (!u?.character || u.id === game.user?.id) continue;
-        const tok = findBestTokenForActor(u.character.id);
+        const tok = bestTokenByActorId.get(u.character.id);
         if (tok) pushEntry(tok, u, false);
       }
       // Fallback for solo GM test worlds with no player characters assigned: show up to MAX_GM_FALLBACK_PCS PC tokens
       if (results.length === 0) {
         let count = 0;
-        for (const tok of tokens) {
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i];
           const base = tok.baseActor;
           const isPc = tok.actorLink || base?.type === "character" || base?.hasPlayerOwner;
           if (!isPc) continue;
-          const ownerUser = Array.from(game.users || []).find(u => !u.isGM && hasTokenOwnerPermissionLazy(tok, u)) || game.user;
+          let ownerUser = game.user;
+          for (let j = 0; j < usersList.length; j++) {
+            const u = usersList[j];
+            if (!u.isGM && hasTokenOwnerPermissionLazy(tok, u)) {
+              ownerUser = u;
+              break;
+            }
+          }
           pushEntry(tok, ownerUser, count === 0);
           count++;
           if (count >= MAX_GM_FALLBACK_PCS) break;
@@ -305,6 +340,59 @@ export class CharacterPinManager {
   rebuild(scene = canvas.scene) {
     if (!this.container || !this.edgeLayerEl) return;
 
+    const cfg = scene?.flags?.[MODULE_ID] || {};
+    this.enabled = cfg.showCharacterPins !== false;
+    if (!this.enabled) {
+      if (this._tickerFn) {
+        (this._ticker || canvas.app?.ticker)?.remove?.(this._tickerFn);
+        this._tickerAdded = false;
+      }
+      for (const e of this.entries) {
+        e.root?.parent?.removeChild(e.root);
+        e.root?.destroy?.({ children: true });
+        e.edgeEl?.remove();
+      }
+      this.entries = [];
+      this.container.visible = false;
+      this.edgeLayerEl.style.display = "none";
+      return;
+    }
+    this.edgeLayerEl.style.display = "";
+    if (this._tickerFn && this._ticker && !this._tickerAdded) {
+      this._ticker.add?.(this._tickerFn);
+      this._tickerAdded = true;
+    }
+
+    const targets = this._collectTrackedTargets(scene);
+
+    // Skip tearing down PIXI + DOM nodes when tracked PCs & visual metadata are unchanged (avoids NPC spawn/delete churn!)
+    if (targets.length === this.entries.length) {
+      let identical = true;
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        const e = this.entries[i];
+        if (
+          e.id !== t.id ||
+          e.name !== t.name ||
+          e.colorCss !== t.colorCss ||
+          e.portraitSrc !== t.portraitSrc ||
+          e.isSelf !== t.isSelf
+        ) {
+          identical = false;
+          break;
+        }
+      }
+      if (identical) {
+        for (let i = 0; i < targets.length; i++) {
+          this.entries[i].tokenDoc = targets[i].tokenDoc;
+          this.entries[i].actor = targets[i].actor;
+          this.entries[i].user = targets[i].user;
+        }
+        this.updateViewport();
+        return;
+      }
+    }
+
     for (const e of this.entries) {
       e.root?.parent?.removeChild(e.root);
       e.root?.destroy?.({ children: true });
@@ -312,16 +400,6 @@ export class CharacterPinManager {
     }
     this.entries = [];
 
-    const cfg = scene?.flags?.[MODULE_ID] || {};
-    this.enabled = cfg.showCharacterPins !== false;
-    if (!this.enabled) {
-      this.container.visible = false;
-      this.edgeLayerEl.style.display = "none";
-      return;
-    }
-    this.edgeLayerEl.style.display = "";
-
-    const targets = this._collectTrackedTargets(scene);
     for (const target of targets) {
       this._createEntry(target);
     }
@@ -395,7 +473,7 @@ export class CharacterPinManager {
     sprite.height = diam;
 
     this._getCircularAvatarTexture(portraitSrc).then((tex) => {
-      if (!tex || sprite.destroyed) return;
+      if (!isTextureUsable(tex) || sprite.destroyed) return;
       sprite.texture = tex;
       sprite.width = diam;
       sprite.height = diam;
@@ -582,14 +660,49 @@ export class CharacterPinManager {
     }
     const sw = window.innerWidth || 1280;
     const sh = window.innerHeight || 720;
+    const left = Math.min(Math.max(44, this._cachedLeftInset), Math.max(44, sw - 220));
+    const right = Math.max(left + 80, sw - this._cachedRightInset);
     return {
-      left: Math.min(Math.max(44, this._cachedLeftInset), Math.max(44, sw - 220)),
-      right: Math.max(200, sw - this._cachedRightInset),
+      left,
+      right,
       top: 66,
       bottom: Math.max(160, sh - 92),
       sw,
       sh
     };
+  }
+
+  _setEdgeDom(entry, { display, transform, tipClass, arrowDisplay, arrowTransform, badgeDisplay, subText }) {
+    if (entry._lastDisplay !== display) {
+      entry._lastDisplay = display;
+      entry.edgeEl.style.display = display;
+    }
+    if (display === "none") return;
+    if (transform !== undefined && entry._lastTransform !== transform) {
+      entry._lastTransform = transform;
+      entry.edgeEl.style.transform = transform;
+    }
+    if (tipClass !== undefined && entry._lastTipClass !== tipClass) {
+      if (entry._lastTipClass) entry.edgeEl.classList.remove(entry._lastTipClass);
+      if (tipClass) entry.edgeEl.classList.add(tipClass);
+      entry._lastTipClass = tipClass;
+    }
+    if (arrowDisplay !== undefined && entry._lastArrowDisplay !== arrowDisplay) {
+      entry._lastArrowDisplay = arrowDisplay;
+      entry.arrowEl.style.display = arrowDisplay;
+    }
+    if (arrowTransform !== undefined && entry._lastArrowTransform !== arrowTransform) {
+      entry._lastArrowTransform = arrowTransform;
+      entry.arrowEl.style.transform = arrowTransform;
+    }
+    if (badgeDisplay !== undefined && entry._lastBadgeDisplay !== badgeDisplay) {
+      entry._lastBadgeDisplay = badgeDisplay;
+      entry.levelBadgeEl.style.display = badgeDisplay;
+    }
+    if (subText !== undefined && entry._lastSubText !== subText) {
+      entry._lastSubText = subText;
+      entry.subEl.textContent = subText;
+    }
   }
 
   updateViewport() {
@@ -616,7 +729,7 @@ export class CharacterPinManager {
       if (!doc || !doc.parent) {
         entry.root.visible = false;
         entry.worldVisible = false;
-        entry.edgeEl.style.display = "none";
+        this._setEdgeDom(entry, { display: "none" });
         continue;
       }
 
@@ -634,13 +747,14 @@ export class CharacterPinManager {
         const ey = safe.bottom - 6;
         otherLevelCount++;
 
-        entry.edgeEl.style.display = "";
-        entry.edgeEl.style.transform = `translate3d(${Math.round(ex)}px, ${Math.round(ey)}px, 0) translate(-50%, -50%)`;
-        entry.edgeEl.classList.remove("tip-left", "tip-right", "tip-bottom");
-        entry.edgeEl.classList.add("tip-right");
-        entry.arrowEl.style.display = "none";
-        entry.levelBadgeEl.style.display = "";
-        entry.subEl.textContent = levelName;
+        this._setEdgeDom(entry, {
+          display: "",
+          transform: `translate3d(${Math.round(ex)}px, ${Math.round(ey)}px, 0) translate(-50%, -50%)`,
+          tipClass: "tip-right",
+          arrowDisplay: "none",
+          badgeDisplay: "",
+          subText: levelName
+        });
         continue;
       }
 
@@ -649,7 +763,7 @@ export class CharacterPinManager {
       const inView = sx >= safe.left - 24 && sx <= safe.right + 24 && sy >= safe.top - 24 && sy <= safe.bottom + 24;
 
       if (inView) {
-        entry.edgeEl.style.display = "none";
+        this._setEdgeDom(entry, { display: "none" });
         if (worldAlpha > 0.01) {
           entry.root.visible = true;
           entry.worldVisible = true;
@@ -674,36 +788,38 @@ export class CharacterPinManager {
         let ex = cx + dx * scaleEdge;
         let ey = cy + dy * scaleEdge;
 
-        // Avoid stacking multiple off-screen indicators on top of each other
+        // Avoid stacking multiple off-screen indicators on top of each other (offset inward near corners)
         for (const prev of placedEdges) {
           const d = Math.hypot(ex - prev.x, ey - prev.y);
           if (d < 54) {
             const onHorizontalEdge = Math.abs(ey - safe.top) < 6 || Math.abs(ey - safe.bottom) < 6;
             if (onHorizontalEdge) {
-              ex = Math.max(safe.left, Math.min(safe.right, ex + 56));
+              ex = (ex + 56 <= safe.right) ? (ex + 56) : Math.max(safe.left, ex - 56);
             } else {
-              ey = Math.max(safe.top, Math.min(safe.bottom, ey + 56));
+              ey = (ey + 56 <= safe.bottom) ? (ey + 56) : Math.max(safe.top, ey - 56);
             }
           }
         }
         placedEdges.push({ x: ex, y: ey });
 
-        entry.edgeEl.style.display = "";
-        entry.edgeEl.style.transform = `translate3d(${Math.round(ex)}px, ${Math.round(ey)}px, 0) translate(-50%, -50%)`;
-        entry.arrowEl.style.display = "";
-        entry.arrowEl.style.transform = `rotate(${angle}rad)`;
-        entry.levelBadgeEl.style.display = "none";
-        entry.subEl.textContent = formatWorldDistance(pos.x - (pivot?.x || 0), pos.y - (pivot?.y || 0));
-
-        // Direct hover tooltip inward so it never clips off the viewport edge
-        entry.edgeEl.classList.remove("tip-left", "tip-right", "tip-bottom");
+        let tipClass = "";
         if (ex > cx + halfW * 0.55) {
-          entry.edgeEl.classList.add("tip-left");
+          tipClass = "tip-left";
         } else if (ex < cx - halfW * 0.55) {
-          entry.edgeEl.classList.add("tip-right");
+          tipClass = "tip-right";
         } else if (ey < cy) {
-          entry.edgeEl.classList.add("tip-bottom");
+          tipClass = "tip-bottom";
         }
+
+        this._setEdgeDom(entry, {
+          display: "",
+          transform: `translate3d(${Math.round(ex)}px, ${Math.round(ey)}px, 0) translate(-50%, -50%)`,
+          tipClass,
+          arrowDisplay: "",
+          arrowTransform: `rotate(${angle.toFixed(3)}rad)`,
+          badgeDisplay: "none",
+          subText: formatWorldDistance(pos.x - (pivot?.x || 0), pos.y - (pivot?.y || 0))
+        });
       }
     }
 
@@ -713,20 +829,20 @@ export class CharacterPinManager {
   }
 
   onTokenUpdated(doc, changes) {
-    if (!this.enabled || !doc || doc.parent?.id !== canvas.scene?.id) return;
+    if (!this.enabled || !doc || !changes || typeof changes !== "object" || doc.parent?.id !== canvas.scene?.id) return;
     const entry = this.entries.find(e => e.id === doc.id);
     if (!entry) {
-      if ("actorId" in changes || "actorLink" in changes || "hidden" in changes) {
+      if ("actorId" in changes || "actorLink" in changes || "hidden" in changes || "delta" in changes || "level" in changes) {
         this.scheduleRebuild();
       }
       return;
     }
-    if ("texture" in changes || "ring" in changes || "name" in changes || "hidden" in changes || "actorId" in changes || "actorLink" in changes) {
+    if ("texture" in changes || "ring" in changes || "name" in changes || "hidden" in changes || "actorId" in changes || "actorLink" in changes || "delta" in changes) {
       this.scheduleRebuild();
       return;
     }
     if ("x" in changes || "y" in changes || "level" in changes || "width" in changes || "height" in changes) {
-      this.updateViewport();
+      this._scheduleViewportUpdate();
     }
   }
 
@@ -819,10 +935,15 @@ export class CharacterPinManager {
 
   unmount() {
     this._mountGen = (this._mountGen || 0) + 1;
+    this.enabled = false;
+    this._rebuildQueued = false;
+    this._vpQueued = false;
     if (this._tickerFn) {
-      canvas.app?.ticker?.remove?.(this._tickerFn);
+      (this._ticker || canvas.app?.ticker)?.remove?.(this._tickerFn);
       this._tickerFn = null;
     }
+    this._ticker = null;
+    this._tickerAdded = false;
     if (this.container) {
       try { this.container.parent?.removeChild(this.container); } catch {}
       if (!this.container.destroyed) {
@@ -866,6 +987,7 @@ export function installCharacterSwitchPatch(controller) {
 
     // Suppress native flat `canvas.animatePan` triggered inside cycleTokens while capturing its args
     // so nearby tokens still fall back to instant native panning.
+    const hadOwnAnimatePan = Object.hasOwn(canvas, "animatePan");
     const origAnimatePan = canvas.animatePan;
     let panSuppressed = false;
     let capturedPanArgs = null;
@@ -879,7 +1001,8 @@ export function installCharacterSwitchPatch(controller) {
     try {
       next = origCycleTokens.call(this, forwards, reset);
     } finally {
-      canvas.animatePan = origAnimatePan;
+      if (hadOwnAnimatePan) canvas.animatePan = origAnimatePan;
+      else delete canvas.animatePan;
     }
 
     const targetToken = next || (panSuppressed ? this.controlled?.[0] : null);
@@ -900,7 +1023,16 @@ export function installCharacterSwitchPatch(controller) {
     }
 
     // If no controllable token exists on the currently viewed level, fly back to the user's assigned character
-    controller.charPins?.focusCharacter?.();
+    // and return a truthy handle so Foundry v14 `_onCycleViewKey` does not override the flight with `canvas.recenter()`.
+    const pins = controller.charPins;
+    if (pins) {
+      if (!pins.entries?.length && canvas.scene) pins.rebuild(canvas.scene);
+      const fallbackEntry = pins.entries?.find?.(e => e.isSelf) || pins.entries?.[0] || null;
+      if (fallbackEntry) {
+        pins.focusEntry(fallbackEntry);
+        return fallbackEntry.tokenDoc?._object || fallbackEntry.tokenDoc || true;
+      }
+    }
     return next;
   };
 

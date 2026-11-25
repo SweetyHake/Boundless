@@ -851,7 +851,8 @@ export class PoiManager {
     const isDetail = tier === "detail";
     const iconKey = inferPoiIcon(poi);
     const baseColorStr = poi.hidden ? "#b87aff" : (poi.color || POI_ICON_META[iconKey]?.defaultColor || "#f5c96b");
-    const accentHex = foundry.utils.Color.from(baseColorStr).valueOf();
+    const parsedColor = foundry.utils.Color.from(baseColorStr);
+    const accentHex = parsedColor?.valid ? parsedColor.valueOf() : 0xf5c96b;
     const hasJournal = Boolean(poi.journalUuid);
     const hasSubtitle = Boolean(poi.subtitle);
 
@@ -1060,6 +1061,7 @@ export class PoiManager {
     });
 
     root.on("pointerout", () => {
+      if (!this.container || root.destroyed) return;
       entry.hovered = false;
       if (entry.dragging) return;
       drawMedal(false);
@@ -1375,6 +1377,7 @@ export class PoiManager {
         if (!this.placementActive || ev.button !== 0) return;
         if (!canvas?.ready || !canvas.stage) return;
         if (ev.target !== view) return;
+        if (document.querySelector("dialog[open]")) return;
         if (this._contextMenuEl) {
           ev.preventDefault();
           ev.stopPropagation();
@@ -1386,6 +1389,7 @@ export class PoiManager {
         const sx = ev.clientX - rect.left;
         const sy = ev.clientY - rect.top;
         const worldPt = canvas.stage.toLocal(new PIXI.Point(sx, sy));
+        if (!Number.isFinite(worldPt?.x) || !Number.isFinite(worldPt?.y)) return;
         const stageScale = canvas.stage.scale?.x || 1;
         const pivot = canvas.stage.pivot;
         const [sw = window.innerWidth, sh = window.innerHeight] = canvas.screenDimensions || [];
@@ -1514,14 +1518,18 @@ export class PoiManager {
       this._syncSuperGridSubPins(stageScale, wt, sw, sh);
     }
 
-    // Collect base pins + active superGrid sub-pins
-    const allEntries = this._superGridSubProvinces.size > 0
-      ? [...this.pins, ...Array.from(this._superGridSubProvinces.values()).flatMap(b => b.entries)]
-      : this.pins;
+    const includeSubPins = this._superGridSubProvinces.size > 0 && (stageScale >= 0.022 || this.placementActive);
+    if (!includeSubPins && this._superGridSubProvinces.size > 0) {
+      for (const bucket of this._superGridSubProvinces.values()) {
+        for (const p of bucket.entries) {
+          if (p.root && !p.root.destroyed) p.root.visible = false;
+        }
+      }
+    }
 
-    // 1. Project pins to screen space, evaluate per-tier zoom visibility & cull offscreen
+    // 1. Project pins to screen space, evaluate per-tier zoom visibility & cull offscreen (0 spread allocations)
     const onScreen = [];
-    for (const entry of allEntries) {
+    const evalEntry = (entry) => {
       const poi = entry.poi;
       const pinX = Number.isFinite(entry.root?.position?.x) ? entry.root.position.x : poi.x;
       const pinY = Number.isFinite(entry.root?.position?.y) ? entry.root.position.y : poi.y;
@@ -1529,7 +1537,7 @@ export class PoiManager {
       const sy = wt.d * pinY + wt.ty;
       if (!entry.dragging && (sx < -240 || sx > sw + 240 || sy < -180 || sy > sh + 180)) {
         entry.root.visible = false;
-        continue;
+        return;
       }
 
       let a = this.placementActive ? 0.96 : computePoiTierAlpha(poi, stageScale);
@@ -1539,9 +1547,15 @@ export class PoiManager {
       if (poi.hidden) a *= 0.85;
       if (a <= 0.01 && !entry.hovered && !entry.dragging) {
         entry.root.visible = false;
-        continue;
+        return;
       }
       onScreen.push({ entry, sx, sy, alpha: Math.max(0.05, a) });
+    };
+    for (let i = 0; i < this.pins.length; i++) evalEntry(this.pins[i]);
+    if (includeSubPins) {
+      for (const bucket of this._superGridSubProvinces.values()) {
+        for (let i = 0; i < bucket.entries.length; i++) evalEntry(bucket.entries[i]);
+      }
     }
 
     if (onScreen.length === 0) {
@@ -1565,13 +1579,41 @@ export class PoiManager {
       return a.entry.orderIndex - b.entry.orderIndex;
     });
 
-    // 3. Screen-space greedy decluttering: full pill -> compact medal -> hidden
-    const occupiedFull = [];
-    const occupiedMedals = [];
+    // 3. O(N) screen-space greedy decluttering via 2D spatial hash grid (96px cells): full pill -> compact medal -> hidden
+    const CELL = 96;
+    const fullGrid = new Map();
+    const medalGrid = new Map();
+    const insertGrid = (grid, r) => {
+      const cx0 = Math.floor(r.x0 / CELL), cy0 = Math.floor(r.y0 / CELL);
+      const cx1 = Math.floor(r.x1 / CELL), cy1 = Math.floor(r.y1 / CELL);
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const gk = ((cx + 32768) << 16) ^ (cy + 32768);
+          let arr = grid.get(gk);
+          if (!arr) { arr = []; grid.set(gk, arr); }
+          arr.push(r);
+        }
+      }
+    };
+    const overlapsGrid = (grid, r, pad) => {
+      if (grid.size === 0) return false;
+      const cx0 = Math.floor((r.x0 - pad) / CELL), cy0 = Math.floor((r.y0 - pad) / CELL);
+      const cx1 = Math.floor((r.x1 + pad) / CELL), cy1 = Math.floor((r.y1 + pad) / CELL);
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const arr = grid.get(((cx + 32768) << 16) ^ (cy + 32768));
+          if (!arr) continue;
+          for (let i = 0; i < arr.length; i++) {
+            if (rectsOverlap(r, arr[i], pad)) return true;
+          }
+        }
+      }
+      return false;
+    };
     const margin = 6;
 
-    for (const item of onScreen) {
-      const { entry, sx, sy, alpha } = item;
+    for (let idx = 0; idx < onScreen.length; idx++) {
+      const { entry, sx, sy, alpha } = onScreen[idx];
       const fullRect = {
         x0: sx - entry.boxW * 0.5,
         y0: sy + entry.fullTopY,
@@ -1592,13 +1634,13 @@ export class PoiManager {
         entry.pillGroup.visible = true;
         entry.root.hitArea = entry.hitFull;
         this._applyPinTransform(entry, stageScale);
-        occupiedFull.push(fullRect);
-        occupiedMedals.push(medalRect);
+        insertGrid(fullGrid, fullRect);
+        insertGrid(medalGrid, medalRect);
         continue;
       }
 
-      const blocksFull = occupiedFull.some(r => rectsOverlap(fullRect, r, margin))
-        || occupiedMedals.some(r => rectsOverlap(fullRect, r, 3));
+      const blocksFull = overlapsGrid(fullGrid, fullRect, margin)
+        || overlapsGrid(medalGrid, fullRect, 3);
 
       if (!blocksFull) {
         entry.mode = "full";
@@ -1607,12 +1649,12 @@ export class PoiManager {
         entry.pillGroup.visible = true;
         entry.root.hitArea = entry.hitFull;
         this._applyPinTransform(entry, stageScale);
-        occupiedFull.push(fullRect);
-        occupiedMedals.push(medalRect);
+        insertGrid(fullGrid, fullRect);
+        insertGrid(medalGrid, medalRect);
         continue;
       }
 
-      const blocksMedal = occupiedMedals.some(r => rectsOverlap(medalRect, r, 4));
+      const blocksMedal = overlapsGrid(medalGrid, medalRect, 4);
       if (!blocksMedal || this.placementActive) {
         entry.mode = "compact";
         entry.root.visible = true;
@@ -1620,7 +1662,7 @@ export class PoiManager {
         entry.pillGroup.visible = false;
         entry.root.hitArea = entry.hitCompact;
         this._applyPinTransform(entry, stageScale);
-        occupiedMedals.push(medalRect);
+        insertGrid(medalGrid, medalRect);
         continue;
       }
 
@@ -1843,8 +1885,13 @@ export class PoiManager {
         const elapsed = now - startTime;
         const t = Math.max(0, Math.min(1, elapsed / duration));
         const progress = path.rawTime ? t : easeCameraFlight(t);
-        const pose = path.sample(progress);
-        canvas.pan(pose);
+        try {
+          const pose = path.sample(progress);
+          canvas.pan(pose);
+        } catch {
+          finish(false);
+          return;
+        }
 
         if (t >= 1) {
           finish(true);

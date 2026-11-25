@@ -27,6 +27,7 @@ self.onmessage = async (event) => {
   inflight.set(id, ctrl);
   const t0 = performance.now();
 
+  let bitmap = null;
   try {
     const resp = await fetch(url, {
       signal: ctrl.signal,
@@ -50,7 +51,7 @@ self.onmessage = async (event) => {
       premultiplyAlpha: premultiply === false ? "none" : "premultiply",
       colorSpaceConversion: "none"
     };
-    let bitmap = await createImageBitmap(blob, decodeOpts);
+    bitmap = await createImageBitmap(blob, decodeOpts);
 
     if (maxDim > 0 && (bitmap.width > maxDim || bitmap.height > maxDim) && !ctrl.signal.aborted) {
       const ratio = maxDim / Math.max(bitmap.width, bitmap.height);
@@ -70,12 +71,15 @@ self.onmessage = async (event) => {
 
     if (ctrl.signal.aborted) {
       try { bitmap.close(); } catch {}
+      bitmap = null;
       self.postMessage({ id, aborted: true });
       return;
     }
 
     const decodeMs = performance.now() - t0;
-    self.postMessage({ id, bitmap, decodeMs }, [bitmap]);
+    const transferBmp = bitmap;
+    bitmap = null;
+    self.postMessage({ id, bitmap: transferBmp, decodeMs }, [transferBmp]);
   } catch (err) {
     if (ctrl.signal.aborted || err?.name === "AbortError") {
       self.postMessage({ id, aborted: true });
@@ -83,6 +87,9 @@ self.onmessage = async (event) => {
       self.postMessage({ id, error: err?.message || String(err) });
     }
   } finally {
+    if (bitmap) {
+      try { bitmap.close(); } catch {}
+    }
     inflight.delete(id);
   }
 };

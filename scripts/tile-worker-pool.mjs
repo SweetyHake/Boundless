@@ -85,6 +85,7 @@ export class TileWorkerPool {
         const idx = this._workers.length;
         w.onmessage = (ev) => this._onWorkerMessage(idx, ev);
         w.onerror = (err) => this._onWorkerError(idx, err);
+        w.onmessageerror = (err) => this._onWorkerError(idx, err);
         this._workers.push(w);
         this._workerLoad.push(0);
       } catch (err) {
@@ -218,21 +219,30 @@ export class TileWorkerPool {
    * Returns a Set of cancelled `src` URLs (excluding any URLs in `excludeSrcSet`).
    */
   cancelAtOrBelowPriority(minPriority = 2, excludeSrcSet = null) {
-    const idsToCancel = [];
-    for (const job of this._queue) {
-      if (job.priority >= minPriority && !excludeSrcSet?.has?.(job.src)) {
-        idsToCancel.push(job.id);
-      }
-    }
-    for (const [id, act] of this._active.entries()) {
-      if (act.priority >= minPriority && !excludeSrcSet?.has?.(act.src)) {
-        idsToCancel.push(id);
-      }
-    }
     const cancelledSrcs = new Set();
-    for (let i = 0; i < idsToCancel.length; i++) {
-      const src = this._cancelById(idsToCancel[i]);
-      if (src !== null) cancelledSrcs.add(src);
+    // Single O(N) filter pass over queued jobs
+    if (this._queue.length > 0) {
+      const kept = [];
+      for (let i = 0; i < this._queue.length; i++) {
+        const job = this._queue[i];
+        if (job.priority >= minPriority && !excludeSrcSet?.has?.(job.src)) {
+          this._untrackSrc(job.src, job.id);
+          this.stats.aborted++;
+          cancelledSrcs.add(job.src);
+          const err = new Error("aborted");
+          err.aborted = true;
+          job.reject(err);
+        } else {
+          kept.push(job);
+        }
+      }
+      this._queue = kept;
+    }
+    for (const [id, act] of Array.from(this._active.entries())) {
+      if (act.priority >= minPriority && !excludeSrcSet?.has?.(act.src)) {
+        const src = this._cancelById(id);
+        if (src !== null) cancelledSrcs.add(src);
+      }
     }
     if (cancelledSrcs.size > 0) this._dispatch();
     return cancelledSrcs;
@@ -240,9 +250,11 @@ export class TileWorkerPool {
 
   cancelAll() {
     let total = 0;
-    // Drain queued jobs directly WITHOUT calling _dispatch() so queued items are never sent to workers just to be aborted
-    while (this._queue.length > 0) {
-      const job = this._queue.shift();
+    // Drain queued jobs in O(N) WITHOUT calling _dispatch() so queued items are never sent to workers just to be aborted
+    const queued = this._queue;
+    this._queue = [];
+    for (let i = 0; i < queued.length; i++) {
+      const job = queued[i];
       this._untrackSrc(job.src, job.id);
       this.stats.aborted++;
       total++;
@@ -301,11 +313,9 @@ export class TileWorkerPool {
           maxDim: job.maxDim || 0
         });
       } catch (err) {
-        this._active.delete(job.id);
-        this._untrackSrc(job.src, job.id);
-        this._workerLoad[bestIdx] = Math.max(0, this._workerLoad[bestIdx] - 1);
-        this.stats.errors++;
-        job.reject(err);
+        // Kill the broken worker so remaining queued jobs re-route to healthy workers instead of failing in a loop
+        this._onWorkerError(bestIdx, err);
+        break;
       }
     }
   }
