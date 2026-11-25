@@ -641,11 +641,12 @@ export class TokenImpostorLayer {
       col = idx % colsPerRow;
       row = Math.floor(idx / colsPerRow);
     } else {
-      // Recycle an unused atlas slot (zero refcount in docsByKey)
+      // Recycle an unused or failed atlas slot (zero refcount in docsByKey, or permanently failed decode)
       let victimKey = null;
       let victimSlot = null;
       for (const [k, s] of this.slotsByKey) {
-        if (!this.docsByKey.get(k)?.size) {
+        if (s.decoding) continue;
+        if (!this.docsByKey.get(k)?.size || s.failed) {
           victimKey = k;
           victimSlot = s;
           break;
@@ -667,7 +668,8 @@ export class TokenImpostorLayer {
       uSpan: CONTENT_PX * inv,
       spec,
       ready: false,
-      failed: false
+      failed: false,
+      decoding: false
     };
     this.slotsByKey.set(spec.slotKey, slot);
 
@@ -685,10 +687,12 @@ export class TokenImpostorLayer {
       const slotKey = this._decodeQueue.shift();
       this._decodeQueuedSet.delete(slotKey);
       const slot = this.slotsByKey.get(slotKey);
-      if (!slot || slot.ready || slot.failed) continue;
+      if (!slot || slot.ready || slot.failed || slot.decoding) continue;
+      slot.decoding = true;
       this._activeDecodes++;
       const gen = this._gen;
       this._decodeAndPack(slotKey, slot, gen).finally(() => {
+        slot.decoding = false;
         if (gen !== this._gen) return;
         this._activeDecodes = Math.max(0, this._activeDecodes - 1);
         if (this.mounted && this._decodeQueue.length > 0) {
@@ -984,8 +988,9 @@ export class TokenImpostorLayer {
     const grid = canvas.grid?.size || 100;
     const x = Number(doc._source?.x ?? doc.x ?? 0);
     const y = Number(doc._source?.y ?? doc.y ?? 0);
-    const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
-    const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
+    const sz = typeof doc.getSize === "function" ? doc.getSize() : null;
+    const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid);
+    const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid);
     const cx = x + w * 0.5;
     const cy = y + h * 0.5;
     const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0);
@@ -998,8 +1003,12 @@ export class TokenImpostorLayer {
     const slot = spec.artSrc ? this._requestAtlasSlot(spec) : null;
     const hasSlot = Boolean(slot?.ready);
 
+    // Keep Dynamic Token Rings circular even on non-square (e.g. 2x1) footprints
+    const halfW = spec.ringEnabled ? (Math.min(w, h) * 0.5) : (w * 0.5);
+    const halfH = spec.ringEnabled ? (Math.min(w, h) * 0.5) : (h * 0.5);
+
     this._writeQuad2(this.centerArr, idx, cx, cy);
-    this._writeQuad4(this.sizeInfoArr, idx, w * 0.5, h * 0.5, rotRad, elev);
+    this._writeQuad4(this.sizeInfoArr, idx, halfW, halfH, rotRad, elev);
     this._writeQuad4(this.atlasRectArr, idx, hasSlot ? slot.u0 : 0, hasSlot ? slot.v0 : 0, hasSlot ? slot.uSpan : 0, hasSlot ? 1.0 : 0.0);
     this._writeQuad4(this.flipAndPadArr, idx, spec.flipX, spec.flipY, spec.texScale, 0);
 
@@ -1033,9 +1042,11 @@ export class TokenImpostorLayer {
       const batch = Array.from(this._pendingUpserts.values());
       this._pendingUpserts.clear();
       const visCtx = this._collectVisionCheckers();
+      const liveTokens = globalThis.canvas?.scene?.tokens;
       for (let i = 0; i < batch.length; i++) {
         const d = batch[i];
         if (!d?.id) continue;
+        if (liveTokens?.has && !liveTokens.has(d.id)) continue;
         this._upsertDocInternal(d);
         this._updateSingleTokenState(d, visCtx);
       }
@@ -1319,6 +1330,10 @@ export class TokenImpostorLayer {
       if (doc) {
         this._updateSingleTokenState(doc, visCtx);
         if (this.stateArr[i * 16] > 0.002) visCount++;
+      } else if (this.stateArr[i * 16] > 0.001) {
+        // Zero out any orphaned GPU slot whose TokenDocument no longer exists
+        this._writeQuad4(this.stateArr, i, 0, 0, 0, 0);
+        this._bufDirty.state = true;
       }
     }
     this.activeVisibleCount = visCount;

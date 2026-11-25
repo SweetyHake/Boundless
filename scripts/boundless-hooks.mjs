@@ -428,6 +428,20 @@ export function registerBoundlessHooks(controller) {
     }
   });
 
+  // Sync TokenImpostorLayer visibility immediately when INVISIBLE / BURROW effects toggle on unmounted NPCs
+  const onEffectVisibilityChange = (effect) => {
+    if (!controller.active || !controller.tokenStreamer?.enabled) return;
+    const inv = CONFIG?.specialStatusEffects?.INVISIBLE || "invisible";
+    const bur = CONFIG?.specialStatusEffects?.BURROW || "burrow";
+    const statuses = effect?.statuses;
+    if (statuses?.has?.(inv) || statuses?.has?.(bur)) {
+      controller.tokenStreamer.onVisibilityChanged();
+    }
+  };
+  Hooks.on("createActiveEffect", onEffectVisibilityChange);
+  Hooks.on("updateActiveEffect", onEffectVisibilityChange);
+  Hooks.on("deleteActiveEffect", onEffectVisibilityChange);
+
   Hooks.on("collapseSidebar", () => {
     if (!controller.active) return;
     controller.charPins._lastSidebarCheckMs = 0;

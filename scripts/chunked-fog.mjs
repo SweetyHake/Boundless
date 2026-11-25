@@ -328,8 +328,10 @@ export class ChunkedFogManager {
     const maxCx = Math.max(0, Math.ceil(totalW / CHUNK_WORLD_PX));
     const maxCy = Math.max(0, Math.ceil(totalH / CHUNK_WORLD_PX));
 
-    for (const pts of polygons) {
-      if (!Array.isArray(pts) || pts.length < 6) continue;
+    const polyCap = Math.min(polygons.length, 256);
+    for (let pi = 0; pi < polyCap; pi++) {
+      const pts = polygons[pi];
+      if (!Array.isArray(pts) || pts.length < 6 || pts.length > 4096) continue;
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       let valid = true;
       for (let i = 0; i < pts.length; i += 2) {
@@ -352,11 +354,15 @@ export class ChunkedFogManager {
       const cx1 = Math.max(0, Math.min(maxCx, rawCx1));
       const cy1 = Math.max(0, Math.min(maxCy, rawCy1));
 
-      for (let cy = cy0; cy <= cy1; cy++) {
+      let hitCap = false;
+      for (let cy = cy0; cy <= cy1 && !hitCap; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
           const ck = `${cx}_${cy}`;
           const existingChunk = this.chunks.get(ck);
-          if ((!existingChunk || !touched.has(existingChunk)) && touched.size >= maxChunks) continue;
+          if ((!existingChunk || !touched.has(existingChunk)) && touched.size >= maxChunks) {
+            hitCap = true;
+            break;
+          }
           const chunk = existingChunk || this._getOrCreateChunk(cx, cy);
           const ox = cx * CHUNK_WORLD_PX;
           const oy = cy * CHUNK_WORLD_PX;
@@ -394,16 +400,24 @@ export class ChunkedFogManager {
   }
 
   _applyBrushStrokes(strokes, { markDirty = true } = {}) {
-    if (!this.enabled || !this.container || !strokes?.length) return false;
+    if (!this.enabled || !this.container || !Array.isArray(strokes) || !strokes.length) return false;
     const touched = new Set();
+    const scene = game.scenes?.get?.(this.sceneId) ?? (canvas?.scene?.id === this.sceneId ? canvas.scene : null);
+    const pad = Math.max(0, Number(scene?.padding) || 0);
+    const totalW = Number(canvas?.dimensions?.width) || Number(scene?.dimensions?.width) || ((scene?.width || 100000) * (1 + pad * 2));
+    const totalH = Number(canvas?.dimensions?.height) || Number(scene?.dimensions?.height) || ((scene?.height || 100000) * (1 + pad * 2));
+    const maxCx = Math.max(0, Math.ceil(totalW / CHUNK_WORLD_PX));
+    const maxCy = Math.max(0, Math.ceil(totalH / CHUNK_WORLD_PX));
 
     for (const stroke of strokes) {
-      const [x, y, radiusPx, erase] = stroke;
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(radiusPx)) continue;
-      const cx0 = Math.max(0, Math.floor((x - radiusPx) / CHUNK_WORLD_PX));
-      const cy0 = Math.max(0, Math.floor((y - radiusPx) / CHUNK_WORLD_PX));
-      const cx1 = Math.floor((x + radiusPx) / CHUNK_WORLD_PX);
-      const cy1 = Math.floor((y + radiusPx) / CHUNK_WORLD_PX);
+      if (!Array.isArray(stroke)) continue;
+      const [x, y, rawRadiusPx, erase] = stroke;
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(rawRadiusPx)) continue;
+      const radiusPx = Math.max(1, Math.min(BRUSH_MAX_RADIUS_PX * 2, rawRadiusPx));
+      const cx0 = Math.max(0, Math.min(maxCx, Math.floor((x - radiusPx) / CHUNK_WORLD_PX)));
+      const cy0 = Math.max(0, Math.min(maxCy, Math.floor((y - radiusPx) / CHUNK_WORLD_PX)));
+      const cx1 = Math.max(0, Math.min(maxCx, Math.floor((x + radiusPx) / CHUNK_WORLD_PX)));
+      const cy1 = Math.max(0, Math.min(maxCy, Math.floor((y + radiusPx) / CHUNK_WORLD_PX)));
 
       for (let cy = cy0; cy <= cy1; cy++) {
         for (let cx = cx0; cx <= cx1; cx++) {
@@ -565,17 +579,14 @@ export class ChunkedFogManager {
 
     if (!this.enabled) return false;
     if (payload.sceneId !== this.sceneId) return false;
-    if (payload.levelId && payload.levelId !== this.levelId) return false;
+    if (typeof payload.levelId !== "string" || payload.levelId !== this.levelId) return false;
 
     if (payload.type === "fogReveal") {
       if (!this.isSharedMode || !Array.isArray(payload.polygons)) return true;
-      // Only activeGM needs to mark shared chunks dirty for DB persistence; other clients cache locally
+      // Only activeGM needs to mark shared chunks dirty for DB persistence
       const isAuthoritativeGM = game.users?.activeGM?.id === game.user?.id;
-      this._applyPolygons(payload.polygons, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
-      if (!isAuthoritativeGM) {
-        // Keep local cache fresh on non-GM clients without blocking the frame on every incoming step
-        this._scheduleLocalCacheSave();
-      }
+      const cappedPolys = payload.polygons.length > 64 ? payload.polygons.slice(0, 64) : payload.polygons;
+      this._applyPolygons(cappedPolys, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
       return true;
     }
 
@@ -662,6 +673,12 @@ export class ChunkedFogManager {
         targetScene.flags?.[MODULE_ID]?.chunkedFog === false ||
         getSceneFogMode(targetScene) !== getFogModes().SHARED
       ) break;
+      const resetAtBefore = Number(targetScene.flags?.[MODULE_ID]?.fogResetAt?.[targetLevelId]) || 0;
+      // If activeGM switched to this exact (sceneId, targetLevelId), apply locally instead of racing with stale flags
+      if (this.enabled && this.sceneId === sceneId && this.levelId === targetLevelId) {
+        this._applyPolygons(batchPolys.slice(0, 64), { target: "shared", markDirty: true, maxChunks: MAX_REMOTE_CHUNKS_PER_BATCH });
+        continue;
+      }
       const existingMap = targetScene.flags?.[MODULE_ID]?.sharedFog?.[targetLevelId] || {};
       const pad = Math.max(0, Number(targetScene.padding) || 0);
       const totalW = Number(targetScene.dimensions?.width) || ((targetScene.width || 100000) * (1 + pad * 2));
@@ -670,8 +687,10 @@ export class ChunkedFogManager {
       const maxCy = Math.max(0, Math.ceil(totalH / CHUNK_WORLD_PX));
 
       const polysByChunk = new Map();
-      for (const pts of batchPolys) {
-        if (!Array.isArray(pts) || pts.length < 6) continue;
+      const polyLim = Math.min(batchPolys.length, 64);
+      for (let pi = 0; pi < polyLim; pi++) {
+        const pts = batchPolys[pi];
+        if (!Array.isArray(pts) || pts.length < 6 || pts.length > 4096) continue;
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         let valid = true;
         for (let i = 0; i < pts.length; i += 2) {
@@ -692,10 +711,14 @@ export class ChunkedFogManager {
         const cy0 = Math.max(0, Math.min(maxCy, rawCy0));
         const cx1 = Math.max(0, Math.min(maxCx, rawCx1));
         const cy1 = Math.max(0, Math.min(maxCy, rawCy1));
-        for (let cy = cy0; cy <= cy1; cy++) {
+        let hitCap = false;
+        for (let cy = cy0; cy <= cy1 && !hitCap; cy++) {
           for (let cx = cx0; cx <= cx1; cx++) {
             const ck = `${cx}_${cy}`;
-            if (!polysByChunk.has(ck) && polysByChunk.size >= MAX_REMOTE_CHUNKS_PER_BATCH) continue;
+            if (!polysByChunk.has(ck) && polysByChunk.size >= MAX_REMOTE_CHUNKS_PER_BATCH) {
+              hitCap = true;
+              break;
+            }
             let arr = polysByChunk.get(ck);
             if (!arr) { arr = []; polysByChunk.set(ck, arr); }
             arr.push(pts);
@@ -706,6 +729,7 @@ export class ChunkedFogManager {
 
       const scale = CHUNK_TEX_PX / CHUNK_WORLD_PX;
       const update = {};
+      let aborted = false;
       for (const [ck, polys] of polysByChunk) {
         const [cx, cy] = ck.split("_").map(Number);
         const c = document.createElement("canvas");
@@ -720,6 +744,12 @@ export class ChunkedFogManager {
             img.onerror = resolve;
             img.src = prevUrl;
           });
+        }
+        // Re-check reset & mode after async image decode so cleared fog can NEVER be resurrected
+        const resetAtNow = Number(targetScene.flags?.[MODULE_ID]?.fogResetAt?.[targetLevelId]) || 0;
+        if (resetAtNow > resetAtBefore || getSceneFogMode(targetScene) !== getFogModes().SHARED) {
+          aborted = true;
+          break;
         }
         const ox = cx * CHUNK_WORLD_PX;
         const oy = cy * CHUNK_WORLD_PX;
@@ -737,6 +767,12 @@ export class ChunkedFogManager {
         }
         ctx.restore();
         update[`flags.${MODULE_ID}.sharedFog.${targetLevelId}.${ck}`] = encodeCanvas(c);
+      }
+      if (aborted) break;
+      // Final check: if GM switched to this level while decoding, route through live local chunks instead of clobbering
+      if (this.enabled && this.sceneId === sceneId && this.levelId === targetLevelId) {
+        this._applyPolygons(batchPolys.slice(0, 64), { target: "shared", markDirty: true, maxChunks: MAX_REMOTE_CHUNKS_PER_BATCH });
+        continue;
       }
       if (Object.keys(update).length) {
         try {
@@ -841,7 +877,8 @@ export class ChunkedFogManager {
   }
 
   _saveLocalCacheOnly() {
-    if (!this._storageKey || this._pendingChunkLoads.size > 0) return;
+    // In SHARED mode, authoritative fog lives in scene flags; never pollute private localStorage cache or waste quota
+    if (this.isSharedMode || !this._storageKey || this._pendingChunkLoads.size > 0) return;
     try {
       const chunks = {};
       for (const [key, chunk] of this.chunks) {
@@ -849,7 +886,12 @@ export class ChunkedFogManager {
         chunks[key] = chunk.encodedUrl;
       }
       localStorage.setItem(this._storageKey, JSON.stringify({ savedAt: Date.now(), chunks }));
-    } catch {}
+    } catch (err) {
+      // Remove stale cache key on QuotaExceededError so outdated fog never resurfaces
+      if (err?.name === "QuotaExceededError") {
+        try { localStorage.removeItem(this._storageKey); } catch {}
+      }
+    }
   }
 
   async saveNow() {
@@ -1086,6 +1128,9 @@ export class ChunkedFogManager {
     this._dirtyShared.clear();
     this._dirtyPrivate.clear();
     this._lastPolySigs.clear();
+    if (this.sceneId && this.levelId) {
+      this._remoteRevealQueues.delete(`${this.sceneId}::${this.levelId}`);
+    }
 
     for (const chunk of this.chunks.values()) {
       this._destroyChunkEntry(chunk);
@@ -1392,6 +1437,9 @@ export class ChunkedFogManager {
     this._dirtyShared.clear();
     this._dirtyPrivate.clear();
     this._lastPolySigs.clear();
+    if (this.sceneId && this.levelId) {
+      this._remoteRevealQueues.delete(`${this.sceneId}::${this.levelId}`);
+    }
 
     for (const chunk of this.chunks.values()) {
       this._destroyChunkEntry(chunk);

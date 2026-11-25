@@ -141,10 +141,13 @@ export const overlayMethods = {
     const renderer = canvas?.app?.renderer;
     if (!renderer || !layers?.length) return;
 
-    // Pick the primary layer carrying baked building roofs (supports monolithic 1000x1000, superGrid, chunked worlds, or explicit roofMaskUrl)
+    // Pick the primary layer carrying visible baked building roofs (skip lower-level roofs hidden when viewing an upper level)
+    const viewedBottom = getLevelBottomElevation(canvas.level);
     let targetLayer = null;
     let ovList = null;
     for (const l of layers) {
+      const topElev = getLevelRoofElevation(l.level);
+      if (!l.level?.isView && viewedBottom >= topElev) continue;
       if (l.spec?.roofMaskUrl) {
         targetLayer = l;
         const rawOvs = l.spec?._superGridBase?.overlays || l.spec?.overlays;
@@ -208,8 +211,12 @@ export const overlayMethods = {
         if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
           return;
         }
-        if (!isTextureUsable(maskTex)) return;
-      } else if (roofUrls.size <= MAX_SPRITE_MASK_URLS) {
+        if (!isTextureUsable(maskTex)) {
+          maskTex = null;
+          if (!roofUrls.size) return;
+        }
+      }
+      if (!maskTex && roofUrls.size > 0 && roofUrls.size <= MAX_SPRITE_MASK_URLS) {
         // Small reusable template roof set (e.g. <= 24 shared textures): load & pin for instant pixel-exact mask + z>=5 roofs
         const urlList = Array.from(roofUrls);
         const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
@@ -220,7 +227,7 @@ export const overlayMethods = {
         for (let i = 0; i < urlList.length; i++) {
           if (isTextureUsable(loaded[i])) texByUrl.set(urlList[i], loaded[i]);
         }
-        if (!texByUrl.size) return;
+        if (!texByUrl.size) texByUrl = null;
       }
 
       rt = PIXI.RenderTexture.create({
@@ -232,24 +239,68 @@ export const overlayMethods = {
       });
       container = new PIXI.Container();
 
+      const drawOvFootprint = (gfx, ov, sx, sy) => {
+        const poly = Array.isArray(ov.poly) && ov.poly.length >= 6 ? ov.poly
+          : (Array.isArray(ov.footprint) && ov.footprint.length >= 6 ? ov.footprint : null);
+        if (poly) {
+          const pts = new Array(poly.length);
+          for (let i = 0; i < poly.length; i += 2) {
+            pts[i] = (poly[i] - originX) * sx;
+            pts[i + 1] = (poly[i + 1] - originY) * sy;
+          }
+          gfx.drawPolygon(pts);
+        } else {
+          const hw = (ov.w || 0) * 0.5;
+          const hh = (ov.h || 0) * 0.5;
+          if (hw <= 0 || hh <= 0) return;
+          const rad = ((ov.rot || 0) * Math.PI) / 180;
+          const c = Math.cos(rad);
+          const s = Math.sin(rad);
+          const cx = ov.cx - originX;
+          const cy = ov.cy - originY;
+          gfx.drawPolygon([
+            (cx + (-hw * c - -hh * s)) * sx, (cy + (-hw * s + -hh * c)) * sy,
+            (cx + (hw * c - -hh * s)) * sx, (cy + (hw * s + -hh * c)) * sy,
+            (cx + (hw * c - hh * s)) * sx, (cy + (hw * s + hh * c)) * sy,
+            (cx + (-hw * c - hh * s)) * sx, (cy + (-hw * s + hh * c)) * sy
+          ]);
+        }
+      };
+
       if (maskTex) {
         const sp = new PIXI.Sprite(maskTex);
         sp.width = maskSize;
         sp.height = maskSize;
         container.addChild(sp);
       } else if (texByUrl) {
-        container.scale.set(maskSize / Math.max(1, regionW), maskSize / Math.max(1, regionH));
+        const sx = maskSize / Math.max(1, regionW);
+        const sy = maskSize / Math.max(1, regionH);
+        const spriteLayer = new PIXI.Container();
+        spriteLayer.scale.set(sx, sy);
+        let fallbackGfx = null;
         for (const ov of ovList) {
           if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
           const tex = texByUrl.get(ov.roof);
-          if (!isTextureUsable(tex)) continue;
-          const sp = new PIXI.Sprite(tex);
-          sp.anchor.set(0.5, 0.5);
-          sp.position.set(ov.cx - originX, ov.cy - originY);
-          sp.width = ov.w;
-          sp.height = ov.h;
-          sp.angle = ov.rot || 0;
-          container.addChild(sp);
+          if (isTextureUsable(tex)) {
+            const sp = new PIXI.Sprite(tex);
+            sp.anchor.set(0.5, 0.5);
+            sp.position.set(ov.cx - originX, ov.cy - originY);
+            sp.width = ov.w;
+            sp.height = ov.h;
+            sp.angle = ov.rot || 0;
+            spriteLayer.addChild(sp);
+          } else {
+            if (!fallbackGfx) {
+              fallbackGfx = new PIXI.Graphics();
+              fallbackGfx.beginFill(0xffffff, 1.0);
+            }
+            drawOvFootprint(fallbackGfx, ov, sx, sy);
+          }
+        }
+        container.addChild(spriteLayer);
+        if (fallbackGfx) {
+          fallbackGfx.endFill();
+          container.addChild(fallbackGfx);
         }
       } else {
         // Large city with hundreds/thousands of unique roof textures (e.g. Kartograf exports):
@@ -262,34 +313,7 @@ export const overlayMethods = {
         gfx.beginFill(0xffffff, 1.0);
         for (const ov of ovList) {
           if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
-          const poly = Array.isArray(ov.poly) && ov.poly.length >= 6 ? ov.poly
-            : (Array.isArray(ov.footprint) && ov.footprint.length >= 6 ? ov.footprint : null);
-          if (poly) {
-            const pts = new Array(poly.length);
-            for (let i = 0; i < poly.length; i += 2) {
-              pts[i] = (poly[i] - originX) * sx;
-              pts[i + 1] = (poly[i + 1] - originY) * sy;
-            }
-            gfx.drawPolygon(pts);
-          } else {
-            const hw = (ov.w || 0) * 0.5;
-            const hh = (ov.h || 0) * 0.5;
-            if (hw <= 0 || hh <= 0) continue;
-            const rad = ((ov.rot || 0) * Math.PI) / 180;
-            const c = Math.cos(rad);
-            const s = Math.sin(rad);
-            const cx = ov.cx - originX;
-            const cy = ov.cy - originY;
-            const c0x = (cx + (-hw * c - -hh * s)) * sx;
-            const c0y = (cy + (-hw * s + -hh * c)) * sy;
-            const c1x = (cx + (hw * c - -hh * s)) * sx;
-            const c1y = (cy + (hw * s + -hh * c)) * sy;
-            const c2x = (cx + (hw * c - hh * s)) * sx;
-            const c2y = (cy + (hw * s + hh * c)) * sy;
-            const c3x = (cx + (-hw * c - hh * s)) * sx;
-            const c3y = (cy + (-hw * s + hh * c)) * sy;
-            gfx.drawPolygon([c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y]);
-          }
+          drawOvFootprint(gfx, ov, sx, sy);
         }
         gfx.endFill();
         container.addChild(gfx);
@@ -930,55 +954,67 @@ export const overlayMethods = {
    * (or unloaded virtual tile with `minZ > lastTargetZ`) when no native roofMesh is currently covering it.
    */
   isPointUnderBakedRoof(lid, tx, ty, tokElev = 0) {
-    const layer = this.levelLayers.get(lid);
-    if (!layer?.spec) return false;
-    const { simGrid, simSectorPx, spec, level } = layer;
-    const topElev = getLevelRoofElevation(level);
-    const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
-    const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
+    const layersToCheck = this.visibleLevelLayers?.length
+      ? this.visibleLevelLayers
+      : (this.levelLayers.get(lid) ? [this.levelLayers.get(lid)] : []);
+    if (!layersToCheck.length) return false;
     const occSurfaces = canvas.masks?.occlusion?.occludedSurfaces;
+    const viewedBottom = getLevelBottomElevation(canvas.level);
+    const missingSrcs = this.texMgr?.missingSrcs;
 
-    // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
-    if (tokElev < topElev && spec.overlays && spec.sectors) {
-      const viewedBottom = getLevelBottomElevation(canvas.level);
-      const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
-      if (!hideRoofsForUpperView) {
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const oList = spec.sectors[`${sx + dx}_${sy + dy}`]?.o;
-            if (!oList?.length) continue;
-            for (const oid of oList) {
-              const ovSpec = spec.overlays[oid];
-              if (!isPointUnderRoofSpec(tx, ty, ovSpec)) continue;
-              const mountedRoof = this.activeOverlays.get(`${lid}::${oid}`)?.roofMesh;
-              if (!mountedRoof || mountedRoof.destroyed || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
-                return true;
-              }
-              // Guard against a freshly mounted/unoccluded roof mesh still fading up from low alpha
-              if (mountedRoof.alpha < 0.9 && !this._isRoofRevealed(mountedRoof, occSurfaces)) {
-                return true;
+    for (let li = 0; li < layersToCheck.length; li++) {
+      const layer = layersToCheck[li];
+      if (!layer?.spec) continue;
+      const { simGrid, simSectorPx, spec, level } = layer;
+      const layerId = level.id;
+      const topElev = getLevelRoofElevation(level);
+      const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
+      const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
+
+      // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
+      if (tokElev < topElev && spec.overlays && spec.sectors) {
+        const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
+        if (!hideRoofsForUpperView) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const oList = spec.sectors[`${sx + dx}_${sy + dy}`]?.o;
+              if (!oList?.length) continue;
+              for (const oid of oList) {
+                const ovSpec = spec.overlays[oid];
+                if (!isPointUnderRoofSpec(tx, ty, ovSpec)) continue;
+                // Do not permanently hide indoor tokens at tactical zoom if the roof texture 404'd
+                if (ovSpec.roof && missingSrcs?.has?.(ovSpec.roof)) continue;
+                const mountedRoof = this.activeOverlays.get(`${layerId}::${oid}`)?.roofMesh;
+                if (!mountedRoof || mountedRoof.destroyed || !mountedRoof.visible || mountedRoof.unoccludedAlpha < 0.9) {
+                  return true;
+                }
+                // Guard against a freshly mounted/unoccluded roof mesh still fading up from low alpha
+                if (mountedRoof.alpha < 0.9 && !this._isRoofRevealed(mountedRoof, occSurfaces)) {
+                  return true;
+                }
               }
             }
           }
         }
       }
-    }
 
-    // 2. Check virtual tiles with minZ (or elevated roof/canopy tiles) sitting above this point that are NOT yet mounted & opaque
-    if (spec.tiles?.length) {
-      const candidateTids = this._collectVirtualTileCandidates(
-        lid, spec,
-        Math.max(0, sx - 1), Math.max(0, sy - 1),
-        Math.min(simGrid - 1, sx + 1), Math.min(simGrid - 1, sy + 1)
-      );
-      for (const tid of candidateTids) {
-        const tSpec = this.resolveVirtualTile(lid, tid, spec.tiles[tid], level);
-        if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
-        if (tSpec.minZ !== undefined) {
-          const mountedVt = this.activeVirtualTiles.get(`${lid}::${tid}`)?.mesh;
-          const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
-          if (!vtReadyOpaque && this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
-            return true;
+      // 2. Check virtual tiles with minZ (or elevated roof/canopy tiles) sitting above this point that are NOT yet mounted & opaque
+      if (spec.tiles?.length) {
+        const candidateTids = this._collectVirtualTileCandidates(
+          layerId, spec,
+          Math.max(0, sx - 1), Math.max(0, sy - 1),
+          Math.min(simGrid - 1, sx + 1), Math.min(simGrid - 1, sy + 1)
+        );
+        for (const tid of candidateTids) {
+          const tSpec = this.resolveVirtualTile(layerId, tid, spec.tiles[tid], level);
+          if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
+          if (tSpec.minZ !== undefined) {
+            if (tSpec.src && missingSrcs?.has?.(tSpec.src)) continue;
+            const mountedVt = this.activeVirtualTiles.get(`${layerId}::${tid}`)?.mesh;
+            const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
+            if (!vtReadyOpaque && this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
+              return true;
+            }
           }
         }
       }

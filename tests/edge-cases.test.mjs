@@ -552,3 +552,179 @@ test("CharacterPinManager preserves PIXI/DOM on unchanged rebuild, clamps narrow
   assert.equal(removedTicker, true, "unmount must remove ticker callback from stored ticker");
   assert.equal(mgr.enabled, false, "unmount must reset enabled to false");
 });
+
+test("MegaLightBatch.syncDarknessLevel accumulates 240Hz micro-steps across darkMin threshold", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+  const lb = new MegaLightBatch();
+  lb._hasDarknessRangedLights = true;
+  lb._currentDarkness = 0.4998;
+  lb.weightArray = new Float32Array(12);
+  lb.weightBuffer = { update() {} };
+  const meta = {
+    vStart: 0, vCount: 12,
+    baseWeight: 1, weight: 0,
+    isIndoor: false,
+    darkMin: 0.5, darkMax: 1.0,
+    batch: null
+  };
+  lb.lightMetaById.set("l1", meta);
+
+  // Feed tiny 0.00005 steps (below 0.0001 delta individually) across 0.5000
+  let crossed = false;
+  for (let i = 1; i <= 10; i++) {
+    if (lb.syncDarknessLevel(0.4998 + i * 0.00005)) crossed = true;
+  }
+  assert.equal(crossed, true, "micro-stepped darkness ramp must trigger threshold crossing");
+  assert.equal(meta.weight, 1, "night-only light must turn ON once darkness passes darkMin");
+});
+
+test("Boundless lighting blocks client doorState spoofing, survives non-string dKey, and recovers from externally destroyed fading light", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+  let weightRestored = null;
+  const ctrl = Object.assign(Object.create(lightingMethods), {
+    active: true,
+    doorStates: new Map(),
+    openDoors: new Map(),
+    closingDoorTimers: new Map(),
+    dynamicLights: new Map(),
+    _lightFades: new Map(),
+    lastDynLightKey: "l1",
+    fogManager: { handleSocketMessage: () => false },
+    lightBatch: {
+      setLightWeight(id, w) { weightRestored = { id, w }; },
+      flushWeights() {}
+    }
+  });
+  globalThis.canvas = { scene: { id: "s1" } };
+  globalThis.game.user = { id: "player1", isGM: false };
+  globalThis.game.users = new Map([["gm1", { id: "gm1", isGM: true }]]);
+  globalThis.game.users.activeGM = { id: "gm1" };
+
+  // 1. Spoofed GM doorState socket packet must NOT mutate doorStates
+  await ctrl._onSocketMessage({ type: "doorState", sceneId: "s1", senderId: "gm1", dKey: "lvl::0_0_0", ds: 1 });
+  assert.equal(ctrl.doorStates.size, 0, "unauthenticated doorState socket must not mutate state");
+
+  // 2. Non-string dKey payloads must return null safely without throwing TypeError
+  assert.equal(ctrl._resolveDoorByKey(12345), null);
+  assert.equal(ctrl._resolveDoorByKey(["a::b"]), null);
+  assert.equal(ctrl._resolveDoorByKey("lvl::bad_-1_0"), null);
+
+  // 3. Externally destroyed PointLightSource mid-fade must restore GPU weight = 1 and clean dynamicLights
+  const deadLs = { destroyed: true };
+  ctrl.dynamicLights.set("l_fade", deadLs);
+  ctrl._lightFades.set("l_fade", { dir: "in", t: 0.5, dur: 220, ls: deadLs, baseColorAlpha: 1, baseBgAlpha: 1 });
+  ctrl._stepDynamicLightFades(16);
+  assert.equal(ctrl.dynamicLights.has("l_fade"), false, "destroyed fading light must be removed from dynamicLights");
+  assert.deepEqual(weightRestored, { id: "l_fade", w: 1.0 });
+  assert.equal(ctrl.lastDynLightKey, null);
+});
+
+test("ChunkedFogManager guards malformed brush/polygon payloads, skips localStorage in SHARED mode, and clears remote queue on reset", async () => {
+  installBaseGlobals();
+  const storage = new Map();
+  let throwQuota = false;
+  globalThis.localStorage = {
+    setItem(k, v) {
+      if (throwQuota) { const e = new Error("quota"); e.name = "QuotaExceededError"; throw e; }
+      storage.set(k, v);
+    },
+    getItem(k) { return storage.get(k) ?? null; },
+    removeItem(k) { storage.delete(k); }
+  };
+  globalThis.document = {
+    createElement() {
+      return {
+        width: 256, height: 256,
+        getContext: () => ({ clearRect() {}, save() {}, restore() {}, beginPath() {}, arc() {}, fill() {}, moveTo() {}, lineTo() {}, closePath() {} }),
+        toDataURL: () => "data:image/webp;base64,ok"
+      };
+    }
+  };
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+  const fm = new ChunkedFogManager();
+  fm.enabled = true;
+  fm.sceneId = "s1";
+  fm.levelId = "lvl1";
+  fm.container = new PIXI.Container();
+  fm._storageKey = "boundless.fog.test2";
+  fm.updateViewportCulling = () => {};
+  fm._scheduleSave = () => {};
+
+  // 1. Malformed strokes (non-array, NaN) must not throw
+  assert.equal(fm._applyBrushStrokes(["bad", null, [NaN, 0, 100, 0]]), false);
+
+  // 2. Empty levelId on socket fogReveal must be rejected (no cross-level reveal leak)
+  fm.mode = CONST.FOG_EXPLORATION_MODES.SHARED;
+  assert.equal(fm.handleSocketMessage({ type: "fogReveal", sceneId: "s1", levelId: "", polygons: [[0, 0, 100, 0, 100, 100]] }), false);
+
+  // 3. SHARED mode must not write to private localStorage
+  fm._applyBrushStrokes([[500, 500, 200, 0]], { markDirty: false });
+  fm._saveLocalCacheOnly();
+  assert.equal(storage.size, 0, "SHARED mode must not write unused localStorage cache");
+
+  // 4. INDIVIDUAL mode removes stale cache key on QuotaExceededError
+  fm.mode = CONST.FOG_EXPLORATION_MODES.INDIVIDUAL;
+  storage.set("boundless.fog.test2", "stale");
+  throwQuota = true;
+  fm._saveLocalCacheOnly();
+  assert.equal(storage.has("boundless.fog.test2"), false, "QuotaExceededError must purge stale cache key");
+
+  // 5. reset() clears pending _remoteRevealQueues for the reset level
+  fm._remoteRevealQueues.set("s1::lvl1", { polygons: [[0, 0, 10, 0, 10, 10]], running: null });
+  await fm.reset({ broadcast: false, persist: false });
+  assert.equal(fm._remoteRevealQueues.has("s1::lvl1"), false);
+});
+
+test("VirtualLayerEditors skips stale/offscreen/edited rAF mount jobs and updates queued snapshots", async () => {
+  installBaseGlobals();
+  const { VirtualLayerEditors } = await import("../scripts/layer-editors.mjs");
+  const ctrl = { active: true, lightEditsRev: 1 };
+  const le = new VirtualLayerEditors(ctrl);
+  le.lightActive = true;
+  le._lightGen = 1;
+  le._lastLightNeededKeys = new Set(["l_keep"]);
+
+  const mounted = [];
+  le._mountNativeLight = (item) => { mounted.push(item); };
+
+  // Enqueue offscreen/deleted item + kept item, then overwrite kept item with updated snapshot
+  le._enqueueMount("light", "l_gone", { lKey: "l_gone", x: 10 }, 1, 1);
+  le._enqueueMount("light", "l_keep", { lKey: "l_keep", x: 10 }, 1, 1);
+  le._enqueueMount("light", "l_keep", { lKey: "l_keep", x: 999 }, 1, 1);
+  le._enqueueMount("light", "l_oldrev", { lKey: "l_oldrev", x: 5 }, 1, 0);
+  le._lastLightNeededKeys.add("l_oldrev");
+
+  // Pump synchronously
+  le._pumpMountQueue();
+  assert.equal(mounted.length, 1, "only in-view, current-rev item may mount");
+  assert.equal(mounted[0].x, 999, "re-enqueued item must use latest snapshot");
+});
+
+test("TokenImpostorLayer zeroes orphaned GPU slots in refreshVisibility and recycles failed atlas slots", async () => {
+  installBaseGlobals();
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+  const imp = new TokenImpostorLayer({}, {});
+  imp.mounted = true;
+  imp.atlasSize = 256; // 2x2 = 4 slots max (CELL_PX = 128)
+  imp.nextSlotIdx = 4;
+  imp.slotsByKey.set("bad_art", { col: 0, row: 0, ready: false, failed: true, decoding: false });
+  imp._pumpAtlasDecodes = () => {};
+
+  // Recycling failed slot succeeds even when nextSlotIdx === maxSlots
+  const recycled = imp._requestAtlasSlot({ slotKey: "good_art", artSrc: "good.webp" });
+  assert.ok(recycled, "failed atlas slot must be recyclable when atlas is full");
+  assert.equal(imp.slotsByKey.has("bad_art"), false);
+
+  // Orphaned GPU slot whose TokenDocument vanished from scene.tokens must be zeroed out
+  imp.count = 1;
+  imp.docIds = ["ghost_tok"];
+  imp.stateArr = new Float32Array(16).fill(1.0);
+  imp.mesh = { visible: true };
+  globalThis.canvas = { scene: { tokens: new Map() }, visibility: { tokenVision: false }, effects: {} };
+  imp.refreshVisibility(true);
+  assert.equal(imp.stateArr[0], 0, "orphaned GPU slot alpha must be zeroed");
+  assert.equal(imp.activeVisibleCount, 0);
+  assert.equal(imp.mesh.visible, false);
+});

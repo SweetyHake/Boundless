@@ -105,7 +105,17 @@ export class VirtualLayerEditors {
 
   _enqueueMount(kind, key, item, gen, editsRev) {
     const qk = `${kind}:${key}`;
-    if (this._mountQueuedKeys.has(qk)) return;
+    if (this._mountQueuedKeys.has(qk)) {
+      for (let i = 0; i < this._mountQueue.length; i++) {
+        if (this._mountQueue[i].qk === qk) {
+          this._mountQueue[i].item = item;
+          this._mountQueue[i].gen = gen;
+          this._mountQueue[i].editsRev = editsRev;
+          break;
+        }
+      }
+      return;
+    }
     this._mountQueuedKeys.add(qk);
     this._mountQueue.push({ kind, key, qk, item, gen, editsRev });
     if (this._mountRafId === null) {
@@ -148,14 +158,20 @@ export class VirtualLayerEditors {
       this._mountQueuedKeys.delete(job.qk);
       if (job.kind === "light") {
         if (!this.lightActive || job.gen !== this._lightGen || this.lightsByKey.has(job.key)) continue;
+        if (this._lastLightNeededKeys && !this._lastLightNeededKeys.has(job.key)) continue;
+        if (job.editsRev !== (this.controller.lightEditsRev || 0)) continue;
         this._mountNativeLight(job.item, job.gen, job.editsRev);
         mounted++;
       } else if (job.kind === "sound") {
         if (!this.soundActive || job.gen !== this._soundGen || this.soundsByKey.has(job.key)) continue;
+        if (this._lastSoundNeededKeys && !this._lastSoundNeededKeys.has(job.key)) continue;
+        if (job.editsRev !== (this.controller.soundEditsRev || 0)) continue;
         this._mountNativeSound(job.item, job.gen, job.editsRev);
         mounted++;
       } else if (job.kind === "tile") {
         if (!this.tileActive || job.gen !== this._tileGen || this.tilesByKey.has(job.key)) continue;
+        if (this._lastTileNeededKeys && !this._lastTileNeededKeys.has(job.key)) continue;
+        if (job.editsRev !== (this.controller.tileEditsRev || 0)) continue;
         this._mountNativeTile(job.item, job.gen, job.editsRev);
         mounted++;
       }
@@ -367,6 +383,7 @@ export class VirtualLayerEditors {
 
   _clearLights() {
     this._lightGen++;
+    this._lastLightNeededKeys = null;
     this._purgeMountQueue("light");
     for (const entry of Array.from(this.lightsByKey.values())) {
       this._destroyPlaceable(canvas?.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
@@ -533,6 +550,7 @@ export class VirtualLayerEditors {
 
     const needed = new Map();
     for (const it of items) needed.set(it.lKey, it);
+    this._lastLightNeededKeys = new Set(needed.keys());
     const lvlEdits = this.controller.lightEdits?.get(lid);
 
     for (const entry of Array.from(this.lightsByKey.values())) {
@@ -649,10 +667,11 @@ export class VirtualLayerEditors {
         intensity: cfg.animation?.intensity ?? 3,
         attenuation: cfg.attenuation ?? 0.5,
         luminosity: cfg.luminosity ?? 0.5,
-        ...(Number.isFinite(cfg.coloration) ? { coloration: cfg.coloration } : {})
+        coloration: Number.isFinite(cfg.coloration) ? Number(cfg.coloration) : null
       };
       flagUpdate[`flags.${MODULE_ID}.lightEdits.${entry.levelId}.${entry.key}`] = nextState;
       this.controller.setVirtualLightEditLocal(entry.levelId, entry.key, nextState);
+      entry.editsRev = this.controller.lightEditsRev || 0;
       entry.sig = JSON.stringify({ levelId: entry.levelId, sk: entry.sk, idx: entry.idx, lKey: entry.key, ...nextState });
 
       if (entry.placeable && !entry.placeable.destroyed) {
@@ -718,6 +737,7 @@ export class VirtualLayerEditors {
 
   _clearSounds() {
     this._soundGen++;
+    this._lastSoundNeededKeys = null;
     this._purgeMountQueue("sound");
     for (const entry of Array.from(this.soundsByKey.values())) {
       this._destroyPlaceable(canvas?.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
@@ -882,6 +902,7 @@ export class VirtualLayerEditors {
 
     const needed = new Map();
     for (const it of items) needed.set(it.sKey, it);
+    this._lastSoundNeededKeys = new Set(needed.keys());
     const lvlEdits = this.controller.soundEdits?.get(lid);
 
     for (const entry of Array.from(this.soundsByKey.values())) {

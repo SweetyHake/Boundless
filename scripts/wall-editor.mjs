@@ -513,6 +513,16 @@ export class VirtualWallEditor {
         if (!context?.save && context?.keepId && cloned && cloned.id === id && cloned.parent === doc.parent) {
           cloned.update = doc.update;
           cloned.delete = doc.delete;
+          attachVirtualCollectionProxy(cloned, id, canvas.scene.walls);
+          Object.defineProperty(cloned, "edge", {
+            get() {
+              const c = this.c;
+              return Array.isArray(c) && c.length >= 4
+                ? { a: { x: c[0], y: c[1] }, b: { x: c[2], y: c[3] }, intersections: {} }
+                : null;
+            },
+            configurable: true
+          });
         }
         return cloned;
       };
@@ -771,6 +781,13 @@ export class VirtualWallEditor {
         } else if (!this._pendingMountKeys.has(seg.wKey)) {
           this._pendingMountKeys.add(seg.wKey);
           this._pendingMounts.push(seg);
+        } else {
+          for (let pi = 0; pi < this._pendingMounts.length; pi++) {
+            if (this._pendingMounts[pi].wKey === seg.wKey) {
+              this._pendingMounts[pi] = seg;
+              break;
+            }
+          }
         }
       } else {
         const dKey = this._buildDoorKey(seg);

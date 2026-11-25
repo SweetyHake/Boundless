@@ -326,6 +326,24 @@ export const lightingMethods = {
         }
       }
 
+      // Ensure native negative darkness sources & native AmbientLights (e.g. vision-providing lights) have virtual wall edges
+      if (canvas.effects?.darknessSources?.size) {
+        for (const ds of canvas.effects.darknessSources) {
+          if (!ds?.active || ds.data?.walls === false) continue;
+          const r = Math.min(MAX_LOS_RADIUS_PX, Number(ds.radius || ds.data?.radius) || 0);
+          if (r > 0) addSimBubble(ds.level?.id ?? ds.data?.level ?? canvas.level?.id, ds.x, ds.y, r + 100);
+        }
+      }
+      if (canvas.effects?.lightSources?.size) {
+        const globalLs = canvas.environment?.globalLightSource;
+        for (const ls of canvas.effects.lightSources) {
+          if (!ls?.active || ls === globalLs || ls.data?.walls === false) continue;
+          if (typeof ls.sourceId === "string" && ls.sourceId.startsWith("MegaLight.")) continue;
+          const r = Math.min(MAX_LOS_RADIUS_PX, Number(ls.radius || ls.data?.dim || ls.data?.bright) || 0);
+          if (r > 0) addSimBubble(ls.level?.id ?? ls.data?.level ?? canvas.level?.id, ls.x, ls.y, r + 100);
+        }
+      }
+
       for (const door of this.openDoors.values()) {
         addSimBubble(door.levelId, door.x, door.y, LIGHT_PAD_WORLD_PX);
       }
@@ -442,12 +460,13 @@ export const lightingMethods = {
       const tVpStart = performance.now();
       let newVpPromotes = 0;
 
-      if (force || dynKey !== this.lastDynLightKey || edgesChanged) {
+      if (force || dynKey !== this.lastDynLightKey || edgesChanged || (dynKey === "" && this.dynamicLights.size > 0)) {
         for (const [lid, ls] of this.dynamicLights) {
           if (!neededDynLights.has(lid)) {
             const canSmoothRetire = Boolean(
               !force &&
               !this._mounting &&
+              ls && !ls.destroyed &&
               ls._boundlessVpAnimOnly &&
               this.lightBatch.lightMetaById.has(lid) &&
               ls.layers?.coloration?.mesh?.shader?.uniforms
@@ -466,7 +485,7 @@ export const lightingMethods = {
             }
             this._lightFades.delete(lid);
             this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
-            ls.destroy();
+            if (ls && !ls.destroyed) { try { ls.destroy(); } catch {} }
             this.dynamicLights.delete(lid);
             this.lightBatch.setLightWeight(lid, 1.0);
             lightsChanged = true;
@@ -474,8 +493,9 @@ export const lightingMethods = {
         }
 
         for (const lid of neededDynLights) {
-          if (this.dynamicLights.has(lid)) {
-            const ls = this.dynamicLights.get(lid);
+          const existingLs = this.dynamicLights.get(lid);
+          if (existingLs && !existingLs.destroyed) {
+            const ls = existingLs;
             const isVpOnly = vpAnimOnlyIds.has(lid);
             ls._boundlessVpAnimOnly = isVpOnly;
             // Cancel any pending fade-out if the light came back into view or became door/vision driven
@@ -498,6 +518,9 @@ export const lightingMethods = {
               }
             }
             continue;
+          } else if (existingLs) {
+            this._lightFades.delete(lid);
+            this.dynamicLights.delete(lid);
           }
           // Spread viewport-only promotions across tiny slices (<= 2 lights & <= 1.6ms/tick) to eliminate zoom/levelSwitch spikes
           if (vpAnimOnlyIds.has(lid)) {
@@ -521,6 +544,7 @@ export const lightingMethods = {
             color, alpha,
             attenuation: meta.attenuation ?? 0.5,
             luminosity: meta.luminosity ?? 0.5,
+            darkness: { min: meta.darkMin ?? 0, max: meta.darkMax ?? 1 },
             animation: anim ? { type: anim, speed: meta.speed ?? 3, intensity: meta.intensity ?? 3 } : {}
           };
           if (Number.isFinite(meta.coloration)) initData.coloration = meta.coloration;
@@ -539,7 +563,7 @@ export const lightingMethods = {
           if (isVpOnly) newVpPromotes++;
         }
 
-        this.lastDynLightKey = moreVpAnimPending ? "" : dynKey;
+        this.lastDynLightKey = moreVpAnimPending ? null : dynKey;
       }
 
       this.lightBatch.flushWeights();
@@ -598,6 +622,12 @@ export const lightingMethods = {
       const ls = f.ls;
       if (!ls || ls.destroyed || this.dynamicLights.get(lid) !== ls) {
         this._lightFades.delete(lid);
+        if (this.dynamicLights.get(lid) === ls) {
+          this.dynamicLights.delete(lid);
+          this.lightBatch.setLightWeight(lid, 1.0);
+          weightsDirty = true;
+          this.lastDynLightKey = null;
+        }
         continue;
       }
 
@@ -704,14 +734,25 @@ export const lightingMethods = {
     game.socket.on(SOCKET_NAME, (payload) => this._onSocketMessage(payload));
   },
 
+  _clearClosingDoorTimer(dKey) {
+    const t = this.closingDoorTimers?.get?.(dKey);
+    if (t) {
+      clearTimeout(t);
+      this.closingDoorTimers.delete(dKey);
+    }
+  },
+
   _resolveDoorByKey(dKey) {
-    if (!dKey || !dKey.includes("::")) return null;
-    const [levelId, rest] = dKey.split("::");
+    if (typeof dKey !== "string" || !dKey.includes("::")) return null;
+    const sep = dKey.indexOf("::");
+    const levelId = dKey.slice(0, sep);
+    const rest = dKey.slice(sep + 2);
     const parts = rest.split("_");
     if (parts.length !== 3) return null;
     const sx = Number(parts[0]), sy = Number(parts[1]);
     const isConvertedWall = parts[2].startsWith("w");
     const idx = Number(isConvertedWall ? parts[2].slice(1) : parts[2]);
+    if (!Number.isInteger(sx) || !Number.isInteger(sy) || !Number.isInteger(idx) || sx < 0 || sy < 0 || idx < 0) return null;
     const sk = `${sx}_${sy}`;
     const layer = this.levelLayers.get(levelId);
     const sec = layer?.spec?.sectors?.[sk];
@@ -926,57 +967,30 @@ export const lightingMethods = {
   },
 
   async _onSocketMessage(payload) {
-    if (!payload || !this.active || payload.sceneId !== canvas.scene?.id) return;
+    if (!payload || typeof payload !== "object" || !this.active || payload.sceneId !== canvas.scene?.id) return;
     if (payload.senderId === game.user?.id) return;
 
     if (this.fogManager.handleSocketMessage(payload)) return;
 
+    // Never mutate door state / level.edges from unauthenticated client `doorState` socket messages
+    // (authoritative GM->client state propagates strictly via server-validated Scene flags in `onSceneUpdate`).
+    if (payload.type !== "doorRequest") return;
+
+    // Only the single active GM persists player door requests via authoritative `scene.update`
+    if (game.users.activeGM?.id !== game.user?.id) return;
     const info = this._resolveDoorByKey(payload.dKey);
-    if (!info) {
-      if (payload.type === "doorState" && payload.dKey) {
-        if (!game.users?.get?.(payload.senderId)?.isGM) return;
-        const targetDs = payload.ds !== undefined
-          ? this._normalizeDoorState(payload.ds, 0)
-          : (payload.isOpen ? 1 : 0);
-        this.doorStates.set(payload.dKey, targetDs);
-      }
-      return;
-    }
+    if (!info) return;
 
     const targetDs = payload.ds !== undefined
       ? this._normalizeDoorState(payload.ds, info.defaultDs)
       : (payload.isOpen ? 1 : 0);
 
-    if (payload.type === "doorState") {
-      if (!game.users?.get?.(payload.senderId)?.isGM) return;
-      this._applyDoorStateLocal(info, targetDs, { playSound: payload.playSound !== false });
-    } else if (payload.type === "doorRequest") {
-      // Only the single active GM persists player door requests and broadcasts authoritative state
-      if (game.users.activeGM?.id !== game.user?.id) return;
-      const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
-      if (info.doorType === 2 || curDs === 2 || targetDs === 2) {
-        // Send authoritative state back so rejected player rolls back optimistic local toggle
-        game.socket?.emit(SOCKET_NAME, {
-          type: "doorState",
-          sceneId: canvas.scene.id,
-          dKey: info.dKey,
-          ds: curDs,
-          playSound: false,
-          senderId: game.user.id
-        });
-        return;
-      }
-      this._applyDoorStateLocal(info, targetDs, { playSound: true });
-      game.socket?.emit(SOCKET_NAME, {
-        type: "doorState",
-        sceneId: canvas.scene.id,
-        dKey: info.dKey,
-        ds: targetDs,
-        playSound: true,
-        senderId: game.user.id
-      });
-      await canvas.scene.update({ [`flags.${MODULE_ID}.doorStates.${info.dKey}`]: targetDs });
+    const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
+    if (info.doorType === 2 || curDs === 2 || targetDs === 2) {
+      return;
     }
+    this._applyDoorStateLocal(info, targetDs, { playSound: true });
+    await canvas.scene.update({ [`flags.${MODULE_ID}.doorStates.${info.dKey}`]: targetDs });
   },
 
   requestDoorState(dKey, targetDs, { playSound = true } = {}) {
@@ -990,17 +1004,8 @@ export const lightingMethods = {
       if (!game.users?.activeGM) return;
     }
 
-    this._applyDoorStateLocal(info, ds, { playSound });
-
     if (game.user.isGM) {
-      game.socket?.emit(SOCKET_NAME, {
-        type: "doorState",
-        sceneId: canvas.scene?.id,
-        dKey,
-        ds,
-        playSound,
-        senderId: game.user.id
-      });
+      this._applyDoorStateLocal(info, ds, { playSound });
       canvas.scene?.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: ds }).catch(err => {
         console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
       });
@@ -1114,6 +1119,7 @@ export const lightingMethods = {
     const sectors = layer.spec?.sectors;
     for (const [dKey, door] of this.openDoors) {
       if (door.levelId === lid && !sectors?.[`${door.sx}_${door.sy}`]) {
+        this._clearClosingDoorTimer(dKey);
         this.openDoors.delete(dKey);
       }
     }

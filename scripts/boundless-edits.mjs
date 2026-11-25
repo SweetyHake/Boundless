@@ -112,11 +112,13 @@ export const editsMethods = {
     this.simSectors.clear();
     this.lastSimKey = "";
 
-    // Revalidate tracked doors in openDoors after wall/door edits (removals, wall conversions, coordinate moves)
-    for (const dKey of Array.from(this.openDoors.keys())) {
+    // Revalidate tracked doors in openDoors & doorStates after wall/door edits (removals, wall conversions, coordinate moves)
+    for (const dKey of Array.from(new Set([...this.openDoors.keys(), ...this.doorStates.keys()]))) {
       const info = this._resolveDoorByKey(dKey);
       if (!info) {
+        this._clearClosingDoorTimer?.(dKey);
         this.openDoors.delete(dKey);
+        this.doorStates.delete(dKey);
         continue;
       }
       const curDs = this.getCurrentDoorState(dKey, info.defaultDs);
@@ -366,10 +368,12 @@ export const editsMethods = {
       let anyDoorChanged = false;
       // Keep this.doorStates intact while reverting so _applyDoorStateLocal sees curDs !== defaultDs
       for (const dKey of prevKeys) {
+        this._clearClosingDoorTimer?.(dKey);
         const info = this._resolveDoorByKey(dKey);
         if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: true })) {
           anyDoorChanged = true;
         }
+        this._clearClosingDoorTimer?.(dKey);
       }
       this.doorStates.clear();
       this.openDoors.clear();
@@ -392,16 +396,18 @@ export const editsMethods = {
       for (const [rawKey, rawVal] of entries) {
         if (rawKey.startsWith("-=") || rawVal === null) {
           const dKey = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
+          this._clearClosingDoorTimer?.(dKey);
           const info = this._resolveDoorByKey(dKey);
           if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: batchMode })) {
             anyDoorChanged = true;
           }
+          this._clearClosingDoorTimer?.(dKey);
           this.doorStates.delete(dKey);
           this.openDoors.delete(dKey);
         } else {
           const info = this._resolveDoorByKey(rawKey);
           if (info) {
-            if (this._applyDoorStateLocal(info, rawVal, { playSound: false, deferRefresh: batchMode })) {
+            if (this._applyDoorStateLocal(info, rawVal, { playSound: !batchMode, deferRefresh: batchMode })) {
               anyDoorChanged = true;
             }
           } else {

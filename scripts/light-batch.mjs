@@ -2614,9 +2614,9 @@ export class MegaLightBatch {
   syncDarknessLevel(darkness) {
     const next = Number.isFinite(darkness) ? darkness : 0;
     const prev = this._currentDarkness;
-    const changed = Math.abs(next - prev) > 0.0001;
+    if (Math.abs(next - prev) <= 0.0001) return false;
     this._currentDarkness = next;
-    if (!changed || !this._hasDarknessRangedLights) return false;
+    if (!this._hasDarknessRangedLights) return false;
     if (!this.weightArray && this.chunkBatches.size === 0) return false;
     let thresholdCrossed = false;
     for (const meta of this.lightMetaById.values()) {

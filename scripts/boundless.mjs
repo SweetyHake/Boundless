@@ -25,6 +25,7 @@ import {
 } from "./boundless-hooks.mjs";
 import {
   MODULE_ID,
+  isTextureUsable,
   getLevelBaseElevation,
   getLevelBottomElevation
 } from "./utils.mjs";
@@ -748,7 +749,45 @@ class MegaWorld1000 {
         console.warn(`${MODULE_ID} | WebGL context lost; releasing non-pinned texture cache.`);
         this.texMgr.clear(false);
       };
+      this._webglContextRestoredFn = () => {
+        if (!this.active) return;
+        console.info(`${MODULE_ID} | WebGL context restored; rebuilding GPU roof mask and broken textures.`);
+        // Purge active overlays, virtual tiles, and pyramid tiles referencing destroyed BaseTextures
+        for (const [k, ov] of Array.from(this.activeOverlays.entries())) {
+          if ((ov.roofMesh && !isTextureUsable(ov.roofMesh.texture)) || (ov.wallsMesh && !isTextureUsable(ov.wallsMesh.texture))) {
+            this._retireOverlayEntry(k, ov);
+          }
+        }
+        for (const [k, vt] of Array.from(this.activeVirtualTiles.entries())) {
+          if (vt?.mesh && !isTextureUsable(vt.mesh.texture)) {
+            this.retireMesh(vt.mesh);
+            this.activeVirtualTiles.delete(k);
+          }
+        }
+        for (const [k, e] of Array.from(this.tilesByKey.entries())) {
+          if (e?.mesh && !isTextureUsable(e.mesh.texture)) {
+            this.retireMesh(e.mesh);
+            this.tilesByKey.delete(k);
+          }
+        }
+        for (const layer of this.visibleLevelLayers) {
+          layer.lastOverlayKey = "";
+          layer.lastTileKey = "";
+        }
+        if (this.lightBatch?.bakedRoofMask) {
+          try { this.lightBatch.bakedRoofMask.destroy(true); } catch {}
+          this.lightBatch.bakedRoofMask = null;
+          this.lightBatch.useBakedRoofMask = false;
+        }
+        this._bakeRoofMask(this.visibleLevelLayers, canvas.scene?.id, canvas.level?.id);
+        if (this.tokenStreamer?.impostors?.atlasTexture?.baseTexture) {
+          this.tokenStreamer.impostors.atlasDirty = true;
+          this.tokenStreamer.impostors.flush();
+        }
+        this.updatePyramid();
+      };
       glView.addEventListener("webglcontextlost", this._webglContextLostFn, false);
+      glView.addEventListener("webglcontextrestored", this._webglContextRestoredFn, false);
     }
     this._restoreCamera(scene);
     this.syncZoomLimits({ animate: false });
@@ -996,7 +1035,11 @@ class MegaWorld1000 {
     if (this._webglContextLostFn && this._webglContextLostView) {
       this._webglContextLostView.removeEventListener("webglcontextlost", this._webglContextLostFn, false);
     }
+    if (this._webglContextRestoredFn && this._webglContextLostView) {
+      this._webglContextLostView.removeEventListener("webglcontextrestored", this._webglContextRestoredFn, false);
+    }
     this._webglContextLostFn = null;
+    this._webglContextRestoredFn = null;
     this._webglContextLostView = null;
     this._restoringCamera = false;
     this._zoomSyncQueued = false;

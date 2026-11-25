@@ -744,7 +744,9 @@ export class TokenStreamer {
     const gen = this._gen;
     const limit = Math.min(PREDECODE_LOOKAHEAD, this._drawQueue.length);
     for (let i = 0; i < limit; i++) {
-      const src = this._getDocTexSrc(this._drawQueue[i]?.doc);
+      const qDoc = this._drawQueue[i]?.doc;
+      if (!qDoc || (globalThis.canvas?.scene?.tokens?.has && !globalThis.canvas.scene.tokens.has(qDoc.id))) continue;
+      const src = this._getDocTexSrc(qDoc);
       if (!src || this._isTexReady(src) || this._inflightTexLoads.has(src)) continue;
       const p = Promise.resolve(loadTexFn(src))
         .catch(() => null)
@@ -836,7 +838,7 @@ export class TokenStreamer {
         this._drawQueue.splice(pickIdx, 1);
         this._queuedIds.delete(doc.id);
 
-        if (!doc.parent || doc.parent.id !== this.sceneId || !doc.viewed) continue;
+        if (!doc.parent || doc.parent.id !== this.sceneId || !doc.viewed || (globalThis.canvas?.scene?.tokens?.has && !globalThis.canvas.scene.tokens.has(doc.id))) continue;
 
         const dx = Number(doc._source?.x ?? doc.x ?? 0);
         const dy = Number(doc._source?.y ?? doc.y ?? 0);
@@ -1370,7 +1372,7 @@ export class TokenStreamer {
       const doc = docs[i];
       if (!doc) continue;
       const tok = doc._object;
-      if (tok && !tok.destroyed && tok.parent === layer.objects) {
+      if (tok && !tok.destroyed && tok.parent === layer.objects && !this.isTokenDrawing(tok)) {
         this.lastSeenMs.set(doc.id, now);
         if (!tok.renderable) {
           tok.renderable = true;
@@ -1425,8 +1427,9 @@ export class TokenStreamer {
       if (!curVp || !doc) return true;
       const x = Number(doc._source?.x ?? doc.x ?? 0);
       const y = Number(doc._source?.y ?? doc.y ?? 0);
-      const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
-      const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
+      const sz = typeof doc.getSize === "function" ? doc.getSize() : null;
+      const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid);
+      const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid);
       return !(x + w < curVp.x0 - CULL_VP_PAD_PX || x > curVp.x1 + CULL_VP_PAD_PX || y + h < curVp.y0 - CULL_VP_PAD_PX || y > curVp.y1 + CULL_VP_PAD_PX);
     };
 
@@ -1500,6 +1503,10 @@ export class TokenStreamer {
         if (!doc || !canvas.scene?.tokens?.has?.(doc.id) || !this._canUserControlDoc(doc)) continue;
         let obj = doc._object;
         const onScr = isDocOnScreen(doc);
+        if (this._drawingIds.has(doc.id) || this.isTokenDrawing(obj)) {
+          queue.push(doc);
+          break;
+        }
         if (obj && !obj.destroyed && obj.parent === layer.objects) {
           if (onScr) {
             obj.renderable = true;
@@ -1507,10 +1514,6 @@ export class TokenStreamer {
           }
           newlyMounted.push({ tok: obj, onScr });
           continue;
-        }
-        if (this._drawingIds.has(doc.id)) {
-          queue.push(doc);
-          break;
         }
         this._drawingIds.add(doc.id);
         try {
@@ -1529,7 +1532,16 @@ export class TokenStreamer {
           await obj.draw();
           frameWorkMs += (performance.now() - tDraw);
           if (gen === this._gen) this._drawingIds.delete(doc.id);
-          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || obj.destroyed) continue;
+          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || !layer.active) break;
+          if (obj.destroyed || !canvas.scene?.tokens?.has?.(doc.id)) {
+            if (!obj.destroyed) {
+              try {
+                layer.objects.removeChild(obj);
+                obj.destroy({ children: true });
+              } catch {}
+            }
+            continue;
+          }
           // Keep offscreen tokens non-renderable so selecting 150+ continent tokens adds zero offscreen GPU cost!
           const wantVis = onScr;
           obj.renderable = wantVis;
