@@ -324,40 +324,55 @@ export function updateStandardSceneCulling() {
  * onto PIXI's lightweight `"batch"` shader instead of Foundry's heavier `"batchOcclusion"` shader.
  * Always resets to `null` (never `"batchOcclusion"`) so CanvasDepthMask's `"batchDepth"` stays intact.
  */
+let _hasFastBatchTiles = false;
+
+function syncSingleDecorativeTile(t, allow) {
+  const m = t?.mesh;
+  if (!m || m.destroyed || m._boundlessMesh) return;
+  if (!allow) {
+    if (m._blFastBatch) {
+      m.pluginName = null;
+      m._blFastBatch = false;
+    }
+    return;
+  }
+  const doc = t.document;
+  // Check both document & mesh fields: PIXI "batch" shader ignores unoccludedAlpha (Tile opacity < 1),
+  // occlusion modes, and light/weather depth restrictions.
+  const docAlpha = doc?.alpha ?? 1;
+  const unoccAlpha = m.unoccludedAlpha ?? 1;
+  const hasDocOcc = Boolean(doc?.occlusion?.modes?.size || doc?.occlusion?.mode);
+  const hasDocRestrict = Boolean(doc?.restrictions?.light || doc?.restrictions?.weather);
+  const isDecorative =
+    docAlpha >= 0.999 &&
+    unoccAlpha >= 0.999 &&
+    !hasDocOcc &&
+    !hasDocRestrict &&
+    !m.occlusionMode &&
+    !m.restrictsLight &&
+    !m.restrictsWeather &&
+    !t.isVideo;
+  if (isDecorative) {
+    if (m.pluginName !== "batch") {
+      m.pluginName = "batch";
+      m._blFastBatch = true;
+      _hasFastBatchTiles = true;
+    }
+  } else if (m._blFastBatch) {
+    m.pluginName = null;
+    m._blFastBatch = false;
+  }
+}
+
 export function syncDecorativeTileShaders(enable) {
   const tiles = globalThis.canvas?.tiles?.placeables;
   if (!tiles?.length) return;
   const allow = Boolean(enable && PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling && isStandardSceneActive());
+  if (!allow && !_hasFastBatchTiles) return;
   for (let i = 0; i < tiles.length; i++) {
-    const t = tiles[i];
-    const m = t.mesh;
-    if (!m || m.destroyed || m._boundlessMesh) continue;
-    const doc = t.document;
-    // Check both document & mesh fields: PIXI "batch" shader ignores unoccludedAlpha (Tile opacity < 1),
-    // occlusion modes, and light/weather depth restrictions.
-    const docAlpha = doc?.alpha ?? 1;
-    const unoccAlpha = m.unoccludedAlpha ?? 1;
-    const hasDocOcc = Boolean(doc?.occlusion?.modes?.size || doc?.occlusion?.mode);
-    const hasDocRestrict = Boolean(doc?.restrictions?.light || doc?.restrictions?.weather);
-    const isDecorative =
-      docAlpha >= 0.999 &&
-      unoccAlpha >= 0.999 &&
-      !hasDocOcc &&
-      !hasDocRestrict &&
-      !m.occlusionMode &&
-      !m.restrictsLight &&
-      !m.restrictsWeather &&
-      !t.isVideo;
-    if (allow && isDecorative) {
-      if (m.pluginName !== "batch") {
-        m.pluginName = "batch";
-        m._blFastBatch = true;
-      }
-    } else if (m._blFastBatch) {
-      m.pluginName = null;
-      m._blFastBatch = false;
-    }
+    syncSingleDecorativeTile(tiles[i], allow);
   }
+  if (!allow) _hasFastBatchTiles = false;
 }
 
 function scheduleStandardCulling() {
@@ -590,11 +605,31 @@ export function installAutoPerfEngine(controller) {
     scheduleStandardCulling();
   });
 
-  for (const h of ["drawTile", "refreshTile", "createTile", "updateTile", "deleteTile"]) {
-    Hooks.on(h, () => {
-      if (!isStandardSceneActive()) return;
-      syncDecorativeTileShaders(true);
+  Hooks.on("drawTile", (tile) => {
+    if (!isStandardSceneActive()) return;
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
+      syncSingleDecorativeTile(tile, true);
       scheduleStandardCulling();
+    }
+  });
+
+  Hooks.on("refreshTile", (tile, flags) => {
+    if (!isStandardSceneActive()) return;
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return;
+    // O(1) update strictly for the refreshed tile (avoids O(N^2) 300ms+ freeze on 200+ tile scenes when TilesLayer activates or Showstopper slices tiles!)
+    if (!flags || flags.refreshMesh || flags.refreshShader || flags.refreshState || flags.refreshElevation) {
+      syncSingleDecorativeTile(tile, true);
+    }
+    scheduleStandardCulling();
+  });
+
+  for (const h of ["createTile", "updateTile", "deleteTile"]) {
+    Hooks.on(h, (doc) => {
+      if (!isStandardSceneActive()) return;
+      if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
+        if (doc?.object) syncSingleDecorativeTile(doc.object, true);
+        scheduleStandardCulling();
+      }
     });
   }
 
@@ -612,6 +647,7 @@ export function installAutoPerfEngine(controller) {
 
   Hooks.on("canvasTearDown", () => {
     _prewarmGen++;
+    _hasFastBatchTiles = false;
     if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
     if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
     if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }
