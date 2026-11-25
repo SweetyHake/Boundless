@@ -1374,6 +1374,56 @@ function patchMiscCpuGuards() {
     return res;
   }, { staticOnly: true });
 
+  // Zero-alloc RenderedEffectSource#animate & animateTime MUST be wrapped BEFORE PointLightSource/PointDarknessSource
+  // so subclass wrappers delegate to the zero-alloc path instead of capturing the old unpatched prototype method!
+  const RenderedSrcCls = globalThis.foundry?.canvas?.sources?.RenderedEffectSource;
+  if (RenderedSrcCls?.prototype) {
+    if (typeof RenderedSrcCls.prototype.animate === "function") {
+      wrapTargetMethod(RenderedSrcCls.prototype, "animate", "RenderedEffectSource.prototype.animate", function (wrapped, dt) {
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt);
+        if (!this.isAnimated) return;
+        const anim = this.animation;
+        const fn = anim?.animation;
+        if (typeof fn !== "function") return;
+        // Reuse options object per source instead of allocating `{animation, ...options}` every frame
+        let opts = this._blAnimOpts;
+        if (!opts || this._blAnimSrc !== anim) {
+          opts = {};
+          for (const k in anim) {
+            if (k !== "animation") opts[k] = anim[k];
+          }
+          this._blAnimSrc = anim;
+          this._blAnimOpts = opts;
+        } else {
+          for (const k in anim) {
+            if (k !== "animation") opts[k] = anim[k];
+          }
+        }
+        return fn.call(this, dt, opts);
+      });
+    }
+    if (typeof RenderedSrcCls.prototype.animateTime === "function") {
+      wrapTargetMethod(RenderedSrcCls.prototype, "animateTime", "RenderedEffectSource.prototype.animateTime", function (wrapped, dt, options) {
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt, options);
+        const speed = options?.speed ?? 5;
+        const intensity = options?.intensity ?? 5;
+        const reverse = Boolean(options?.reverse);
+        let t = globalThis.canvas?.app?.ticker?.lastTime ?? 0;
+        if (reverse) t *= -1;
+        const time = ((speed * t) / 5000) + (this.animation?.seed ?? 0);
+        if (this.animation) this.animation.time = time;
+        const layers = this.layers;
+        if (!layers) return;
+        for (const k in layers) {
+          const u = layers[k]?.mesh?.uniforms;
+          if (!u) continue;
+          u.time = time;
+          u.intensity = intensity;
+        }
+      });
+    }
+  }
+
   // Skip per-frame uniform/shader animation CPU work for offscreen-culled light & darkness sources
   const okLightAnim = wrapFoundryMethod("PointLightSource", "animate", function (wrapped, dt) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
@@ -1408,57 +1458,6 @@ function patchMiscCpuGuards() {
     }
     return wrapped(dt);
   });
-
-  // Zero-alloc RenderedEffectSource#animate & animateTime (eliminates per-frame rest-spread & Object.values allocations on 60+ torches @ 120Hz)
-  const RenderedSrcCls = globalThis.foundry?.canvas?.sources?.RenderedEffectSource;
-  if (RenderedSrcCls?.prototype) {
-    if (typeof RenderedSrcCls.prototype.animate === "function") {
-      wrapTargetMethod(RenderedSrcCls.prototype, "animate", "RenderedEffectSource.prototype.animate", function (wrapped, dt) {
-        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt);
-        if (!this.isAnimated) return;
-        const anim = this.animation;
-        const fn = anim?.animation;
-        if (typeof fn !== "function") return;
-        // Reuse options object per source instead of allocating `{animation, ...options}` every frame
-        let opts = this._blAnimOpts;
-        if (!opts || this._blAnimSrc !== anim) {
-          opts = {};
-          for (const k in anim) {
-            if (k !== "animation") opts[k] = anim[k];
-          }
-          this._blAnimSrc = anim;
-          this._blAnimOpts = opts;
-        } else {
-          opts.speed = anim.speed;
-          opts.intensity = anim.intensity;
-          opts.reverse = anim.reverse;
-          opts.seed = anim.seed;
-          opts.time = anim.time;
-        }
-        return fn.call(this, dt, opts);
-      });
-    }
-    if (typeof RenderedSrcCls.prototype.animateTime === "function") {
-      wrapTargetMethod(RenderedSrcCls.prototype, "animateTime", "RenderedEffectSource.prototype.animateTime", function (wrapped, dt, options) {
-        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt, options);
-        const speed = options?.speed ?? 5;
-        const intensity = options?.intensity ?? 5;
-        const reverse = Boolean(options?.reverse);
-        let t = globalThis.canvas?.app?.ticker?.lastTime ?? 0;
-        if (reverse) t *= -1;
-        const time = ((speed * t) / 5000) + (this.animation?.seed ?? 0);
-        if (this.animation) this.animation.time = time;
-        const layers = this.layers;
-        if (!layers) return;
-        for (const k in layers) {
-          const u = layers[k]?.mesh?.uniforms;
-          if (!u) continue;
-          u.time = time;
-          u.intensity = intensity;
-        }
-      });
-    }
-  }
 
   // Lazy Actor#applyActiveEffects: skip 2x Actor#getRollData() + Map + expandObject on actors with 0 active AE changes (80-90% of NPCs)
   wrapFoundryMethod("Actor", "applyActiveEffects", function (wrapped, phase) {

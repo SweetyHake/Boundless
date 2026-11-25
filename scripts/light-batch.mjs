@@ -1167,7 +1167,16 @@ export class MegaLightBatch {
       const extraLevelSig = rawExtraSig.replace(/\|od:[^|]*/g, "");
       const hasSigWallEdits = Boolean(extraLevelSig && /(?:^|\|)we:(?!0(?:\||$))/.test(extraLevelSig));
       const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || hasSigWallEdits || nativeEdges.length > 0;
-      const wallGeomHash = spec._superGridBase ? "sg" : hashLevelWallGeometry(sectors);
+      let wallGeomHash = "sg";
+      if (!spec._superGridBase) {
+        if (spec._wallGeomHashRef === sectors && typeof spec._wallGeomHash === "string") {
+          wallGeomHash = spec._wallGeomHash;
+        } else {
+          wallGeomHash = hashLevelWallGeometry(sectors);
+          spec._wallGeomHash = wallGeomHash;
+          spec._wallGeomHashRef = sectors;
+        }
+      }
       const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}|wg:${wallGeomHash}`;
 
       // Fast instanced light baking for unmodified superGrid worlds (only when regionPx divides evenly by baseSimSectorPx)
@@ -2721,22 +2730,36 @@ export class MegaLightBatch {
     const sw = canvas.screenDimensions?.[0] || 1;
     const sh = canvas.screenDimensions?.[1] || 1;
     const dark = canvas.environment?.darknessLevel ?? 0;
+    const animOn = canvas.effects?.animateLightSources !== false;
+    const dynDark = Boolean(canvas.effects?.illumination?.hasDynamicDarknessLevel);
     // Deduplicate across up to 9 chunk meshes sharing the same illumShader in a single render frame
     if (
       tickTime > 0 &&
+      this._lastIllumShader === this.illumShader &&
       tickTime === this._lastIllumTick &&
       scale === this._lastIllumScale &&
       sw === this._lastIllumSw &&
       sh === this._lastIllumSh &&
-      dark === this._lastIllumDark
+      dark === this._lastIllumDark &&
+      animOn === this._lastIllumAnim &&
+      dynDark === this._lastIllumDyn &&
+      this.useDepthTexture === this._lastIllumDepth &&
+      this.useBakedRoofMask === this._lastIllumRoof &&
+      this.bakedRoofMask === this._lastIllumRoofTex
     ) {
       return;
     }
+    this._lastIllumShader = this.illumShader;
     this._lastIllumTick = tickTime;
     this._lastIllumScale = scale;
     this._lastIllumSw = sw;
     this._lastIllumSh = sh;
     this._lastIllumDark = dark;
+    this._lastIllumAnim = animOn;
+    this._lastIllumDyn = dynDark;
+    this._lastIllumDepth = this.useDepthTexture;
+    this._lastIllumRoof = this.useBakedRoofMask;
+    this._lastIllumRoofTex = this.bakedRoofMask;
 
     this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
@@ -2801,19 +2824,30 @@ export class MegaLightBatch {
     const scale = canvas.stage?.scale?.x || 1;
     const sw = canvas.screenDimensions?.[0] || 1;
     const sh = canvas.screenDimensions?.[1] || 1;
+    const animOn = canvas.effects?.animateLightSources !== false;
     if (
       tickTime > 0 &&
+      this._lastColorShader === this.colorShader &&
       tickTime === this._lastColorTick &&
       scale === this._lastColorScale &&
       sw === this._lastColorSw &&
-      sh === this._lastColorSh
+      sh === this._lastColorSh &&
+      animOn === this._lastColorAnim &&
+      this.useDepthTexture === this._lastColorDepth &&
+      this.useBakedRoofMask === this._lastColorRoof &&
+      this.bakedRoofMask === this._lastColorRoofTex
     ) {
       return;
     }
+    this._lastColorShader = this.colorShader;
     this._lastColorTick = tickTime;
     this._lastColorScale = scale;
     this._lastColorSw = sw;
     this._lastColorSh = sh;
+    this._lastColorAnim = animOn;
+    this._lastColorDepth = this.useDepthTexture;
+    this._lastColorRoof = this.useBakedRoofMask;
+    this._lastColorRoofTex = this.bakedRoofMask;
 
     this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
@@ -3098,6 +3132,10 @@ export class MegaLightBatch {
     this.sectorBounds = [];
     this.lastVisKey = "";
     this._lastCullBox = null;
+    this._lastIllumTick = -1;
+    this._lastColorTick = -1;
+    this._lastIllumShader = null;
+    this._lastColorShader = null;
     this.totalLights = 0;
     this.totalVertices = 0;
     this.visibleIndexCount = 0;

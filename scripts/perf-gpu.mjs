@@ -158,6 +158,17 @@ function getUiAtlas() {
   ctx.stroke();
   ctx.restore();
 
+  // (K) Status Effect Icon Background tile at (0, 192, 36, 36):
+  // Matches Foundry v14 Token#_refreshEffects bg.beginFill(0x000000, 0.40).lineStyle(s, 0x000000).drawRoundedRect(..., 2*s)
+  ctx.save();
+  roundedRectPath(2, 194, 32, 32, 3.6);
+  ctx.fillStyle = "rgba(0,0,0,0.40)";
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(0,0,0,1)";
+  ctx.stroke();
+  ctx.restore();
+
   const base = PIXI.BaseTexture.from(canvasEl, {
     scaleMode: PIXI.SCALE_MODES.LINEAR,
     mipmap: PIXI.MIPMAP_MODES.OFF
@@ -181,7 +192,8 @@ function getUiAtlas() {
     barFillR: new PIXI.Texture(base, new PIXI.Rectangle(102, 160, 10, 24)),
     barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 160, 10, 24)),
     barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 160, 24, 24)),
-    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 160, 10, 24))
+    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 160, 10, 24)),
+    effectBg: new PIXI.Texture(base, new PIXI.Rectangle(0, 192, 36, 36))
   };
   return _uiAtlas;
 }
@@ -1100,37 +1112,118 @@ function patchTokenUiCaching() {
 
   patchDnd5eHpBars();
 
+  const hideFxBgSprites = (bg) => {
+    const arr = bg?._blFxBgSprites;
+    if (!arr) return;
+    for (let i = 0; i < arr.length; i++) arr[i].visible = false;
+  };
+
   const okDrawFx = wrapFoundryMethod("Token", "_drawEffects", function (wrapped, ...args) {
-    if (this.effects) this.effects.cacheAsBitmap = false;
+    if (this.effects) {
+      this.effects.cacheAsBitmap = false;
+      hideFxBgSprites(this.effects.bg);
+    }
     return wrapped(...args);
   }, { type: "WRAPPER" });
 
   const okRefFx = wrapFoundryMethod("Token", "_refreshEffects", function (wrapped, ...args) {
-    if (this.effects) this.effects.cacheAsBitmap = false;
+    if (this.effects) {
+      this.effects.cacheAsBitmap = false;
+      hideFxBgSprites(this.effects.bg);
+    }
     const res = wrapped(...args);
+    const fx = this.effects;
+    const bg = fx?.bg;
     if (
       PERF_CONFIG.perfEnabled &&
       PERF_CONFIG.perfTokenUiCache &&
       !isPrimePerfActive() &&
-      this.effects &&
-      !this.effects.destroyed &&
+      fx && !fx.destroyed &&
+      bg && !bg.destroyed &&
       !this.isPreview &&
-      !this.effects.overlay &&
-      !this.effects.filters?.length &&
-      !this.effects.bg?.filters?.length &&
-      !this.effects.bg?.customDnd5eBgParams &&
-      this.effects.children?.length >= 5 &&
-      this.effects.children.every(ch => ch === this.effects.bg || (
-        ch instanceof PIXI.Sprite
-        && !ch.children?.length
-        && !ch.filters?.length
-        && !ch.customDnd5eBaseScale
-        && (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")
-      ))
+      !fx.filters?.length &&
+      !bg.filters?.length &&
+      !bg.customDnd5eBgParams
     ) {
-      this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
-      this.effects.cacheAsBitmap = true;
-      perfStats.tokenEffectsCached++;
+      const kids = fx.children;
+      const statusIcons = [];
+      let allStandard = true;
+      for (let i = 0; i < kids.length; i++) {
+        const ch = kids[i];
+        if (ch === bg || ch === fx.overlay) continue;
+        if (
+          ch instanceof PIXI.Sprite &&
+          !ch.children?.length &&
+          !ch.filters?.length &&
+          !ch.customDnd5eBaseScale &&
+          (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")
+        ) {
+          statusIcons.push(ch);
+        } else {
+          allStandard = false;
+          break;
+        }
+      }
+      if (allStandard && statusIcons.length >= 1 && statusIcons.length <= 4) {
+        // Batch 1-4 status effect backgrounds onto shared _uiAtlas sprites (merges all combat tokens into 1 draw call!)
+        const atlas = getUiAtlas();
+        if (atlas?.effectBg) {
+          const s = globalThis.canvas?.dimensions?.uiScale || 1;
+          bg.clear();
+          let pool = bg._blFxBgSprites;
+          if (!pool) pool = bg._blFxBgSprites = [];
+          for (let i = 0; i < statusIcons.length; i++) {
+            const ic = statusIcons[i];
+            let sp = pool[i];
+            if (!sp || sp.destroyed) {
+              sp = new PIXI.Sprite(atlas.effectBg);
+              sp.eventMode = "none";
+              bg.addChild(sp);
+              pool[i] = sp;
+            } else if (sp.parent !== bg) {
+              bg.addChild(sp);
+            }
+            const sz = Math.max(1, (ic.width || (20 * s)) - 2 * s);
+            sp.visible = true;
+            sp.position.set((ic.x || 0) + s, (ic.y || 0) + s);
+            sp.width = sz;
+            sp.height = sz;
+          }
+          for (let i = statusIcons.length; i < pool.length; i++) {
+            if (pool[i] && !pool[i].destroyed) pool[i].visible = false;
+          }
+          perfStats.tokenEffectsCached++;
+        }
+      } else if (allStandard && !fx.overlay && statusIcons.length >= 5) {
+        fx.cacheAsBitmapResolution = getBitmapCacheResolution();
+        fx.cacheAsBitmap = true;
+        perfStats.tokenEffectsCached++;
+      }
+    }
+    return res;
+  }, { type: "WRAPPER" });
+
+  // Lazy Token#_refreshBorder: skip expensive border + DashLineShader tessellation on unselected/unhovered tokens during scene load
+  wrapFoundryMethod("Token", "_refreshBorder", function (wrapped, ...args) {
+    if (
+      PERF_CONFIG.perfEnabled &&
+      PERF_CONFIG.perfTokenUiCache &&
+      !isPrimePerfActive() &&
+      this.border && !this.border.destroyed &&
+      !this.border.visible && !this.controlled && !this.hover && !this.layer?.highlightObjects
+    ) {
+      this._blBorderDirty = true;
+      return;
+    }
+    this._blBorderDirty = false;
+    return wrapped(...args);
+  }, { type: "MIXED" });
+
+  wrapFoundryMethod("Token", "_refreshState", function (wrapped, ...args) {
+    const res = wrapped(...args);
+    if (this._blBorderDirty && this.border && !this.border.destroyed && this.border.visible) {
+      this._blBorderDirty = false;
+      this._refreshBorder();
     }
     return res;
   }, { type: "WRAPPER" });
@@ -1143,12 +1236,17 @@ export function refreshTokenBars() {
   if (!placeables?.length) return;
   for (let i = 0; i < placeables.length; i++) {
     const tok = placeables[i];
-    if (!tok || tok.destroyed || !tok.bars || tok.bars.destroyed) continue;
-    if (typeof tok.drawBars === "function") {
-      try { tok.drawBars(); } catch {}
-    } else {
-      hideBar3SliceSprites(tok.bars.bar1);
-      hideBar3SliceSprites(tok.bars.bar2);
+    if (!tok || tok.destroyed) continue;
+    if (tok.bars && !tok.bars.destroyed) {
+      if (typeof tok.drawBars === "function") {
+        try { tok.drawBars(); } catch {}
+      } else {
+        hideBar3SliceSprites(tok.bars.bar1);
+        hideBar3SliceSprites(tok.bars.bar2);
+      }
+    }
+    if (tok.effects && !tok.effects.destroyed && tok.effects.children?.length > 1 && typeof tok._refreshEffects === "function") {
+      try { tok._refreshEffects(); } catch {}
     }
   }
 }
@@ -1423,6 +1521,23 @@ function patchV14CoreRenderPasses() {
       pcoListDirty = false;
     };
 
+    let glCtxGen = 0;
+    const bindGlRestoreCounter = () => {
+      const view = globalThis.canvas?.app?.view;
+      if (view && !view._blCtxGenBound) {
+        view._blCtxGenBound = true;
+        view.addEventListener?.("webglcontextrestored", () => { glCtxGen++; }, { passive: true });
+      }
+    };
+    Hooks.on("canvasReady", bindGlRestoreCounter);
+    Hooks.on("canvasTearDown", () => { glCtxGen++; });
+    bindGlRestoreCounter();
+
+    const maskStateKey = (rt, extra = "") => {
+      if (!rt) return null;
+      return `${glCtxGen}:${rt.baseTexture?.uid ?? 0}:${rt.width}x${rt.height}${extra}`;
+    };
+
     // OcclusionMask renders right before DepthMask and feeds depth shader's occlusionTexture
     results.push(wrapTargetMethod(OccMaskCls.prototype, "render", "CanvasOcclusionMask.prototype.render", function (wrapped, renderer) {
       const willRender = this.autoRender || this.renderDirty;
@@ -1433,7 +1548,7 @@ function patchV14CoreRenderPasses() {
       const res = wrapped(renderer);
       if (willRender) {
         const isEmpty = !this.tokens?.geometry?.graphicsData?.length && !this.surfaces?.geometry?.graphicsData?.length && this.children.length <= 2;
-        this._blCleanState = isEmpty && this.renderTexture ? `${this.renderTexture.width}x${this.renderTexture.height}` : null;
+        this._blCleanState = isEmpty ? maskStateKey(this.renderTexture) : null;
       }
       return res;
     }));
@@ -1447,8 +1562,8 @@ function patchV14CoreRenderPasses() {
         const willRender = this.autoRender || this.renderDirty;
         const res = wrapped(renderer);
         if (willRender) {
-          this._blCleanState = (this.children.length === 0 && this.renderTexture)
-            ? `${this.renderTexture.width}x${this.renderTexture.height}:${this.clearColor?.[0] ?? 0}`
+          this._blCleanState = this.children.length === 0
+            ? maskStateKey(this.renderTexture, `:${this.clearColor?.[0] ?? 0}`)
             : null;
         }
         return res;
@@ -1460,9 +1575,7 @@ function patchV14CoreRenderPasses() {
         const res = wrapped(renderer);
         if (willRender) {
           const isVisOff = !globalThis.canvas?.visibility?.visible && !(globalThis.canvas?.effects?.visionSources?.size > 0);
-          this._blCleanState = (isVisOff && this.renderTexture)
-            ? `${this.renderTexture.width}x${this.renderTexture.height}`
-            : null;
+          this._blCleanState = isVisOff ? maskStateKey(this.renderTexture) : null;
         }
         return res;
       }));
@@ -1483,11 +1596,11 @@ function patchV14CoreRenderPasses() {
           const rt = mask.renderTexture;
           if (rt && mask._blCleanState) {
             if (mask === darkMask || mask.constructor?.name === "DarknessLevelContainer") {
-              if (mask.children.length === 0 && mask._blCleanState === `${rt.width}x${rt.height}:${mask.clearColor?.[0] ?? 0}`) continue;
+              if (mask.children.length === 0 && mask._blCleanState === maskStateKey(rt, `:${mask.clearColor?.[0] ?? 0}`)) continue;
             } else if (mask === occMask) {
-              if (!mask.tokens?.geometry?.graphicsData?.length && !mask.surfaces?.geometry?.graphicsData?.length && mask.children.length <= 2 && mask._blCleanState === `${rt.width}x${rt.height}`) continue;
+              if (!mask.tokens?.geometry?.graphicsData?.length && !mask.surfaces?.geometry?.graphicsData?.length && mask.children.length <= 2 && mask._blCleanState === maskStateKey(rt)) continue;
             } else if (mask === visMask) {
-              if (visOff && mask._blCleanState === `${rt.width}x${rt.height}`) continue;
+              if (visOff && mask._blCleanState === maskStateKey(rt)) continue;
             }
           }
           mask.renderDirty = true;
@@ -1502,7 +1615,7 @@ function patchV14CoreRenderPasses() {
         if (!this.rendered) return;
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) {
           this._blAlignDirty = false;
-          this._blLastHudSig = null;
+          this._blHudX = NaN;
           return wrapped();
         }
         const hud = this.element;
@@ -1519,7 +1632,7 @@ function patchV14CoreRenderPasses() {
             if (el.id === "measurement") {
               const mKids = el.children;
               for (let j = 0; j < mKids.length; j++) {
-                if (!mKids[j].classList?.contains("hidden") || mKids[j].childElementCount > 0) {
+                if (!mKids[j].classList?.contains("hidden")) {
                   hasActiveHud = true;
                   break;
                 }
@@ -1581,6 +1694,18 @@ function patchV14CoreRenderPasses() {
           syncHudIfDirty();
           return res;
         }));
+      }
+      // Also align HUD immediately when a Ruler or TokenRuler shows measurement labels after a pan/zoom
+      const interaction = globalThis.foundry?.canvas?.interaction;
+      for (const rName of ["BaseRuler", "Ruler", "TokenRuler"]) {
+        const RCls = interaction?.[rName] ?? globalThis.foundry?.canvas?.placeables?.tokens?.[rName];
+        if (RCls?.prototype?.refresh) {
+          results.push(wrapTargetMethod(RCls.prototype, "refresh", `${rName}.prototype.refresh`, function (wrapped, ...args) {
+            const res = wrapped(...args);
+            if (this.active || this.visible) syncHudIfDirty();
+            return res;
+          }));
+        }
       }
     }
 

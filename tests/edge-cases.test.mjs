@@ -3017,3 +3017,47 @@ test("hasPlayerOwnerLazy avoids touching doc.actor on lazy synthetic ActorDelta"
   assert.equal(hasPlayerOwnerLazy(makeLazy("a2")), false);
   assert.equal(actorTouched, false, "must never read doc.hasPlayerOwner on lazy ActorDelta");
 });
+
+test("isWorkerDecodableUrl accepts URLs with query strings and hash fragments", async () => {
+  const { isWorkerDecodableUrl } = await import("../scripts/tile-worker-pool.mjs");
+  assert.equal(isWorkerDecodableUrl("tiles/0_0.webp"), true);
+  assert.equal(isWorkerDecodableUrl("tiles/0_0.webp?v=123"), true);
+  assert.equal(isWorkerDecodableUrl("tiles/0_0.png#anchor"), true);
+  assert.equal(isWorkerDecodableUrl("icons/sword.svg"), false);
+  assert.equal(isWorkerDecodableUrl("data:image/webp;base64,AAA"), false);
+});
+
+test("MegaAudioStreamer expands search padding for large-radius virtual sounds (> 80ft)", async () => {
+  installBaseGlobals();
+  const attached = [];
+  class MockSoundSource {
+    constructor(opts) { this.sourceId = opts.sourceId; this.attached = false; this.shape = { radius: 3000 }; }
+    initialize(cfg) { this.cfg = cfg; }
+    add() { this.attached = true; attached.push(this.sourceId); }
+    destroy() { this.attached = false; }
+  }
+  globalThis.foundry = { canvas: { sources: { PointSoundSource: MockSoundSource } } };
+  globalThis.canvas = {
+    ready: true,
+    sounds: { livePreview: false },
+    dimensions: { size: 100, distance: 5 },
+    environment: { darknessLevel: 0 },
+    stage: { scale: { x: 1 } },
+    tokens: { placeables: [] },
+    level: { id: "l0" },
+    perception: { update() {} }
+  };
+
+  const { MegaAudioStreamer } = await import("../scripts/audio-streamer.mjs");
+  const as = new MegaAudioStreamer();
+  // Sound in sector 2_0 (x=4200, y=500) with radius 150ft (3000px), viewport at x=[0..1000] (> 1600px away!)
+  const layer = {
+    level: { id: "l0", elevation: { bottom: 0, top: 20 } },
+    simGrid: 10,
+    simSectorPx: 2000,
+    spec: { sectors: { "2_0": { s: [[4200, 500, 150, "rain.ogg", 0.5, false, true, 0, 1]] } } }
+  };
+  as.update([layer], { x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 });
+  assert.equal(attached.length, 1, "150ft sound at 3200px distance must be discovered via dynamic padPx");
+  as.unmount();
+});

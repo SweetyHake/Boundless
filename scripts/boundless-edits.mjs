@@ -1071,10 +1071,28 @@ export const editsMethods = {
     let migratedLevels = 0;
     let activeSceneTouched = false;
 
+    const legacyPrefix = `modules/${LEGACY_ID}/`;
+    const hasLegacyPath = (val, depth = 0) => {
+      if (!val || depth > 5) return false;
+      if (typeof val === "string") return val.includes(legacyPrefix);
+      if (Array.isArray(val)) {
+        for (let i = 0; i < val.length; i++) if (hasLegacyPath(val[i], depth + 1)) return true;
+        return false;
+      }
+      if (typeof val === "object") {
+        for (const k in val) {
+          // Skip massive fog/edit payloads that cannot contain module asset URLs
+          if (k === "sharedFog" || k === "wallEdits" || k === "doorStates" || k === "sectors") continue;
+          if (hasLegacyPath(val[k], depth + 1)) return true;
+        }
+      }
+      return false;
+    };
+
     for (const scene of game.scenes || []) {
       const legacyScene = scene.flags?.[LEGACY_ID];
       const curScene = scene.flags?.[MODULE_ID];
-      const curHasOldPath = curScene && JSON.stringify(curScene).includes(`modules/${LEGACY_ID}/`);
+      const curHasOldPath = Boolean(curScene && hasLegacyPath(curScene));
 
       if (legacyScene || curHasOldPath) {
         const base = legacyScene ? rewritePaths(foundry.utils.deepClone(legacyScene)) : {};
@@ -1091,7 +1109,7 @@ export const editsMethods = {
       for (const level of scene.levels || []) {
         const legacyLvl = level.flags?.[LEGACY_ID];
         const curLvl = level.flags?.[MODULE_ID];
-        const lvlHasOldPath = curLvl && JSON.stringify(curLvl).includes(`modules/${LEGACY_ID}/`);
+        const lvlHasOldPath = Boolean(curLvl && hasLegacyPath(curLvl));
         if (!legacyLvl && !lvlHasOldPath) continue;
 
         const base = legacyLvl ? rewritePaths(foundry.utils.deepClone(legacyLvl)) : {};

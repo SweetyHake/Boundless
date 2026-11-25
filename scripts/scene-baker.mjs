@@ -313,119 +313,121 @@ async function sliceAndUploadPyramid({
   const sparseTiles = skipEmptyAlpha ? {} : null;
   let uploadedBaseUrl = null;
 
-  await ensureDirectoryRecursive(pyramidDir);
+  try {
+    await ensureDirectoryRecursive(pyramidDir);
 
-  for (const lvl of plan.levels) {
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    const zDir = `${pyramidDir}/${lvl.z}`;
-    await ensureDirectoryRecursive(zDir);
-
-    // Use anti-aliased mipProxy when downscaling > 2.5x from full source (respect max dimension for portrait maps)
-    const useProxy = Boolean(mipProxy && (lvl.nTiles * TILE_PX) <= Math.max(mipProxy.width, mipProxy.height) * 1.15);
-    const drawSrc = useProxy ? mipProxy.source : loadedImg.source;
-    const srcW = useProxy ? mipProxy.width : loadedImg.width;
-    const srcH = useProxy ? mipProxy.height : loadedImg.height;
-    const fitted = computeFitDrawDimensions(bgFit, sceneBounds.w, sceneBounds.h, srcW, srcH);
-
-    const coords = [];
-    for (let ty = 0; ty <= lvl.maxTy; ty++) {
-      for (let tx = 0; tx <= lvl.maxTx; tx++) {
-        coords.push({ tx, ty });
-      }
-    }
-
-    const pendingUploads = [];
-    const flushUploads = async (minKeep = 0) => {
-      while (pendingUploads.length > minKeep) {
-        await pendingUploads.shift();
-      }
-    };
-
-    for (const { tx, ty } of coords) {
+    for (const lvl of plan.levels) {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const zDir = `${pyramidDir}/${lvl.z}`;
+      await ensureDirectoryRecursive(zDir);
 
-      const wx0 = tx * lvl.tileWorldSize;
-      const wy0 = ty * lvl.tileWorldSize;
-      const scaleToTile = TILE_PX / lvl.tileWorldSize;
+      // Use anti-aliased mipProxy when downscaling > 2.5x from full source (respect max dimension for portrait maps)
+      const useProxy = Boolean(mipProxy && (lvl.nTiles * TILE_PX) <= Math.max(mipProxy.width, mipProxy.height) * 1.15);
+      const drawSrc = useProxy ? mipProxy.source : loadedImg.source;
+      const srcW = useProxy ? mipProxy.width : loadedImg.width;
+      const srcH = useProxy ? mipProxy.height : loadedImg.height;
+      const fitted = computeFitDrawDimensions(bgFit, sceneBounds.w, sceneBounds.h, srcW, srcH);
 
-      work.ctx.save();
-      work.ctx.clearRect(0, 0, TILE_PX, TILE_PX);
-
-      if (!hasTransform) {
-        const ix0 = Math.max(0, wx0);
-        const iy0 = Math.max(0, wy0);
-        const ix1 = Math.min(sceneBounds.w, wx0 + lvl.tileWorldSize);
-        const iy1 = Math.min(sceneBounds.h, wy0 + lvl.tileWorldSize);
-        if (ix1 > ix0 && iy1 > iy0) {
-          const sx = (ix0 / sceneBounds.w) * srcW;
-          const sy = (iy0 / sceneBounds.h) * srcH;
-          const sw = ((ix1 - ix0) / sceneBounds.w) * srcW;
-          const sh = ((iy1 - iy0) / sceneBounds.h) * srcH;
-          const dx = (ix0 - wx0) * scaleToTile;
-          const dy = (iy0 - wy0) * scaleToTile;
-          const dw = (ix1 - ix0) * scaleToTile;
-          const dh = (iy1 - iy0) * scaleToTile;
-          work.ctx.drawImage(drawSrc, sx, sy, sw, sh, dx, dy, dw, dh);
+      const coords = [];
+      for (let ty = 0; ty <= lvl.maxTy; ty++) {
+        for (let tx = 0; tx <= lvl.maxTx; tx++) {
+          coords.push({ tx, ty });
         }
-      } else {
-        work.ctx.scale(scaleToTile, scaleToTile);
-        work.ctx.translate(-wx0, -wy0);
-        work.ctx.translate(sceneBounds.w * 0.5 + bgOffX, sceneBounds.h * 0.5 + bgOffY);
-        if (bgRotRad) work.ctx.rotate(bgRotRad);
-        work.ctx.scale(bgScaleX, bgScaleY);
-        work.ctx.drawImage(
-          drawSrc,
-          -fitted.drawW * bgAnchorX,
-          -fitted.drawH * bgAnchorY,
-          fitted.drawW,
-          fitted.drawH
-        );
-      }
-      work.ctx.restore();
-
-      if (skipEmptyAlpha && isCanvasEmptyAlpha(work)) {
-        onTileProgress?.(lvl.z, false);
-        continue;
       }
 
-      if (sparseTiles) {
-        const zk = String(lvl.z);
-        if (!sparseTiles[zk]) sparseTiles[zk] = [];
-        sparseTiles[zk].push(`${tx}_${ty}`);
-      }
+      const pendingUploads = [];
+      const flushUploads = async (minKeep = 0) => {
+        while (pendingUploads.length > minKeep) {
+          await pendingUploads.shift();
+        }
+      };
 
-      const blob = await canvasToWebpBlob(work, quality);
-      const file = new File([blob], `${tx}_${ty}.webp`, { type: "image/webp" });
+      for (const { tx, ty } of coords) {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-      const upPromise = uploadFileSilent(zDir, file).then((res) => {
-        if (!uploadedBaseUrl && res?.path) {
-          const suffix = `/${lvl.z}/${tx}_${ty}.webp`;
-          if (res.path.endsWith(suffix)) {
-            uploadedBaseUrl = res.path.slice(0, -suffix.length);
+        const wx0 = tx * lvl.tileWorldSize;
+        const wy0 = ty * lvl.tileWorldSize;
+        const scaleToTile = TILE_PX / lvl.tileWorldSize;
+
+        work.ctx.save();
+        work.ctx.clearRect(0, 0, TILE_PX, TILE_PX);
+
+        if (!hasTransform) {
+          const ix0 = Math.max(0, wx0);
+          const iy0 = Math.max(0, wy0);
+          const ix1 = Math.min(sceneBounds.w, wx0 + lvl.tileWorldSize);
+          const iy1 = Math.min(sceneBounds.h, wy0 + lvl.tileWorldSize);
+          if (ix1 > ix0 && iy1 > iy0) {
+            const sx = (ix0 / sceneBounds.w) * srcW;
+            const sy = (iy0 / sceneBounds.h) * srcH;
+            const sw = ((ix1 - ix0) / sceneBounds.w) * srcW;
+            const sh = ((iy1 - iy0) / sceneBounds.h) * srcH;
+            const dx = (ix0 - wx0) * scaleToTile;
+            const dy = (iy0 - wy0) * scaleToTile;
+            const dw = (ix1 - ix0) * scaleToTile;
+            const dh = (iy1 - iy0) * scaleToTile;
+            work.ctx.drawImage(drawSrc, sx, sy, sw, sh, dx, dy, dw, dh);
           }
+        } else {
+          work.ctx.scale(scaleToTile, scaleToTile);
+          work.ctx.translate(-wx0, -wy0);
+          work.ctx.translate(sceneBounds.w * 0.5 + bgOffX, sceneBounds.h * 0.5 + bgOffY);
+          if (bgRotRad) work.ctx.rotate(bgRotRad);
+          work.ctx.scale(bgScaleX, bgScaleY);
+          work.ctx.drawImage(
+            drawSrc,
+            -fitted.drawW * bgAnchorX,
+            -fitted.drawH * bgAnchorY,
+            fitted.drawW,
+            fitted.drawH
+          );
         }
-        onTileProgress?.(lvl.z, true);
-      });
-      // Prevent spurious UnhandledPromiseRejection if a later concurrent upload rejects before FIFO shift() awaits it
-      upPromise.catch(() => {});
-      pendingUploads.push(upPromise);
-      allPendingUploads.push(upPromise);
-      if (pendingUploads.length >= UPLOAD_CONCURRENCY) {
-        await flushUploads(UPLOAD_CONCURRENCY - 1);
+        work.ctx.restore();
+
+        if (skipEmptyAlpha && isCanvasEmptyAlpha(work)) {
+          onTileProgress?.(lvl.z, false);
+          continue;
+        }
+
+        if (sparseTiles) {
+          const zk = String(lvl.z);
+          if (!sparseTiles[zk]) sparseTiles[zk] = [];
+          sparseTiles[zk].push(`${tx}_${ty}`);
+        }
+
+        const blob = await canvasToWebpBlob(work, quality);
+        const file = new File([blob], `${tx}_${ty}.webp`, { type: "image/webp" });
+
+        const upPromise = uploadFileSilent(zDir, file).then((res) => {
+          if (!uploadedBaseUrl && res?.path) {
+            const suffix = `/${lvl.z}/${tx}_${ty}.webp`;
+            if (res.path.endsWith(suffix)) {
+              uploadedBaseUrl = res.path.slice(0, -suffix.length);
+            }
+          }
+          onTileProgress?.(lvl.z, true);
+        });
+        // Prevent spurious UnhandledPromiseRejection if a later concurrent upload rejects before FIFO shift() awaits it
+        upPromise.catch(() => {});
+        pendingUploads.push(upPromise);
+        allPendingUploads.push(upPromise);
+        if (pendingUploads.length >= UPLOAD_CONCURRENCY) {
+          await flushUploads(UPLOAD_CONCURRENCY - 1);
+        }
       }
+      await flushUploads(0);
     }
-    await flushUploads(0);
-  }
 
-  if (work?.canvas) { work.canvas.width = 0; work.canvas.height = 0; }
-  if (mipProxy?.source && "width" in mipProxy.source) {
-    try { mipProxy.source.width = 0; mipProxy.source.height = 0; } catch {}
+    return {
+      sparseTiles,
+      baseUrl: uploadedBaseUrl || encodePathSegments(pyramidDir)
+    };
+  } finally {
+    if (work?.canvas) { work.canvas.width = 0; work.canvas.height = 0; }
+    if (mipProxy?.source && "width" in mipProxy.source) {
+      try { mipProxy.source.width = 0; mipProxy.source.height = 0; } catch {}
+    }
   }
-
-  return {
-    sparseTiles,
-    baseUrl: uploadedBaseUrl || encodePathSegments(pyramidDir)
-  };
 }
 
 /**
@@ -1709,28 +1711,32 @@ async function stitchPyramidToWebp({
     work.ctx.clearRect(0, 0, outW, outH);
     let drawn = 0;
 
+    const coords = [];
     for (let ty = y0; ty <= y1; ty++) {
       for (let tx = x0; tx <= x1; tx++) {
-        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         if (sparseSet && !sparseSet.has(`${chosenZ}/${tx}_${ty}`)) continue;
-        const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
-        let img = null;
-        try {
-          img = await loadImageSource(url, signal);
-          const dx = tx * tileWorld * scaleZ;
-          const dy = ty * tileWorld * scaleZ;
-          const dw = tileWorld * scaleZ;
-          const dh = tileWorld * scaleZ;
-          work.ctx.drawImage(img.source, dx, dy, dw, dh);
-          drawn++;
-        } catch (err) {
-          if (err?.name === "AbortError") throw err;
-          console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
-        } finally {
-          img?.close?.();
-        }
+        coords.push({ tx, ty });
       }
     }
+    await runPool(coords, 4, async ({ tx, ty }) => {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
+      let img = null;
+      try {
+        img = await loadImageSource(url, signal);
+        const dx = tx * tileWorld * scaleZ;
+        const dy = ty * tileWorld * scaleZ;
+        const dw = tileWorld * scaleZ;
+        const dh = tileWorld * scaleZ;
+        work.ctx.drawImage(img.source, dx, dy, dw, dh);
+        drawn++;
+      } catch (err) {
+        if (err?.name === "AbortError") throw err;
+        console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
+      } finally {
+        img?.close?.();
+      }
+    });
     if (!drawn) return null;
     return await canvasToWebpBlob(work, quality);
   } finally {

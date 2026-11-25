@@ -292,12 +292,13 @@ function _pruneHalfRecords(db) {
           const toDelete = total > 0 ? Math.max(1, Math.ceil(total / 2)) : 0;
           if (toDelete <= 0) return;
           const idx = store.index("updatedAt");
-          const cursorReq = idx.openCursor();
+          const cursorReq = typeof idx.openKeyCursor === "function" ? idx.openKeyCursor() : idx.openCursor();
           cursorReq.onsuccess = () => {
             try {
               const cursor = cursorReq.result;
               if (!cursor || deleted >= toDelete) return;
-              cursor.delete();
+              if (typeof cursor.delete === "function") cursor.delete();
+              else store.delete(cursor.primaryKey);
               deleted++;
               cursor.continue();
             } catch {}
@@ -337,12 +338,13 @@ function _pruneOldRecords(db, maxRecords) {
           if (excess <= 0) return;
           const idx = store.index("updatedAt");
           let deleted = 0;
-          const cursorReq = idx.openCursor();
+          const cursorReq = typeof idx.openKeyCursor === "function" ? idx.openKeyCursor() : idx.openCursor();
           cursorReq.onsuccess = () => {
             try {
               const cursor = cursorReq.result;
               if (!cursor || deleted >= excess) return;
-              cursor.delete();
+              if (typeof cursor.delete === "function") cursor.delete();
+              else store.delete(cursor.primaryKey);
               deleted++;
               cursor.continue();
             } catch {}
@@ -384,6 +386,21 @@ export async function clearPolyCacheDB(sceneId = null, worldId = null) {
       const store = tx.objectStore(STORE_NAME);
       if (!sceneId && !worldId) {
         store.clear();
+      } else if (typeof store.openKeyCursor === "function") {
+        // Key-only cursor avoids deserializing megabytes of Float32Array polygons when clearing a scene
+        const cursorReq = store.openKeyCursor();
+        cursorReq.onsuccess = () => {
+          try {
+            const cursor = cursorReq.result;
+            if (!cursor) return;
+            const parts = String(cursor.primaryKey || "").split("::");
+            const worldMatch = !worldId || parts[0] === worldId;
+            const sceneMatch = !sceneId || parts[1] === sceneId;
+            if (sceneMatch && worldMatch) store.delete(cursor.primaryKey);
+            cursor.continue();
+          } catch {}
+        };
+        cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
       } else {
         const cursorReq = store.openCursor();
         cursorReq.onsuccess = () => {

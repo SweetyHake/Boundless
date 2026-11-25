@@ -1,4 +1,4 @@
-import { getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy } from "./utils.mjs";
+import { getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy, hasPlayerOwnerLazy } from "./utils.mjs";
 
 const SOUND_PAD_WORLD_PX = 1600;
 const SOUND_VP_MIN_SCALE = 0.25;
@@ -18,21 +18,36 @@ export class MegaAudioStreamer {
 
     // Fast O(1) bailout on maps with zero virtual sounds (avoids token/sector scans on every pan)
     let hasAnySounds = false;
+    let maxSoundRadPx = SOUND_PAD_WORLD_PX;
     const editRev = globalThis.Boundless?.soundEditsRev || 0;
+    const pxPerFtPre = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
     for (let i = 0; i < visibleLevelLayers.length; i++) {
       const l = visibleLevelLayers[i];
       const sectors = l?.spec?.sectors;
       if (!sectors) continue;
       if (l._hasVirtualSoundsRev !== editRev || l._hasVirtualSoundsRef !== sectors) {
         let found = false;
+        let maxR = 0;
         for (const k in sectors) {
-          if (sectors[k]?.s?.length > 0) { found = true; break; }
+          const sl = sectors[k]?.s;
+          if (sl?.length > 0) {
+            found = true;
+            for (let si = 0; si < sl.length; si++) {
+              const r = Number(sl[si]?.[2]);
+              if (Number.isFinite(r) && r > maxR) maxR = r;
+            }
+          }
         }
         l._hasVirtualSounds = found;
+        l._maxSoundRadiusUnits = maxR;
         l._hasVirtualSoundsRev = editRev;
         l._hasVirtualSoundsRef = sectors;
       }
-      if (l._hasVirtualSounds) { hasAnySounds = true; break; }
+      if (l._hasVirtualSounds) {
+        hasAnySounds = true;
+        const rPx = (l._maxSoundRadiusUnits || 0) * pxPerFtPre + 200;
+        if (rPx > maxSoundRadPx) maxSoundRadPx = rPx;
+      }
     }
     if (!hasAnySounds && this.activeSources.size === 0) {
       this.lastKey = "";
@@ -40,7 +55,8 @@ export class MegaAudioStreamer {
       return;
     }
 
-    const pxPerFt = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
+    const pxPerFt = pxPerFtPre;
+    const padPx = Math.min(8000, maxSoundRadPx);
     const darkness = canvas.environment?.darknessLevel ?? 0;
 
     // Collect listener anchor points (viewport only on tactical zoom or livePreview + all controlled/player tokens)
@@ -50,10 +66,10 @@ export class MegaAudioStreamer {
       const effScale = getEffectiveScale(vpScale);
       if (effScale >= SOUND_VP_MIN_SCALE) {
         anchors.push({
-          x0: vp.x0 - SOUND_PAD_WORLD_PX,
-          y0: vp.y0 - SOUND_PAD_WORLD_PX,
-          x1: vp.x1 + SOUND_PAD_WORLD_PX,
-          y1: vp.y1 + SOUND_PAD_WORLD_PX,
+          x0: vp.x0 - padPx,
+          y0: vp.y0 - padPx,
+          x1: vp.x1 + padPx,
+          y1: vp.y1 + padPx,
           levelId: null
         });
       } else if (canvas.sounds.livePreview && canvas.mousePosition) {
@@ -61,10 +77,10 @@ export class MegaAudioStreamer {
         const my = Number(canvas.mousePosition.y);
         if (Number.isFinite(mx) && Number.isFinite(my)) {
           anchors.push({
-            x0: mx - SOUND_PAD_WORLD_PX,
-            y0: my - SOUND_PAD_WORLD_PX,
-            x1: mx + SOUND_PAD_WORLD_PX,
-            y1: my + SOUND_PAD_WORLD_PX,
+            x0: mx - padPx,
+            y0: my - padPx,
+            x1: mx + padPx,
+            y1: my + padPx,
             levelId: canvas.level?.id || null
           });
         }
@@ -76,18 +92,17 @@ export class MegaAudioStreamer {
       const isActiveListener = tok.controlled || (
         game.user?.isGM
           ? Boolean(
-              doc?.baseActor?.hasPlayerOwner ||
-              (!doc?.baseActor && doc?.hasPlayerOwner) ||
+              hasPlayerOwnerLazy(doc) ||
               (doc?._source?.delta?.ownership && game.users?.some?.(u => !u.isGM && hasTokenPermissionLazy(doc, u, "OWNER")))
             )
           : hasTokenPermissionLazy(doc, game.user, "OBSERVER")
       );
       if (!isActiveListener) continue;
       anchors.push({
-        x0: tok.center.x - SOUND_PAD_WORLD_PX,
-        y0: tok.center.y - SOUND_PAD_WORLD_PX,
-        x1: tok.center.x + SOUND_PAD_WORLD_PX,
-        y1: tok.center.y + SOUND_PAD_WORLD_PX,
+        x0: tok.center.x - padPx,
+        y0: tok.center.y - padPx,
+        x1: tok.center.x + padPx,
+        y1: tok.center.y + padPx,
         levelId: tok.document?.level || canvas.level?.id
       });
     }

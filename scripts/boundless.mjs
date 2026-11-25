@@ -357,13 +357,24 @@ class MegaWorld1000 {
       }
       if (!data.sectors) data.sectors = {};
       if (!data.overlays) data.overlays = {};
-      this.manifestCache.set(url, data);
+      this._setManifestCache(url, data);
       return { ...data, sectors: {}, overlays: {} };
     } else if (data?.superGrid?.baseManifestUrl) {
       data = await this._expandSuperGridManifest(data);
     }
-    this.manifestCache.set(url, data);
+    this._setManifestCache(url, data);
     return data;
+  }
+
+  _setManifestCache(url, data) {
+    // LRU cap (max 6 manifests) prevents unbounded multi-megabyte RAM growth across scene switches
+    if (this.manifestCache.has(url)) this.manifestCache.delete(url);
+    this.manifestCache.set(url, data);
+    while (this.manifestCache.size > 6) {
+      const oldest = this.manifestCache.keys().next().value;
+      if (oldest === url) break;
+      this.manifestCache.delete(oldest);
+    }
   }
 
   _normalizeLevelSpec(rawSpec, level, levelCfg = {}) {
@@ -650,8 +661,13 @@ class MegaWorld1000 {
 
   _hasMultiElevationDepth() {
     if (this.visibleLevelLayers?.length > 1) return true;
-    const visibleLevels = (canvas.scene?.levels?.sorted || []).filter(l => l.isVisible);
-    if (visibleLevels.length > 1) return true;
+    const sorted = canvas.scene?.levels?.sorted;
+    if (sorted?.length > 1) {
+      let visCount = 0;
+      for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i]?.isVisible && ++visCount > 1) return true;
+      }
+    }
     const baseElev = getLevelBaseElevation(canvas.level);
 
     // Check native TileDocuments that restrict light above base elevation

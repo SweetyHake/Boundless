@@ -8,7 +8,7 @@
 
 import { resolveFoundryRoute } from "./utils.mjs";
 
-const RASTER_EXT_RE = /\.(webp|png|jpe?g|avif|bmp|gif)(\?.*)?$/i;
+const RASTER_EXT_RE = /\.(webp|png|jpe?g|avif|bmp|gif)([?#].*)?$/i;
 const MAX_INFLIGHT_PER_WORKER = 2;
 const MAX_RESPAWNS_PER_SLOT = 3;
 

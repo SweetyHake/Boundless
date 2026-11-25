@@ -1653,164 +1653,167 @@ export const pyramidMethods = {
       }
     }
 
-    const estimateFreshUploadBytes = (tex) => {
-      const bt = tex?.baseTexture;
-      if (!bt) return 0;
-      if (bt._glTextures) {
-        for (const _ in bt._glTextures) return 0;
-      }
-      return this.texMgr._estimateBytes(tex);
-    };
-    const tFrameStart = performance.now();
     const isMoving = this.isActivelyMoving();
-    const stepBudgetMs = isMoving ? 1.8 : 3.0;
-    const HEAVY_UPLOAD_BYTES = 2 * 1024 * 1024; // 1024px+ pyramid tiles & roofs; small prop sprites (<=2MB) use the byte + small-count budget
-    const gpuUploadBudget = isMoving ? (5 * 1024 * 1024) : Math.min(9 * 1024 * 1024, MAX_GPU_UPLOAD_BYTES_PER_FRAME);
-    const maxHeavyUploads = isMoving ? 1 : 2;
-    const maxSmallUploads = isMoving ? 6 : 14;
-    let frameGpuUploadBytes = 0;
-    let frameHeavyUploads = 0;
-    let frameSmallUploads = 0;
-
-    const canUploadFresh = (estBytes) => {
-      if (estBytes <= 0) return true;
-      if (estBytes > HEAVY_UPLOAD_BYTES) {
-        if (frameHeavyUploads >= maxHeavyUploads) return false;
-      } else {
-        if (frameSmallUploads >= maxSmallUploads) return false;
-      }
-      if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) return false;
-      return true;
-    };
-    const recordFreshUpload = (estBytes) => {
-      if (estBytes <= 0) return;
-      frameGpuUploadBytes += estBytes;
-      if (estBytes > HEAVY_UPLOAD_BYTES) frameHeavyUploads++;
-      else frameSmallUploads++;
-    };
-
-    const bindTextureNow = (tex) => {
-      const bt = tex?.baseTexture;
-      if (bt && !bt.destroyed && canvas.app?.renderer?.texture?.bind) {
-        try { canvas.app.renderer.texture.bind(bt); } catch {}
-      }
-    };
-
-    // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
-    if (this.pendingTileMounts.length > 0) {
-      const maxMounts = isMoving ? 6 : 16;
-      let mounted = 0;
-      while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
-        if (mounted > 0 && (performance.now() - tFrameStart) >= stepBudgetMs) break;
-        const peek = this.pendingTileMounts[0];
-        const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (!canUploadFresh(estBytes)) break;
-        const item = this.pendingTileMounts.shift();
-        const e = this.tilesByKey.get(item.key);
-        if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
-        const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
-        if (!isTextureUsable(tex)) {
-          this.tilesByKey.delete(item.key);
-          if (e.layer) {
-            if (e.channel === "fg") e.layer.lastForegroundPyramidKey = "";
-            else e.layer.lastPyramidKey = "";
-          }
-          continue;
+    const hasPendingMounts =
+      this.pendingTileMounts.length > 0 ||
+      this.pendingOverlayMounts.length > 0 ||
+      this.pendingVirtualTileMounts.length > 0;
+    if (hasPendingMounts) {
+      const estimateFreshUploadBytes = (tex) => {
+        const bt = tex?.baseTexture;
+        if (!bt) return 0;
+        if (bt._glTextures) {
+          for (const _ in bt._glTextures) return 0;
         }
-        if (this._mountTileMesh(e, tex, item.instant)) {
-          mounted++;
-          if (estBytes > 0) {
-            // Pre-upload EVERY fresh tile (visible, awaitingSwap, AND offscreen-padded!) within this frame's budget
-            // so zooming out into the 28% padding never bursts 8-11 deferred gl.texImage2D uploads in a single render frame!
-            bindTextureNow(tex);
-            recordFreshUpload(estBytes);
-          }
-        }
-      }
-      if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
-    }
+        return this.texMgr._estimateBytes(tex);
+      };
+      const tFrameStart = performance.now();
+      const stepBudgetMs = isMoving ? 1.8 : 3.0;
+      const HEAVY_UPLOAD_BYTES = 2 * 1024 * 1024; // 1024px+ pyramid tiles & roofs; small prop sprites (<=2MB) use the byte + small-count budget
+      const gpuUploadBudget = isMoving ? (5 * 1024 * 1024) : Math.min(9 * 1024 * 1024, MAX_GPU_UPLOAD_BYTES_PER_FRAME);
+      const maxHeavyUploads = isMoving ? 1 : 2;
+      const maxSmallUploads = isMoving ? 6 : 14;
+      let frameGpuUploadBytes = 0;
+      let frameHeavyUploads = 0;
+      let frameSmallUploads = 0;
 
-    // 2. Frame-budgeted overlay mounting: cached GPU roofs mount instantly; fresh roofs cap at 1/frame
-    //    (allow mounting even while pyramid tiles queue if visible z>=5 tiles are waiting on these roofs so interiors never flash!)
-    if (this.pendingOverlayMounts.length > 0) {
-      const maxCachedOvMounts = isMoving ? 6 : 12;
-      let mountedOv = 0;
-      let freshHeavyOv = 0;
-      const curVp = this.getViewportWorldRect(0.35, null, { predictive: !this.isCameraFlying });
-      const visNow = this.getViewportWorldRect(0.0);
-      const roofsBlockingZ5 = this.visibleLevelLayers.some(l => this._hasPendingVisibleRoofs(l, visNow));
-      while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
-        if ((mountedOv > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) {
-          if (!roofsBlockingZ5 || mountedOv > 0) break;
+      const canUploadFresh = (estBytes) => {
+        if (estBytes <= 0) return true;
+        if (estBytes > HEAVY_UPLOAD_BYTES) {
+          if (frameHeavyUploads >= maxHeavyUploads) return false;
+        } else {
+          if (frameSmallUploads >= maxSmallUploads) return false;
         }
-        const peek = this.pendingOverlayMounts[0];
-        const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
-        if (estBytes > 0) {
+        if (frameGpuUploadBytes > 0 && (frameGpuUploadBytes + estBytes) > gpuUploadBudget) return false;
+        return true;
+      };
+      const recordFreshUpload = (estBytes) => {
+        if (estBytes <= 0) return;
+        frameGpuUploadBytes += estBytes;
+        if (estBytes > HEAVY_UPLOAD_BYTES) frameHeavyUploads++;
+        else frameSmallUploads++;
+      };
+
+      const bindTextureNow = (tex) => {
+        const bt = tex?.baseTexture;
+        if (bt && !bt.destroyed && canvas.app?.renderer?.texture?.bind) {
+          try { canvas.app.renderer.texture.bind(bt); } catch {}
+        }
+      };
+
+      // 1. Pyramid tiles FIRST so zoom/pan never starves background chunks behind heavy 4K roofs or hundreds of props!
+      if (this.pendingTileMounts.length > 0) {
+        const maxMounts = isMoving ? 6 : 16;
+        let mounted = 0;
+        while (this.pendingTileMounts.length > 0 && mounted < maxMounts) {
+          if (mounted > 0 && (performance.now() - tFrameStart) >= stepBudgetMs) break;
+          const peek = this.pendingTileMounts[0];
+          const estBytes = estimateFreshUploadBytes(peek?.tex);
           if (!canUploadFresh(estBytes)) break;
-          if (estBytes > HEAVY_UPLOAD_BYTES && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
-        }
-        const item = this.pendingOverlayMounts.shift();
-        if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
-        if (this._mountOverlayMeshes(item, curVp)) {
-          mountedOv++;
-          if (estBytes > 0) {
-            if (estimateFreshUploadBytes(item.tRoof) > 0) bindTextureNow(item.tRoof);
-            if (estimateFreshUploadBytes(item.tWalls) > 0) bindTextureNow(item.tWalls);
-            recordFreshUpload(estBytes);
-            if (estBytes > HEAVY_UPLOAD_BYTES) freshHeavyOv++;
+          const item = this.pendingTileMounts.shift();
+          const e = this.tilesByKey.get(item.key);
+          if (!e || e !== item.entry || e.ready || e.fadingOut || (!e.desired && e.z > 0)) continue;
+          const tex = isTextureUsable(item.tex) ? item.tex : this.texMgr.getSync(e.src);
+          if (!isTextureUsable(tex)) {
+            this.tilesByKey.delete(item.key);
+            if (e.layer) {
+              if (e.channel === "fg") e.layer.lastForegroundPyramidKey = "";
+              else e.layer.lastPyramidKey = "";
+            }
+            continue;
+          }
+          if (this._mountTileMesh(e, tex, item.instant)) {
+            mounted++;
+            if (estBytes > 0) {
+              bindTextureNow(tex);
+              recordFreshUpload(estBytes);
+            }
           }
         }
+        if (this.pendingTileMounts.length > 0) this._tilesDirty = true;
       }
-      if (mountedOv > 0) {
-        canvas.primary.sortDirty = true;
-        this._tilesDirty = true;
-        this._occlusionDirty = true;
-        this._markDepthDirty({ syncElev: true });
-        this._roofTokenOccDirty = true;
-        this.invalidateShowstopperSurfaces();
-      }
-      if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
-    }
 
-    // 3. Frame-budgeted virtual tile mounting (small prop textures use byte + small-count budget so rooms never pop in 2 props/frame)
-    if (this.pendingVirtualTileMounts.length > 0 && (performance.now() - tFrameStart) < stepBudgetMs) {
-      const maxVtMounts = isMoving ? 14 : 32;
-      let mountedVt = 0;
-      let anyVtLight = false;
-      let anyVtOcc = false;
-      const curVp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
-      while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
-        if ((mountedVt > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) break;
-        const peek = this.pendingVirtualTileMounts[0];
-        const estBytes = estimateFreshUploadBytes(peek?.tex);
-        if (!canUploadFresh(estBytes)) break;
-        const item = this.pendingVirtualTileMounts.shift();
-        if (item?.fullId) this._pendingVirtualTileKeys.delete(item.fullId);
-        const m = this._mountVirtualTileMesh(item, curVp);
-        if (m) {
-          mountedVt++;
-          if (estBytes > 0) {
-            bindTextureNow(item.tex);
-            recordFreshUpload(estBytes);
+      // 2. Frame-budgeted overlay mounting
+      if (this.pendingOverlayMounts.length > 0) {
+        const maxCachedOvMounts = isMoving ? 6 : 12;
+        let mountedOv = 0;
+        let freshHeavyOv = 0;
+        const curVp = this.getViewportWorldRect(0.35, null, { predictive: !this.isCameraFlying });
+        const visNow = this.getViewportWorldRect(0.0);
+        const roofsBlockingZ5 = this.visibleLevelLayers.some(l => this._hasPendingVisibleRoofs(l, visNow));
+        while (this.pendingOverlayMounts.length > 0 && mountedOv < maxCachedOvMounts) {
+          if ((mountedOv > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) {
+            if (!roofsBlockingZ5 || mountedOv > 0) break;
           }
-          if (m.restrictsLight || m.restrictsWeather) anyVtLight = true;
-          if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) anyVtOcc = true;
+          const peek = this.pendingOverlayMounts[0];
+          const estBytes = estimateFreshUploadBytes(peek?.tRoof) + estimateFreshUploadBytes(peek?.tWalls);
+          if (estBytes > 0) {
+            if (!canUploadFresh(estBytes)) break;
+            if (estBytes > HEAVY_UPLOAD_BYTES && (freshHeavyOv > 0 || (!roofsBlockingZ5 && isMoving && this.pendingTileMounts.length > 0))) break;
+          }
+          const item = this.pendingOverlayMounts.shift();
+          if (item?.fullId) this._pendingOverlayKeys.delete(item.fullId);
+          if (this._mountOverlayMeshes(item, curVp)) {
+            mountedOv++;
+            if (estBytes > 0) {
+              if (estimateFreshUploadBytes(item.tRoof) > 0) bindTextureNow(item.tRoof);
+              if (estimateFreshUploadBytes(item.tWalls) > 0) bindTextureNow(item.tWalls);
+              recordFreshUpload(estBytes);
+              if (estBytes > HEAVY_UPLOAD_BYTES) freshHeavyOv++;
+            }
+          }
         }
-      }
-      if (mountedVt > 0) {
-        canvas.primary.sortDirty = true;
-        this.invalidateShowstopperSurfaces();
-        if (anyVtOcc) {
+        if (mountedOv > 0) {
+          canvas.primary.sortDirty = true;
+          this._tilesDirty = true;
           this._occlusionDirty = true;
-          this._roofTokenOccDirty = true;
-        }
-        if (anyVtLight) {
           this._markDepthDirty({ syncElev: true });
+          this._roofTokenOccDirty = true;
+          this.invalidateShowstopperSurfaces();
         }
+        if (this.pendingOverlayMounts.length > 0) this._tilesDirty = true;
       }
-      if (this.pendingVirtualTileMounts.length > 0) this._tilesDirty = true;
-    } else if (this.pendingVirtualTileMounts.length > 0) {
-      this._tilesDirty = true;
+
+      // 3. Frame-budgeted virtual tile mounting
+      if (this.pendingVirtualTileMounts.length > 0 && (performance.now() - tFrameStart) < stepBudgetMs) {
+        const maxVtMounts = isMoving ? 14 : 32;
+        let mountedVt = 0;
+        let anyVtLight = false;
+        let anyVtOcc = false;
+        const curVp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
+        while (this.pendingVirtualTileMounts.length > 0 && mountedVt < maxVtMounts) {
+          if ((mountedVt > 0 || frameGpuUploadBytes > 0) && (performance.now() - tFrameStart) >= stepBudgetMs) break;
+          const peek = this.pendingVirtualTileMounts[0];
+          const estBytes = estimateFreshUploadBytes(peek?.tex);
+          if (!canUploadFresh(estBytes)) break;
+          const item = this.pendingVirtualTileMounts.shift();
+          if (item?.fullId) this._pendingVirtualTileKeys.delete(item.fullId);
+          const m = this._mountVirtualTileMesh(item, curVp);
+          if (m) {
+            mountedVt++;
+            if (estBytes > 0) {
+              bindTextureNow(item.tex);
+              recordFreshUpload(estBytes);
+            }
+            if (m.restrictsLight || m.restrictsWeather) anyVtLight = true;
+            if (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE) anyVtOcc = true;
+          }
+        }
+        if (mountedVt > 0) {
+          canvas.primary.sortDirty = true;
+          this.invalidateShowstopperSurfaces();
+          if (anyVtOcc) {
+            this._occlusionDirty = true;
+            this._roofTokenOccDirty = true;
+          }
+          if (anyVtLight) {
+            this._markDepthDirty({ syncElev: true });
+          }
+        }
+        if (this.pendingVirtualTileMounts.length > 0) this._tilesDirty = true;
+      } else if (this.pendingVirtualTileMounts.length > 0) {
+        this._tilesDirty = true;
+      }
     }
 
     if (this._depthElevSyncNeeded) {
