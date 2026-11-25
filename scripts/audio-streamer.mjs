@@ -16,6 +16,30 @@ export class MegaAudioStreamer {
     const SoundSourceCls = foundry.canvas?.sources?.PointSoundSource;
     if (!SoundSourceCls) return;
 
+    // Fast O(1) bailout on maps with zero virtual sounds (avoids token/sector scans on every pan)
+    let hasAnySounds = false;
+    const editRev = globalThis.Boundless?.soundEditsRev || 0;
+    for (let i = 0; i < visibleLevelLayers.length; i++) {
+      const l = visibleLevelLayers[i];
+      const sectors = l?.spec?.sectors;
+      if (!sectors) continue;
+      if (l._hasVirtualSoundsRev !== editRev || l._hasVirtualSoundsRef !== sectors) {
+        let found = false;
+        for (const k in sectors) {
+          if (sectors[k]?.s?.length > 0) { found = true; break; }
+        }
+        l._hasVirtualSounds = found;
+        l._hasVirtualSoundsRev = editRev;
+        l._hasVirtualSoundsRef = sectors;
+      }
+      if (l._hasVirtualSounds) { hasAnySounds = true; break; }
+    }
+    if (!hasAnySounds && this.activeSources.size === 0) {
+      this.lastKey = "";
+      this._lastFastKey = "";
+      return;
+    }
+
     const pxPerFt = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
     const darkness = canvas.environment?.darknessLevel ?? 0;
 
@@ -85,7 +109,7 @@ export class MegaAudioStreamer {
     }
     for (let i = 0; i < anchors.length; i++) {
       const a = anchors[i];
-      fastKey += `;${a.levelId || ""}:${Math.floor(a.x0 / 250)}:${Math.floor(a.y0 / 250)}:${Math.floor(a.x1 / 250)}:${Math.floor(a.y1 / 250)}`;
+      fastKey += `;${a.levelId || ""}:${Math.floor(a.x0 / 500)}:${Math.floor(a.y0 / 500)}:${Math.floor(a.x1 / 500)}:${Math.floor(a.y1 / 500)}`;
     }
     if (this.lastKey !== null && this._lastFastKey === fastKey) return;
 

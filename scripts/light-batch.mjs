@@ -2624,6 +2624,18 @@ export class MegaLightBatch {
 
     // 3. Monolithic single-buffer batch (classic 1000x1000 scenes)
     if (!this.indexBuffer || !this.illumMesh || !this.colorMesh) return;
+    // O(1) hysteresis box check: skip sector scan & GPU indexBuffer re-pack while camera stays inside buffered cull box
+    const cb = this._lastCullBox;
+    if (cb && this.lastVisKey && x0 >= cb.x0 && y0 >= cb.y0 && x1 <= cb.x1 && y1 <= cb.y1) {
+      return;
+    }
+    const HYST_PX = 450;
+    const cx0 = x0 - HYST_PX;
+    const cy0 = y0 - HYST_PX;
+    const cx1 = x1 + HYST_PX;
+    const cy1 = y1 + HYST_PX;
+    this._lastCullBox = { x0: cx0, y0: cy0, x1: cx1, y1: cy1 };
+
     const sectors = this.sectorBounds;
     const totalSec = sectors.length;
     let visCount = 0;
@@ -2631,15 +2643,19 @@ export class MegaLightBatch {
     let h2 = 0;
     for (let i = 0; i < totalSec; i++) {
       const s = sectors[i];
-      if (s.maxX >= x0 && s.minX <= x1 && s.maxY >= y0 && s.minY <= y1) {
+      if (s.maxX >= cx0 && s.minX <= cx1 && s.maxY >= cy0 && s.minY <= cy1) {
         visCount++;
         h1 = Math.imul(h1 ^ i, 16777619) >>> 0;
         h2 = ((h2 << 5) - h2 + i + 1) | 0;
       }
     }
-    const key = `${visCount}:${h1}:${h2}`;
-    if (key === this.lastVisKey) return;
-    this.lastVisKey = key;
+    if (this.lastVisKey && visCount === this._lastVisCount && h1 === this._lastVisH1 && h2 === this._lastVisH2) {
+      return;
+    }
+    this._lastVisCount = visCount;
+    this._lastVisH1 = h1;
+    this._lastVisH2 = h2;
+    this.lastVisKey = `${visCount}:${h1}:${h2}`;
 
     let cursor = 0;
     if (visCount === totalSec && totalSec > 0) {
@@ -2648,7 +2664,7 @@ export class MegaLightBatch {
     } else if (visCount > 0) {
       for (let i = 0; i < totalSec; i++) {
         const s = sectors[i];
-        if (s.maxX >= x0 && s.minX <= x1 && s.maxY >= y0 && s.minY <= y1) {
+        if (s.maxX >= cx0 && s.minX <= cx1 && s.maxY >= cy0 && s.minY <= cy1) {
           this.visibleIndices.set(
             this.allIndices.subarray(s.idxStart, s.idxStart + s.idxCount),
             cursor
@@ -3020,6 +3036,7 @@ export class MegaLightBatch {
     this.lightMetaById.clear();
     this.sectorBounds = [];
     this.lastVisKey = "";
+    this._lastCullBox = null;
     this.totalLights = 0;
     this.totalVertices = 0;
     this.visibleIndexCount = 0;

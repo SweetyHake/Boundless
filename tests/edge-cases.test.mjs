@@ -2630,3 +2630,106 @@ test("overlayMethods.syncVirtualTiles deduplicates shared multi-level virtual ti
   assert.equal(ctrl.pendingVirtualTileMounts.length, 1, "shared multi-level virtual tile must only be queued once across visible levels");
   assert.equal(ctrl.pendingVirtualTileMounts[0].fullId, "lvlUpper::0", "viewed level must win deduplication");
 });
+
+test("TokenImpostorLayer suppresses impostors for frustum-culled native tokens at tactical zoom and defers hidden atlas uploads", async () => {
+  installBaseGlobals();
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  const tokensObjects = {};
+  globalThis.canvas = {
+    tokens: { objects: tokensObjects },
+    grid: { size: 100 },
+    level: { id: "lvl1" }
+  };
+  globalThis.game.user = { id: "gm1", isGM: true };
+
+  const layer = new TokenImpostorLayer({
+    isActivelyMoving: () => false
+  });
+  layer.mounted = true;
+  layer.streamer = { _nativeTokensActive: true, isTokenDrawing: () => false };
+
+  const doc = {
+    id: "t1",
+    viewed: true,
+    _source: { x: 5000, y: 5000, width: 1, height: 1, hidden: false },
+    _object: {
+      destroyed: false,
+      parent: tokensObjects,
+      visible: true,
+      renderable: false, // frustum-culled offscreen at tactical zoom
+      mesh: { destroyed: false, renderable: false }
+    }
+  };
+  const res = layer._computeTokenAlpha(doc, { isGM: true, tokenVision: false, visionSourceDocIds: new Set() });
+  assert.equal(res.alpha, 0, "frustum-culled native token at tactical zoom must NOT trigger GPU impostor rendering");
+
+  // Atlas upload deferred while mesh.visible === false, allowed with forceAtlas: true
+  let uploads = 0;
+  layer.mesh = { visible: false };
+  layer.atlasTexture = { baseTexture: { update() { uploads++; } } };
+  layer.atlasDirty = true;
+  layer.flush();
+  assert.equal(uploads, 0, "atlas upload must be deferred when impostor mesh is hidden");
+  layer.flush({ forceAtlas: true });
+  assert.equal(uploads, 1, "forceAtlas flush must upload even when mesh is hidden");
+});
+
+test("applyLightingRenderScale hides empty CanvasDarknessEffects FBO when no darkness sources exist", async () => {
+  installBaseGlobals();
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const { applyLightingRenderScale } = await import("../scripts/perf-gpu.mjs");
+
+  const prevEnabled = PERF_CONFIG.perfEnabled;
+  const prevScale = PERF_CONFIG.perfLightingScale;
+  try {
+    const darkness = { destroyed: false, visible: true, children: [], filters: [{}] };
+    globalThis.canvas = {
+      ready: true,
+      performance: { mode: 2 },
+      app: { renderer: { resolution: 1, renderTexture: { current: null } } },
+      effects: { illumination: {}, coloration: {}, darkness }
+    };
+    PERF_CONFIG.perfEnabled = true;
+    PERF_CONFIG.perfLightingScale = "full";
+    applyLightingRenderScale();
+    assert.equal(darkness.visible, false, "empty darkness layer with only VoidFilter should skip FBO pass");
+
+    darkness.children.push({});
+    applyLightingRenderScale();
+    assert.equal(darkness.visible, true, "darkness layer must re-enable as soon as a darkness source exists");
+
+    darkness.children.length = 0;
+    PERF_CONFIG.perfEnabled = false;
+    applyLightingRenderScale();
+    assert.equal(darkness.visible, true, "disabling perf engine must restore darkness layer visibility");
+  } finally {
+    PERF_CONFIG.perfEnabled = prevEnabled;
+    PERF_CONFIG.perfLightingScale = prevScale;
+  }
+});
+
+test("MegaLightBatch.updateViewport uses hysteresis cull box to avoid redundant GPU indexBuffer updates on small pans", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+
+  const lb = new MegaLightBatch();
+  let bufUpdates = 0;
+  lb.indexBuffer = { update() { bufUpdates++; } };
+  lb.illumMesh = { visible: false, size: 0 };
+  lb.colorMesh = { visible: false, size: 0 };
+  lb.activeLightsCount = 2;
+  lb.allIndices = new Uint32Array([0, 1, 2, 3, 4, 5]);
+  lb.visibleIndices = new Uint32Array(6);
+  lb.sectorBounds = [
+    { minX: 0, minY: 0, maxX: 500, maxY: 500, idxStart: 0, idxCount: 3 },
+    { minX: 1200, minY: 0, maxX: 1700, maxY: 500, idxStart: 3, idxCount: 3 }
+  ];
+
+  lb.updateViewport({ x0: 100, y0: 100, x1: 900, y1: 600, scale: 1 });
+  assert.equal(bufUpdates, 1, "first updateViewport should pack visible sectors");
+
+  // Small 80px pan stays inside 450px hysteresis cull box -> 0 sector scans and 0 GPU buffer updates
+  lb.updateViewport({ x0: 180, y0: 140, x1: 980, y1: 640, scale: 1 });
+  assert.equal(bufUpdates, 1, "small pan inside hysteresis box must not re-upload indexBuffer");
+});

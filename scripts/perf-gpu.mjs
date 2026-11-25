@@ -813,55 +813,8 @@ function getBitmapCacheResolution() {
 }
 
 function patchTokenUiCaching() {
-  const cacheBar = (bar) => {
-    if (!bar || bar.destroyed || !bar.visible) return false;
-    bar.cacheAsBitmapResolution = getBitmapCacheResolution();
-    bar.cacheAsBitmap = true;
-    return true;
-  };
-
-  const okBars = wrapFoundryMethod("Token", "drawBars", function (wrapped, ...args) {
-    if (this.bars) {
-      this.bars.cacheAsBitmap = false;
-      if (this.bars.bar1) this.bars.bar1.cacheAsBitmap = false;
-      if (this.bars.bar2) this.bars.bar2.cacheAsBitmap = false;
-    }
-    const res = wrapped(...args);
-    if (
-      PERF_CONFIG.perfEnabled &&
-      PERF_CONFIG.perfTokenUiCache &&
-      !isPrimePerfActive() &&
-      this.bars &&
-      !this.bars.destroyed &&
-      !this.isPreview &&
-      this.bars.visible &&
-      (this.bars.children?.length ?? 0) <= 2
-    ) {
-      // Cache bar1 and bar2 individually instead of the whole token-sized `this.bars` container (avoids 10MB empty VRAM on Huge/Gargantuan tokens)
-      const c1 = cacheBar(this.bars.bar1);
-      const c2 = cacheBar(this.bars.bar2);
-      if (c1 || c2) perfStats.tokenBarsCached++;
-    }
-    return res;
-  }, { type: "WRAPPER" });
-
-  const okDrawBar = wrapFoundryMethod("Token", "_drawBar", function (wrapped, number, bar, data, ...rest) {
-    if (this.bars) this.bars.cacheAsBitmap = false;
-    if (bar) bar.cacheAsBitmap = false;
-    const res = wrapped(number, bar, data, ...rest);
-    if (
-      PERF_CONFIG.perfEnabled &&
-      PERF_CONFIG.perfTokenUiCache &&
-      !isPrimePerfActive() &&
-      this.bars?.visible &&
-      bar && !bar.destroyed && bar.visible && !this.isPreview &&
-      (this.bars?.children?.length ?? 0) <= 2
-    ) {
-      cacheBar(bar);
-    }
-    return res;
-  }, { type: "WRAPPER" });
-
+  // Note: Do NOT cacheAsBitmap bar1/bar2 — Foundry v14 animates HP bars over 90-216 frames,
+  // and per-bar RenderTextures thrash FBOs during animations and break multi-texture batching (>16 textures).
   const okDrawFx = wrapFoundryMethod("Token", "_drawEffects", function (wrapped, ...args) {
     if (this.effects) this.effects.cacheAsBitmap = false;
     return wrapped(...args);
@@ -897,7 +850,7 @@ function patchTokenUiCaching() {
     return res;
   }, { type: "WRAPPER" });
 
-  return [Boolean(okBars), Boolean(okDrawBar), Boolean(okDrawFx), Boolean(okRefFx)];
+  return [Boolean(okDrawFx), Boolean(okRefFx)];
 }
 
 export function clearTokenUiBitmapCaches() {
@@ -1065,6 +1018,12 @@ function patchAnimatedLightShaders() {
       if (def?.[key]) patchClassFrag(def[key], `${k}.${key}`);
     }
   }
+  const darkAnims = globalThis.CONFIG?.Canvas?.darknessAnimations || {};
+  for (const [k, def] of Object.entries(darkAnims)) {
+    for (const key of ["darknessShader", "illuminationShader", "colorationShader", "backgroundShader"]) {
+      if (def?.[key]) patchClassFrag(def[key], `dark.${k}.${key}`);
+    }
+  }
 
   // Always bind uBoundlessNoise whenever a compiled program references it (shader programs stay cached on classes even if setting toggles off)
   wrapTargetMethod(Adaptive, "create", "AdaptiveLightingShader.create", function (wrapped, uniforms = {}, options = {}) {
@@ -1165,6 +1124,17 @@ export function applyLightingRenderScale() {
   applyOne(effects.illumination, preset.illumination);
   applyOne(effects.coloration, preset.coloration);
   applyOne(effects.darkness, preset.darkness);
+
+  // Skip empty full-screen CanvasDarknessEffects FBO clear + VoidFilter blit on scenes with 0 darkness sources
+  if (effects.darkness && !effects.darkness.destroyed) {
+    if (PERF_CONFIG.perfEnabled) {
+      const hasDarkChildren = (effects.darkness.children?.length ?? 0) > 0;
+      const hasCustomFilters = (effects.darkness.filters?.length ?? 0) > 1;
+      effects.darkness.visible = hasDarkChildren || hasCustomFilters;
+    } else {
+      effects.darkness.visible = true;
+    }
+  }
 }
 
 export function applyDisableUiBlur() {

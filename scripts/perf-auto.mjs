@@ -205,10 +205,11 @@ export function updateStandardSceneCulling() {
     }
   }
 
-  // Light control icons: only engage when scene has >= 20 lights (use full radius for v14 ShapeControls border)
+  // Light control icons: skip when LightingLayer container is hidden (e.g. on TokensLayer)
   const lights = c.lighting?.placeables ?? [];
+  const lightsVisible = c.lighting?.objects?.visible !== false && c.lighting?.visible !== false;
   const lightsHi = Boolean(c.lighting?.highlightObjects);
-  if (lights.length >= 20) {
+  if (lightsVisible && lights.length >= 20) {
     for (let i = 0; i < lights.length; i++) {
       const al = lights[i];
       const icon = al.controls ?? al.controlIcon;
@@ -224,17 +225,18 @@ export function updateStandardSceneCulling() {
       icon.renderable = inView;
       if (!inView) culledLights++;
     }
-  } else {
+  } else if (lightsVisible) {
     for (let i = 0; i < lights.length; i++) {
       const icon = lights[i].controls ?? lights[i].controlIcon;
       if (icon && !icon.destroyed) icon.renderable = true;
     }
   }
 
-  // Sound control icons: only engage when scene has >= 20 sounds (use full radius for v14 ShapeControls border)
+  // Sound control icons: skip when SoundsLayer container is hidden
   const sounds = c.sounds?.placeables ?? [];
+  const soundsVisible = c.sounds?.objects?.visible !== false && c.sounds?.visible !== false;
   const soundsHi = Boolean(c.sounds?.highlightObjects);
-  if (sounds.length >= 20) {
+  if (soundsVisible && sounds.length >= 20) {
     for (let i = 0; i < sounds.length; i++) {
       const as = sounds[i];
       const icon = as.controls ?? as.controlIcon;
@@ -250,17 +252,18 @@ export function updateStandardSceneCulling() {
       icon.renderable = inView;
       if (!inView) culledSounds++;
     }
-  } else {
+  } else if (soundsVisible) {
     for (let i = 0; i < sounds.length; i++) {
       const icon = sounds[i].controls ?? sounds[i].controlIcon;
       if (icon && !icon.destroyed) icon.renderable = true;
     }
   }
 
-  // Note control icons: engage when scene has >= 8 notes
+  // Note control icons: skip when NotesLayer is hidden
   const notes = c.notes?.placeables ?? [];
+  const notesVisible = c.notes?.visible !== false && c.notes?.objects?.visible !== false;
   const notesHi = Boolean(c.notes?.highlightObjects);
-  if (notes.length >= 8) {
+  if (notesVisible && notes.length >= 8) {
     for (let i = 0; i < notes.length; i++) {
       const n = notes[i];
       const icon = n.controlIcon ?? n.controls;
@@ -273,7 +276,7 @@ export function updateStandardSceneCulling() {
       const y = n.document?.y ?? 0;
       icon.renderable = (x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY);
     }
-  } else {
+  } else if (notesVisible) {
     for (let i = 0; i < notes.length; i++) {
       const icon = notes[i].controlIcon ?? notes[i].controls;
       if (icon && !icon.destroyed) icon.renderable = true;
@@ -297,10 +300,11 @@ export function updateStandardSceneCulling() {
     }
   }
 
-  // WallsLayer frustum culling: engage when scene has >= 100 walls
+  // WallsLayer frustum culling: skip when WallsLayer is hidden (saves O(N) walk of 1000+ walls on every gameplay pan!)
   const walls = c.walls?.placeables ?? [];
+  const wallsVisible = c.walls?.objects?.visible !== false && c.walls?.visible !== false;
   const wallsHi = Boolean(c.walls?.highlightObjects);
-  if (walls.length >= 100) {
+  if (wallsVisible && walls.length >= 100) {
     for (let i = 0; i < walls.length; i++) {
       const w = walls[i];
       if (!w || w.destroyed) continue;
@@ -316,7 +320,7 @@ export function updateStandardSceneCulling() {
       const maxY = coords[1] > coords[3] ? coords[1] : coords[3];
       w.renderable = rectsIntersect(minX, minY, maxX, maxY, vp);
     }
-  } else {
+  } else if (wallsVisible) {
     for (let i = 0; i < walls.length; i++) {
       if (walls[i] && !walls[i].destroyed) walls[i].renderable = true;
     }
@@ -798,15 +802,30 @@ export function installAutoPerfEngine(controller) {
     "createAmbientSound", "updateAmbientSound", "deleteAmbientSound",
     "createNote", "updateNote", "deleteNote",
     "createWall", "updateWall", "deleteWall",
-    "controlTile", "hoverTile",
-    "controlAmbientLight", "hoverAmbientLight",
-    "controlAmbientSound", "hoverAmbientSound",
-    "controlNote", "hoverNote",
-    "controlWall", "hoverWall",
-    "highlightObjects"
+    "controlTile",
+    "controlAmbientLight",
+    "controlAmbientSound",
+    "controlNote",
+    "controlWall",
+    "highlightObjects",
+    "activateWallsLayer", "activateLightingLayer", "activateSoundsLayer", "activateNotesLayer", "activateTilesLayer"
   ]) {
     Hooks.on(h, () => {
       if (isStandardSceneActive()) scheduleStandardCulling(true);
+    });
+  }
+
+  // O(1) hover un-cull without triggering a full O(N) scene culling pass on every mouseover
+  for (const h of ["hoverTile", "hoverAmbientLight", "hoverAmbientSound", "hoverNote", "hoverWall"]) {
+    Hooks.on(h, (obj, hovered) => {
+      if (!hovered || !obj || obj.destroyed || !isStandardSceneActive()) return;
+      if (obj.mesh && !obj.mesh.destroyed && obj.mesh._blStdCulled) {
+        obj.mesh.renderable = true;
+        obj.mesh._blStdCulled = false;
+      }
+      const icon = obj.controls ?? obj.controlIcon;
+      if (icon && !icon.destroyed) icon.renderable = true;
+      if (obj.renderable === false) obj.renderable = true;
     });
   }
 

@@ -209,14 +209,29 @@ function getRenderFlagClosure(flagsDef, key) {
   }
   let entry = map.get(key);
   if (entry !== undefined) return entry;
+  const rootCfg = flagsDef[key];
+  if (!rootCfg) {
+    // Unknown flag: must delegate to core so Foundry handles/warns identically
+    entry = { unknown: true, addList: null, hasAnyReset: true };
+    map.set(key, entry);
+    return entry;
+  }
   const visited = new Set([key]);
   const stack = [key];
+  const addList = [];
   let hasAnyReset = false;
+  let hasDeprecated = false;
   while (stack.length) {
     const cur = stack.pop();
     const cfg = flagsDef[cur];
-    if (cfg?.reset?.length > 0) hasAnyReset = true;
-    const prop = cfg?.propagate;
+    if (!cfg) {
+      hasAnyReset = true;
+      continue;
+    }
+    if (cfg.deprecated) hasDeprecated = true;
+    if (cfg.reset?.length > 0) hasAnyReset = true;
+    if (!cfg.alias) addList.push(cur);
+    const prop = cfg.propagate;
     if (prop?.length) {
       for (let i = 0; i < prop.length; i++) {
         const p = prop[i];
@@ -227,48 +242,55 @@ function getRenderFlagClosure(flagsDef, key) {
       }
     }
   }
-  visited.delete(key);
-  entry = { props: Array.from(visited), hasAnyReset };
+  entry = { unknown: false, addList, hasAnyReset, hasDeprecated };
   map.set(key, entry);
   return entry;
 }
 
 function patchRenderFlags() {
   return wrapFoundryMethod("RenderFlags", "set", function (wrapped, changes) {
-    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && changes && typeof changes === "object") {
-      const pending = this.object ? globalThis.canvas?.pendingRenderFlags?.[this.priority] : null;
-      const queued = !pending || pending.has(this.object);
-      if (queued) {
-        let allPresent = true;
-        for (const k in changes) {
-          if (!changes[k]) continue;
-          if (!this.has(k)) {
-            allPresent = false;
-            break;
-          }
-          const closure = getRenderFlagClosure(this.flags, k);
-          if (closure?.hasAnyReset) {
-            allPresent = false;
-            break;
-          }
-          const props = closure?.props;
-          if (props?.length) {
-            for (let i = 0; i < props.length; i++) {
-              if (!this.has(props[i])) {
-                allPresent = false;
-                break;
-              }
-            }
-            if (!allPresent) break;
-          }
-        }
-        if (allPresent) {
-          perfStats.flagsDeduped++;
-          return;
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !changes || typeof changes !== "object") {
+      return wrapped(changes);
+    }
+    const flagsDef = this.flags;
+    if (!flagsDef) return wrapped(changes);
+
+    // Zero-alloc fast path: verify all requested flags are known, non-deprecated, and have no reset clauses;
+    // handles both regular and alias flags (e.g. { refresh: true }) without Object.entries() or new Set().
+    let hasTruthy = false;
+    let needsFallback = false;
+    for (const k in changes) {
+      if (!changes[k]) continue;
+      hasTruthy = true;
+      const closure = getRenderFlagClosure(flagsDef, k);
+      if (!closure || closure.unknown || closure.hasAnyReset || closure.hasDeprecated) {
+        needsFallback = true;
+        break;
+      }
+    }
+    if (!hasTruthy) return;
+    if (needsFallback) return wrapped(changes);
+
+    let addedAny = false;
+    for (const k in changes) {
+      if (!changes[k]) continue;
+      const addList = getRenderFlagClosure(flagsDef, k).addList;
+      for (let i = 0; i < addList.length; i++) {
+        const f = addList[i];
+        if (!this.has(f)) {
+          this.add(f);
+          addedAny = true;
         }
       }
     }
-    return wrapped(changes);
+
+    const obj = this.object;
+    const pending = obj ? globalThis.canvas?.pendingRenderFlags?.[this.priority] : null;
+    if (!addedAny && (!pending || pending.has(obj))) {
+      perfStats.flagsDeduped++;
+      return;
+    }
+    if (pending && obj) pending.add(obj);
   });
 }
 
@@ -466,12 +488,16 @@ function patchVisibilityAndLos() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || options?.object) {
       return wrapped(points, options);
     }
-    const arr = Array.isArray(points) ? points : [points];
-    if (arr.length !== 1) return wrapped(points, options);
-    const p = arr[0];
+    // Fast-path when tokenVision is disabled (e.g. non-vision scenes or GM overview without sight)
+    if (!this.tokenVision) return true;
+    const isSingleObj = points && !Array.isArray(points);
+    if (!isSingleObj && (!Array.isArray(points) || points.length !== 1)) return wrapped(points, options);
+    const p = isSingleObj ? points : points[0];
     if (!Number.isFinite(p?.x) || !Number.isFinite(p?.y)) return wrapped(points, options);
+    // Avoid polluting _cellVisCache with transient high-frequency mouse cursor coordinates from Canvas##onMouseMove
+    if (p === globalThis.canvas?.mousePosition) return wrapped(points, options);
     const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
-    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv1|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;
@@ -484,23 +510,53 @@ function patchVisibilityAndLos() {
     return res;
   });
 
-  const ok4 = wrapFoundryMethod("FogManager", "isPointExplored", function (wrapped, point) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
-      return wrapped(point);
+  // Prototype-backed visibility test object eliminates per-offset Object.defineProperty + 2 closures in v14 _createVisibilityTestConfig
+  class FastVisibilityTest {
+    constructor(point, level) {
+      this.point = point;
+      this.level = level;
+      this.los = new Map();
     }
-    const key = `${point.x.toFixed(1)},${point.y.toFixed(1)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|e${_exploredVer}`;
-    const hit = _cellExploredCache.get(key);
-    if (hit !== undefined) {
-      perfStats.cellFogHits++;
-      return hit;
+    get elevation() {
+      globalThis.foundry?.utils?.logCompatibilityWarning?.("CanvasVisibilityTest#elevation is deprecated. Use CanvasVisibilityTest#point.elevation instead.", { since: 14, until: 16, once: true });
+      return this.point.elevation;
     }
-    perfStats.cellFogMisses++;
-    const res = wrapped(point);
-    if (_cellExploredCache.size >= 5000) _cellExploredCache.delete(_cellExploredCache.keys().next().value);
-    _cellExploredCache.set(key, res);
-    return res;
+    set elevation(v) {
+      globalThis.foundry?.utils?.logCompatibilityWarning?.("CanvasVisibilityTest#elevation is deprecated. Use CanvasVisibilityTest#point.elevation instead.", { since: 14, until: 16, once: true });
+      this.point.elevation = v;
+    }
+  }
+  const ZERO_OFFSETS = [[0, 0]];
+  const TOL2_OFFSETS = [[0, 0], [-2, -2], [-2, 0], [-2, 2], [0, -2], [0, 2], [2, -2], [2, 0], [2, 2]];
+
+  const ok4 = wrapFoundryMethod("CanvasVisibility", "_createVisibilityTestConfig", function (wrapped, points, options = {}) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(points, options);
+    const pts = Array.isArray(points) ? points : [points];
+    const t = options?.tolerance ?? 2;
+    const offsets = t === 0 ? ZERO_OFFSETS : (t === 2 ? TOL2_OFFSETS : (t > 0 ? [[0, 0], [-t, -t], [-t, 0], [-t, t], [0, -t], [0, t], [t, -t], [t, 0], [t, t]] : ZERO_OFFSETS));
+    const object = options?.object ?? null;
+    const rawLevel = options?.level;
+    const level = typeof rawLevel === "string"
+      ? (globalThis.canvas?.scene?.levels?.get?.(rawLevel) ?? globalThis.canvas?.level)
+      : (rawLevel ?? globalThis.canvas?.level);
+    const defaultElev = level?.elevation?.bottom ?? 0;
+    const tests = [];
+    for (let i = 0; i < pts.length; i++) {
+      const pt = pts[i];
+      if (!pt) continue;
+      const px = pt.x;
+      const py = pt.y;
+      const pe = pt.elevation ?? defaultElev;
+      for (let j = 0; j < offsets.length; j++) {
+        const off = offsets[j];
+        tests.push(new FastVisibilityTest({ x: px + off[0], y: py + off[1], elevation: pe }, level));
+      }
+    }
+    return { object, level, tests };
   });
 
+  // Note: FogManager#isPointExplored is intentionally NOT wrapped — v14's native implementation is an O(1)
+  // 3x3 Uint8ClampedArray lookup (~200ns, 0 allocs), which is faster than building string cache keys.
   return [Boolean(ok1), Boolean(ok2), Boolean(ok3), Boolean(ok4)];
 }
 
@@ -627,10 +683,15 @@ function patchFogAndOcclusion() {
 
   const regVis = wrapFoundryMethod("Token", "_refreshVisibility", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfFogOcclusionThrottle) return wrapped();
+    const prevToken = _visGuardToken;
+    const prevWasVisible = _visGuardWasVisible;
     _visGuardToken = this;
     _visGuardWasVisible = this.visible;
     try { return wrapped(); }
-    finally { _visGuardToken = null; }
+    finally {
+      _visGuardToken = prevToken;
+      _visGuardWasVisible = prevWasVisible;
+    }
   }, { type: "WRAPPER" });
 
   return [Boolean(regFog), Boolean(regSave), Boolean(regOcc1), Boolean(regOcc2), Boolean(regOccSurf), Boolean(regPerc), Boolean(regVis)];
@@ -1501,6 +1562,120 @@ function patchMiscCpuGuards() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Edge Y-AABB Pruning + O(k) Quadtree#remove & Zero-Alloc Quadtree#getObjects
+// ---------------------------------------------------------------------------
+
+function patchGeometryStructures() {
+  const results = [];
+
+  // 1. Edge.identifyEdgeIntersections: v14 sweeps by X but omits Y-AABB check, causing distant edges at different Y to call getIntersection
+  const EdgeCls = globalThis.foundry?.canvas?.geometry?.edges?.Edge;
+  if (EdgeCls && typeof EdgeCls.identifyEdgeIntersections === "function") {
+    results.push(wrapTargetMethod(EdgeCls, "identifyEdgeIntersections", "Edge.identifyEdgeIntersections", function (wrapped, edges, levelId) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(edges, levelId);
+      const arr = Array.from(edges);
+      const n = arr.length;
+      if (n < 2) return;
+      arr.sort((a, b) => a.nw.x - b.nw.x);
+      for (let i = 0; i < n; i++) {
+        const e1 = arr[i];
+        const e1MaxX = e1.se.x;
+        const e1MinY = e1.nw.y;
+        const e1MaxY = e1.se.y;
+        const a1x = e1.a.x, a1y = e1.a.y, b1x = e1.b.x, b1y = e1.b.y;
+        for (let j = i + 1; j < n; j++) {
+          const e2 = arr[j];
+          if (e2.nw.x > e1MaxX) break;
+          // Y-interval rejection (missing in v14 core)
+          if (e2.nw.y > e1MaxY || e2.se.y < e1MinY) continue;
+          // Fast shared-endpoint rejection without Point#equals call overhead
+          const a2x = e2.a.x, a2y = e2.a.y, b2x = e2.b.x, b2y = e2.b.y;
+          if ((a1x === a2x && a1y === a2y) || (a1x === b2x && a1y === b2y) || (b1x === a2x && b1y === a2y) || (b1x === b2x && b1y === b2y)) continue;
+          e1.recordIntersections(e2, levelId);
+        }
+      }
+    }));
+  }
+
+  // 2. Quadtree#remove (O(k) via root entry Map instead of full-tree walk) + zero-alloc Quadtree#getObjects
+  const QT = globalThis.foundry?.canvas?.geometry?.Quadtree ?? globalThis.Quadtree;
+  if (QT?.prototype) {
+    const okIns = wrapTargetMethod(QT.prototype, "insert", "Quadtree.prototype.insert", function (wrapped, obj) {
+      const res = wrapped(obj);
+      if (this.depth === 0 && obj?.t !== undefined) {
+        if (!this._blEntries) this._blEntries = new Map();
+        this._blEntries.set(obj.t, obj);
+      }
+      return res;
+    });
+
+    const okRem = wrapTargetMethod(QT.prototype, "remove", "Quadtree.prototype.remove", function (wrapped, target) {
+      if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && this.depth === 0 && this._blEntries) {
+        const entry = this._blEntries.get(target);
+        if (entry) {
+          this._blEntries.delete(target);
+          if (entry.n?.size) {
+            for (const leaf of entry.n) {
+              const arr = leaf.objects;
+              const idx = arr.indexOf(entry);
+              if (idx !== -1) arr.splice(idx, 1);
+            }
+            entry.n.clear();
+          }
+          return this;
+        }
+      }
+      if (this.depth === 0 && this._blEntries) this._blEntries.delete(target);
+      return wrapped(target);
+    });
+
+    const okClr = wrapTargetMethod(QT.prototype, "clear", "Quadtree.prototype.clear", function (wrapped) {
+      if (this._blEntries) this._blEntries.clear();
+      return wrapped();
+    });
+
+    const okGet = wrapTargetMethod(QT.prototype, "getObjects", "Quadtree.prototype.getObjects", function (wrapped, rect, opts = {}) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !rect || !this.bounds || opts._s) {
+        return wrapped(rect, opts);
+      }
+      const out = new Set();
+      const test = opts.collisionTest || null;
+      const rx = rect.x;
+      const ry = rect.y;
+      const rr = rx + rect.width;
+      const rb = ry + rect.height;
+      // Attach rect briefly only if collisionTest expects (o, rect); fallback-safe via closure-free helper
+      const visit = (node) => {
+        const objs = node.objects;
+        for (let i = 0, len = objs.length; i < len; i++) {
+          const o = objs[i];
+          if (out.has(o.t)) continue;
+          if (!test || test(o, rect)) out.add(o.t);
+        }
+        const subs = node.nodes;
+        if (!subs || subs.length === 0) return;
+        const midX = node.bounds.x + node.bounds.width * 0.5;
+        const midY = node.bounds.y + node.bounds.height * 0.5;
+        const top = ry < midY;
+        const bottom = rb >= midY;
+        const left = rx < midX;
+        const right = rr >= midX;
+        if (right && top && subs[0]) visit(subs[0]);
+        if (left && top && subs[1]) visit(subs[1]);
+        if (left && bottom && subs[2]) visit(subs[2]);
+        if (right && bottom && subs[3]) visit(subs[3]);
+      };
+      visit(this);
+      return out;
+    });
+
+    results.push(okIns, okRem, okClr, okGet);
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // 6. Optional Idle FPS Limiter (battery/laptop saver)
 // ---------------------------------------------------------------------------
 
@@ -1510,20 +1685,35 @@ function restoreIdleFps() {
   if (!_idle.throttled) return;
   _idle.throttled = false;
   try {
-    const settingMax = game.settings.get("core", "maxFPS") || 0;
+    const settingMax = _idle.savedMax !== undefined ? _idle.savedMax : (game.settings.get("core", "maxFPS") || 0);
     const ticker = globalThis.canvas?.app?.ticker;
     if (ticker) ticker.maxFPS = settingMax;
   } catch {}
   _idle.savedMax = undefined;
 }
 
+export function syncIdleFpsLimiter() {
+  if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfIdleFpsLimit) {
+    attachIdleFpsLimiter();
+  } else {
+    restoreIdleFps();
+    if (_idle.ticker && _idle.tickerFn) {
+      try { _idle.ticker.remove(_idle.tickerFn); } catch {}
+      _idle.ticker = null;
+      _idle.tickerFn = null;
+    }
+  }
+}
+
 function attachIdleFpsLimiter() {
+  if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) return;
   const ticker = globalThis.canvas?.app?.ticker;
   if (!ticker) return;
   if (!_idle.listenersAttached) {
     _idle.listenersAttached = true;
     _idle.last = performance.now();
     const bump = () => {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) return;
       _idle.last = performance.now();
       restoreIdleFps();
     };
@@ -1621,12 +1811,13 @@ export function installCpuPerfEngine() {
   patchFogAndOcclusion();
   patchDragAndMovement();
   patchMiscCpuGuards();
+  patchGeometryStructures();
 
   Hooks.on("initializeVisionMode", () => { _lastLightSig = null; });
   Hooks.on("canvasReady", () => {
     resetCpuCaches();
     bindFogExploredListener();
-    attachIdleFpsLimiter();
+    syncIdleFpsLimiter();
   });
   Hooks.on("canvasTearDown", () => {
     if (_fogExploredTarget) {
@@ -1656,10 +1847,16 @@ export function installCpuPerfEngine() {
       if (h !== "lightingRefresh" && h !== "visibilityRefresh") _losCache.clear();
     });
   }
-  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "controlToken", "sightRefresh", "visibilityRefresh", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
+  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "controlToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
   }
-  for (const h of ["updateActor", "deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry", "updateScene", "updateMacro", "updateRollTable", "updateUser"]) {
+  Hooks.on("updateActor", (_doc, changes) => {
+    // Do not wipe the entire enrichHTML cache on routine HP/resource ticks during combat
+    if (changes && ("name" in changes || "img" in changes || "ownership" in changes)) {
+      _enrichCache.clear();
+    }
+  });
+  for (const h of ["deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry", "updateScene", "updateMacro", "updateRollTable", "updateUser"]) {
     Hooks.on(h, () => { _enrichCache.clear(); });
   }
 

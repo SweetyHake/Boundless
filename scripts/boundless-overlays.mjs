@@ -229,9 +229,9 @@ export const overlayMethods = {
         }
       }
       if (!maskTex && roofUrls.size > 0 && roofUrls.size <= MAX_SPRITE_MASK_URLS) {
-        // Small reusable template roof set (e.g. <= 24 shared textures): load & pin for instant pixel-exact mask + z>=5 roofs
+        // Small reusable template roof set (<= 24 shared textures): load into LRU cache without permanently pinning VRAM across levels
         const urlList = Array.from(roofUrls);
-        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: true })));
+        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: false })));
         if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
           return;
         }
@@ -725,10 +725,13 @@ export const overlayMethods = {
     const effectiveZ = Math.max(targetZ, showInterior ? (layer.zOffset + 5) : 0);
 
     const isMoving = this.isActivelyMoving();
-    // Quantize the predictive prefetch box into coarse viewport cells while moving so props entering
-    // the forward lookahead margin inside the SAME 2500px sector start loading BEFORE entering the screen!
-    const vpCellW = Math.max(256, Math.round((vp.x1 - vp.x0) * 0.25));
-    const vpCellH = Math.max(256, Math.round((vp.y1 - vp.y0) * 0.25));
+    // Quantize the predictive prefetch box using a STABLE screen-derived cell size (independent of velocity lookahead width)
+    // so tileKey stays cached during smooth panning instead of thrashing every frame.
+    const sw = globalThis.canvas?.app?.renderer?.screen?.width || 1920;
+    const sh = globalThis.canvas?.app?.renderer?.screen?.height || 1080;
+    const safeScale = Math.max(0.01, vp.scale || 1);
+    const vpCellW = Math.max(384, Math.round((sw / safeScale) * 0.35));
+    const vpCellH = Math.max(384, Math.round((sh / safeScale) * 0.35));
     const moveBucket = isMoving
       ? `_m_${Math.floor(vp.x0 / vpCellW)}_${Math.floor(vp.y0 / vpCellH)}_${Math.floor(vp.x1 / vpCellW)}_${Math.floor(vp.y1 / vpCellH)}`
       : "_s";
@@ -892,7 +895,6 @@ export const overlayMethods = {
     const secX1 = (curSx1 + 1) * simSectorPx;
     const secY1 = (curSy1 + 1) * simSectorPx;
     if (pivX + halfDiag < secX0 || pivX - halfDiag > secX1 || pivY + halfDiag < secY0 || pivY - halfDiag > secY1) {
-      layer.lastTileKey = "";
       return null;
     }
 
@@ -1064,8 +1066,12 @@ export const overlayMethods = {
           Math.min(simGrid - 1, sx + 1), Math.min(simGrid - 1, sy + 1)
         );
         const curTargetZ = layer.lastTargetZ ?? 0;
+        const hasTileEditsOnLevel = Boolean(this.tileEdits?.get?.(layerId)?.size);
         for (const tid of candidateTids) {
-          const tSpec = this.resolveVirtualTile(layerId, tid, spec.tiles[tid], level);
+          const rawTile = spec.tiles[tid];
+          if (!rawTile) continue;
+          if (!hasTileEditsOnLevel && rawTile.minZ === undefined) continue;
+          const tSpec = this.resolveVirtualTile(layerId, tid, rawTile, level);
           if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
           if (tSpec.maxZ !== undefined && curTargetZ > tSpec.maxZ) continue;
           if (tSpec.minZ !== undefined) {

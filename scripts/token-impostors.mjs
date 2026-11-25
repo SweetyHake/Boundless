@@ -1346,6 +1346,11 @@ export class TokenImpostorLayer {
       if (obj.visible === false || hiddenByShowstopper) {
         return { alpha: 0, needsVision, isParty };
       }
+      // At tactical zoom (_nativeTokensActive), mounted native tokens with renderable=false are simply frustum-culled
+      // offscreen by TokenStreamer — never turn on the GPU Impostor shader & atlas bind for them!
+      if (this.streamer?._nativeTokensActive && !hasFadeOverride) {
+        return { alpha: 0, needsVision, isParty };
+      }
       const nativeActive = Boolean(obj.renderable && (!obj.mesh || (!obj.mesh.destroyed && obj.mesh.renderable)));
       if (nativeActive && !hasFadeOverride) {
         return { alpha: 0, needsVision, isParty };
@@ -1501,13 +1506,16 @@ export class TokenImpostorLayer {
   flush({ forceAtlas = false } = {}) {
     if (!this.mounted) return;
     if (this.atlasDirty && this.atlasTexture?.baseTexture) {
-      const now = performance.now();
-      const stillStreaming = this._activeDecodes > 0 || this._decodeQueue.length > 0;
-      // Coalesce expensive 2048x2048 mipmapped atlas uploads while portraits are actively streaming in
-      if (forceAtlas || !stillStreaming || (now - (this._lastAtlasUploadMs || 0)) >= 180) {
-        this.atlasDirty = false;
-        this._lastAtlasUploadMs = now;
-        this.atlasTexture.baseTexture.update();
+      // Skip expensive 16MB 2048x2048 mipmapped GPU atlas uploads while impostors are hidden (tactical zoom) or camera is actively panning
+      const canUpload = forceAtlas || (this.mesh?.visible !== false && !this.controller?.isActivelyMoving?.());
+      if (canUpload) {
+        const now = performance.now();
+        const stillStreaming = this._activeDecodes > 0 || this._decodeQueue.length > 0;
+        if (forceAtlas || !stillStreaming || (now - (this._lastAtlasUploadMs || 0)) >= 180) {
+          this.atlasDirty = false;
+          this._lastAtlasUploadMs = now;
+          this.atlasTexture.baseTexture.update();
+        }
       }
     }
     if (this._bufDirty.center && this.centerBuf) { this.centerBuf.update(); this._bufDirty.center = false; }

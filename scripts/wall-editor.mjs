@@ -663,6 +663,8 @@ export class VirtualWallEditor {
       sk: seg.sk,
       idx: seg.idx,
       isDoor: Boolean(seg.door > 0),
+      editsRev: this.controller?.wallEditsRev || 0,
+      liveDs,
       sig,
       wall,
       doc
@@ -784,7 +786,9 @@ export class VirtualWallEditor {
     const inNativeZoom = isWallsEditMode ? (effScale >= NATIVE_WALLS_MIN_SCALE) : this._doorsZoomActive;
     const showDoorControls = isWallsEditMode || effScale >= DOOR_CONTROL_MIN_SCALE;
 
-    const qStep = Math.max(200, Math.round(60 / Math.max(0.01, curVp.scale)));
+    const qStep = isWallsEditMode
+      ? Math.max(200, Math.round(60 / Math.max(0.01, curVp.scale)))
+      : Math.max(400, Math.round(120 / Math.max(0.01, curVp.scale)));
     const qx0 = Math.floor(curVp.x0 / qStep);
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
@@ -876,7 +880,8 @@ export class VirtualWallEditor {
     }
 
     const gen = this._clearGen;
-    const maxSyncMounts = force ? (isWallsEditMode ? 24 : 8) : (isWallsEditMode ? 8 : 3);
+    const isMoving = Boolean(!force && this.controller?.isActivelyMoving?.());
+    const maxSyncMounts = force ? (isWallsEditMode ? 24 : 8) : (isMoving ? 0 : (isWallsEditMode ? 8 : 3));
     const tMountStart = performance.now();
     let syncMounted = 0;
     for (const [mKey, seg] of needed) {

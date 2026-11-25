@@ -893,27 +893,28 @@ export const pyramidMethods = {
     if (!this.active || this._mounting || !this.visibleLevelLayers.length || !canvas?.ready || this._inUpdatePyramid) return;
     this._inUpdatePyramid = true;
     try {
-    const vp = this.getViewportWorldRect(0.28, null, { predictive: !this.isCameraFlying });
+    const stableVp = this.getViewportWorldRect(0.28, null, { predictive: false });
+    const vp = this.isCameraFlying ? stableVp : this.getViewportWorldRect(0.28, null, { predictive: true });
 
     // Update GPU light frustum culling, spatial chunk streaming, POI pin scale, chunked fog culling, spatial audio, and native streamed walls/doors
     this.chunkStreamer.update(vp);
-    this.lightBatch.updateViewport(vp);
+    this.lightBatch.updateViewport(stableVp);
     this._optimizeEffectsLayers(canvas.effects);
-    this.poiManager.updateViewport(vp);
+    this.poiManager.updateViewport(stableVp);
     this.charPins.updateViewport();
-    this.fogManager.updateViewportCulling(vp);
+    this.fogManager.updateViewportCulling(stableVp);
     // Keep token frustum culling & GPU Impostor Atlas synced even during camera flight (<0.05ms)
-    this.tokenStreamer.scheduleSync(vp);
+    this.tokenStreamer.scheduleSync(stableVp);
     if (!this.isCameraFlying) {
       this.audioStreamer.update(
         this.visibleLevelLayers,
-        vp,
+        stableVp,
         (lid, sk, idx, raw, lvl) => this.resolveVirtualSound(lid, sk, idx, raw, lvl)
       );
-      this.wallEditor.syncViewport(false, vp);
-      this.layerEditors.syncViewport(false, vp);
+      this.wallEditor.syncViewport(false, stableVp);
+      this.layerEditors.syncViewport(false, stableVp);
     }
-    if (this.lightBatch.useDepthTexture || this.activeOverlays.size > 0 || this._hasMultiElevationDepth()) {
+    if (this.lightBatch.useDepthTexture || this.activeOverlays.size > 0 || this.visibleLevelLayers.length > 1 || this._hasMultiElevationDepth()) {
       this._depthDirty = true;
       if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
@@ -1522,7 +1523,7 @@ export const pyramidMethods = {
         occCount++;
       }
     }
-    if (this.tilesByKey.size > 0) {
+    if (this.visibleLevelLayers.length > 1 && this.tilesByKey.size > 0) {
       let ptIdx = 0;
       for (const e of this.tilesByKey.values()) {
         const m = e?.mesh;
@@ -1588,7 +1589,10 @@ export const pyramidMethods = {
 
     const estimateFreshUploadBytes = (tex) => {
       const bt = tex?.baseTexture;
-      if (!bt || (bt._glTextures && Object.keys(bt._glTextures).length > 0)) return 0;
+      if (!bt) return 0;
+      if (bt._glTextures) {
+        for (const _ in bt._glTextures) return 0;
+      }
       return this.texMgr._estimateBytes(tex);
     };
     const tFrameStart = performance.now();
