@@ -64,8 +64,12 @@ export function installHoverFadeHitTestPatch(controller) {
         if (this._boundlessTile && !this.hoverFade) return false;
         if (controller.isActivelyMoving()) return false;
       } else if (PERF_CONFIG.perfEnabled) {
-        // On any standard scene, skip synchronous gl.readPixels() alpha-map stall for non-hoverFade, non-occludable meshes
-        if (!this.hoverFade && !this.occlusionMode) return false;
+        // On standard scenes, skip synchronous gl.readPixels() alpha-map stall for non-hoverFade, non-occludable ground/background meshes,
+        // while preserving opaque upper tiles/platforms that intentionally block hoverFade from bleeding through to roofs below.
+        const baseElev = Number.isFinite(canvas?.level?.elevation?.base)
+          ? canvas.level.elevation.base
+          : (Number.isFinite(canvas?.level?.elevation?.bottom) ? canvas.level.elevation.bottom : 0);
+        if (!this.hoverFade && !this.occlusionMode && (this.elevation ?? 0) <= baseElev) return false;
       }
     }
     return origContainsCanvasPoint.apply(this, args);
@@ -285,6 +289,9 @@ export function registerBoundlessHooks(controller) {
       _controlTokenQueued = false;
       if (!isRuntimeReady() || controller.tokenStreamer?._selectingBatch) return;
       controller.updateSimAndLightBubbles(false);
+      if (controller.tokenStreamer?.enabled && !controller.tokenStreamer._nativeTokensActive) {
+        controller.tokenStreamer.scheduleSync(null, true);
+      }
       controller.tokenStreamer.onVisibilityChanged();
       controller.selectionOverlay?.refresh?.();
       controller._roofTokenOccDirty = true;
@@ -374,15 +381,16 @@ export function registerBoundlessHooks(controller) {
     controller.tokenStreamer.onTokenUpdated(doc, changes);
     controller.charPins.onTokenUpdated(doc, changes);
     const posChanged = "x" in changes || "y" in changes || "level" in changes;
+    const sizeChanged = "width" in changes || "height" in changes;
     const elevChanged = "elevation" in changes;
     const lightChanged = "light" in changes || "sight" in changes;
-    if (posChanged || elevChanged || lightChanged) {
+    if (posChanged || sizeChanged || elevChanged || lightChanged) {
       if ((posChanged || elevChanged) && !controller._depthDirty && controller._hasMultiElevationDepth()) controller._depthDirty = true;
-      if (posChanged || elevChanged) controller._roofTokenOccDirty = true;
+      if (posChanged || sizeChanged || elevChanged) controller._roofTokenOccDirty = true;
       const needOcc = posChanged && !_tokBatchOcclusion && controller.needsOcclusionRefreshNear(doc);
       queueTokenBatchFlush({
         bubbles: posChanged || lightChanged,
-        selection: posChanged || elevChanged,
+        selection: posChanged || sizeChanged || elevChanged,
         occlusion: needOcc
       });
     }
@@ -412,10 +420,13 @@ export function registerBoundlessHooks(controller) {
 
   Hooks.on("deleteToken", (doc) => {
     if (!isRuntimeReady() || doc?.parent?.id !== canvas.scene?.id) return;
+    if (doc._object) controller._roofHiddenTokens?.delete?.(doc._object);
     controller.tokenStreamer.onTokenDeleted(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
-    queueTokenBatchFlush({ bubbles: true, selection: true, voidFilter: true });
+    controller._roofTokenOccDirty = true;
+    const needOcc = !_tokBatchOcclusion && controller.needsOcclusionRefreshNear(doc);
+    queueTokenBatchFlush({ bubbles: true, selection: true, voidFilter: true, occlusion: needOcc });
   });
 
   Hooks.on("updateUser", (_user, changes) => {

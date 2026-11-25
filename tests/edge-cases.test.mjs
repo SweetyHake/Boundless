@@ -1256,3 +1256,323 @@ test("TileWorkerPool resets _supported on destroy() and respawns crashed worker 
   pool.destroy();
   assert.equal(pool._supported, null, "destroy() must reset _supported to null");
 });
+
+test("hasTokenPermissionLazy respects Foundry v14 precedence including explicit delta deny and INHERIT", async () => {
+  installBaseGlobals();
+  globalThis.CONST.DOCUMENT_OWNERSHIP_LEVELS = { INHERIT: -1, NONE: 0, LIMITED: 1, OBSERVER: 2, OWNER: 3 };
+  const { hasTokenPermissionLazy } = await import("../scripts/utils.mjs");
+
+  const player = { id: "u1", isGM: false };
+  const gm = { id: "gm1", isGM: true };
+
+  // Explicit delta[uid] = NONE (0) must override baseActor[uid] = OWNER (3)
+  const docDenied = {
+    isLazyDelta: true,
+    _source: { delta: { ownership: { u1: 0, default: 3 } } },
+    baseActor: { ownership: { u1: 3, default: 3 } }
+  };
+  assert.equal(hasTokenPermissionLazy(docDenied, player, "OWNER"), false);
+  assert.equal(hasTokenPermissionLazy(docDenied, player, "LIMITED"), false);
+  assert.equal(hasTokenPermissionLazy(docDenied, gm, "OWNER"), true);
+
+  // INHERIT (-1) in delta[uid] must fall through to baseActor[uid]
+  const docInherit = {
+    isLazyDelta: true,
+    _source: { delta: { ownership: { u1: -1, default: 0 } } },
+    baseActor: { ownership: { u1: 2, default: 0 } }
+  };
+  assert.equal(hasTokenPermissionLazy(docInherit, player, "OBSERVER"), true);
+  assert.equal(hasTokenPermissionLazy(docInherit, player, "OWNER"), false);
+
+  // delta.default overrides base.default when per-user entries are absent
+  const docDeltaDefault = {
+    isLazyDelta: true,
+    _source: { delta: { ownership: { default: 1 } } },
+    baseActor: { ownership: { default: 3 } }
+  };
+  assert.equal(hasTokenPermissionLazy(docDeltaDefault, player, "LIMITED"), true);
+  assert.equal(hasTokenPermissionLazy(docDeltaDefault, player, "OBSERVER"), false);
+});
+
+test("VirtualWallEditor batched GM door updates resolve DoorInfo, notify perception, and revert by seq on error", async () => {
+  installBaseGlobals();
+  globalThis.foundry = {
+    utils: {
+      isEmpty: (o) => !o || Object.keys(o).length === 0,
+      deepClone: (o) => structuredClone(o),
+      expandObject: (o) => o
+    }
+  };
+  const { VirtualWallEditor } = await import("../scripts/wall-editor.mjs");
+
+  let rejectUpdate;
+  const perceptionCalls = [];
+  const applied = [];
+  const doorInfos = new Map([
+    ["lvl1:0_0:d:0", { dKey: "lvl1:0_0:d:0", defaultDs: 0 }],
+    ["lvl1:0_0:d:1", { dKey: "lvl1:0_0:d:1", defaultDs: 2 }]
+  ]);
+
+  const scene = {
+    flags: { boundless: { doorStates: {} } },
+    update: () => new Promise((_res, rej) => { rejectUpdate = rej; })
+  };
+  globalThis.canvas = {
+    scene,
+    perception: { update: (flags) => perceptionCalls.push(flags) }
+  };
+
+  const controller = {
+    active: true,
+    _pendingDoorCommits: new Map(),
+    _resolveDoorByKey: (k) => doorInfos.get(k) ?? null,
+    _normalizeDoorState: (ds, def) => (Number.isFinite(ds) ? ds : def),
+    _applyDoorStateLocal: (info, ds, opts) => {
+      assert.equal(typeof info, "object", "must receive resolved DoorInfo object, not string key");
+      applied.push({ dKey: info.dKey, ds, opts });
+      return true;
+    },
+    updateSimAndLightBubbles: () => {}
+  };
+
+  const editor = new VirtualWallEditor(controller);
+  const makeEntry = (id, dKey, ds) => ({
+    id,
+    dKey,
+    isDoor: true,
+    levelId: "lvl1",
+    wKey: dKey.slice(5),
+    doc: { id, ds, door: 1, updateSource() {} }
+  });
+  editor.mountedById.set("w1", makeEntry("w1", "lvl1:0_0:d:0", 0));
+  editor.mountedById.set("w2", makeEntry("w2", "lvl1:0_0:d:1", 2));
+
+  await editor._commitVirtualUpdates([
+    { _id: "w1", ds: 1 },
+    { _id: "w2", ds: 0 }
+  ]);
+
+  assert.equal(applied.length, 2);
+  assert.equal(applied[0].ds, 1);
+  assert.equal(applied[1].ds, 0);
+  assert.equal(perceptionCalls[0].initializeVision, true);
+  assert.equal(perceptionCalls[0].initializeSounds, true);
+
+  // Trigger rejection -> must revert both doors to their defaultDs (0 and 2)
+  rejectUpdate(new Error("db_fail"));
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(applied.length, 4);
+  assert.equal(applied[2].ds, 0);
+  assert.equal(applied[3].ds, 2);
+  assert.equal(controller._pendingDoorCommits.size, 0);
+});
+
+test("TileWorkerPool keeps isSupported() true while respawn attempts remain so LRUTextureManager can recover", async () => {
+  const { TileWorkerPool } = await import("../scripts/tile-worker-pool.mjs");
+  let spawns = 0;
+  const pool = new TileWorkerPool({
+    poolSize: 1,
+    workerFactory() {
+      const idx = ++spawns;
+      return {
+        onmessage: null,
+        onerror: null,
+        onmessageerror: null,
+        postMessage(msg) {
+          if (idx === 1 && msg.type === "decode") {
+            queueMicrotask(() => this.onerror?.({ message: "worker_oom" }));
+            return;
+          }
+          if (msg.type === "decode") {
+            queueMicrotask(() => this.onmessage?.({ data: { id: msg.id, bitmap: { width: 16, height: 16, close() {} }, decodeMs: 1 } }));
+          }
+        },
+        terminate() {}
+      };
+    }
+  });
+
+  await assert.rejects(pool.decode("tile1.webp"));
+  assert.equal(pool.isSupported(), true, "isSupported() must remain true while respawn attempts remain");
+
+  const bmp = await pool.decode("tile2.webp");
+  assert.equal(bmp.width, 16);
+  assert.equal(spawns, 2);
+  pool.destroy();
+});
+
+test("ChunkedFogManager SHARED brush reveal does not taint privateCanvas, while erase clears both and marks _dirtyPrivate", async () => {
+  installBaseGlobals();
+  globalThis.CONST.FOG_EXPLORATION_MODES = { DISABLED: 0, INDIVIDUAL: 1, SHARED: 2 };
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  const makeMockCtx = () => ({
+    ops: [],
+    globalCompositeOperation: "source-over",
+    fillStyle: "",
+    save() {},
+    restore() {},
+    beginPath() {},
+    arc(x, y, r) { this.ops.push({ op: this.globalCompositeOperation, x, y, r }); },
+    fill() {},
+    clearRect() {},
+    drawImage() {}
+  });
+
+  const fog = new ChunkedFogManager();
+  fog.enabled = true;
+  fog.container = {};
+  fog.sceneId = "sc1";
+  fog.levelId = "lvl1";
+  fog.mode = globalThis.CONST.FOG_EXPLORATION_MODES.SHARED;
+
+  const sharedCtx = makeMockCtx();
+  const privateCtx = makeMockCtx();
+  const displayCtx = makeMockCtx();
+  const chunk = {
+    cx: 0,
+    cy: 0,
+    key: "0_0",
+    sprite: { visible: true },
+    canvas: { width: 512, height: 512 },
+    ctx: displayCtx,
+    sharedCanvas: { width: 512, height: 512 },
+    sharedCtx,
+    privateCanvas: { width: 512, height: 512 },
+    privateCtx,
+    hasPrivate: true,
+    texture: { baseTexture: { update() {} } }
+  };
+  fog.chunks.set("0_0", chunk);
+  fog._getOrCreateChunk = () => chunk;
+  fog._recompositeChunk = () => {};
+  fog._scheduleSave = () => {};
+  fog._scheduleLocalCacheSave = () => {};
+
+  // Reveal stroke in SHARED mode: must touch sharedCtx only, NEVER privateCtx or _dirtyPrivate
+  fog._applyBrushStrokes([[200, 200, 50, 0]], { markDirty: true });
+  assert.equal(sharedCtx.ops.length, 1);
+  assert.equal(privateCtx.ops.length, 0, "SHARED reveal must not draw into privateCtx");
+  assert.equal(fog._dirtyShared.has("0_0"), true);
+  assert.equal(fog._dirtyPrivate.has("0_0"), false, "SHARED reveal must not mark _dirtyPrivate");
+
+  // Erase stroke in SHARED mode: must erase both sharedCtx and privateCtx and mark _dirtyPrivate
+  fog._applyBrushStrokes([[200, 200, 50, 1]], { markDirty: true });
+  assert.equal(sharedCtx.ops.length, 2);
+  assert.equal(sharedCtx.ops[1].op, "destination-out");
+  assert.equal(privateCtx.ops.length, 1);
+  assert.equal(privateCtx.ops[0].op, "destination-out");
+  assert.equal(fog._dirtyPrivate.has("0_0"), true, "SHARED erase with hasPrivate must mark _dirtyPrivate");
+});
+
+test("perf-auto handles 90-degree rotated camera viewport and avoids deprecated TileDocument#occlusion.mode", async () => {
+  installBaseGlobals();
+  const { computeExpandedViewport, syncSingleDecorativeTile } = await import("../scripts/perf-auto.mjs");
+
+  // 90 deg rotation matrix: a=0, b=1, c=-1, d=0 -> det = 1
+  const stage = { worldTransform: { a: 0, b: 1, c: -1, d: 0, tx: 100, ty: 50 } };
+  const vp = computeExpandedViewport(stage, { x: 0, y: 0, width: 200, height: 100 }, 0, 0);
+  assert.ok(vp, "rotated stage with a=0,d=0 must produce a valid viewport");
+  assert.equal(vp.minX, -50);
+  assert.equal(vp.maxX, 50);
+  assert.equal(vp.minY, -100);
+  assert.equal(vp.maxY, 100);
+
+  // TileDocument with v14 occlusion.modes Set must NEVER touch deprecated occlusion.mode getter
+  let deprecatedRead = false;
+  const occ = {
+    modes: new Set(),
+    get mode() { deprecatedRead = true; return 0; }
+  };
+  const mesh = { pluginName: "batchOcclusion", _shader: { pluginName: "batchOcclusion" }, unoccludedAlpha: 1, destroyed: false };
+  const tile = { mesh, document: { alpha: 1, occlusion: occ, restrictions: {} }, isVideo: false };
+
+  syncSingleDecorativeTile(tile, true);
+  assert.equal(deprecatedRead, false, "must not access deprecated doc.occlusion.mode when modes Set exists");
+  assert.equal(mesh.pluginName, "batch");
+  assert.equal(mesh._blFastBatch, true);
+
+  // If a third-party module swaps the tile's shader to a custom one, sync must release our batch override
+  mesh._shader = { pluginName: "customFxShader" };
+  syncSingleDecorativeTile(tile, true);
+  assert.equal(mesh.pluginName, null);
+  assert.equal(mesh._blFastBatch, false);
+});
+
+test("applyLightingRenderScale overrides Foundry v14 non-MAX no-op setter and restores original descriptor on full", async () => {
+  installBaseGlobals();
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const { applyLightingRenderScale } = await import("../scripts/perf-gpu.mjs");
+
+  const prevEnabled = PERF_CONFIG.perfEnabled;
+  const prevScale = PERF_CONFIG.perfLightingScale;
+  try {
+    const makeFilter = () => {
+      const f = { destroyed: false };
+      Object.defineProperty(f, "resolution", {
+        configurable: true,
+        enumerable: true,
+        get() { return 1; },
+        set() {} // Foundry v14 LOW/MED/HIGH no-op setter
+      });
+      return f;
+    };
+    const illumFilter = makeFilter();
+    const colorFilter = makeFilter();
+    const darkFilter = makeFilter();
+
+    globalThis.canvas = {
+      ready: true,
+      performance: { mode: 2 },
+      app: { renderer: { resolution: 2, renderTexture: { current: null } } },
+      effects: {
+        illumination: { filter: illumFilter },
+        coloration: { filter: colorFilter },
+        darkness: { filter: darkFilter }
+      }
+    };
+
+    PERF_CONFIG.perfEnabled = true;
+    PERF_CONFIG.perfLightingScale = "balanced";
+    applyLightingRenderScale();
+    assert.equal(illumFilter.resolution, 1.1, "balanced scale 0.55 * renderer resolution 2 = 1.1");
+    assert.equal(colorFilter.resolution, 1.7, "balanced scale 0.85 * renderer resolution 2 = 1.7");
+
+    PERF_CONFIG.perfLightingScale = "full";
+    applyLightingRenderScale();
+    assert.equal(illumFilter.resolution, 1, "full mode must restore original getter");
+    assert.equal(illumFilter._blResMult, undefined);
+  } finally {
+    PERF_CONFIG.perfEnabled = prevEnabled;
+    PERF_CONFIG.perfLightingScale = prevScale;
+  }
+});
+
+test("buildMeasureCacheKey distinguishes undefined elevation from 0 and uses exact keys for short paths", async () => {
+  const { buildMeasureCacheKey } = await import("../scripts/perf-cpu.mjs");
+
+  const kUndef = buildMeasureCacheKey([{ x: 100, y: 100 }, { x: 200, y: 100 }], {});
+  const kZero = buildMeasureCacheKey([{ x: 100, y: 100, elevation: 0 }, { x: 200, y: 100, elevation: 0 }], {});
+  assert.ok(kUndef && kZero);
+  assert.notEqual(kUndef, kZero, "elevation: undefined and elevation: 0 must not collide");
+  assert.ok(kUndef.startsWith("E:"), "short paths (<= 12 waypoints) must use exact string key");
+});
+
+test("resolveFoundryClass skips deprecated foundry.canvas.tokens and resolves Roll from foundry.dice", async () => {
+  installBaseGlobals();
+  let deprecatedTokensTouched = false;
+  class FakeRoll {}
+  globalThis.foundry = {
+    canvas: {
+      get tokens() { deprecatedTokensTouched = true; return {}; },
+      layers: {},
+      placeables: {}
+    },
+    dice: { Roll: FakeRoll }
+  };
+  const { resolveFoundryClass } = await import("../scripts/perf-patcher.mjs");
+  const resolved = resolveFoundryClass("Roll");
+  assert.equal(resolved?.cls, FakeRoll);
+  assert.equal(resolved?.path, "foundry.dice.Roll");
+  assert.equal(deprecatedTokensTouched, false, "must never enumerate deprecated foundry.canvas.tokens");
+});

@@ -74,6 +74,14 @@ export class TileWorkerPool {
     return this._supported;
   }
 
+  _canRespawnAny() {
+    if (!this._initialized || !this._workers.length) return false;
+    for (let i = 0; i < this._workers.length; i++) {
+      if (!this._workers[i] && (this._respawnCounts[i] || 0) < MAX_RESPAWNS_PER_SLOT) return true;
+    }
+    return false;
+  }
+
   _spawnWorkerSlot(idx) {
     try {
       const w = this._workerFactory
@@ -106,6 +114,7 @@ export class TileWorkerPool {
         this._supported = true;
         return true;
       }
+      this._supported = false;
       return false;
     }
     this._initialized = true;
@@ -309,7 +318,7 @@ export class TileWorkerPool {
         }
       }
       if (!anyAlive) {
-        this._supported = false;
+        if (!this._canRespawnAny()) this._supported = false;
         while (this._queue.length > 0) {
           const job = this._queue.shift();
           this._untrackSrc(job.src, job.id);
@@ -399,7 +408,7 @@ export class TileWorkerPool {
       act.reject(new Error("worker_error"));
     }
     this._workerLoad[workerIdx] = 0;
-    if (!this._workers.some(Boolean)) {
+    if (!this._workers.some(Boolean) && !this._canRespawnAny()) {
       this._supported = false;
     }
     this._dispatch();

@@ -135,7 +135,7 @@ export const pyramidMethods = {
   },
 
   prewarmArea(worldX, worldY, targetScale) {
-    if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready) return;
+    if (!this.active || this._mounting || !this.visibleLevelLayers.length || !canvas?.ready) return;
     this.chunkStreamer.prewarmPoint(worldX, worldY);
     this.tokenStreamer.prewarmTarget(worldX, worldY, targetScale);
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
@@ -324,9 +324,11 @@ export const pyramidMethods = {
       const macroMaxZ = superGrid.macroMaxZ ?? 2;
       const regionPx = superGrid.regionPx || 100000;
       const localRatio = (regionPx * scale) / tilePx;
-      if (localRatio >= 0.92) {
-        const localZ = Math.max(0, Math.ceil(Math.log2(Math.max(1, localRatio))));
-        return Math.min(effMaxZ, (macroMaxZ + 1) + localZ);
+      const localThreshold = (prevZ > macroMaxZ) ? 0.86 : 0.96;
+      if (localRatio >= (hysteresis ? localThreshold : 0.92)) {
+        const exactLocal = (macroMaxZ + 1) + Math.log2(Math.max(0.5, localRatio));
+        const z = hysteresis ? applyHyst(exactLocal) : Math.ceil(exactLocal);
+        return Math.max(macroMaxZ + 1, Math.min(effMaxZ, z));
       }
       const macroExact = Math.log2(Math.max(0.5, (worldPx * scale) / tilePx));
       return Math.max(0, Math.min(macroMaxZ, applyHyst(macroExact)));
@@ -502,6 +504,7 @@ export const pyramidMethods = {
       m.elevation = 0;
       m.sort = 0;
       m.sortLayer = 0;
+      m.zIndex = 0;
       m.angle = 0;
       m.anchor?.set?.(0, 0);
       m.position?.set?.(0, 0);
@@ -551,6 +554,7 @@ export const pyramidMethods = {
     m.elevation = 0;
     m.sort = 0;
     m.sortLayer = 0;
+    m.zIndex = 0;
     m.angle = 0;
     m.tint = 0xffffff;
     m.anchor?.set?.(0, 0);
@@ -614,7 +618,7 @@ export const pyramidMethods = {
       if (!ssApi.getTokenMovementSetting?.("vertical") || !ssApi.getTokenMovementSetting?.("verticalBlur")) return;
       const baseElev = getLevelBaseElevation(canvas?.level);
       const obsElev = Number(ssApi.getObserverElevation?.());
-      if (!Number.isFinite(obsElev) || obsElev <= baseElev + 0.05) return;
+      if (!Number.isFinite(obsElev) || Math.abs(obsElev - baseElev) <= 0.05) return;
       if (typeof ssApi.computeElevationPerspective === "function") {
         const grid = canvas?.grid?.size ?? 100;
         const sceneDist = Number(canvas?.scene?.grid?.distance ?? canvas?.grid?.distance) || 5;
@@ -1112,14 +1116,15 @@ export const pyramidMethods = {
     m.restrictsLight = !isFg && (e.z > 0 || needZ0Depth);
     m.restrictsWeather = !isFg && (e.z > 0 || needZ0Depth);
 
-    // Only defer visibility (`awaitingSwap`) when zooming IN (`other.z < e.z`, coarser ancestor fully covers this tile).
-    // When zooming OUT (`e.z < other.z`), the new coarser tile sorts BEHIND old finer tiles (`m.sort` increases with z)
-    // so making it immediately visible fills surrounding space around old tiles with zero black borders!
+    // Defer visibility (`awaitingSwap`) when zooming IN (`other.z < e.z`), and for semi-transparent layers (`isFg || layer.isUpper`)
+    // also when zooming OUT (`other.z !== e.z`) so overlapping LODs never double-blend dark halos.
     const eCh = e.channel || "bg";
+    const isTranslucentChannel = isFg || Boolean(layer.isUpper);
     let hasOtherZCovering = false;
     if (!instant && e.z > 0 && !e.isReveal) {
       for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && (other.channel || "bg") === eCh && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
+        const zMatch = isTranslucentChannel ? (other.z !== e.z) : (other.z < e.z);
+        if (other.levelId === e.levelId && (other.channel || "bg") === eCh && other.ready && !other.awaitingSwap && other.z > 0 && zMatch && other.mesh?.visible && other.alpha >= 0.9 &&
             this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
           hasOtherZCovering = true;
           break;
@@ -1144,7 +1149,7 @@ export const pyramidMethods = {
       m.updateCanvasTransform = NOOP_TRANSFORM;
       if (!isFg && e.z === 0) this._buildLevelOpacityMask(layer, e, tex);
     }
-    this._syncShowstopperMeshDof(m);
+    if (m.visible) this._syncShowstopperMeshDof(m);
     canvas.primary.sortDirty = true;
     this._tilesDirty = true;
     if (m.visible && !isFg) {
@@ -1197,10 +1202,9 @@ export const pyramidMethods = {
     for (const layer of this.visibleLevelLayers) {
       const lid = layer.level.id;
       if (layer.hasPyramid) {
-        const st = levelReadyState?.get?.(lid);
         const z0 = this.tilesByKey.get(`${lid}::0_0_0`);
-        const fullyCovered = Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero)
-          || this._isViewportCoveredByHigherTiles(layer, visVp, "bg");
+        // Always verify actual viewport coverage so a failed/404 high-Z tile never hides the z=0 fallback and leaves a black hole
+        const fullyCovered = this._isViewportCoveredByHigherTiles(layer, visVp, "bg");
         if (z0?.mesh) {
           const shouldShowBase = !fullyCovered;
           if (z0.mesh.visible !== shouldShowBase) {
@@ -1841,6 +1845,7 @@ export const pyramidMethods = {
             if (e.mesh) {
               e.mesh.unoccludedAlpha = 1.0;
               e.mesh.visible = true;
+              this._syncShowstopperMeshDof(e.mesh);
             }
             let visArr = readyVisBuckets.get(bk);
             if (!visArr) { visArr = []; readyVisBuckets.set(bk, visArr); }
@@ -1871,11 +1876,14 @@ export const pyramidMethods = {
         const curTargetZ = isFg ? e.layer.lastForegroundTargetZ : e.layer.lastTargetZ;
         const baseKey = isFg ? `${e.levelId}::fg::0_0_0` : `${e.levelId}::0_0_0`;
         const baseReady = Boolean(this.tilesByKey.get(baseKey)?.ready) || (isFg && !this.hasForegroundTile(e.layer, 0, 0, 0));
+        const inVis = !(e.x0 + e.sizePx < visVp.x0 || e.x0 > visVp.x1 || e.y0 + e.sizePx < visVp.y0 || e.y0 > visVp.y1);
+        const replacedByDesired = (!isFg && e.z < curTargetZ && inVis)
+          ? this.isTileFullyReplacedByDesired(e, visVp, readyDesBuckets.get(bk) || EMPTY_ARRAY)
+          : true;
         const canDropOld = (curTargetZ === 0 && baseReady)
           || (isFg
               ? Boolean(st?.visDesiredReady && curTargetZ > 0)
-              : Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero));
-        const inVis = !(e.x0 + e.sizePx < visVp.x0 || e.x0 > visVp.x1 || e.y0 + e.sizePx < visVp.y0 || e.y0 > visVp.y1);
+              : Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero && replacedByDesired));
         if (canDropOld || !inVis || (st?.visDesiredReady && !st.hasVisDesiredNonZero && e.z > curTargetZ)) {
           toDelete.push(k);
           anyPyramidSwapped = true;

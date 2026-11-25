@@ -120,9 +120,15 @@ export function isAgPerfCoreActive() {
 export function resolveFoundryClass(className) {
   const roots = [];
   if (globalThis.foundry) {
+    if (foundry.dice && typeof foundry.dice === "object") {
+      roots.push(["foundry.dice", foundry.dice]);
+    }
     for (const [topName, top] of [["canvas", foundry.canvas], ["applications", foundry.applications]]) {
       if (!top || typeof top !== "object") continue;
-      for (const [ns, mod] of Object.entries(top)) {
+      for (const ns of Object.keys(top)) {
+        // Skip deprecated Foundry v14 proxy `foundry.canvas.tokens` BEFORE reading its getter to avoid compatibility warnings
+        if (topName === "canvas" && ns === "tokens") continue;
+        const mod = top[ns];
         if (mod && typeof mod === "object") roots.push([`foundry.${topName}.${ns}`, mod]);
       }
     }

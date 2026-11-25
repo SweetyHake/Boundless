@@ -980,40 +980,66 @@ export class VirtualWallEditor {
     } else if (doorOnlyUpdates.length > 1 && game.user?.isGM) {
       const doorFlagUpdate = {};
       const pendingKeys = [];
+      this.controller._pendingDoorCommits ??= new Map();
       for (const d of doorOnlyUpdates) {
         const dKey = d.entry.dKey;
-        this.controller._applyDoorStateLocal(dKey, d.targetDs, {
+        const info = this.controller._resolveDoorByKey(dKey);
+        if (!info) continue;
+        const ds = this.controller._normalizeDoorState(d.targetDs, info.defaultDs);
+        const seq = (this.controller._pendingDoorCommits.get(dKey) || 0) + 1;
+        this.controller._pendingDoorCommits.set(dKey, seq);
+        this.controller._applyDoorStateLocal(info, ds, {
           playSound: d.playSound,
           deferRefresh: true,
           skipDeferRebake: true
         });
-        doorFlagUpdate[`flags.${MODULE_ID}.doorStates.${dKey}`] = d.targetDs;
-        this.controller._pendingDoorCommits?.set?.(dKey, d.targetDs);
-        pendingKeys.push({ dKey, ds: d.targetDs });
+        doorFlagUpdate[`flags.${MODULE_ID}.doorStates.${dKey}`] = ds;
+        pendingKeys.push({ dKey, seq });
       }
-      this.controller.updateSimAndLightBubbles(false);
-      canvas.perception?.update({
-        initializeLighting: true,
-        refreshLightSources: true,
-        refreshLighting: true,
-        refreshVision: true
-      });
-      scene.update(doorFlagUpdate)
-        .catch((err) => {
-          console.warn(`${MODULE_ID} | Failed to persist batched door state:`, err);
-          for (const { dKey } of pendingKeys) {
-            const persisted = scene.flags?.[MODULE_ID]?.doorStates?.[dKey];
-            const fallback = Number.isFinite(persisted) ? persisted : 0;
-            this.controller._applyDoorStateLocal(dKey, fallback, { playSound: false, skipDeferRebake: true });
-          }
-        })
-        .finally(() => {
-          for (const { dKey, ds } of pendingKeys) {
-            if (this.controller._pendingDoorCommits?.get?.(dKey) === ds) {
-              this.controller._pendingDoorCommits.delete(dKey);
-            }
-          }
+      if (pendingKeys.length) {
+        this.controller.updateSimAndLightBubbles(false);
+        canvas.perception?.update({
+          initializeVision: true,
+          initializeLighting: true,
+          initializeSounds: true,
+          refreshLightSources: true,
+          refreshLighting: true,
+          refreshVision: true
         });
+        scene.update(doorFlagUpdate)
+          .catch((err) => {
+            console.warn(`${MODULE_ID} | Failed to persist batched door state:`, err);
+            let revertedAny = false;
+            for (const { dKey, seq } of pendingKeys) {
+              if (this.controller._pendingDoorCommits?.get?.(dKey) !== seq || !this.controller.active) continue;
+              const info = this.controller._resolveDoorByKey(dKey);
+              if (!info) continue;
+              const persisted = scene.flags?.[MODULE_ID]?.doorStates?.[dKey];
+              const revertDs = persisted !== undefined ? persisted : info.defaultDs;
+              if (this.controller._applyDoorStateLocal(info, revertDs, { playSound: false, deferRefresh: true, skipDeferRebake: true })) {
+                revertedAny = true;
+              }
+            }
+            if (revertedAny) {
+              this.controller.updateSimAndLightBubbles(false);
+              canvas.perception?.update({
+                initializeVision: true,
+                initializeLighting: true,
+                initializeSounds: true,
+                refreshLightSources: true,
+                refreshLighting: true,
+                refreshVision: true
+              });
+            }
+          })
+          .finally(() => {
+            for (const { dKey, seq } of pendingKeys) {
+              if (this.controller._pendingDoorCommits?.get?.(dKey) === seq) {
+                this.controller._pendingDoorCommits.delete(dKey);
+              }
+            }
+          });
+      }
     }
 
     if (hasGeometryOrConfigEdit && Object.keys(flagUpdate).length) {

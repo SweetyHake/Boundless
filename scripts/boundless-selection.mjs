@@ -312,12 +312,29 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         }
       }
       const res = runBulkOnTokenLayer(this, () => origSelectObjects.apply(this, callArgs));
-      if (missing?.length && controller?.active && streamer?.enabled && this.options?.controllableObjects !== false) {
-        streamer.materializeAndSelect(missing, {
-          releaseOthers: false,
-          maxCount: MAX_MARQUEE_MATERIALIZE,
-          bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
-        });
+      if (controller?.active && streamer?.enabled && this.options?.controllableObjects !== false) {
+        if (missing?.length) {
+          const normRect = callArgs[0];
+          const remainingBudget = Math.max(0, MAX_MARQUEE_MATERIALIZE - (this.controlled?.length || 0));
+          const hexRect = (canvas?.grid?.isHexagonal && normRect && typeof PIXI?.Rectangle === "function")
+            ? new PIXI.Rectangle(normRect.x, normRect.y, normRect.width, normRect.height)
+            : null;
+          if (remainingBudget > 0) {
+            streamer.materializeAndSelect(missing, {
+              releaseOthers: false,
+              maxCount: remainingBudget,
+              selectionRect: hexRect,
+              bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
+            });
+          }
+        }
+        if (!streamer._nativeTokensActive) {
+          queueMicrotask(() => {
+            if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
+              streamer.scheduleSync(null, true);
+            }
+          });
+        }
       }
       return res;
     };
@@ -345,7 +362,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
   wrapBulkMethod("controlAll", {
     before() {
       const streamer = controller?.tokenStreamer;
-      if (!controller?.active || !streamer?.enabled || streamer._nativeTokensActive) return;
+      if (!controller?.active || !streamer?.enabled) return;
       const docs = streamer.getControllableDocsOnLevel?.();
       if (docs?.length) streamer.prepareMountedTokensForSelection?.(docs);
     }
@@ -398,11 +415,20 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         }
 
         if (plan.action === "viewport") {
-          const rect = { x: vp.x0, y: vp.y0, width: vp.x1 - vp.x0, height: vp.y1 - vp.y0 };
-          this.selectObjects(rect, { releaseOthers: true });
-          if (plan.notify) {
+          const res = streamer.materializeAndSelect(inViewDocs, {
+            releaseOthers: true,
+            maxCount: MAX_MARQUEE_MATERIALIZE,
+            bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
+          });
+          const picked = Math.min(inViewDocs.length, MAX_MARQUEE_MATERIALIZE);
+          if (res.capped) {
+            notifyKey("BOUNDLESS.Selection.LevelCapped", {
+              selected: picked,
+              total: allLevelDocs.length
+            }, "warn");
+          } else if (plan.notify) {
             notifyKey("BOUNDLESS.Selection.ViewportSelected", {
-              selected: Math.min(inViewDocs.length, MAX_MARQUEE_MATERIALIZE),
+              selected: picked,
               total: allLevelDocs.length
             }, "info");
           }
@@ -549,6 +575,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         !this._draggedToken &&
         !this.hover &&
         game.activeTool === "select" &&
+        !event?.shiftKey &&
         !event?.ctrlKey &&
         !event?.metaKey &&
         !canvas.controls?.ruler?.active &&
@@ -558,21 +585,72 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
           const rawScale = Math.max(0.0005, canvas.stage?.scale?.x || 1);
           const minHitRadius = Math.max(40, 14 / rawScale);
-          const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
+          const minPermission = event?.altKey ? "OWNER" : "LIMITED";
+          const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius, { minPermission });
           if (hitDoc) {
             if (event.altKey) {
               if (hitDoc.canUserModify?.(game.user, "update") && hitDoc.sheet?.render) {
                 hitDoc.sheet.render(true);
                 return;
               }
-            } else if (hitDoc.actor?.sheet?.render) {
-              hitDoc.actor.sheet.render(true);
-              return;
+            } else {
+              const sheet = hitDoc.actor?.sheet;
+              if (sheet?.render) {
+                if (sheet.rendered) {
+                  sheet.maximize?.();
+                  sheet.bringToFront?.();
+                } else {
+                  sheet.render(true, { token: hitDoc });
+                }
+                return;
+              }
             }
           }
         }
       }
       return origClickLeft2.call(this, event);
+    };
+  }
+
+  // Right-click on macro-zoom impostor opens native Token HUD cleanly
+  if (typeof TokenLayerCls.prototype._onClickRight === "function") {
+    const origClickRight = TokenLayerCls.prototype._onClickRight;
+    TokenLayerCls.prototype._onClickRight = function (event) {
+      const streamer = controller?.tokenStreamer;
+      if (
+        this.active &&
+        controller?.active &&
+        streamer?.enabled &&
+        !streamer._nativeTokensActive &&
+        !this._draggedToken &&
+        !this.hover &&
+        game.activeTool === "select" &&
+        !event?.ctrlKey &&
+        !event?.metaKey
+      ) {
+        const origin = event?.interactionData?.origin ?? event?.getLocalPosition?.(this);
+        if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
+          const rawScale = Math.max(0.0005, canvas.stage?.scale?.x || 1);
+          const minHitRadius = Math.max(40, 14 / rawScale);
+          const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
+          if (hitDoc) {
+            const alreadyControlled = Boolean(hitDoc._object?.controlled);
+            streamer.materializeAndSelect([hitDoc], {
+              releaseOthers: !alreadyControlled,
+              maxCount: 1,
+              bulkRunner: (fn) => runBulkOnTokenLayer(this, fn),
+              onComplete: (tokens) => {
+                const tok = tokens?.[0] || hitDoc._object;
+                if (tok && !tok.destroyed && this.active && (typeof tok._canHUD !== "function" || tok._canHUD(game.user, event))) {
+                  this.hud?.bind?.(tok);
+                }
+              }
+            });
+            return;
+          }
+        }
+      }
+      return origClickRight.call(this, event);
     };
   }
 

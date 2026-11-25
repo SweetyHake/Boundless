@@ -832,11 +832,11 @@ export class MegaLightBatch {
     return saveLevelPolysToDB(worldId, sceneId, byLevel);
   }
 
-  async clearPolyCacheDB(sceneId = null) {
+  async clearPolyCacheDB(sceneId = null, worldId = null) {
     if (!sceneId || sceneId === this._polyCacheSceneId) {
       this.clearPolyCache();
     }
-    return clearPolyCacheStorage(sceneId);
+    return clearPolyCacheStorage(sceneId, worldId);
   }
 
   _buildNativeEdgesSig(nativeEdges) {

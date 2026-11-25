@@ -178,7 +178,7 @@ export class MegaAudioStreamer {
       const itemSig = entrySigs.get(k);
       const radiusPx = (Number.isFinite(item.radius) ? item.radius : 20) * pxPerFt;
       if (existing) {
-        if (this._sourceSigs.get(k) === itemSig && existing.attached) {
+        if (this._sourceSigs.get(k) === itemSig && existing.attached !== false) {
           continue;
         }
         try {
@@ -192,8 +192,8 @@ export class MegaAudioStreamer {
             volume: item.volume,
             easing: Boolean(item.easing)
           });
-          if (existing.shape && !existing.attached) existing.add();
-          if (existing.shape && existing.attached) {
+          if (existing.shape && existing.attached === false) existing.add();
+          if (existing.shape && existing.attached !== false) {
             this._sourceSigs.set(k, itemSig);
             changed = true;
           } else {

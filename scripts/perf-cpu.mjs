@@ -63,6 +63,8 @@ export function buildMeasureCacheKey(waypoints, options) {
     if (typeof v === "function" || (v !== null && typeof v === "object")) return null;
     opts += `${k}=${String(v)};`;
   }
+  const exact = waypoints.length <= 12;
+  let exactKey = "";
   let h1 = waypoints.length | 0;
   let h2 = 0x9e3779b9;
   for (let i = 0; i < waypoints.length; i++) {
@@ -72,25 +74,35 @@ export function buildMeasureCacheKey(waypoints, options) {
     if (w.terrain != null || w.cost != null) return null;
     const qx = Math.round(w.x * 16) | 0;
     const qy = Math.round(w.y * 16) | 0;
-    h1 = (Math.imul(h1, 33) ^ qx) | 0;
-    h2 = (Math.imul(h2, 31) ^ qy) | 0;
-    h2 = (h2 ^ Math.round((w.elevation ?? 0) * 8)) | 0;
-    if (w.action) {
-      for (let c = 0; c < w.action.length; c++) {
-        h1 = (Math.imul(h1, 31) ^ w.action.charCodeAt(c)) | 0;
+    const elevUndef = w.elevation === undefined;
+    const elevNull = w.elevation === null;
+    const qElev = (elevUndef || elevNull) ? 0 : (Math.round(w.elevation * 8) | 0);
+    const flags = (w.checkpoint ? 1 : 0) | (w.explicit ? 2 : 0) | (w.snapped ? 4 : 0) | (w.intermediate ? 8 : 0);
+    if (exact) {
+      const eStr = elevUndef ? "u" : (elevNull ? "n" : String(qElev));
+      exactKey += `${qx},${qy},${eStr},${w.action ?? ""},${w.level ?? ""},${w.width ?? ""},${w.height ?? ""},${w.depth ?? ""},${w.shape ?? ""},${flags};`;
+    } else {
+      h1 = (Math.imul(h1, 33) ^ qx) | 0;
+      h2 = (Math.imul(h2, 31) ^ qy) | 0;
+      h2 = (Math.imul(h2, 31) ^ (elevUndef ? 0x55aa55aa : (elevNull ? 0x33cc33cc : qElev))) | 0;
+      if (w.action) {
+        for (let c = 0; c < w.action.length; c++) {
+          h1 = (Math.imul(h1, 31) ^ w.action.charCodeAt(c)) | 0;
+        }
       }
-    }
-    if (w.level) {
-      for (let c = 0; c < w.level.length; c++) {
-        h2 = (Math.imul(h2, 31) ^ w.level.charCodeAt(c)) | 0;
+      if (w.level) {
+        for (let c = 0; c < w.level.length; c++) {
+          h2 = (Math.imul(h2, 31) ^ w.level.charCodeAt(c)) | 0;
+        }
       }
+      if (w.width != null) h1 = (Math.imul(h1, 17) ^ Math.round(w.width * 16)) | 0;
+      if (w.height != null) h2 = (Math.imul(h2, 17) ^ Math.round(w.height * 16)) | 0;
+      if (w.depth != null) h1 = (Math.imul(h1, 13) ^ Math.round(w.depth * 16)) | 0;
+      if (w.shape != null) h2 = (Math.imul(h2, 13) ^ (w.shape | 0)) | 0;
+      h1 = (h1 + flags) | 0;
     }
-    if (w.width != null) h1 = (Math.imul(h1, 17) ^ Math.round(w.width * 16)) | 0;
-    if (w.height != null) h2 = (Math.imul(h2, 17) ^ Math.round(w.height * 16)) | 0;
-    if (w.depth != null) h1 = (Math.imul(h1, 13) ^ Math.round(w.depth * 16)) | 0;
-    if (w.shape != null) h2 = (Math.imul(h2, 13) ^ (w.shape | 0)) | 0;
-    h1 = (h1 + (w.checkpoint ? 1 : 0) + (w.explicit ? 2 : 0) + (w.snapped ? 4 : 0) + (w.intermediate ? 8 : 0)) | 0;
   }
+  if (exact) return `E:${exactKey}|${opts}`;
   const first = waypoints[0];
   const last = waypoints[waypoints.length - 1];
   return `${h1},${h2},${Math.round(first.x * 16)},${Math.round(first.y * 16)},${Math.round(last.x * 16)},${Math.round(last.y * 16)}|${opts}`;
@@ -186,6 +198,41 @@ function makeTickerThrottle(methodName, getMs, statKeys, opts = {}) {
 // 1. RenderFlags deduplication
 // ---------------------------------------------------------------------------
 
+const _rfClosureCache = new WeakMap();
+
+function getRenderFlagClosure(flagsDef, key) {
+  if (!flagsDef || typeof flagsDef !== "object") return null;
+  let map = _rfClosureCache.get(flagsDef);
+  if (!map) {
+    map = new Map();
+    _rfClosureCache.set(flagsDef, map);
+  }
+  let entry = map.get(key);
+  if (entry !== undefined) return entry;
+  const visited = new Set([key]);
+  const stack = [key];
+  let hasAnyReset = false;
+  while (stack.length) {
+    const cur = stack.pop();
+    const cfg = flagsDef[cur];
+    if (cfg?.reset?.length > 0) hasAnyReset = true;
+    const prop = cfg?.propagate;
+    if (prop?.length) {
+      for (let i = 0; i < prop.length; i++) {
+        const p = prop[i];
+        if (!visited.has(p)) {
+          visited.add(p);
+          stack.push(p);
+        }
+      }
+    }
+  }
+  visited.delete(key);
+  entry = { props: Array.from(visited), hasAnyReset };
+  map.set(key, entry);
+  return entry;
+}
+
 function patchRenderFlags() {
   return wrapFoundryMethod("RenderFlags", "set", function (wrapped, changes) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && changes && typeof changes === "object") {
@@ -195,15 +242,19 @@ function patchRenderFlags() {
         let allPresent = true;
         for (const k in changes) {
           if (!changes[k]) continue;
-          const cfg = this.flags?.[k];
-          if (!this.has(k) || (cfg?.reset?.length > 0)) {
+          if (!this.has(k)) {
             allPresent = false;
             break;
           }
-          const prop = cfg?.propagate;
-          if (prop?.length) {
-            for (let i = 0; i < prop.length; i++) {
-              if (!this.has(prop[i])) {
+          const closure = getRenderFlagClosure(this.flags, k);
+          if (closure?.hasAnyReset) {
+            allPresent = false;
+            break;
+          }
+          const props = closure?.props;
+          if (props?.length) {
+            for (let i = 0; i < props.length; i++) {
+              if (!this.has(props[i])) {
                 allPresent = false;
                 break;
               }
@@ -642,11 +693,29 @@ function patchDragAndMovement() {
     return wrapped(...args);
   });
 
+  const okRemoveWp = wrapFoundryMethod("Token", "_removeDragWaypoint", function (wrapped, ...args) {
+    clearDragPending();
+    return wrapped(...args);
+  });
+
+  const okElev = wrapFoundryMethod("Token", "_changeDragElevation", function (wrapped, ...args) {
+    flushDragDestination(true);
+    return wrapped(...args);
+  });
+
   // On cancel / finalize, simply cancel any stale pending timer without running extra recalc
   const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
     clearDragPending();
     return wrapped(...args);
   });
+
+  const cloneMeasureResult = (r) => {
+    if (!r || typeof r !== "object") return r;
+    const out = { ...r };
+    if (Array.isArray(r.spaces)) out.spaces = r.spaces.slice();
+    if (Array.isArray(r.waypoints)) out.waypoints = r.waypoints.slice();
+    return out;
+  };
 
   const okMeasure = wrapFoundryMethod("Token", "measureMovementPath", function (wrapped, waypoints, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce || !Array.isArray(waypoints) || waypoints.length < 2) {
@@ -662,30 +731,34 @@ function patchDragAndMovement() {
     const hit = cache.get(key);
     if (hit !== undefined) {
       perfStats.measureHits++;
-      return hit;
+      return cloneMeasureResult(hit);
     }
     perfStats.measureRuns++;
     const res = wrapped(waypoints, options);
     if (cache.size >= 4) cache.delete(cache.keys().next().value);
-    cache.set(key, res);
+    cache.set(key, cloneMeasureResult(res));
     return res;
   });
 
   const okPos = wrapFoundryMethod("Token", "_refreshPosition", function (wrapped) {
-    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfDragCoalesce && !this.isInteractable && this.mesh) {
-      const { x, y } = this.document;
-      if (this.position.x !== x || this.position.y !== y) {
-        this.position.set(x, y);
-        const center = this.mesh.position = this.center;
-        if (this.turnMarker) this.turnMarker.position.set(center.x - x, center.y - y);
-        perfStats.emulatedSkipped++;
-        return;
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfDragCoalesce && !this.isInteractable) {
+      const MIM = globalThis.foundry?.canvas?.interaction?.MouseInteractionManager ?? globalThis.MouseInteractionManager;
+      if (MIM && typeof MIM.emulateMoveEvent === "function") {
+        const origEmulate = MIM.emulateMoveEvent;
+        let skipped = false;
+        MIM.emulateMoveEvent = () => { skipped = true; };
+        try {
+          return wrapped();
+        } finally {
+          MIM.emulateMoveEvent = origEmulate;
+          if (skipped) perfStats.emulatedSkipped++;
+        }
       }
     }
     return wrapped();
   });
 
-  return [Boolean(okMove), Boolean(okDrop), Boolean(okWaypoint), Boolean(okFinal), Boolean(okMeasure), Boolean(okPos)];
+  return [Boolean(okMove), Boolean(okDrop), Boolean(okWaypoint), Boolean(okRemoveWp), Boolean(okElev), Boolean(okFinal), Boolean(okMeasure), Boolean(okPos)];
 }
 
 // ---------------------------------------------------------------------------
@@ -734,24 +807,34 @@ function patchMiscCpuGuards() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
     const docName = this.document?.name ?? "";
     const key = `${docName}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}`;
-    if (this.__blNpKey === key && this.nameplate?.text === docName) {
+    if (this.__blNpKey === key && this.__blNpObj === this.nameplate && this.nameplate?.text === docName) {
       perfStats.textSkipped++;
       return;
     }
+    const res = wrapped();
     this.__blNpKey = key;
-    return wrapped();
+    this.__blNpObj = this.nameplate;
+    return res;
   });
 
   const okTt = wrapFoundryMethod("Token", "_refreshTooltip", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped();
     const text = this._getTooltipText?.() ?? "";
-    const key = `${text}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}`;
-    if (this.__blTtKey === key && this.tooltip?.text === text) {
+    const key = `${text}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}|${this.tooltip?.y ?? ""}`;
+    if (
+      this.__blTtKey === key &&
+      this.__blTtObj === this.tooltip &&
+      this.__blLvlObj === this.levelIndicator &&
+      this.tooltip?.text === text
+    ) {
       perfStats.textSkipped++;
       return;
     }
-    this.__blTtKey = key;
-    return wrapped();
+    const res = wrapped();
+    this.__blTtKey = `${text}|${this.w}|${this.h}|${canvas.dimensions?.uiScale}|${this.tooltip?.y ?? ""}`;
+    this.__blTtObj = this.tooltip;
+    this.__blLvlObj = this.levelIndicator;
+    return res;
   });
 
   const okDet = wrapFoundryMethod("Token", "_renderDetectionFilter", function (wrapped, renderer) {
@@ -921,8 +1004,15 @@ function patchMiscCpuGuards() {
         const scale = Math.min(10000, Math.max(100, Math.floor(1e8 / Math.max(radius, 1))));
         const invScale = 1 / scale;
         const path = new Clipper.Path(outerN);
+        let oMinX = Infinity, oMaxX = -Infinity, oMinY = Infinity, oMaxY = -Infinity;
         for (let i = 0, k = 0; i < pts.length; i += 2, k++) {
-          path[k] = new Clipper.IntPoint(Math.round((pts[i] - x) * scale), Math.round((pts[i + 1] - y) * scale));
+          const lx = pts[i] - x;
+          const ly = pts[i + 1] - y;
+          if (lx < oMinX) oMinX = lx;
+          if (lx > oMaxX) oMaxX = lx;
+          if (ly < oMinY) oMinY = ly;
+          if (ly > oMaxY) oMaxY = ly;
+          path[k] = new Clipper.IntPoint(Math.round(lx * scale), Math.round(ly * scale));
         }
         let paths = new Clipper.Paths();
         try {
@@ -930,6 +1020,33 @@ function patchMiscCpuGuards() {
           _sharedOffsetter.Execute(paths, Math.round(offset * scale));
         } finally {
           _sharedOffsetter.Clear();
+        }
+
+        // If 1-pass inset collapsed a narrow corridor or doorway slit (< 2 * |offset|) while leaving the main room,
+        // the collapsed branch would render at depth = 0 (black beam). Delegate to Foundry's multi-pass PolygonMesher.
+        if (paths.length > 0) {
+          let iMinX = Infinity, iMaxX = -Infinity, iMinY = Infinity, iMaxY = -Infinity;
+          for (let c = 0; c < paths.length; c++) {
+            const p = paths[c];
+            for (let i = 0; i < p.length; i++) {
+              const px = p[i].X * invScale;
+              const py = p[i].Y * invScale;
+              if (px < iMinX) iMinX = px;
+              if (px > iMaxX) iMaxX = px;
+              if (py < iMinY) iMinY = py;
+              if (py > iMaxY) iMaxY = py;
+            }
+          }
+          const maxShrink = Math.abs(offset) * 3.5;
+          if (
+            (iMinX - oMinX) > maxShrink ||
+            (oMaxX - iMaxX) > maxShrink ||
+            (iMinY - oMinY) > maxShrink ||
+            (oMaxY - iMaxY) > maxShrink
+          ) {
+            this.__blGeomKey = null;
+            return wrapped();
+          }
         }
 
         let innerDepth = 1.0;
@@ -1096,8 +1213,11 @@ function patchMiscCpuGuards() {
       return wrapped(content, options);
     }
     const o = options ?? {};
-    // Never cache immediate inline rolls [[1d20]] (non-deferred) or @Embed or custom enricher options
+    // Never cache immediate inline rolls [[1d20]] (non-deferred), @Embed, synthetic relativeTo without uuid,
+    // or system enrichers [[/...]] tied to a relativeTo document (whose actor/item stats can change)
+    if (o.relativeTo && !o.relativeTo.uuid) return wrapped(content, options);
     if (o.rolls !== false && /\[\[(?!\/)/.test(content)) return wrapped(content, options);
+    if (o.custom !== false && o.relativeTo && content.includes("[[/")) return wrapped(content, options);
     if (o.embeds !== false && content.includes("@Embed[")) return wrapped(content, options);
     for (const k in o) {
       if (!_enrichAllowedKeys.has(k)) return wrapped(content, options);
@@ -1175,7 +1295,7 @@ function patchMiscCpuGuards() {
     let hasActiveVision = 0;
     if (ds?.size) {
       for (const vs of effects.visionSources ?? []) {
-        if (vs.active && vs.radius > 0) { hasActiveVision = 1; break; }
+        if (vs.active) { hasActiveVision = 1; break; }
       }
     }
     let sig = `${ls.size}|${ds?.size ?? 0}|${canvas.environment?.darknessLevel ?? ""}|${gls?.active ? 1 : 0}:${gls?.updateId ?? 0}|v${hasActiveVision}`;
@@ -1194,7 +1314,7 @@ function patchMiscCpuGuards() {
         if (sourceHasLayerReset(s)) return null;
         const d = s.data;
         const ld = s.layers?.darkness;
-        sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.elevation ?? ""}:${d?.animation?.type ?? ""}:${ld?.active ? 1 : 0}:${ld?.mesh?.shader?.program?.id ?? ""}`;
+        sig += `;D${s.sourceId ?? ""}:${s.active ? 1 : 0}:${s.updateId ?? 0}:${d?.color ?? ""}:${d?.alpha ?? ""}:${d?.luminosity ?? ""}:${d?.elevation ?? ""}:${d?.animation?.type ?? ""}:${ld?.active ? 1 : 0}:${ld?.mesh?.shader?.program?.id ?? ""}`;
       }
     }
     return sig;
@@ -1428,10 +1548,17 @@ export function installCpuPerfEngine() {
       }
     });
   }
-  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "updateToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect"]) {
+  for (const h of ["lightingRefresh", "visibilityRefresh", "initializeVisionSources", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect"]) {
+    Hooks.on(h, () => {
+      _perceptionVer++;
+      _cellVisCache.clear();
+      if (h !== "lightingRefresh" && h !== "visibilityRefresh") _losCache.clear();
+    });
+  }
+  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
   }
-  for (const h of ["updateActor", "deleteActor", "updateItem", "deleteItem", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry"]) {
+  for (const h of ["updateActor", "deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry", "updateScene", "updateMacro", "updateRollTable", "updateUser"]) {
     Hooks.on(h, () => { _enrichCache.clear(); });
   }
 

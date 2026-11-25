@@ -287,7 +287,7 @@ async function runRealMouseDrag(tok, steps = 28) {
     }
   } finally {
     try { tok.mouseInteractionManager?.cancel?.(); } catch {}
-    try { globalThis.canvas?.tokens?._finalizeDragLeft?.(); } catch {}
+    try { tok._finalizeDragLeft?.(); } catch {}
     await nextFrame();
   }
 
@@ -523,8 +523,8 @@ export async function benchmarkCurrentScene(opts = {}) {
         const n = warmup ? 4 : 40;
         const t0 = performance.now();
         for (let i = 0; i < n; i++) {
-          const fakeEv = { global: { x: 200 + (i * 19) % 600, y: 200 + (i * 23) % 400 } };
-          try { canvas.primary._onMouseMove(fakeEv); } catch {}
+          const pt = new PIXI.Point(200 + (i * 19) % 600, 200 + (i * 23) % 400);
+          try { canvas.primary._onMouseMove(pt, true); } catch {}
         }
         return { ms: performance.now() - t0 };
       });
@@ -649,13 +649,16 @@ export async function benchmarkCurrentScene(opts = {}) {
           if (t.nameplate) t.nameplate.visible = true;
           if (t.bars) {
             t.bars.visible = true;
+            try { t.drawBars?.(); } catch {}
             try { t._drawBar?.(0, t.bars.bar1, { value: 30, max: 50 }); } catch {}
             if (t.bars.bar1) t.bars.bar1.visible = true;
           }
         }
         const { off, on } = await runABBA(async (warmup) => {
-          // Settle 3 frames so Static Token UI Cache bakes cleanly on ON
-          for (let k = 0; k < 3; k++) { canvas.tokens.objects.render(renderer); renderer.batch.flush(); }
+          for (const t of tokens) {
+            try { t.drawBars?.(); } catch {}
+          }
+          for (let k = 0; k < 2; k++) { canvas.tokens.objects.render(renderer); renderer.batch.flush(); }
           return measureGlRender(() => canvas.tokens.objects.render(renderer), warmup ? 4 : 50);
         });
         pushRow(`14. Idle Combat Token UI (${tokens.length} tokens)`, off, on, {}, { absToleranceMs: 0.12 });

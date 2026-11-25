@@ -31,6 +31,51 @@ export function resolveFoundryRoute(src) {
 }
 
 /**
+ * Evaluate Foundry v14 token ownership permission without materializing lazy ActorDelta.
+ * Precedence matches Foundry v14: delta[uid] -> base[uid] -> delta.default -> base.default (ignoring INHERIT = -1).
+ */
+export function hasTokenPermissionLazy(doc, user, level = "OWNER") {
+  if (!doc || !user) return false;
+  if (user.isGM) return true;
+  if (!doc.isLazyDelta) {
+    try {
+      if (typeof doc.testUserPermission === "function") return Boolean(doc.testUserPermission(user, level));
+      if (level === "OWNER" && "isOwner" in doc) return Boolean(doc.isOwner);
+      return Boolean(doc.baseActor?.testUserPermission?.(user, level));
+    } catch {
+      return false;
+    }
+  }
+  const levels = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS || { NONE: 0, LIMITED: 1, OBSERVER: 2, OWNER: 3, INHERIT: -1 };
+  const reqLvl = typeof level === "number" ? level : (levels[level] ?? 3);
+  const inheritLvl = levels.INHERIT ?? -1;
+  const deltaOwn = doc._source?.delta?.ownership;
+  const baseOwn = doc.baseActor?.ownership;
+  const uid = user.id;
+
+  if (uid && typeof deltaOwn?.[uid] === "number" && deltaOwn[uid] !== inheritLvl) {
+    return deltaOwn[uid] >= reqLvl;
+  }
+  if (uid && typeof baseOwn?.[uid] === "number" && baseOwn[uid] !== inheritLvl) {
+    return baseOwn[uid] >= reqLvl;
+  }
+  if (typeof deltaOwn?.default === "number" && deltaOwn.default !== inheritLvl) {
+    return deltaOwn.default >= reqLvl;
+  }
+  if (typeof baseOwn?.default === "number" && baseOwn.default !== inheritLvl) {
+    return baseOwn.default >= reqLvl;
+  }
+  if (!baseOwn && typeof doc.baseActor?.testUserPermission === "function") {
+    try {
+      return Boolean(doc.baseActor.testUserPermission(user, level));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
  * In Foundry v14, unset `level.elevation.bottom` resolves to `-Infinity` and `top` to `Infinity` (ExtendedNumberField).
  * Always fall back to finite `base` -> finite `bottom` -> `0` when a finite default elevation is required.
  */

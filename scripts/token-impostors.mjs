@@ -1,6 +1,7 @@
 import {
   MODULE_ID,
   isTextureUsable,
+  resolveFoundryRoute,
   getLevelBaseElevation as getFiniteLevelBaseElevation,
   getLevelRoofElevation as getFiniteLevelRoofElevation
 } from "./utils.mjs";
@@ -540,7 +541,9 @@ export class TokenImpostorLayer {
     } else {
       u.uBakedRoofMask = PIXI.Texture.EMPTY;
     }
-    u.uRoofElev = getFiniteLevelRoofElevation(canvas.level);
+    u.uRoofElev = Number.isFinite(lb?.bakedRoofElevation)
+      ? lb.bakedRoofElevation
+      : getFiniteLevelRoofElevation(canvas.level);
   }
 
   _ensureCapacity(minCount) {
@@ -732,32 +735,26 @@ export class TokenImpostorLayer {
   }
 
   async _loadDrawable(src) {
-    // 1. Fast path: reuse already loaded PIXI / Foundry cached image source if available
+    const resolvedSrc = resolveFoundryRoute(src);
+    // 1. Fast path: reuse already loaded PIXI / Foundry cached image source if available (require readyState >= 2 for video)
     try {
-      const cached = globalThis.PIXI?.Assets?.cache?.get?.(src) || globalThis.foundry?.canvas?.getTexture?.(src);
+      const cached = globalThis.PIXI?.Assets?.cache?.get?.(src)
+        || (resolvedSrc !== src ? globalThis.PIXI?.Assets?.cache?.get?.(resolvedSrc) : null)
+        || globalThis.foundry?.canvas?.getTexture?.(src);
       const resSrc = cached?.baseTexture?.resource?.source;
-      if (resSrc && (resSrc.videoWidth > 0 || resSrc.naturalWidth > 0 || resSrc.width > 0)) {
+      const isReadyVideo = !("readyState" in (resSrc || {})) || resSrc.readyState >= 2;
+      if (resSrc && isReadyVideo && (resSrc.videoWidth > 0 || resSrc.naturalWidth > 0 || resSrc.width > 0)) {
         return { drawable: resSrc, shouldClose: false };
       }
     } catch {}
 
-    // 2. Animated video tokens (.webm / .mp4): capture first decoded frame without keeping a live <video> element around
-    const lower = String(src).split("?")[0].toLowerCase();
+    // 2. Animated video tokens (.webm / .mp4): capture first decoded frame via temporary <video> without retaining a live element
+    const lower = String(resolvedSrc).split("?")[0].toLowerCase();
     const isVideo = Boolean(
-      globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(src) ||
+      globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(resolvedSrc) ||
       /\.(webm|mp4|m4v|ogv|ogg|mov)$/.test(lower)
     );
     if (isVideo) {
-      try {
-        const loadTex = globalThis.foundry?.canvas?.loadTexture;
-        if (typeof loadTex === "function") {
-          const tex = await loadTex(src);
-          const vSrc = tex?.baseTexture?.resource?.source;
-          if (vSrc && (vSrc.videoWidth > 0 || vSrc.width > 0)) {
-            return { drawable: vSrc, shouldClose: false };
-          }
-        }
-      } catch {}
       if (typeof document !== "undefined" && typeof document.createElement === "function") {
         const video = document.createElement("video");
         video.muted = true;
@@ -779,10 +776,10 @@ export class TokenImpostorLayer {
             const timer = setTimeout(() => finish(false, new Error("video timeout")), 4000);
             video.onloadeddata = () => finish(true);
             video.onerror = (e) => finish(false, e);
-            video.src = src;
+            video.src = resolvedSrc;
             try { video.load(); } catch {}
           });
-          if (video.videoWidth > 0 && video.videoHeight > 0) {
+          if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
             if (typeof createImageBitmap === "function") {
               const bmp = await createImageBitmap(video);
               return { drawable: bmp, shouldClose: true };
@@ -808,7 +805,7 @@ export class TokenImpostorLayer {
     const isSvg = lower.endsWith(".svg");
     if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
       try {
-        const res = await fetch(src);
+        const res = await fetch(resolvedSrc);
         if (res.ok) {
           const blob = await res.blob();
           const bmp = await createImageBitmap(blob);
@@ -824,7 +821,7 @@ export class TokenImpostorLayer {
         el.crossOrigin = "anonymous";
         el.onload = () => resolve(el);
         el.onerror = reject;
-        el.src = src;
+        el.src = resolvedSrc;
       });
       return { drawable: img, shouldClose: false };
     }

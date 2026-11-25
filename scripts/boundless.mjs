@@ -285,9 +285,20 @@ class MegaWorld1000 {
             totalLights += bsec.l.length;
           }
           if (bsec.o?.length) {
-            const sec = getOrCreateSector(defaultSk);
-            for (let i = 0; i < bsec.o.length; i++) {
-              sec.o.push(bsec.o[i] + ovOffset);
+            if (exactSectorDiv) {
+              const sec = getOrCreateSector(defaultSk);
+              for (let i = 0; i < bsec.o.length; i++) {
+                sec.o.push(bsec.o[i] + ovOffset);
+              }
+            } else {
+              for (let i = 0; i < bsec.o.length; i++) {
+                const ovIdx = bsec.o[i] + ovOffset;
+                const ov = overlays[ovIdx];
+                const targetSk = ov
+                  ? `${Math.floor(ov.cx / baseSimSectorPx)}_${Math.floor(ov.cy / baseSimSectorPx)}`
+                  : defaultSk;
+                getOrCreateSector(targetSk).o.push(ovIdx);
+              }
             }
           }
         }
@@ -786,7 +797,7 @@ class MegaWorld1000 {
         this.texMgr.clear(false);
       };
       this._webglContextRestoredFn = () => {
-        if (!this.active) return;
+        if (!this.active || this._mounting) return;
         console.info(`${MODULE_ID} | WebGL context restored; rebuilding GPU roof mask and broken textures.`);
         // Purge active overlays, virtual tiles, and pyramid tiles referencing destroyed BaseTextures
         for (const [k, ov] of Array.from(this.activeOverlays.entries())) {
@@ -1182,6 +1193,7 @@ class MegaWorld1000 {
       this._origScaleMin = null;
       this._origScaleMax = null;
     }
+    this._worldMinScale = WORLD_MIN_SCALE;
 
     for (const [, bgMesh] of this._hiddenNativeLevelBg) {
       if (bgMesh && !bgMesh.destroyed) bgMesh.visible = true;

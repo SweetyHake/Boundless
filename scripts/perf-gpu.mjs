@@ -225,9 +225,17 @@ function patchWallSprites() {
     sp.height = lw * 3;
     sp.tint = wc;
 
-    this.line.hitArea = makeLineHitPolygon(c[0], c[1], c[2], c[3], Math.max(6, lw * 2));
+    const hitPad = Math.max(6, lw * 2);
+    const hitKey = `${c[0]},${c[1]},${c[2]},${c[3]},${hitPad}`;
+    const hitChanged = this._blHitKey !== hitKey || !this.line.hitArea;
+    if (hitChanged) {
+      this._blHitKey = hitKey;
+      this.line.hitArea = makeLineHitPolygon(c[0], c[1], c[2], c[3], hitPad);
+    }
     if (this.doorControl) this.doorControl.reposition();
-    globalThis.foundry?.canvas?.interaction?.MouseInteractionManager?.emulateMoveEvent?.();
+    if (hitChanged) {
+      globalThis.foundry?.canvas?.interaction?.MouseInteractionManager?.emulateMoveEvent?.();
+    }
 
     if (this.directionIcon) {
       this.directionIcon.position.set((c[0] + c[2]) * 0.5, (c[1] + c[3]) * 0.5);
@@ -533,19 +541,35 @@ function getStageViewportWorldRect(padWorld = 240) {
   const renderer = globalThis.canvas?.app?.renderer;
   if (!stage?.worldTransform || !renderer?.screen) return null;
   const wt = stage.worldTransform;
-  const a = wt.a || 1;
-  const d = wt.d || 1;
-  if (Math.abs(a) < 1e-6 || Math.abs(d) < 1e-6) return null;
+  const a = Number.isFinite(wt.a) ? wt.a : 1;
+  const b = Number.isFinite(wt.b) ? wt.b : 0;
+  const c = Number.isFinite(wt.c) ? wt.c : 0;
+  const d = Number.isFinite(wt.d) ? wt.d : 1;
+  const tx = Number.isFinite(wt.tx) ? wt.tx : 0;
+  const ty = Number.isFinite(wt.ty) ? wt.ty : 0;
+  const det = a * d - b * c;
+  if (Math.abs(det) < 1e-6) return null;
+  const invDet = 1 / det;
   const scr = renderer.screen;
-  const minX = (scr.x - wt.tx) / a - padWorld;
-  const maxX = (scr.x + scr.width - wt.tx) / a + padWorld;
-  const minY = (scr.y - wt.ty) / d - padWorld;
-  const maxY = (scr.y + scr.height - wt.ty) / d + padWorld;
+  const sx0 = scr.x, sx1 = scr.x + scr.width;
+  const sy0 = scr.y, sy1 = scr.y + scr.height;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  const corners = [[sx0, sy0], [sx1, sy0], [sx0, sy1], [sx1, sy1]];
+  for (let i = 0; i < 4; i++) {
+    const dx = corners[i][0] - tx;
+    const dy = corners[i][1] - ty;
+    const wx = (d * dx - c * dy) * invDet;
+    const wy = (-b * dx + a * dy) * invDet;
+    if (wx < minX) minX = wx;
+    if (wx > maxX) maxX = wx;
+    if (wy < minY) minY = wy;
+    if (wy > maxY) maxY = wy;
+  }
   return {
-    minX: Math.min(minX, maxX),
-    maxX: Math.max(minX, maxX),
-    minY: Math.min(minY, maxY),
-    maxY: Math.max(minY, maxY)
+    minX: minX - padWorld,
+    maxX: maxX + padWorld,
+    minY: minY - padWorld,
+    maxY: maxY + padWorld
   };
 }
 
@@ -567,6 +591,14 @@ function isStandardTokenChild(t, c) {
     c === t.nameplate ||
     c === t.tooltip
   );
+}
+
+function hasAnyCustomChild(t) {
+  const kids = t.children;
+  for (let j = 0; j < kids.length; j++) {
+    if (!isStandardTokenChild(t, kids[j])) return true;
+  }
+  return false;
 }
 
 function hasCustomUnderlayChild(t) {
@@ -646,7 +678,13 @@ function attachTokenUiBatcher() {
       const tok = kids[i];
       if (!tok || tok.destroyed || !tok.visible || !tok.renderable || tok.worldAlpha <= 0) continue;
 
-      if (vp && !tok.controlled && !tok.hover && !tok.isPreview) {
+      const hasLargeExtension = Boolean(
+        tok.turnMarker?.visible ||
+        tok._mask ||
+        (tok.filters && tok.filters.length) ||
+        hasAnyCustomChild(tok)
+      );
+      if (vp && !tok.controlled && !tok.hover && !tok.isPreview && !hasLargeExtension) {
         const tx = tok.x ?? tok.document?.x ?? 0;
         const ty = tok.y ?? tok.document?.y ?? 0;
         const tw = tok.w || 100;
@@ -758,8 +796,19 @@ function getBitmapCacheResolution() {
 }
 
 function patchTokenUiCaching() {
+  const cacheBar = (bar) => {
+    if (!bar || bar.destroyed || !bar.visible) return false;
+    bar.cacheAsBitmapResolution = getBitmapCacheResolution();
+    bar.cacheAsBitmap = true;
+    return true;
+  };
+
   const okBars = wrapFoundryMethod("Token", "drawBars", function (wrapped, ...args) {
-    if (this.bars) this.bars.cacheAsBitmap = false;
+    if (this.bars) {
+      this.bars.cacheAsBitmap = false;
+      if (this.bars.bar1) this.bars.bar1.cacheAsBitmap = false;
+      if (this.bars.bar2) this.bars.bar2.cacheAsBitmap = false;
+    }
     const res = wrapped(...args);
     if (
       PERF_CONFIG.perfEnabled &&
@@ -769,11 +818,28 @@ function patchTokenUiCaching() {
       !this.bars.destroyed &&
       !this.isPreview &&
       this.bars.visible &&
-      (this.bars.bar1?.visible || this.bars.bar2?.visible)
+      (this.bars.children?.length ?? 0) <= 2
     ) {
-      this.bars.cacheAsBitmapResolution = getBitmapCacheResolution();
-      this.bars.cacheAsBitmap = true;
-      perfStats.tokenBarsCached++;
+      // Cache bar1 and bar2 individually instead of the whole token-sized `this.bars` container (avoids 10MB empty VRAM on Huge/Gargantuan tokens)
+      const c1 = cacheBar(this.bars.bar1);
+      const c2 = cacheBar(this.bars.bar2);
+      if (c1 || c2) perfStats.tokenBarsCached++;
+    }
+    return res;
+  }, { type: "WRAPPER" });
+
+  const okDrawBar = wrapFoundryMethod("Token", "_drawBar", function (wrapped, number, bar, data, ...rest) {
+    if (this.bars) this.bars.cacheAsBitmap = false;
+    if (bar) bar.cacheAsBitmap = false;
+    const res = wrapped(number, bar, data, ...rest);
+    if (
+      PERF_CONFIG.perfEnabled &&
+      PERF_CONFIG.perfTokenUiCache &&
+      !isPrimePerfActive() &&
+      bar && !bar.destroyed && bar.visible && !this.isPreview &&
+      (this.bars?.children?.length ?? 0) <= 2
+    ) {
+      cacheBar(bar);
     }
     return res;
   }, { type: "WRAPPER" });
@@ -794,7 +860,8 @@ function patchTokenUiCaching() {
       !this.effects.destroyed &&
       !this.isPreview &&
       !this.effects.overlay &&
-      this.effects.children?.length >= 4
+      this.effects.children?.length >= 4 &&
+      this.effects.children.every(ch => ch instanceof PIXI.Sprite && !ch.children?.length)
     ) {
       this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
       this.effects.cacheAsBitmap = true;
@@ -803,7 +870,7 @@ function patchTokenUiCaching() {
     return res;
   }, { type: "WRAPPER" });
 
-  return [Boolean(okBars), Boolean(okDrawFx), Boolean(okRefFx)];
+  return [Boolean(okBars), Boolean(okDrawBar), Boolean(okDrawFx), Boolean(okRefFx)];
 }
 
 export function clearTokenUiBitmapCaches() {
@@ -811,7 +878,11 @@ export function clearTokenUiBitmapCaches() {
   const placeables = globalThis.canvas?.tokens?.placeables;
   if (!placeables) return;
   for (const tok of placeables) {
-    if (tok.bars) tok.bars.cacheAsBitmap = false;
+    if (tok.bars) {
+      tok.bars.cacheAsBitmap = false;
+      if (tok.bars.bar1) tok.bars.bar1.cacheAsBitmap = false;
+      if (tok.bars.bar2) tok.bars.bar2.cacheAsBitmap = false;
+    }
     if (tok.effects) tok.effects.cacheAsBitmap = false;
   }
 }
@@ -1002,11 +1073,12 @@ export function resolveLightingScalePreset(mode, perfMode = 2) {
   return LIGHTING_SCALE_PRESETS.balanced;
 }
 
+const _origFilterResDescs = new WeakMap();
+
 export function applyLightingRenderScale() {
   if (isPrimePerfActive()) return;
   if (!globalThis.canvas?.ready) return;
   const effects = globalThis.canvas?.effects;
-  const baseRes = globalThis.canvas?.app?.renderer?.resolution || 1;
   if (!effects) return;
 
   const mode = PERF_CONFIG.perfEnabled ? PERF_CONFIG.perfLightingScale : "full";
@@ -1018,12 +1090,38 @@ export function applyLightingRenderScale() {
     if (!filter || filter.destroyed) return;
     // Do not override filters whose resolution is locked by Boundless mega-map engine
     if (globalThis.Boundless?._patchedFilters?.has?.(filter)) return;
-    const targetRes = Math.max(0.25, Math.min(baseRes, Math.round(baseRes * mult * 1000) / 1000));
     try {
-      const cur = filter.resolution;
-      if (Math.abs((cur || baseRes) - targetRes) > 0.01) {
-        filter.resolution = targetRes;
+      if (mult >= 0.999) {
+        const saved = _origFilterResDescs.get(filter);
+        if (saved) {
+          if (saved.hadOwn && saved.desc) {
+            Object.defineProperty(filter, "resolution", saved.desc);
+          } else {
+            delete filter.resolution;
+          }
+          _origFilterResDescs.delete(filter);
+        }
+        delete filter._blResMult;
+        return;
       }
+      if (filter._blResMult === mult && _origFilterResDescs.has(filter)) return;
+      if (!_origFilterResDescs.has(filter)) {
+        const hadOwn = Object.prototype.hasOwnProperty.call(filter, "resolution");
+        const desc = hadOwn ? Object.getOwnPropertyDescriptor(filter, "resolution") : null;
+        _origFilterResDescs.set(filter, { hadOwn, desc });
+      }
+      // Redefine via dynamic getter so Foundry v14's non-MAX no-op setter on illumination.filter is bypassed cleanly
+      Object.defineProperty(filter, "resolution", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const rt = globalThis.canvas?.app?.renderer?.renderTexture?.current;
+          const base = rt ? rt.resolution : (globalThis.canvas?.app?.renderer?.resolution || 1);
+          return Math.max(0.25, Math.round(base * mult * 1000) / 1000);
+        },
+        set() {}
+      });
+      filter._blResMult = mult;
     } catch {}
   };
   applyOne(effects.illumination, preset.illumination);
@@ -1082,6 +1180,8 @@ export function installGpuPerfEngine() {
   applyDisableUiBlur();
 }
 
+let _lastSpriteIconsSig = null;
+
 export function refreshGpuPerfSettings() {
   applyDisableUiBlur();
   if (isPrimePerfActive()) return;
@@ -1089,7 +1189,10 @@ export function refreshGpuPerfSettings() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiCache) {
     clearTokenUiBitmapCaches();
   }
-  // Re-render walls, notes, doors, and sound icons so toggle takes effect immediately
+  const spriteIconsSig = `${PERF_CONFIG.perfEnabled ? 1 : 0}:${PERF_CONFIG.perfWallSprites ? 1 : 0}:${PERF_CONFIG.perfControlIconCache ? 1 : 0}`;
+  if (spriteIconsSig === _lastSpriteIconsSig) return;
+  _lastSpriteIconsSig = spriteIconsSig;
+  // Re-render walls, notes, doors, sounds, and template icons only when sprite/icon toggles actually change
   const walls = globalThis.canvas?.walls?.placeables;
   if (walls?.length) {
     for (const w of walls) {
@@ -1101,6 +1204,14 @@ export function refreshGpuPerfSettings() {
     for (const n of notes) {
       if (n.controlIcon && !n.controlIcon.destroyed) {
         try { n.controlIcon._refresh?.(); } catch {}
+      }
+    }
+  }
+  const templates = globalThis.canvas?.templates?.placeables;
+  if (templates?.length) {
+    for (const tpl of templates) {
+      if (tpl.controlIcon && !tpl.controlIcon.destroyed) {
+        try { tpl.controlIcon._refresh?.(); } catch {}
       }
     }
   }

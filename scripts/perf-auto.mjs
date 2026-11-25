@@ -13,6 +13,7 @@ import { PERF_CONFIG, perfStats } from "./perf-patcher.mjs";
 let _autoInstalled = false;
 let _controllerRef = null;
 let _cullTimer = null;
+let _lightCullRaf = null;
 let _vramTimer = null;
 let _prewarmTimer = null;
 let _prewarmGen = 0;
@@ -34,19 +35,39 @@ function isStandardSceneActive() {
 export function computeExpandedViewport(stage, screen, marginFactor = 0.45, minPadPx = 420) {
   if (!stage?.worldTransform || !screen) return null;
   const wt = stage.worldTransform;
-  const a = wt.a || 1;
-  const d = wt.d || 1;
-  if (Math.abs(a) < 1e-6 || Math.abs(d) < 1e-6) return null;
+  const a = wt.a ?? 1;
+  const b = wt.b ?? 0;
+  const c = wt.c ?? 0;
+  const d = wt.d ?? 1;
+  const tx = wt.tx ?? 0;
+  const ty = wt.ty ?? 0;
+  const det = a * d - b * c;
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-10) return null;
 
-  const x0 = (screen.x - wt.tx) / a;
-  const x1 = (screen.x + screen.width - wt.tx) / a;
-  const y0 = (screen.y - wt.ty) / d;
-  const y1 = (screen.y + screen.height - wt.ty) / d;
+  const invDet = 1 / det;
+  const sx0 = screen.x ?? 0;
+  const sy0 = screen.y ?? 0;
+  const sx1 = sx0 + (screen.width ?? 0);
+  const sy1 = sy0 + (screen.height ?? 0);
 
-  const minX = Math.min(x0, x1);
-  const maxX = Math.max(x0, x1);
-  const minY = Math.min(y0, y1);
-  const maxY = Math.max(y0, y1);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  const corners = [
+    [sx0, sy0],
+    [sx1, sy0],
+    [sx0, sy1],
+    [sx1, sy1]
+  ];
+  for (let i = 0; i < 4; i++) {
+    const dx = corners[i][0] - tx;
+    const dy = corners[i][1] - ty;
+    const wx = (d * dx - c * dy) * invDet;
+    const wy = (-b * dx + a * dy) * invDet;
+    if (wx < minX) minX = wx;
+    if (wx > maxX) maxX = wx;
+    if (wy < minY) minY = wy;
+    if (wy > maxY) maxY = wy;
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
 
   const padX = Math.max(minPadPx, (maxX - minX) * marginFactor);
   const padY = Math.max(minPadPx, (maxY - minY) * marginFactor);
@@ -132,22 +153,28 @@ export function updateStandardSceneCulling() {
         mesh.renderable = true;
         continue;
       }
-      const doc = t.document;
-      const rawW = Number(doc.width) || 0;
-      const rawH = Number(doc.height) || 0;
-      const absW = Math.abs(rawW);
-      const absH = Math.abs(rawH);
-      const scaleX = Math.max(1, Math.abs(Number(doc.texture?.scaleX) || 1));
-      const scaleY = Math.max(1, Math.abs(Number(doc.texture?.scaleY) || 1));
-      const x0 = rawW >= 0 ? (doc.x ?? 0) : (doc.x ?? 0) + rawW;
-      const y0 = rawH >= 0 ? (doc.y ?? 0) : (doc.y ?? 0) + rawH;
-      const cx = x0 + absW * 0.5;
-      const cy = y0 + absH * 0.5;
-      const halfW = absW * scaleX * 0.5;
-      const halfH = absH * scaleY * 0.5;
-      // Generous padding for rotated/scaled/flipped tiles
-      const diagPad = doc.rotation ? Math.max(halfW, halfH) : 0;
-      const inView = rectsIntersect(cx - halfW - diagPad, cy - halfH - diagPad, cx + halfW + diagPad, cy + halfH + diagPad, vp);
+      const cb = mesh.canvasBounds;
+      let inView;
+      if (cb && Number.isFinite(cb.x) && Number.isFinite(cb.y) && cb.width > 0 && cb.height > 0) {
+        inView = rectsIntersect(cb.x, cb.y, cb.x + cb.width, cb.y + cb.height, vp);
+      } else {
+        const doc = t.document;
+        const rawW = Number(doc.width) || 0;
+        const rawH = Number(doc.height) || 0;
+        const absW = Math.abs(rawW);
+        const absH = Math.abs(rawH);
+        const scaleX = Math.max(1, Math.abs(Number(doc.texture?.scaleX) || 1));
+        const scaleY = Math.max(1, Math.abs(Number(doc.texture?.scaleY) || 1));
+        const x0 = rawW >= 0 ? (doc.x ?? 0) : (doc.x ?? 0) + rawW;
+        const y0 = rawH >= 0 ? (doc.y ?? 0) : (doc.y ?? 0) + rawH;
+        const cx = x0 + absW * 0.5;
+        const cy = y0 + absH * 0.5;
+        const halfW = absW * scaleX * 0.5;
+        const halfH = absH * scaleY * 0.5;
+        // Generous padding for rotated/scaled/flipped tiles
+        const diagPad = doc.rotation ? Math.max(halfW, halfH) : 0;
+        inView = rectsIntersect(cx - halfW - diagPad, cy - halfH - diagPad, cx + halfW + diagPad, cy + halfH + diagPad, vp);
+      }
       mesh.renderable = inView;
       if (!inView) culledTiles++;
     }
@@ -275,6 +302,23 @@ export function updateStandardSceneCulling() {
   }
 
   // Offscreen PointLightSource / PointDarknessSource mesh culling (skips offscreen light shader passes!)
+  const culledLightMeshes = updateStandardLightMeshCulling(vp);
+
+  perfStats.autoCulledTiles = culledTiles;
+  perfStats.autoCulledLights = culledLights;
+  perfStats.autoCulledLightMeshes = culledLightMeshes;
+  perfStats.autoCulledDoors = culledDoors;
+  perfStats.autoCulledSounds = culledSounds;
+}
+
+export function updateStandardLightMeshCulling(vp = null) {
+  if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return 0;
+  if (!isStandardSceneActive()) return 0;
+  const c = globalThis.canvas;
+  const bounds = vp ?? computeExpandedViewport(c.stage, c.app?.renderer?.screen, 0.45, 420);
+  if (!bounds) return 0;
+  _hasStandardCulling = true;
+
   let culledLightMeshes = 0;
   const lightSources = c.effects?.lightSources;
   const globalLs = c.environment?.globalLightSource;
@@ -296,7 +340,7 @@ export function updateStandardSceneCulling() {
       const lx = ls.x ?? ls.data?.x;
       const ly = ls.y ?? ls.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
-      const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
+      const inView = (lx + r >= bounds.minX) && (lx - r <= bounds.maxX) && (ly + r >= bounds.minY) && (ly - r <= bounds.maxY);
       if (bg && !bg.destroyed) bg.renderable = inView;
       if (il && !il.destroyed) il.renderable = inView;
       if (co && !co.destroyed) co.renderable = inView;
@@ -314,22 +358,18 @@ export function updateStandardSceneCulling() {
         dk.renderable = true;
         continue;
       }
-      const r = ds.radius ?? ds.data?.radius;
+      const r = ds._visualShape?.config?.radius ?? ((ds.radius ?? ds.data?.radius ?? 0) + (ds._padding ?? 0));
       if (!Number.isFinite(r) || r <= 0) continue;
       const lx = ds.x ?? ds.data?.x;
       const ly = ds.y ?? ds.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
-      const inView = (lx + r >= vp.minX) && (lx - r <= vp.maxX) && (ly + r >= vp.minY) && (ly - r <= vp.maxY);
+      const inView = (lx + r >= bounds.minX) && (lx - r <= bounds.maxX) && (ly + r >= bounds.minY) && (ly - r <= bounds.maxY);
       dk.renderable = inView;
       if (!inView) culledLightMeshes++;
     }
   }
-
-  perfStats.autoCulledTiles = culledTiles;
-  perfStats.autoCulledLights = culledLights;
   perfStats.autoCulledLightMeshes = culledLightMeshes;
-  perfStats.autoCulledDoors = culledDoors;
-  perfStats.autoCulledSounds = culledSounds;
+  return culledLightMeshes;
 }
 
 /**
@@ -339,7 +379,7 @@ export function updateStandardSceneCulling() {
  */
 let _hasFastBatchTiles = false;
 
-function syncSingleDecorativeTile(t, allow) {
+export function syncSingleDecorativeTile(t, allow) {
   const m = t?.mesh;
   if (!m || m.destroyed || m._boundlessMesh) return;
   if (!allow) {
@@ -349,12 +389,18 @@ function syncSingleDecorativeTile(t, allow) {
     }
     return;
   }
+  // If a third-party module replaced the tile's shader (setShaderClass), release our `"batch"` override
+  if (m._blFastBatch && m._shader?.pluginName && m._shader.pluginName !== "batchOcclusion") {
+    m.pluginName = null;
+    m._blFastBatch = false;
+    return;
+  }
   const doc = t.document;
   // Check both document & mesh fields: PIXI "batch" shader ignores unoccludedAlpha (Tile opacity < 1),
   // occlusion modes, and light/weather depth restrictions.
   const docAlpha = doc?.alpha ?? 1;
   const unoccAlpha = m.unoccludedAlpha ?? 1;
-  const hasDocOcc = Boolean(doc?.occlusion?.modes?.size || doc?.occlusion?.mode);
+  const hasDocOcc = doc?.occlusion?.modes ? doc.occlusion.modes.size > 0 : Boolean(doc?.occlusion?.mode);
   const hasDocRestrict = Boolean(doc?.restrictions?.light || doc?.restrictions?.weather);
   const isDecorative =
     docAlpha >= 0.999 &&
@@ -367,7 +413,8 @@ function syncSingleDecorativeTile(t, allow) {
     !t.isVideo;
   if (isDecorative) {
     // Only switch default Foundry batchOcclusion tiles; preserve any custom tile shader (FXMaster, Showstopper, TokenMagic)
-    if (m.pluginName === "batchOcclusion") {
+    const shaderPlugin = m._shader?.pluginName ?? m.pluginName;
+    if (shaderPlugin === "batchOcclusion" && !m._blFastBatch) {
       m.pluginName = "batch";
       m._blFastBatch = true;
       _hasFastBatchTiles = true;
@@ -414,6 +461,20 @@ function scheduleStandardCulling(immediateFrame = false) {
     _cullTimer = null;
     updateStandardSceneCulling();
   }, 16);
+}
+
+function scheduleLightMeshCulling() {
+  if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return;
+  if (_cullRaf !== null) return; // full pass already queued for this frame
+  if (typeof globalThis.requestAnimationFrame === "function") {
+    if (_lightCullRaf !== null) return;
+    _lightCullRaf = globalThis.requestAnimationFrame(() => {
+      _lightCullRaf = null;
+      updateStandardLightMeshCulling();
+    });
+    return;
+  }
+  updateStandardLightMeshCulling();
 }
 
 // ---------------------------------------------------------------------------
@@ -704,18 +765,22 @@ export function installAutoPerfEngine(controller) {
     "controlAmbientSound", "hoverAmbientSound",
     "controlNote", "hoverNote",
     "controlWall", "hoverWall",
-    "highlightObjects", "lightingRefresh"
+    "highlightObjects"
   ]) {
     Hooks.on(h, () => {
       if (isStandardSceneActive()) scheduleStandardCulling(true);
     });
   }
 
+  Hooks.on("lightingRefresh", () => {
+    if (isStandardSceneActive()) scheduleLightMeshCulling();
+  });
+
   Hooks.on("updateToken", (doc, changes) => {
     if (!isStandardSceneActive()) return;
-    if ((globalThis.canvas?.effects?.lightSources?.size ?? 0) < 16) return;
-    if (doc?.object?.light?.active && changes && ("x" in changes || "y" in changes || "light" in changes || "level" in changes)) {
-      scheduleStandardCulling(true);
+    if ((globalThis.canvas?.effects?.lightSources?.size ?? 0) < 16 && (globalThis.canvas?.effects?.darknessSources?.size ?? 0) < 8) return;
+    if ((doc?.object?.light?.active || doc?.light?.negative) && changes && ("x" in changes || "y" in changes || "light" in changes || "level" in changes)) {
+      scheduleLightMeshCulling();
     }
   });
 
@@ -728,6 +793,10 @@ export function installAutoPerfEngine(controller) {
     if (_cullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
       globalThis.cancelAnimationFrame(_cullRaf);
       _cullRaf = null;
+    }
+    if (_lightCullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
+      globalThis.cancelAnimationFrame(_lightCullRaf);
+      _lightCullRaf = null;
     }
     if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
     if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }

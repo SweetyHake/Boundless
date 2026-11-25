@@ -429,7 +429,7 @@ export class ChunkedFogManager {
         chunk.texture.baseTexture.update();
       }
       this.updateViewportCulling();
-      if (markDirty) this._scheduleSave();
+      if (markDirty || this._dirtyPrivate.size > 0) this._scheduleSave();
       return true;
     }
     return false;
@@ -473,13 +473,21 @@ export class ChunkedFogManager {
           if (chunk.sharedCtx) {
             this._drawCircleToCtx(chunk.sharedCtx, x, y, radiusPx, ox, oy, Boolean(erase));
           }
-          if (chunk.privateCtx) {
+          // In SHARED mode, only erase strokes touch GM's privateCanvas; shared reveal strokes stay strictly in sharedCanvas
+          if (chunk.privateCtx && (erase || !this.isSharedMode)) {
             this._drawCircleToCtx(chunk.privateCtx, x, y, radiusPx, ox, oy, Boolean(erase));
           }
           touched.add(chunk);
           if (markDirty) {
-            if (this.isSharedMode) this._dirtyShared.add(chunk.key);
-            if (!this.isSharedMode || chunk.hasPrivate) this._dirtyPrivate.add(chunk.key);
+            if (this.isSharedMode) {
+              this._dirtyShared.add(chunk.key);
+              if (erase && chunk.hasPrivate) this._dirtyPrivate.add(chunk.key);
+            } else {
+              this._dirtyPrivate.add(chunk.key);
+            }
+          } else if (erase && this.isSharedMode && game.user?.isGM && chunk.hasPrivate) {
+            // Another GM erased fog across a chunk where this GM holds personal private fog: persist the private erase
+            this._dirtyPrivate.add(chunk.key);
           }
         }
       }
@@ -491,7 +499,7 @@ export class ChunkedFogManager {
         chunk.texture.baseTexture.update();
       }
       this.updateViewportCulling();
-      if (markDirty) this._scheduleSave();
+      if (markDirty || this._dirtyPrivate.size > 0) this._scheduleSave();
       return true;
     }
     return false;

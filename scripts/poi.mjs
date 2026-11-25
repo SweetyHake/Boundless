@@ -1377,7 +1377,7 @@ export class PoiManager {
         if (!this.placementActive || ev.button !== 0) return;
         if (!canvas?.ready || !canvas.stage) return;
         if (ev.target !== view) return;
-        if (document.querySelector("dialog[open]")) return;
+        if (this._poiDialogOpen) return;
         if (this._contextMenuEl) {
           ev.preventDefault();
           ev.stopPropagation();
@@ -1411,10 +1411,13 @@ export class PoiManager {
         }
         ev.preventDefault();
         ev.stopPropagation();
-        openPoiEditorDialog(this.controller, canvas.scene, {
+        this._poiDialogOpen = true;
+        Promise.resolve(openPoiEditorDialog(this.controller, canvas.scene, {
           x: Math.round(worldPt.x),
           y: Math.round(worldPt.y),
           levelId: canvas.level?.id || null
+        })).finally(() => {
+          this._poiDialogOpen = false;
         });
       };
 
@@ -1762,7 +1765,7 @@ export class PoiManager {
       if (canvas.scene?.id !== originSceneId || canvas.level?.id !== poi.levelId) return false;
     }
 
-    const worldMinScale = this.controller?._worldMinScale ?? canvas.dimensions?.scale?.min ?? 0.008;
+    const worldMinScale = (this.controller?.active ? this.controller._worldMinScale : null) ?? canvas.dimensions?.scale?.min ?? 0.008;
     const activeMinScale = canvas.dimensions?.scale?.min ?? worldMinScale;
     const maxScale = canvas.dimensions?.scale?.max ?? 2.5;
 

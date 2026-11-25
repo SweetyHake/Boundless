@@ -1,5 +1,5 @@
 import { TokenImpostorLayer } from "./token-impostors.mjs";
-import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation } from "./utils.mjs";
+import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy } from "./utils.mjs";
 import { invalidateTokenLayerCache } from "./perf-gpu.mjs";
 
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
@@ -106,6 +106,15 @@ export function installLazyTokenLayerPatch() {
         return await origLayerDraw.apply(this, args);
       } finally {
         lazyDrawDepth = Math.max(0, lazyDrawDepth - 1);
+        if (lazyDrawDepth === 0) {
+          const ts = globalThis.Boundless?.tokenStreamer;
+          const scene = this.scene ?? globalThis.canvas?.scene;
+          if (ts?.enabled && scene?.id && ts.sceneId === scene.id) {
+            ts._lastStreamKey = "";
+            ts.impostors?.markVisibilityDirty?.();
+            ts._queueSyncMicrotask?.(true);
+          }
+        }
       }
     };
   }
@@ -117,7 +126,7 @@ export function installLazyTokenLayerPatch() {
       yield* origViewed.call(this);
       return;
     }
-    const viewKey = `${scene.id}::${scene._view ?? canvas?.level?.id ?? ""}`;
+    const viewKey = `${scene.id}::${canvas?.level?.id ?? ""}`;
     for (const doc of origViewed.call(this)) {
       if (isAlwaysMountedTokenDoc(doc)) {
         yield doc;
@@ -431,7 +440,7 @@ export class TokenStreamer {
     this._syncMicrotaskForce = false;
 
     const curScene = canvas?.scene;
-    const curViewKey = curScene?.id ? `${curScene.id}::${curScene._view ?? canvas?.level?.id ?? ""}` : null;
+    const curViewKey = curScene?.id ? `${curScene.id}::${canvas?.level?.id ?? ""}` : null;
     if (
       wasEnabled &&
       prevSceneId &&
@@ -1170,7 +1179,8 @@ export class TokenStreamer {
       || "width" in changes
       || "height" in changes
       || "ring" in changes
-      || "disposition" in changes;
+      || "disposition" in changes
+      || Boolean(changes.flags?.["multiple-rings"]);
 
     if (moved) {
       this._indexDoc(doc);
@@ -1249,26 +1259,12 @@ export class TokenStreamer {
     }
   }
 
-  _canUserControlDoc(doc) {
+  _canUserControlDoc(doc, minPermission = "OWNER") {
     if (!doc || doc.viewed === false) return false;
     const isGM = Boolean(game.user?.isGM);
     if (!isGM) {
       if (doc._source?.hidden ?? doc.hidden) return false;
-      const base = doc.baseActor;
-      let isOwner;
-      if (!doc.isLazyDelta) {
-        isOwner = Boolean(doc.isOwner || base?.testUserPermission?.(game.user, "OWNER"));
-      } else {
-        const ownerLevel = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.OWNER ?? 3;
-        const deltaOwn = doc._source?.delta?.ownership;
-        const uid = game.user?.id;
-        const deltaHasOwner = Boolean(
-          deltaOwn &&
-          ((uid && Number(deltaOwn[uid]) >= ownerLevel) || Number(deltaOwn.default) >= ownerLevel)
-        );
-        isOwner = Boolean(base?.testUserPermission?.(game.user, "OWNER") || deltaHasOwner);
-      }
-      if (!isOwner) return false;
+      if (!hasTokenPermissionLazy(doc, game.user, minPermission)) return false;
     }
     const existing = doc._object;
     if (existing && !existing.destroyed) {
@@ -1350,7 +1346,7 @@ export class TokenStreamer {
    * Pick the nearest controllable TokenDocument under world point `(wx, wy)` using at least `minHitRadiusWorld`
    * so clicking tiny impostors on global/continental maps feels effortless.
    */
-  findHitDocAtPoint(wx, wy, minHitRadiusWorld = 0) {
+  findHitDocAtPoint(wx, wy, minHitRadiusWorld = 0, { minPermission = "OWNER" } = {}) {
     const scene = canvas?.scene;
     if (!this.enabled || !scene?.tokens) return null;
     const grid = canvas.grid?.size || 100;
@@ -1368,7 +1364,7 @@ export class TokenStreamer {
         if (!ids) continue;
         for (const docId of ids) {
           const doc = scene.tokens.get(docId);
-          if (!this._canUserControlDoc(doc)) continue;
+          if (!this._canUserControlDoc(doc, minPermission)) continue;
           const b = getTokenDocBounds(doc, grid);
           const halfW = Math.max(b.w * 0.5, minHitRadiusWorld);
           const halfH = Math.max(b.h * 0.5, minHitRadiusWorld);
@@ -1432,7 +1428,7 @@ export class TokenStreamer {
    * Time-sliced materialization & selection for unmounted (or impostor-mode) TokenDocuments.
    * Caps work to <= 2.4ms/frame so even selecting 150+ tokens on a global map stays locked at 120 FPS.
    */
-  materializeAndSelect(docs, { releaseOthers = false, maxCount = 250, bulkRunner = null, onProgress = null } = {}) {
+  materializeAndSelect(docs, { releaseOthers = false, maxCount = 250, bulkRunner = null, onProgress = null, selectionRect = null, onComplete = null } = {}) {
     const layer = canvas?.tokens;
     if (!this.enabled || !canvas?.ready || !layer?.objects || !layer.active) return { immediate: 0, queued: 0, capped: false };
     const list = Array.isArray(docs) ? docs : [];
@@ -1458,17 +1454,32 @@ export class TokenStreamer {
     };
 
     let immediate = 0;
+    const controlledTokens = [];
     runBulk(() => {
       for (let i = 0; i < targetDocs.length; i++) {
         const doc = targetDocs[i];
         const tok = doc?._object;
-        if (tok && !tok.destroyed && tok.parent === layer.objects && !tok.controlled) {
-          const onScr = isDocOnScreen(doc);
-          if (!onScr && !this._nativeTokensActive) {
-            tok.renderable = false;
-            if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+        if (tok && !tok.destroyed && tok.parent === layer.objects) {
+          if (selectionRect && typeof tok._overlapsSelection === "function" && !tok._overlapsSelection(selectionRect)) {
+            if (!this._nativeTokensActive && !tok.controlled) {
+              tok.renderable = false;
+              if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+            }
+            continue;
           }
-          if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) immediate++;
+          if (!tok.controlled) {
+            const onScr = isDocOnScreen(doc);
+            if (!onScr && !this._nativeTokensActive) {
+              tok.renderable = false;
+              if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+            }
+            if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) {
+              immediate++;
+              controlledTokens.push(tok);
+            }
+          } else {
+            controlledTokens.push(tok);
+          }
         }
       }
     });
@@ -1483,6 +1494,7 @@ export class TokenStreamer {
 
     if (!missing.length) {
       onProgress?.({ done: true, selected: layer.controlled.length });
+      onComplete?.(controlledTokens);
       return { immediate, queued: 0, capped };
     }
 
@@ -1610,8 +1622,20 @@ export class TokenStreamer {
         runBulk(() => {
           for (let i = 0; i < newlyMounted.length; i++) {
             const { tok, onScr } = newlyMounted[i];
-            if (tok && !tok.destroyed && !tok.controlled) {
-              tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false });
+            if (!tok || tok.destroyed) continue;
+            if (selectionRect && typeof tok._overlapsSelection === "function" && !tok._overlapsSelection(selectionRect)) {
+              if (!this._nativeTokensActive && !tok.controlled) {
+                tok.renderable = false;
+                if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+              }
+              continue;
+            }
+            if (!tok.controlled) {
+              if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) {
+                controlledTokens.push(tok);
+              }
+            } else {
+              controlledTokens.push(tok);
             }
           }
         });
@@ -1631,6 +1655,7 @@ export class TokenStreamer {
         ui.placeables?.render?.();
         if (game.activeTool === "select") ui.placeablesPalette?.render?.();
         onProgress?.({ done: true, selected: layer.controlled.length });
+        onComplete?.(controlledTokens);
       }
     };
 

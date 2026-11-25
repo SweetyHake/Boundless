@@ -355,7 +355,7 @@ export const editsMethods = {
       return;
     }
 
-    if (!this.active) return;
+    if (!this.active || this._mounting) return;
 
     // React to native Foundry v14 Scene fog mode (DISABLED / INDIVIDUAL / SHARED) & tokenVision changes
     if (changes?.fog || "tokenVision" in (changes || {})) {
@@ -453,23 +453,25 @@ export const editsMethods = {
       }
     }
 
-    if ("pois" in flagChanges || "-=pois" in flagChanges || "showPois" in flagChanges) {
-      if (flagChanges.showPois !== false && !this.poiManager.container) {
+    if ("pois" in flagChanges || "-=pois" in flagChanges || "showPois" in flagChanges || "-=showPois" in flagChanges) {
+      const showPois = scene?.flags?.[MODULE_ID]?.showPois !== false;
+      if (showPois && !this.poiManager.container) {
         this.poiManager.mount(scene, this.manifest);
       } else {
         this.poiManager.rebuild(scene, this.manifest);
       }
     }
 
-    if ("showCharacterPins" in flagChanges) {
-      if (flagChanges.showCharacterPins !== false && !this.charPins.container) {
+    if ("showCharacterPins" in flagChanges || "-=showCharacterPins" in flagChanges) {
+      const showPins = scene?.flags?.[MODULE_ID]?.showCharacterPins !== false;
+      if (showPins && !this.charPins.container) {
         this.charPins.mount(scene);
       } else {
         this.charPins.rebuild(scene);
       }
     }
 
-    if ("chunkedFog" in flagChanges) {
+    if ("chunkedFog" in flagChanges || "-=chunkedFog" in flagChanges) {
       this.fogManager.mount(scene);
     } else {
       if ("sharedFog" in flagChanges || "-=sharedFog" in flagChanges) {
@@ -483,7 +485,7 @@ export const editsMethods = {
       }
     }
 
-    if ("virtualizeTokens" in flagChanges) {
+    if ("virtualizeTokens" in flagChanges || "-=virtualizeTokens" in flagChanges) {
       this.tokenStreamer.mount(scene);
       this.tokenStreamer.scheduleSync(this.getViewportWorldRect(0.28), true);
     }
@@ -565,12 +567,12 @@ export const editsMethods = {
   },
 
   async flyToCharacter(userOrActorId = null, options = {}) {
-    if (!this.active || !canvas?.ready) return false;
+    if (!this.active || this._mounting || !canvas?.ready) return false;
     return this.charPins.focusCharacter(userOrActorId, options);
   },
 
   async flyTo(target, options = {}) {
-    if (!this.active || !canvas?.ready) return false;
+    if (!this.active || this._mounting || !canvas?.ready) return false;
     let poi = target;
     if (typeof target === "string") {
       const needle = target.trim().toLowerCase();

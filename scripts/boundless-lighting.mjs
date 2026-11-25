@@ -2,6 +2,7 @@ import { MegaLightBatch, LIGHT_PAD_WORLD_PX } from "./light-batch.mjs";
 import {
   MODULE_ID,
   getEffectiveScale,
+  getLevelRoofElevation,
   buildEdgeThresholdPx
 } from "./utils.mjs";
 
@@ -112,7 +113,7 @@ export const lightingMethods = {
 
   // Multi-Level Physics Sim-Bubble & Dynamic Lights: strictly driven by tokens (on their own level!), active visionSources, and open doors
   updateSimAndLightBubbles(force = false) {
-    if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready || this._updatingBubbles) return;
+    if (!this.active || this._mounting || !this.visibleLevelLayers.length || !canvas?.ready || this._updatingBubbles) return;
     this._updatingBubbles = true;
     try {
       const EdgeCls = foundry.canvas.geometry.edges.Edge;
@@ -148,9 +149,11 @@ export const lightingMethods = {
         const sy0 = Math.max(0, Math.floor((door.y - LIGHT_PAD_WORLD_PX) / simSectorPx));
         const sx1 = Math.min(simGrid - 1, Math.floor((door.x + LIGHT_PAD_WORLD_PX) / simSectorPx));
         const sy1 = Math.min(simGrid - 1, Math.floor((door.y + LIGHT_PAD_WORLD_PX) / simSectorPx));
+        const visitedDoorSectors = new Set();
         for (let sy = sy0; sy <= sy1; sy++) {
           for (let sx = sx0; sx <= sx1; sx++) {
             const sk = `${sx}_${sy}`;
+            visitedDoorSectors.add(sk);
             const sec = spec.sectors[sk];
             if (!sec?.l?.length) continue;
             for (let li = 0; li < sec.l.length; li++) {
@@ -159,6 +162,19 @@ export const lightingMethods = {
               if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
                 neededDynLights.add(lid);
               }
+            }
+          }
+        }
+        const lvlEdits = this.lightEdits?.get?.(door.levelId);
+        if (lvlEdits?.size) {
+          for (const [lKey, ov] of lvlEdits) {
+            if (!ov) continue;
+            const parts = lKey.split(":");
+            if (parts.length !== 3 || visitedDoorSectors.has(parts[0])) continue;
+            const lid = `${door.levelId}::${parts[0]}_${parts[2]}`;
+            const meta = this.lightBatch.lightMetaById.get(lid);
+            if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
+              neededDynLights.add(lid);
             }
           }
         }
@@ -179,9 +195,11 @@ export const lightingMethods = {
           const sy0 = Math.max(0, Math.floor((vs.y - vRad - LIGHT_PAD_WORLD_PX) / simSectorPx));
           const sx1 = Math.min(simGrid - 1, Math.floor((vs.x + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
           const sy1 = Math.min(simGrid - 1, Math.floor((vs.y + vRad + LIGHT_PAD_WORLD_PX) / simSectorPx));
+          const visitedVsSectors = new Set();
           for (let sy = sy0; sy <= sy1; sy++) {
             for (let sx = sx0; sx <= sx1; sx++) {
               const sk = `${sx}_${sy}`;
+              visitedVsSectors.add(sk);
               const sec = spec.sectors[sk];
               if (!sec?.l?.length) continue;
               for (let li = 0; li < sec.l.length; li++) {
@@ -197,6 +215,26 @@ export const lightingMethods = {
                   const prev = visionCandidates.get(lid);
                   if (prev === undefined || distSq < prev) visionCandidates.set(lid, distSq);
                 }
+              }
+            }
+          }
+          const lvlEdits = this.lightEdits?.get?.(vsLevelId);
+          if (lvlEdits?.size) {
+            for (const [lKey, ov] of lvlEdits) {
+              if (!ov) continue;
+              const parts = lKey.split(":");
+              if (parts.length !== 3 || visitedVsSectors.has(parts[0])) continue;
+              const lid = `${vsLevelId}::${parts[0]}_${parts[2]}`;
+              if (neededDynLights.has(lid)) continue;
+              const meta = this.lightBatch.lightMetaById.get(lid);
+              if (!isMetaEligibleDyn(meta, vs)) continue;
+              const dx = meta.lx - vs.x;
+              const dy = meta.ly - vs.y;
+              const maxD = vRad + meta.dimPx;
+              const distSq = dx * dx + dy * dy;
+              if (distSq <= maxD * maxD) {
+                const prev = visionCandidates.get(lid);
+                if (prev === undefined || distSq < prev) visionCandidates.set(lid, distSq);
               }
             }
           }
@@ -240,9 +278,11 @@ export const lightingMethods = {
             const sy0 = Math.max(0, Math.floor((vpSticky.y0 - LIGHT_PAD_WORLD_PX) / simSectorPx));
             const sx1 = Math.min(simGrid - 1, Math.floor((vpSticky.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             const sy1 = Math.min(simGrid - 1, Math.floor((vpSticky.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
+            const visitedVpSectors = new Set();
             for (let sy = sy0; sy <= sy1; sy++) {
               for (let sx = sx0; sx <= sx1; sx++) {
                 const sk = `${sx}_${sy}`;
+                visitedVpSectors.add(sk);
                 const sec = spec.sectors[sk];
                 if (!sec?.l?.length) continue;
                 for (let idx = 0; idx < sec.l.length; idx++) {
@@ -266,6 +306,33 @@ export const lightingMethods = {
                     distSq: dx * dx + dy * dy
                   });
                 }
+              }
+            }
+            const lvlEdits = this.lightEdits?.get?.(levelId);
+            if (lvlEdits?.size) {
+              for (const [lKey, ov] of lvlEdits) {
+                if (!ov) continue;
+                const parts = lKey.split(":");
+                if (parts.length !== 3 || visitedVpSectors.has(parts[0])) continue;
+                const lid = `${levelId}::${parts[0]}_${parts[2]}`;
+                if (neededDynLights.has(lid)) continue;
+                const meta = this.lightBatch.lightMetaById.get(lid);
+                if (!meta || !meta.raw?.[6] || !isMetaEligibleDyn(meta)) continue;
+                const r = meta.dimPx || 0;
+                const alreadyDyn = this.dynamicLights.has(lid);
+                const box = alreadyDyn ? vpSticky : vp;
+                if (meta.lx + r < box.x0 || meta.lx - r > box.x1 || meta.ly + r < box.y0 || meta.ly - r > box.y1) continue;
+                const dx = meta.lx - cx;
+                const dy = meta.ly - cy;
+                const animType = String(meta.raw[6]).toLowerCase();
+                const isPattern = animType !== "torch" && animType !== "flame" && animType !== "pulse";
+                vpCandidates.push({
+                  lid,
+                  stickyPrio: alreadyDyn ? 0 : 1,
+                  viewPrio,
+                  prio: isPattern ? 0 : 1,
+                  distSq: dx * dx + dy * dy
+                });
               }
             }
           }
@@ -1032,8 +1099,7 @@ export const lightingMethods = {
     if (info.doorType === 2 || curDs === 2 || targetDs === 2) {
       return;
     }
-    this._applyDoorStateLocal(info, targetDs, { playSound: true });
-    await canvas.scene.update({ [`flags.${MODULE_ID}.doorStates.${info.dKey}`]: targetDs });
+    this.requestDoorState(info.dKey, targetDs, { playSound: true });
   },
 
   requestDoorState(dKey, targetDs, { playSound = true } = {}) {
@@ -1109,7 +1175,8 @@ export const lightingMethods = {
               originY: b.y || 0,
               regionW: b.w || regionPx,
               regionH: b.h || regionPx,
-              repeat: true
+              repeat: true,
+              roofElevation: getLevelRoofElevation(bakeLayer.level)
             });
           }
         } else {
@@ -1129,7 +1196,8 @@ export const lightingMethods = {
               originY: minY,
               regionW: maxX - minX,
               regionH: maxY - minY,
-              repeat: false
+              repeat: false,
+              roofElevation: getLevelRoofElevation(bakeLayer.level)
             });
           }
         }

@@ -21,53 +21,54 @@ async function runWithProgressDialog(titleKey, runner, sceneId = null) {
     return { ok: false, err: new Error("A bake or unbake operation is already running for this scene.") };
   }
   if (sceneId) activeBakeScenes.add(sceneId);
-  const DialogV2 = foundry.applications.api.DialogV2;
-  const abortCtrl = new AbortController();
-  const progressDialog = new DialogV2({
-    window: { title: loc(titleKey), icon: "fa-solid fa-spinner fa-spin" },
-    position: { width: 400 },
-    content: `
-      <div class="boundless-baker-progress">
-        <p class="boundless-baker-status">${escapeHtml(loc("BOUNDLESS.Baker.StepPreparing"))}</p>
-        <progress class="boundless-baker-bar" max="100" value="0"></progress>
-        <span class="boundless-baker-pct">0%</span>
-      </div>
-    `,
-    buttons: [{
-      action: "cancel",
-      type: "button",
-      default: false,
-      label: loc("BOUNDLESS.Baker.CancelButton"),
-      icon: "fa-solid fa-xmark",
-      callback: () => { abortCtrl.abort(); }
-    }]
-  });
-
+  let progressDialog = null;
   let finished = false;
-  progressDialog.addEventListener?.("close", () => {
-    if (!finished) abortCtrl.abort();
-  }, { once: true });
-  await progressDialog.render(true);
-
-  const onProgress = ({ pct, text }) => {
-    const rootEl = progressDialog.element;
-    if (!rootEl) return;
-    const bar = rootEl.querySelector(".boundless-baker-bar");
-    const pctEl = rootEl.querySelector(".boundless-baker-pct");
-    const stEl = rootEl.querySelector(".boundless-baker-status");
-    if (bar) bar.value = pct;
-    if (pctEl) pctEl.textContent = `${pct}%`;
-    if (stEl && text) stEl.textContent = text;
-  };
-
   try {
+    const DialogV2 = foundry.applications.api.DialogV2;
+    const abortCtrl = new AbortController();
+    progressDialog = new DialogV2({
+      window: { title: loc(titleKey), icon: "fa-solid fa-spinner fa-spin" },
+      position: { width: 400 },
+      content: `
+        <div class="boundless-baker-progress">
+          <p class="boundless-baker-status">${escapeHtml(loc("BOUNDLESS.Baker.StepPreparing"))}</p>
+          <progress class="boundless-baker-bar" max="100" value="0"></progress>
+          <span class="boundless-baker-pct">0%</span>
+        </div>
+      `,
+      buttons: [{
+        action: "cancel",
+        type: "button",
+        default: false,
+        label: loc("BOUNDLESS.Baker.CancelButton"),
+        icon: "fa-solid fa-xmark",
+        callback: () => { abortCtrl.abort(); }
+      }]
+    });
+
+    progressDialog.addEventListener?.("close", () => {
+      if (!finished) abortCtrl.abort();
+    }, { once: true });
+    await progressDialog.render(true);
+
+    const onProgress = ({ pct, text }) => {
+      const rootEl = progressDialog?.element;
+      if (!rootEl) return;
+      const bar = rootEl.querySelector(".boundless-baker-bar");
+      const pctEl = rootEl.querySelector(".boundless-baker-pct");
+      const stEl = rootEl.querySelector(".boundless-baker-status");
+      if (bar) bar.value = pct;
+      if (pctEl) pctEl.textContent = `${pct}%`;
+      if (stEl && text) stEl.textContent = text;
+    };
+
     const result = await runner({ signal: abortCtrl.signal, onProgress });
     finished = true;
     await progressDialog.close().catch(() => {});
     return { ok: true, result };
   } catch (err) {
     finished = true;
-    await progressDialog.close().catch(() => {});
+    await progressDialog?.close?.().catch(() => {});
     return { ok: false, err };
   } finally {
     if (sceneId) activeBakeScenes.delete(sceneId);
@@ -109,10 +110,12 @@ export async function openOptimizeSceneDialog(controller, scene) {
     rejectClose: false
   });
   if (!opts) return;
+  const liveScene = game.scenes?.get?.(scene.id);
+  if (!liveScene) return;
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Optimize.ProgressTitle", ({ signal, onProgress }) =>
-    bakeSceneToBoundless(controller, scene, {
-      targetDir: buildDefaultBakeDir(scene),
+    bakeSceneToBoundless(controller, liveScene, {
+      targetDir: buildDefaultBakeDir(liveScene),
       levelIds: null,
       createCopy: opts.createCopy,
       removeOriginals: true,
@@ -122,7 +125,7 @@ export async function openOptimizeSceneDialog(controller, scene) {
       signal,
       onProgress
     }),
-    scene.id
+    liveScene.id
   );
 
   if (outcome.ok) {
@@ -174,14 +177,16 @@ export async function openBakeEditsDialog(controller, scene) {
     rejectClose: false
   });
   if (!opts) return;
+  const liveScene = game.scenes?.get?.(scene.id);
+  if (!liveScene || !isSceneBoundlessEditable(liveScene)) return;
 
   const outcome = await runWithProgressDialog("BOUNDLESS.BakeEdits.ProgressTitle", ({ signal, onProgress }) =>
-    bakeSceneEditsToManifest(controller, scene, {
+    bakeSceneEditsToManifest(controller, liveScene, {
       absorbNative: opts.absorbNative,
       signal,
       onProgress
     }),
-    scene.id
+    liveScene.id
   );
 
   if (outcome.ok) {
@@ -246,16 +251,18 @@ export async function openUnbakeSceneDialog(controller, scene) {
     rejectClose: false
   });
   if (!opts) return;
+  const liveScene = game.scenes?.get?.(scene.id);
+  if (!liveScene || !isSceneBoundlessEditable(liveScene)) return;
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Unbake.ProgressTitle", ({ signal, onProgress }) =>
-    unbakeSceneFromBoundless(controller, scene, {
+    unbakeSceneFromBoundless(controller, liveScene, {
       createCopy: opts.createCopy,
       restoreImages: opts.restoreImages,
       activateCopy: true,
       signal,
       onProgress
     }),
-    scene.id
+    liveScene.id
   );
 
   if (outcome.ok) {

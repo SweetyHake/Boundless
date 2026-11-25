@@ -1585,6 +1585,10 @@ async function stitchPyramidToWebp({
       const list = sparseTiles[String(chosenZ)] ?? sparseTiles[chosenZ];
       if (Array.isArray(list)) {
         for (const xy of list) {
+          if (Array.isArray(xy) && xy.length >= 2) {
+            set.add(`${chosenZ}/${xy[0]}_${xy[1]}`);
+            continue;
+          }
           const clean = String(xy || "").trim().replace(/\.webp$/i, "");
           if (clean) set.add(clean.includes("/") ? clean : `${chosenZ}/${clean}`);
         }
