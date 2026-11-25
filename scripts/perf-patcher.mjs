@@ -142,6 +142,41 @@ export function resolveFoundryClass(className) {
   return { cls: null, path: null };
 }
 
+function makeDirectWrapper(prev, wrapperFn) {
+  let curThis;
+  const boundWrapped = function (a, b, c, d) {
+    switch (arguments.length) {
+      case 0: return prev.call(curThis);
+      case 1: return prev.call(curThis, a);
+      case 2: return prev.call(curThis, a, b);
+      case 3: return prev.call(curThis, a, b, c);
+      case 4: return prev.call(curThis, a, b, c, d);
+      default: return prev.apply(curThis, arguments);
+    }
+  };
+  return function (a, b, c, d) {
+    const prevThis = curThis;
+    curThis = this;
+    try {
+      switch (arguments.length) {
+        case 0: return wrapperFn.call(this, boundWrapped);
+        case 1: return wrapperFn.call(this, boundWrapped, a);
+        case 2: return wrapperFn.call(this, boundWrapped, a, b);
+        case 3: return wrapperFn.call(this, boundWrapped, a, b, c);
+        case 4: return wrapperFn.call(this, boundWrapped, a, b, c, d);
+        default: {
+          const arr = new Array(arguments.length + 1);
+          arr[0] = boundWrapped;
+          for (let i = 0; i < arguments.length; i++) arr[i + 1] = arguments[i];
+          return wrapperFn.apply(this, arr);
+        }
+      }
+    } finally {
+      curThis = prevThis;
+    }
+  };
+}
+
 /**
  * Safely wrap a prototype or static method on a Foundry class.
  * @param {string} className
@@ -202,10 +237,7 @@ export function wrapFoundryMethod(className, method, wrapperFn, opts = {}) {
   wrappedSet.add(method);
 
   const prev = original;
-  targetObj[method] = function (...args) {
-    const boundWrapped = (...innerArgs) => prev.apply(this, innerArgs);
-    return wrapperFn.call(this, boundWrapped, ...args);
-  };
+  targetObj[method] = makeDirectWrapper(prev, wrapperFn);
   activePatches.set(fullPath, { via: "direct", active: true });
   return { original: prev, fullPath, viaLibWrapper: false };
 }
@@ -224,10 +256,7 @@ export function wrapTargetMethod(targetObj, method, label, wrapperFn) {
   wrappedSet.add(method);
 
   const prev = targetObj[method];
-  targetObj[method] = function (...args) {
-    const boundWrapped = (...innerArgs) => prev.apply(this, innerArgs);
-    return wrapperFn.call(this, boundWrapped, ...args);
-  };
+  targetObj[method] = makeDirectWrapper(prev, wrapperFn);
   activePatches.set(label, { via: "direct", active: true });
   return { original: prev, fullPath: label };
 }

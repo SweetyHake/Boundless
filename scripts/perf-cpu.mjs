@@ -1637,6 +1637,85 @@ function patchGeometryStructures() {
     results.push(okIns, okRem, okClr);
   }
 
+  // 3. PolygonVertex#attachEdge: zero-allocation inline replacement (eliminates 2 closures + 2 objects per edge attachment inside ClockwiseSweepPolygon)
+  const PVCls = globalThis.foundry?.canvas?.geometry?.edges?.PolygonVertex;
+  if (PVCls?.prototype?.attachEdge) {
+    results.push(wrapTargetMethod(PVCls.prototype, "attachEdge", "PolygonVertex.prototype.attachEdge", function (wrapped, edge, orientation, type) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(edge, orientation, type);
+      this.edges.add(edge);
+      const r = edge[type];
+      if (r > this.restriction) this.restriction = r;
+      if (orientation <= 0) this.cwEdges.add(edge);
+      if (orientation >= 0) this.ccwEdges.add(edge);
+
+      // Update isEndpoint incrementally without closure/some() allocation
+      if (!this.isEndpoint) {
+        const va = edge.vertexA || edge.a;
+        const vb = edge.vertexB || edge.b;
+        if ((va && va.x === this.x && va.y === this.y) || (vb && vb.x === this.x && vb.y === this.y)) {
+          this.isEndpoint = true;
+        }
+      }
+
+      // Inline CCW classification (0 allocs)
+      const ccwS = this.ccwEdges.size;
+      if (ccwS === 0) {
+        this.isLimitingCCW = false;
+        this.isBlockingCCW = false;
+      } else if (ccwS > 1) {
+        this.isLimitingCCW = false;
+        this.isBlockingCCW = true;
+      } else {
+        const first = this.ccwEdges.values().next().value;
+        const lim = first.isLimited(type);
+        this.isLimitingCCW = lim;
+        this.isBlockingCCW = !lim;
+      }
+
+      // Inline CW classification (0 allocs)
+      const cwS = this.cwEdges.size;
+      if (cwS === 0) {
+        this.isLimitingCW = false;
+        this.isBlockingCW = false;
+      } else if (cwS > 1) {
+        this.isLimitingCW = false;
+        this.isBlockingCW = true;
+      } else {
+        const first = this.cwEdges.values().next().value;
+        const lim = first.isLimited(type);
+        this.isLimitingCW = lim;
+        this.isBlockingCW = !lim;
+      }
+    }));
+  }
+
+  // 4. ClockwiseSweepPolygon#_isVertexBehindActiveEdges: reuse scratch result object (0 allocs per sweep vertex)
+  const CSPCls = globalThis.foundry?.canvas?.geometry?.ClockwiseSweepPolygon;
+  if (CSPCls?.prototype?._isVertexBehindActiveEdges) {
+    const _behindScratch = { isBehind: false, wasLimited: false };
+    results.push(wrapTargetMethod(CSPCls.prototype, "_isVertexBehindActiveEdges", "ClockwiseSweepPolygon.prototype._isVertexBehindActiveEdges", function (wrapped, vertex, activeEdges) {
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(vertex, activeEdges);
+      const orient2d = globalThis.foundry?.utils?.orient2dFast;
+      if (!orient2d) return wrapped(vertex, activeEdges);
+      const polyType = this.config.type;
+      let wasLimited = false;
+      for (const edge of activeEdges) {
+        if (vertex.edges.has(edge)) continue;
+        if (orient2d(edge.vertexA, edge.vertexB, vertex) > 0) {
+          if (edge.isLimited(polyType) && !wasLimited) wasLimited = true;
+          else {
+            _behindScratch.isBehind = true;
+            _behindScratch.wasLimited = wasLimited;
+            return _behindScratch;
+          }
+        }
+      }
+      _behindScratch.isBehind = false;
+      _behindScratch.wasLimited = wasLimited;
+      return _behindScratch;
+    }));
+  }
+
   return results;
 }
 

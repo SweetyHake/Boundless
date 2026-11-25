@@ -642,8 +642,9 @@ export class TokenStreamer {
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
       let blockedByRoof = Boolean(roofHidden?.has?.(tok));
-      // Synchronous roof check before revealing/keeping a token on zoom-in/pan so it never flashes above an unmounted roof
-      if (!blockedByRoof && keepVisible && this.controller?.isTokenUnderBakedRoof?.(tok)) {
+      // Synchronous roof check ONLY when revealing a previously hidden token or when roof occlusion changed
+      // (avoids O(tokens * levels * tiles) scans on already-visible tokens during every 120Hz pan!)
+      if (!blockedByRoof && keepVisible && (!tok.renderable || this.controller?._roofTokenOccDirty || force) && this.controller?.isTokenUnderBakedRoof?.(tok)) {
         roofHidden?.add?.(tok);
         blockedByRoof = true;
       }

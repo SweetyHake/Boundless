@@ -205,7 +205,7 @@ function patchWallSprites() {
     const wc = this._getWallColor();
     const lw = getWallLineWidth();
 
-    this.line.clear();
+    if (this.line.geometry?.graphicsData?.length) this.line.clear();
     let sp = this._blLineSprite;
     if (!sp || sp.destroyed) {
       sp = new PIXI.Sprite(atlas.wallLine);
@@ -226,10 +226,14 @@ function patchWallSprites() {
     sp.tint = wc;
 
     const hitPad = Math.max(6, lw * 2);
-    const hitKey = `${c[0]},${c[1]},${c[2]},${c[3]},${hitPad}`;
-    const hitChanged = this._blHitKey !== hitKey || !this.line.hitArea;
+    const hitChanged = !this.line.hitArea ||
+      this._blHitX0 !== c[0] || this._blHitY0 !== c[1] ||
+      this._blHitX1 !== c[2] || this._blHitY1 !== c[3] ||
+      this._blHitPad !== hitPad;
     if (hitChanged) {
-      this._blHitKey = hitKey;
+      this._blHitX0 = c[0]; this._blHitY0 = c[1];
+      this._blHitX1 = c[2]; this._blHitY1 = c[3];
+      this._blHitPad = hitPad;
       this.line.hitArea = makeLineHitPolygon(c[0], c[1], c[2], c[3], hitPad);
     }
     if (this.doorControl) this.doorControl.reposition();
@@ -261,7 +265,7 @@ function patchWallSprites() {
     const cr = (this.hover || this.layer?.highlightObjects) ? lw * 4 : lw * 3;
     const dia = (cr + lw * 0.6) * 2;
 
-    this.endpoints.clear();
+    if (this.endpoints.geometry?.graphicsData?.length) this.endpoints.clear();
     if (!this._blEndA || this._blEndA.destroyed) {
       this._blEndA = new PIXI.Sprite(atlas.wallDot);
       this._blEndA.anchor.set(0.5);
@@ -285,7 +289,13 @@ function patchWallSprites() {
     this._blEndB.width = this._blEndB.height = dia;
     this._blEndB.tint = wc;
 
-    this.endpoints.hitArea = makeEndpointsHitArea(c[0], c[1], c[2], c[3], cr + lw);
+    const endR = cr + lw;
+    if (!this.endpoints.hitArea || this._blEndX0 !== c[0] || this._blEndY0 !== c[1] || this._blEndX1 !== c[2] || this._blEndY1 !== c[3] || this._blEndR !== endR) {
+      this._blEndX0 = c[0]; this._blEndY0 = c[1];
+      this._blEndX1 = c[2]; this._blEndY1 = c[3];
+      this._blEndR = endR;
+      this.endpoints.hitArea = makeEndpointsHitArea(c[0], c[1], c[2], c[3], endR);
+    }
   }, { type: "MIXED" });
 
   return [Boolean(okLine), Boolean(okEnd)];
@@ -536,6 +546,8 @@ function patchDnd5eMapLocationIcons() {
 // 4. Token UI Render Batching + Viewport Frustum Culling
 // ---------------------------------------------------------------------------
 
+const _vpWorldRect = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+
 function getStageViewportWorldRect(padWorld = 240) {
   const stage = globalThis.canvas?.stage;
   const renderer = globalThis.canvas?.app?.renderer;
@@ -547,30 +559,40 @@ function getStageViewportWorldRect(padWorld = 240) {
   const d = Number.isFinite(wt.d) ? wt.d : 1;
   const tx = Number.isFinite(wt.tx) ? wt.tx : 0;
   const ty = Number.isFinite(wt.ty) ? wt.ty : 0;
-  const det = a * d - b * c;
-  if (Math.abs(det) < 1e-6) return null;
-  const invDet = 1 / det;
   const scr = renderer.screen;
   const sx0 = scr.x, sx1 = scr.x + scr.width;
   const sy0 = scr.y, sy1 = scr.y + scr.height;
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  const corners = [[sx0, sy0], [sx1, sy0], [sx0, sy1], [sx1, sy1]];
-  for (let i = 0; i < 4; i++) {
-    const dx = corners[i][0] - tx;
-    const dy = corners[i][1] - ty;
-    const wx = (d * dx - c * dy) * invDet;
-    const wy = (-b * dx + a * dy) * invDet;
-    if (wx < minX) minX = wx;
-    if (wx > maxX) maxX = wx;
-    if (wy < minY) minY = wy;
-    if (wy > maxY) maxY = wy;
+
+  // Fast-path for unrotated stage (99.9% of scenes): 0 allocations, 4 scalar ops
+  if (b === 0 && c === 0) {
+    if (Math.abs(a) < 1e-6 || Math.abs(d) < 1e-6) return null;
+    const invA = 1 / a;
+    const invD = 1 / d;
+    const wx0 = (sx0 - tx) * invA;
+    const wx1 = (sx1 - tx) * invA;
+    const wy0 = (sy0 - ty) * invD;
+    const wy1 = (sy1 - ty) * invD;
+    _vpWorldRect.minX = (wx0 < wx1 ? wx0 : wx1) - padWorld;
+    _vpWorldRect.maxX = (wx0 > wx1 ? wx0 : wx1) + padWorld;
+    _vpWorldRect.minY = (wy0 < wy1 ? wy0 : wy1) - padWorld;
+    _vpWorldRect.maxY = (wy0 > wy1 ? wy0 : wy1) + padWorld;
+    return _vpWorldRect;
   }
-  return {
-    minX: minX - padWorld,
-    maxX: maxX + padWorld,
-    minY: minY - padWorld,
-    maxY: maxY + padWorld
-  };
+
+  const det = a * d - b * c;
+  if (Math.abs(det) < 1e-6) return null;
+  const invDet = 1 / det;
+  const dx0 = sx0 - tx, dx1 = sx1 - tx;
+  const dy0 = sy0 - ty, dy1 = sy1 - ty;
+  const x00 = (d * dx0 - c * dy0) * invDet, y00 = (-b * dx0 + a * dy0) * invDet;
+  const x10 = (d * dx1 - c * dy0) * invDet, y10 = (-b * dx1 + a * dy0) * invDet;
+  const x01 = (d * dx0 - c * dy1) * invDet, y01 = (-b * dx0 + a * dy1) * invDet;
+  const x11 = (d * dx1 - c * dy1) * invDet, y11 = (-b * dx1 + a * dy1) * invDet;
+  _vpWorldRect.minX = Math.min(x00, x10, x01, x11) - padWorld;
+  _vpWorldRect.maxX = Math.max(x00, x10, x01, x11) + padWorld;
+  _vpWorldRect.minY = Math.min(y00, y10, y01, y11) - padWorld;
+  _vpWorldRect.maxY = Math.max(y00, y10, y01, y11) + padWorld;
+  return _vpWorldRect;
 }
 
 function renderChildSafe(child, renderer) {
@@ -614,56 +636,94 @@ function hasCustomUnderlayChild(t) {
   return false;
 }
 
-function renderBatchedTokenPasses(renderer, visibleTokens) {
+const TP_TURN = 1 << 0;
+const TP_BORDER_LOW = 1 << 1;
+const TP_VOID = 1 << 2;
+const TP_DET = 1 << 3;
+const TP_BARS = 1 << 4;
+const TP_FX_LOW = 1 << 5;
+const TP_TARGETS = 1 << 6;
+const TP_NAME = 1 << 7;
+const TP_TOOLTIP = 1 << 8;
+const TP_LVL = 1 << 9;
+const TP_CUSTOM = 1 << 10;
+const TP_BORDER_HI = 1 << 11;
+const TP_FX_HI = 1 << 12;
+
+function isChildRenderable(c) {
+  return Boolean(c && !c.destroyed && c.visible && c.renderable && c.worldAlpha > 0);
+}
+
+function renderBatchedTokenPasses(renderer, visibleTokens, passMask) {
   const n = visibleTokens.length;
-  if (n === 0) return;
+  if (n === 0 || passMask === 0) return;
 
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
-  // Render normal-depth borders before voidMesh; hovered / highlighted borders (zIndex > 0) render after tooltip
-  // so voidMesh ERASE cutout never punches holes in hover borders on pop-out tokens (Hero in a Box / Multiple Rings).
-  for (let i = 0; i < n; i++) {
-    const b = visibleTokens[i].border;
-    if (b && (b.zIndex ?? 0) <= 0) renderChildSafe(b, renderer);
+  if (passMask & TP_TURN) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].turnMarker, renderer);
   }
-  // Render voidMesh (ERASE cutout) & detectionFilterMesh strictly BEFORE UI overlays (bars, effects, nameplates)
-  // so voidMesh never erases token bars, status icons, or tooltips.
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].voidMesh, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].detectionFilterMesh, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
-  for (let i = 0; i < n; i++) {
-    const t = visibleTokens[i];
-    const e = t.effects;
-    const bZ = t.border?.zIndex ?? 0;
-    if (e && !((e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0)) renderChildSafe(e, renderer);
-  }
-  for (let i = 0; i < n; i++) {
-    const t = visibleTokens[i];
-    renderChildSafe(t.targetArrows, renderer);
-    renderChildSafe(t.targetPips, renderer);
-  }
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].nameplate, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].tooltip, renderer);
-  for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].levelIndicator, renderer);
-
-  for (let i = 0; i < n; i++) {
-    const t = visibleTokens[i];
-    const tKids = t.children;
-    for (let j = 0; j < tKids.length; j++) {
-      const c = tKids[j];
-      if (isStandardTokenChild(t, c)) continue;
-      renderChildSafe(c, renderer);
+  if (passMask & TP_BORDER_LOW) {
+    for (let i = 0; i < n; i++) {
+      const b = visibleTokens[i].border;
+      if (b && (b.zIndex ?? 0) <= 0) renderChildSafe(b, renderer);
     }
   }
-  for (let i = 0; i < n; i++) {
-    const b = visibleTokens[i].border;
-    if (b && (b.zIndex ?? 0) > 0) renderChildSafe(b, renderer);
+  if (passMask & TP_VOID) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].voidMesh, renderer);
   }
-  // Render elevated effects (e.g. custom-dnd5e Radial Status Effects with effects.zIndex > border.zIndex) above borders
-  for (let i = 0; i < n; i++) {
-    const t = visibleTokens[i];
-    const e = t.effects;
-    const bZ = t.border?.zIndex ?? 0;
-    if (e && (e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0) renderChildSafe(e, renderer);
+  if (passMask & TP_DET) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].detectionFilterMesh, renderer);
+  }
+  if (passMask & TP_BARS) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].bars, renderer);
+  }
+  if (passMask & TP_FX_LOW) {
+    for (let i = 0; i < n; i++) {
+      const t = visibleTokens[i];
+      const e = t.effects;
+      const bZ = t.border?.zIndex ?? 0;
+      if (e && !((e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0)) renderChildSafe(e, renderer);
+    }
+  }
+  if (passMask & TP_TARGETS) {
+    for (let i = 0; i < n; i++) {
+      const t = visibleTokens[i];
+      renderChildSafe(t.targetArrows, renderer);
+      renderChildSafe(t.targetPips, renderer);
+    }
+  }
+  if (passMask & TP_NAME) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].nameplate, renderer);
+  }
+  if (passMask & TP_TOOLTIP) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].tooltip, renderer);
+  }
+  if (passMask & TP_LVL) {
+    for (let i = 0; i < n; i++) renderChildSafe(visibleTokens[i].levelIndicator, renderer);
+  }
+  if (passMask & TP_CUSTOM) {
+    for (let i = 0; i < n; i++) {
+      const t = visibleTokens[i];
+      const tKids = t.children;
+      for (let j = 0; j < tKids.length; j++) {
+        const c = tKids[j];
+        if (isStandardTokenChild(t, c)) continue;
+        renderChildSafe(c, renderer);
+      }
+    }
+  }
+  if (passMask & TP_BORDER_HI) {
+    for (let i = 0; i < n; i++) {
+      const b = visibleTokens[i].border;
+      if (b && (b.zIndex ?? 0) > 0) renderChildSafe(b, renderer);
+    }
+  }
+  if (passMask & TP_FX_HI) {
+    for (let i = 0; i < n; i++) {
+      const t = visibleTokens[i];
+      const e = t.effects;
+      const bZ = t.border?.zIndex ?? 0;
+      if (e && (e.zIndex ?? 0) > bZ && (e.zIndex ?? 0) > 0) renderChildSafe(e, renderer);
+    }
   }
 }
 
@@ -690,49 +750,79 @@ function attachTokenUiBatcher() {
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
     batchTokens.length = 0;
+    let passMask = 0;
 
     for (let i = 0; i < count; i++) {
       const tok = kids[i];
       if (!tok || tok.destroyed || !tok.visible || !tok.renderable || tok.worldAlpha <= 0) continue;
 
-      const hasLargeExtension = Boolean(
-        tok.turnMarker?.visible ||
-        tok._mask ||
-        (tok.filters && tok.filters.length) ||
-        hasAnyCustomChild(tok)
-      );
-      if (vp && !tok.controlled && !tok.hover && !tok.isPreview && !hasLargeExtension) {
-        const tx = tok.x ?? tok.document?.x ?? 0;
-        const ty = tok.y ?? tok.document?.y ?? 0;
-        const tw = tok.w || 100;
-        const th = tok.h || 100;
-        if (tx + tw < vp.minX || tx > vp.maxX || ty + th < vp.minY || ty > vp.maxY) {
-          perfStats.tokenCulledUi++;
-          continue;
+      // Single pass over tok.children to detect custom children & underlay children at once
+      let hasCustom = false;
+      let hasCustomUnderlay = false;
+      const tKids = tok.children;
+      if (tKids.length > 0) {
+        for (let j = 0; j < tKids.length; j++) {
+          const c = tKids[j];
+          if (!c || c.destroyed || !c.visible || !c.renderable || c.worldAlpha <= 0) continue;
+          if (!isStandardTokenChild(tok, c)) {
+            hasCustom = true;
+            if ((c.zIndex ?? 0) < 0) { hasCustomUnderlay = true; break; }
+          }
         }
       }
 
-      // Preserve exact z-order with complex tokens (masks, filters, vision-5e non-precise detections, under-token auras)
+      if (vp && !tok.controlled && !tok.hover && !tok.isPreview) {
+        const hasLargeExtension = hasCustom || Boolean(tok.turnMarker?.visible || tok._mask || (tok.filters && tok.filters.length));
+        if (!hasLargeExtension) {
+          const tx = tok.x ?? tok.document?.x ?? 0;
+          const ty = tok.y ?? tok.document?.y ?? 0;
+          const tw = tok.w || 100;
+          const th = tok.h || 100;
+          if (tx + tw < vp.minX || tx > vp.maxX || ty + th < vp.minY || ty > vp.maxY) {
+            perfStats.tokenCulledUi++;
+            continue;
+          }
+        }
+      }
+
       if (
         tok._mask ||
         (tok.filters && tok.filters.length) ||
         !tok.bars ||
         tok.detectionFilter != null ||
         (tok._detectionLevel !== undefined && tok._detectionLevel < 2) ||
-        hasCustomUnderlayChild(tok)
+        hasCustomUnderlay
       ) {
         if (batchTokens.length > 0) {
-          renderBatchedTokenPasses(renderer, batchTokens);
+          renderBatchedTokenPasses(renderer, batchTokens, passMask);
           batchTokens.length = 0;
+          passMask = 0;
         }
         tok.render(renderer);
       } else {
         batchTokens.push(tok);
+        if (isChildRenderable(tok.turnMarker)) passMask |= TP_TURN;
+        const b = tok.border;
+        const bZ = b?.zIndex ?? 0;
+        if (isChildRenderable(b)) passMask |= (bZ > 0 ? TP_BORDER_HI : TP_BORDER_LOW);
+        if (isChildRenderable(tok.voidMesh)) passMask |= TP_VOID;
+        if (isChildRenderable(tok.detectionFilterMesh)) passMask |= TP_DET;
+        if (isChildRenderable(tok.bars)) passMask |= TP_BARS;
+        const e = tok.effects;
+        if (isChildRenderable(e)) {
+          const eZ = e.zIndex ?? 0;
+          passMask |= ((eZ > bZ && eZ > 0) ? TP_FX_HI : TP_FX_LOW);
+        }
+        if (isChildRenderable(tok.targetArrows) || isChildRenderable(tok.targetPips)) passMask |= TP_TARGETS;
+        if (isChildRenderable(tok.nameplate)) passMask |= TP_NAME;
+        if (isChildRenderable(tok.tooltip)) passMask |= TP_TOOLTIP;
+        if (isChildRenderable(tok.levelIndicator)) passMask |= TP_LVL;
+        if (hasCustom) passMask |= TP_CUSTOM;
       }
     }
 
     if (batchTokens.length > 0) {
-      renderBatchedTokenPasses(renderer, batchTokens);
+      renderBatchedTokenPasses(renderer, batchTokens, passMask);
       batchTokens.length = 0;
     }
     perfStats.tokenBatchedFrames++;
@@ -757,27 +847,35 @@ function attachLightingLayerBatcher() {
     if (this._mask || (this.filters && this.filters.length) || this.cullable) return wrapped(renderer);
     const kids = this.children;
     const count = kids.length;
-    if (count < 32) return wrapped(renderer);
+    if (count < 8) return wrapped(renderer);
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
     const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
     const distPx = globalThis.canvas?.dimensions?.distancePixels || 20;
     visLights.length = 0;
     complexLights.length = 0;
+    let hasExtraChildren = false;
     for (let i = 0; i < count; i++) {
       const al = kids[i];
       if (!al || al.destroyed || !al.visible || !al.renderable || al.worldAlpha <= 0) continue;
       if (vp && !al.controlled && !al.hover && !al.isPreview) {
         const lx = al.document?.x ?? al.x ?? 0;
         const ly = al.document?.y ?? al.y ?? 0;
-        const cfgR = Math.max(al.document?.config?.dim || 0, al.document?.config?.bright || 0) * distPx;
-        const r = Math.max(80, al.radius || al.lightSource?.radius || cfgR || 100);
+        let r = al.radius || al.lightSource?.radius || 0;
+        if (!r) {
+          const cfgR = Math.max(al.document?.config?.dim || 0, al.document?.config?.bright || 0) * distPx;
+          r = cfgR || 100;
+        }
+        if (r < 80) r = 80;
         if (lx + r < vp.minX || lx - r > vp.maxX || ly + r < vp.minY || ly - r > vp.maxY) continue;
       }
       if (al._mask || (al.filters && al.filters.length)) {
         complexLights.push(al);
       } else {
         visLights.push(al);
+        const ctrl = al.controls ?? al.controlIcon;
+        const expected = (al.field ? 1 : 0) + (ctrl ? 1 : 0);
+        if (al.children.length > expected) hasExtraChildren = true;
       }
     }
 
@@ -788,15 +886,17 @@ function attachLightingLayerBatcher() {
     for (let i = 0; i < n; i++) renderChildSafe(visLights[i].field, renderer);
     // Pass 2: controls (batched sprites)
     for (let i = 0; i < n; i++) renderChildSafe(visLights[i].controls ?? visLights[i].controlIcon, renderer);
-    // Pass 3: remaining children (tooltips, custom overlays)
-    for (let i = 0; i < n; i++) {
-      const al = visLights[i];
-      const ctrl = al.controls ?? al.controlIcon;
-      const alKids = al.children;
-      for (let j = 0; j < alKids.length; j++) {
-        const c = alKids[j];
-        if (c === al.field || c === ctrl) continue;
-        renderChildSafe(c, renderer);
+    // Pass 3: remaining children (only if any light actually has extra overlays/tooltips)
+    if (hasExtraChildren) {
+      for (let i = 0; i < n; i++) {
+        const al = visLights[i];
+        const ctrl = al.controls ?? al.controlIcon;
+        const alKids = al.children;
+        for (let j = 0; j < alKids.length; j++) {
+          const c = alKids[j];
+          if (c === al.field || c === ctrl) continue;
+          renderChildSafe(c, renderer);
+        }
       }
     }
     perfStats.lightingLayerBatched++;
@@ -1028,16 +1128,187 @@ function patchAnimatedLightShaders() {
   // Always bind uBoundlessNoise whenever a compiled program references it (shader programs stay cached on classes even if setting toggles off)
   wrapTargetMethod(Adaptive, "create", "AdaptiveLightingShader.create", function (wrapped, uniforms = {}, options = {}) {
     const shader = wrapped(uniforms, options);
-    if (shader?.program?.fragmentSrc?.includes("uBoundlessNoise")) {
-      const tex = getNoiseLutTexture();
-      if (tex && shader.uniforms) {
-        shader.uniforms.uBoundlessNoise = tex;
+    const prog = shader?.program;
+    if (prog) {
+      if (prog._blHasNoise === undefined) {
+        prog._blHasNoise = Boolean(prog.fragmentSrc?.includes("uBoundlessNoise"));
+      }
+      if (prog._blHasNoise) {
+        const tex = getNoiseLutTexture();
+        if (tex && shader.uniforms) {
+          shader.uniforms.uBoundlessNoise = tex;
+        }
       }
     }
     return shader;
   });
 
   return patchedClasses.size > 0;
+}
+
+// ---------------------------------------------------------------------------
+// 6b. WeatherEffects Empty Mask Skip, PrimarySpriteMesh updateTransform Fast-Path & Dirty CanvasDepthMask
+// ---------------------------------------------------------------------------
+
+function patchV14CoreRenderPasses() {
+  const results = [];
+
+  // 1. WeatherEffects#render: skip 2 batch flushes + scene mask push/pop on every frame when scene has no weather
+  const WeatherCls = globalThis.foundry?.canvas?.layers?.WeatherEffects ?? globalThis.WeatherEffects;
+  if (WeatherCls?.prototype?.render) {
+    results.push(wrapTargetMethod(WeatherCls.prototype, "render", "WeatherEffects.prototype.render", function (wrapped, renderer) {
+      if (
+        PERF_CONFIG.perfEnabled &&
+        (!this.effects || this.effects.size === 0) &&
+        (!this.weatherEffects || this.weatherEffects.children.length === 0) &&
+        this.children.length <= 2
+      ) {
+        return;
+      }
+      return wrapped(renderer);
+    }));
+  }
+
+  // 2. PrimarySpriteMesh#updateTransform: bypass hoverFade/occlusionState bookkeeping on 95% of non-occluding static meshes
+  const PrimarySpriteCls = globalThis.foundry?.canvas?.primary?.PrimarySpriteMesh;
+  const SpriteMeshCls = globalThis.foundry?.canvas?.containers?.SpriteMesh;
+  const baseSpriteUpdateTransform = SpriteMeshCls?.prototype?.updateTransform;
+  if (PrimarySpriteCls?.prototype?.updateTransform && typeof baseSpriteUpdateTransform === "function") {
+    results.push(wrapTargetMethod(PrimarySpriteCls.prototype, "updateTransform", "PrimarySpriteMesh.prototype.updateTransform", function (wrapped) {
+      if (PERF_CONFIG.perfEnabled && this.occlusionMode === 0 && !this.occluded) {
+        const hfs = this._hoverFadeState;
+        const os = this._occlusionState;
+        if (
+          (!hfs || (!hfs.hovered && !hfs.faded && !hfs.fading && hfs.occlusion === 0)) &&
+          (!os || (os.fade === 0 && os.radial === 0 && os.vision === 0 && os.surface === 0))
+        ) {
+          return baseSpriteUpdateTransform.call(this);
+        }
+      }
+      return wrapped();
+    }));
+  }
+
+  // 3. Dirty-driven CanvasDepthMask (autoRender = false) on standard scenes:
+  // eliminates full-screen RGB depth FBO clear + primary children traversal on every idle frame!
+  const DepthMaskCls = globalThis.foundry?.canvas?.layers?.CanvasDepthMask;
+  const OccMaskCls = globalThis.foundry?.canvas?.layers?.CanvasOcclusionMask;
+  if (DepthMaskCls?.prototype?.render && OccMaskCls?.prototype?.render) {
+    let depthPcos = [];
+    let lastPrimaryLen = -1;
+    let pcoListDirty = true;
+    let lastStageWorldId = -1;
+    let lastDepthSigH1 = 0;
+    let lastDepthSigH2 = 0;
+    let lastDepthSigCount = -1;
+
+    const rebuildDepthPcos = () => {
+      depthPcos.length = 0;
+      const kids = globalThis.canvas?.primary?.children;
+      lastPrimaryLen = kids ? kids.length : 0;
+      if (!kids) { pcoListDirty = false; return; }
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (!c || c.destroyed) continue;
+        if (c.shouldRenderDepth) depthPcos.push(c);
+        else if (c.children?.length && typeof c.renderDepthData === "function") depthPcos.push(c);
+      }
+      pcoListDirty = false;
+    };
+
+    // OcclusionMask renders right before DepthMask and feeds depth shader's occlusionTexture
+    results.push(wrapTargetMethod(OccMaskCls.prototype, "render", "CanvasOcclusionMask.prototype.render", function (wrapped, renderer) {
+      if (PERF_CONFIG.perfEnabled && !globalThis.Boundless?.active && (this.autoRender || this.renderDirty)) {
+        const dm = globalThis.canvas?.masks?.depth;
+        if (dm) dm.renderDirty = true;
+      }
+      return wrapped(renderer);
+    }));
+
+    if (typeof DepthMaskCls.prototype._update === "function") {
+      results.push(wrapTargetMethod(DepthMaskCls.prototype, "_update", "CanvasDepthMask.prototype._update", function (wrapped) {
+        if (this._elevationDirty) {
+          this.renderDirty = true;
+          pcoListDirty = true;
+        }
+        return wrapped();
+      }));
+    }
+
+    if (typeof DepthMaskCls.prototype.clear === "function") {
+      results.push(wrapTargetMethod(DepthMaskCls.prototype, "clear", "CanvasDepthMask.prototype.clear", function (wrapped) {
+        this.renderDirty = true;
+        pcoListDirty = true;
+        return wrapped();
+      }));
+    }
+
+    results.push(wrapTargetMethod(DepthMaskCls.prototype, "render", "CanvasDepthMask.prototype.render", function (wrapped, renderer) {
+      // Boundless mega-scenes manage depthMask.autoRender themselves; only optimize standard scenes here
+      if (globalThis.Boundless?.active) return wrapped(renderer);
+      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) {
+        if (this._blStdAutoRenderPatched) {
+          this.autoRender = true;
+          this._blStdAutoRenderPatched = false;
+        }
+        return wrapped(renderer);
+      }
+      if (!this._blStdAutoRenderPatched) {
+        this.autoRender = false;
+        this.renderDirty = true;
+        this._blStdAutoRenderPatched = true;
+        pcoListDirty = true;
+      }
+      if (!this.renderDirty) {
+        const stageId = globalThis.canvas?.stage?.transform?._worldID ?? -1;
+        const primaryLen = globalThis.canvas?.primary?.children?.length ?? 0;
+        if (stageId !== lastStageWorldId) {
+          lastStageWorldId = stageId;
+          this.renderDirty = true;
+        } else {
+          if (pcoListDirty || primaryLen !== lastPrimaryLen) rebuildDepthPcos();
+          let h1 = 2166136261 >>> 0;
+          let h2 = 0;
+          let count = 0;
+          let forceVideo = false;
+          for (let i = 0; i < depthPcos.length; i++) {
+            const p = depthPcos[i];
+            if (!p || p.destroyed) { pcoListDirty = true; this.renderDirty = true; break; }
+            if (p.isVideo && p.sourceElement && !p.sourceElement.paused) { forceVideo = true; break; }
+            const vis = (p.visible && p.renderable) ? 1 : 0;
+            const os = p._occlusionState;
+            const occBits = os
+              ? ((Math.round((os.fade || 0) * 100) & 255) | ((Math.round((os.radial || 0) * 100) & 255) << 8) | ((Math.round((os.vision || 0) * 100) & 255) << 16) | ((Math.round((os.surface || 0) * 100) & 255) << 24))
+              : 0;
+            const v1 = ((p.transform?._worldID | 0) ^ ((p.texture?.baseTexture?._updateID | 0) << 5) ^ ((p._restrictionState | 0) << 12) ^ (vis << 20)) | 0;
+            const v2 = (occBits ^ (Math.round((p.textureAlphaThreshold ?? 0.75) * 100) << 3)) | 0;
+            h1 = Math.imul(h1 ^ v1 ^ v2, 16777619) >>> 0;
+            h2 = ((h2 << 5) - h2 + v1 + v2 + 1) | 0;
+            count++;
+          }
+          if (forceVideo || count !== lastDepthSigCount || h1 !== lastDepthSigH1 || h2 !== lastDepthSigH2) {
+            lastDepthSigCount = count;
+            lastDepthSigH1 = h1;
+            lastDepthSigH2 = h2;
+            this.renderDirty = true;
+          }
+        }
+      } else {
+        lastStageWorldId = globalThis.canvas?.stage?.transform?._worldID ?? -1;
+      }
+      return wrapped(renderer);
+    }));
+
+    Hooks.on("canvasTearDown", () => {
+      depthPcos.length = 0;
+      lastPrimaryLen = -1;
+      pcoListDirty = true;
+      lastStageWorldId = -1;
+      lastDepthSigCount = -1;
+    });
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1435,7 @@ export function installGpuPerfEngine() {
     patchDnd5eMapLocationIcons();
     patchTokenUiCaching();
     patchAnimatedLightShaders();
+    patchV14CoreRenderPasses();
   }
 
   Hooks.once("ready", () => {

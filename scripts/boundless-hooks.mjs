@@ -51,11 +51,53 @@ export function installHoverFadeHitTestPatch(controller) {
   if (!PCG?.prototype?._onMouseMove || !PSM?.prototype?.containsCanvasPoint) return;
 
   const origOnMouseMove = PCG.prototype._onMouseMove;
-  PCG.prototype._onMouseMove = function (...args) {
-    if (!controller?.active && !PERF_CONFIG.perfEnabled) return origOnMouseMove.apply(this, args);
+  let _hasActiveHoverFade = false;
+  PCG.prototype._onMouseMove = function (currentPos, hasMouseMoved, ...rest) {
+    if (!controller?.active && !PERF_CONFIG.perfEnabled) {
+      return origOnMouseMove.call(this, currentPos, hasMouseMoved, ...rest);
+    }
+    // Fast O(1) early-exit when no hoverFade is currently active and pointer is either outside visible/explored
+    // area or no elevated hoverFade objects exist above baseElev (avoids quadtree queries on every 1000Hz pointermove!)
+    if (!_hasActiveHoverFade && !canvas.activeLayer?.hover) {
+      if (!(canvas.mousePositionVisible || canvas.mousePositionExplored)) return;
+      if (currentPos && Number.isFinite(currentPos.x) && Number.isFinite(currentPos.y)) {
+        const objs = this.objects;
+        const baseElev = Number.isFinite(canvas.level?.elevation?.base)
+          ? canvas.level.elevation.base
+          : (Number.isFinite(canvas.level?.elevation?.bottom) ? canvas.level.elevation.bottom : 0);
+        let anyElevatedCandidate = false;
+        if (objs?.length) {
+          for (let i = 0; i < objs.length; i++) {
+            const o = objs[i];
+            if (!o || o.destroyed || !o.visible || !o.renderable || !o.hoverFade) continue;
+            if ((o.elevation ?? 0) > baseElev) {
+              const cb = o.canvasBounds;
+              if (!cb || (currentPos.x >= cb.x && currentPos.x <= cb.x + cb.width && currentPos.y >= cb.y && currentPos.y <= cb.y + cb.height)) {
+                anyElevatedCandidate = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!anyElevatedCandidate) return;
+      }
+    }
     _inHoverFadeHitTest = true;
     try {
-      return origOnMouseMove.apply(this, args);
+      const res = origOnMouseMove.call(this, currentPos, hasMouseMoved, ...rest);
+      let active = false;
+      const objs = this.objects;
+      if (objs?.length) {
+        for (let i = 0; i < objs.length; i++) {
+          const hfs = objs[i]?._hoverFadeState;
+          if (hfs && (hfs.hovered || hfs.fading || hfs.faded || hfs.occlusion > 0)) {
+            active = true;
+            break;
+          }
+        }
+      }
+      _hasActiveHoverFade = active;
+      return res;
     } finally {
       _inHoverFadeHitTest = false;
     }

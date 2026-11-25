@@ -1027,12 +1027,30 @@ export const overlayMethods = {
       if (!layer?.spec) continue;
       const { simGrid, simSectorPx, spec, level } = layer;
       const layerId = level.id;
+      const tileRev = this.tileEditsRev || 0;
+      if (layer._roofCheckRev !== tileRev || layer._roofCheckSpec !== spec) {
+        layer._roofCheckRev = tileRev;
+        layer._roofCheckSpec = spec;
+        let hasOv = false;
+        if (spec.overlays) {
+          for (const _ in spec.overlays) { hasOv = true; break; }
+        }
+        layer._hasRoofOverlays = hasOv;
+        let hasMinZ = Boolean(this.tileEdits?.get?.(layerId)?.size);
+        if (!hasMinZ && spec.tiles?.length) {
+          for (let ti = 0; ti < spec.tiles.length; ti++) {
+            if (spec.tiles[ti]?.minZ !== undefined) { hasMinZ = true; break; }
+          }
+        }
+        layer._hasMinZTiles = hasMinZ;
+      }
+      if (!layer._hasRoofOverlays && !layer._hasMinZTiles) continue;
       const topElev = getLevelRoofElevation(level);
       const sx = Math.max(0, Math.min(simGrid - 1, Math.floor(tx / simSectorPx)));
       const sy = Math.max(0, Math.min(simGrid - 1, Math.floor(ty / simSectorPx)));
 
       // 1. Check baked building roofs across 3x3 neighbor sectors (buildings like taverns can straddle sector borders)
-      if (tokElev < topElev && spec.overlays && spec.sectors) {
+      if (layer._hasRoofOverlays && tokElev < topElev && spec.overlays && spec.sectors) {
         const hideRoofsForUpperView = !level.isView && viewedBottom >= topElev;
         if (!hideRoofsForUpperView) {
           for (let dy = -1; dy <= 1; dy++) {
@@ -1059,7 +1077,7 @@ export const overlayMethods = {
       }
 
       // 2. Check virtual tiles with minZ (or elevated roof/canopy tiles) sitting above this point that are NOT yet mounted & opaque
-      if (spec.tiles?.length) {
+      if (layer._hasMinZTiles && spec.tiles?.length) {
         const candidateTids = this._collectVirtualTileCandidates(
           layerId, spec,
           Math.max(0, sx - 1), Math.max(0, sy - 1),

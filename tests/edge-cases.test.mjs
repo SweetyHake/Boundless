@@ -2733,3 +2733,73 @@ test("MegaLightBatch.updateViewport uses hysteresis cull box to avoid redundant 
   lb.updateViewport({ x0: 180, y0: 140, x1: 980, y1: 640, scale: 1 });
   assert.equal(bufUpdates, 1, "small pan inside hysteresis box must not re-upload indexBuffer");
 });
+
+test("wrapTargetMethod zero-alloc direct wrapper preserves reentrant `this` and 0..6 arguments", async () => {
+  const { wrapTargetMethod } = await import("../scripts/perf-patcher.mjs");
+
+  const obj = {
+    tag: "A",
+    inner(x) { return `${this.tag}:${x}`; },
+    outer(a, b, c, d, e) { return `${this.inner(a + b)}|${c},${d},${e}`; }
+  };
+  const obj2 = { tag: "B", inner: obj.inner };
+
+  wrapTargetMethod(obj, "inner", "test.reentrant.inner", function (wrapped, x) {
+    return `[${wrapped(x * 2)}]`;
+  });
+  wrapTargetMethod(obj, "outer", "test.reentrant.outer", function (wrapped, a, b, c, d, e) {
+    const other = obj.inner.call(obj2, 5);
+    return `${other}+${wrapped(a, b, c, d, e)}`;
+  });
+
+  assert.equal(obj.outer(1, 2, 3, 4, 5), "[B:10]+[A:6]|3,4,5");
+});
+
+test("pyramidMethods._isRectOccludedByUpperLevels uses O(1) 2D prefix sum accurately", async () => {
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+
+  // 4x4 mask where (2,2) is transparent (alpha=0) and all other 15 pixels are opaque (alpha=255)
+  const dim = 4;
+  const stride = dim + 1;
+  const alpha = new Uint8Array(dim * dim).fill(255);
+  alpha[2 * dim + 2] = 0;
+  const prefix = new Uint32Array(stride * stride);
+  for (let py = 0; py < dim; py++) {
+    let rowSum = 0;
+    for (let px = 0; px < dim; px++) {
+      if (alpha[py * dim + px] >= 240) rowSum++;
+      prefix[(py + 1) * stride + (px + 1)] = prefix[py * stride + (px + 1)] + rowSum;
+    }
+  }
+  const lower = { level: { id: "l0", isView: false, elevation: { bottom: 0, top: 20 } }, isUpper: false };
+  const upper = {
+    level: { id: "l1", isView: true, elevation: { bottom: 20, top: 40 } },
+    isUpper: false,
+    opacityMask: { alpha, prefix, stride, w: dim, h: dim, x0: 0, y0: 0, worldW: 400, worldH: 400 }
+  };
+  const ctrl = { ...pyramidMethods, visibleLevelLayers: [lower, upper] };
+
+  assert.equal(ctrl._isRectOccludedByUpperLevels(lower, 10, 10, 80, 80), true, "fully opaque quadrant (pixels 0..1) must be occluded");
+  assert.equal(ctrl._isRectOccludedByUpperLevels(lower, 180, 180, 150, 150), false, "rect containing transparent pixel (2,2) must NOT be occluded");
+});
+
+test("ChunkedFogManager.updateViewportCulling caches chunk coordinates and updates on boundary crossing", async () => {
+  installBaseGlobals();
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  const mgr = new ChunkedFogManager();
+  mgr.enabled = true;
+  const s0 = { visible: false };
+  const s2 = { visible: true };
+  mgr.chunks.set("0_0", { cx: 0, cy: 0, sprite: s0 });
+  mgr.chunks.set("2_0", { cx: 2, cy: 0, sprite: s2 });
+
+  mgr.updateViewportCulling({ x0: 100, y0: 100, x1: 1000, y1: 1000 });
+  assert.equal(s0.visible, true);
+  assert.equal(s2.visible, false);
+
+  // Move viewport to chunk 2_0 -> visibility must flip
+  mgr.updateViewportCulling({ x0: 10100, y0: 100, x1: 11000, y1: 1000 });
+  assert.equal(s0.visible, false);
+  assert.equal(s2.visible, true);
+});

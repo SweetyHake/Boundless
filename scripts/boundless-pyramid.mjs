@@ -360,15 +360,32 @@ export const pyramidMethods = {
       ctx.drawImage(src, 0, 0, dim, dim);
       const rgba = ctx.getImageData(0, 0, dim, dim).data;
       const alpha = new Uint8Array(dim * dim);
+      // Build 2D Integral Image (prefix sum of opaque pixels) for O(1) rectangular occlusion queries (4 array reads!)
+      const stride = dim + 1;
+      const prefix = new Uint32Array(stride * stride);
       let opaqueCount = 0;
-      for (let i = 0, p = 3; i < alpha.length; i++, p += 4) {
-        const a = rgba[p];
-        alpha[i] = a;
-        if (a >= 240) opaqueCount++;
+      for (let py = 0; py < dim; py++) {
+        const rowA = py * dim;
+        const rowP = (py + 1) * stride;
+        const prevP = py * stride;
+        let rowSum = 0;
+        for (let px = 0; px < dim; px++) {
+          const a = rgba[(rowA + px) * 4 + 3];
+          alpha[rowA + px] = a;
+          if (a >= 240) {
+            opaqueCount++;
+            rowSum++;
+          }
+          prefix[rowP + px + 1] = prefix[prevP + px + 1] + rowSum;
+        }
       }
+      cv.width = 0;
+      cv.height = 0;
       if (opaqueCount === 0) return;
       layer.opacityMask = {
         alpha,
+        prefix,
+        stride,
         w: dim,
         h: dim,
         x0: e.x0,
@@ -420,6 +437,14 @@ export const pyramidMethods = {
       const iy0 = Math.max(0, Math.floor((ry - m.y0) * sy));
       const ix1 = Math.min(m.w - 1, Math.ceil((rx + rw - m.x0) * sx));
       const iy1 = Math.min(m.h - 1, Math.ceil((ry + rh - m.y0) * sy));
+      if (m.prefix) {
+        const st = m.stride;
+        const p = m.prefix;
+        const total = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
+        const opaque = p[(iy1 + 1) * st + (ix1 + 1)] - p[iy0 * st + (ix1 + 1)] - p[(iy1 + 1) * st + ix0] + p[iy0 * st + ix0];
+        if (opaque === total) return true;
+        continue;
+      }
       const data = m.alpha;
       const mw = m.w;
       let allOpaque = true;
@@ -899,7 +924,6 @@ export const pyramidMethods = {
     // Update GPU light frustum culling, spatial chunk streaming, POI pin scale, chunked fog culling, spatial audio, and native streamed walls/doors
     this.chunkStreamer.update(vp);
     this.lightBatch.updateViewport(stableVp);
-    this._optimizeEffectsLayers(canvas.effects);
     this.poiManager.updateViewport(stableVp);
     this.charPins.updateViewport();
     this.fogManager.updateViewportCulling(stableVp);
@@ -915,8 +939,9 @@ export const pyramidMethods = {
       this.layerEditors.syncViewport(false, stableVp);
     }
     if (this.lightBatch.useDepthTexture || this.activeOverlays.size > 0 || this.visibleLevelLayers.length > 1 || this._hasMultiElevationDepth()) {
-      this._depthDirty = true;
+      // Set renderDirty directly without also raising _depthDirty (avoids rendering CanvasDepthMask twice on consecutive frames!)
       if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
+      else this._depthDirty = true;
     }
 
     let anyTilesOrOverlaysChanged = false;
@@ -1407,8 +1432,16 @@ export const pyramidMethods = {
 
   _setNativeLevelTextureVisible(level, kind, visible) {
     const store = kind === "foreground" ? this._hiddenNativeLevelFg : this._hiddenNativeLevelBg;
-    const lt = canvas.primary?.levelTextures?.find(m => m.name === `Level.${level.index}.${kind}`);
-    if (!lt) return;
+    let lt = store.get(level.id);
+    if (!lt || lt.destroyed) {
+      const targetName = `Level.${level.index}.${kind}`;
+      const list = canvas.primary?.levelTextures;
+      if (!list?.length) return;
+      for (let i = 0; i < list.length; i++) {
+        if (list[i]?.name === targetName) { lt = list[i]; break; }
+      }
+      if (!lt) return;
+    }
     if (!visible) {
       if (lt.visible) {
         lt.visible = false;

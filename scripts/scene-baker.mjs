@@ -294,7 +294,9 @@ async function sliceAndUploadPyramid({
   allPendingUploads,
   onTileProgress
 }) {
-  const texCfg = level.textures || level.background || {};
+  const texCfg = skipEmptyAlpha
+    ? (level.foreground || {})
+    : (level.textures || level.background || {});
   const bgOffX = Number(texCfg.offsetX) || 0;
   const bgOffY = Number(texCfg.offsetY) || 0;
   const bgScaleX = Number.isFinite(Number(texCfg.scaleX)) && Number(texCfg.scaleX) !== 0 ? Number(texCfg.scaleX) : 1;
@@ -413,6 +415,11 @@ async function sliceAndUploadPyramid({
       }
     }
     await flushUploads(0);
+  }
+
+  if (work?.canvas) { work.canvas.width = 0; work.canvas.height = 0; }
+  if (mipProxy?.source && "width" in mipProxy.source) {
+    try { mipProxy.source.width = 0; mipProxy.source.height = 0; } catch {}
   }
 
   return {

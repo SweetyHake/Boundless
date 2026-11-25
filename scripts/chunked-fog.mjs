@@ -1,4 +1,4 @@
-import { MODULE_ID } from "./utils.mjs";
+import { MODULE_ID, hasTokenPermissionLazy } from "./utils.mjs";
 
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const CHUNK_WORLD_PX = 5000; // 50x50 cells per chunk (20x20 grid on 1000x1000 world)
@@ -605,10 +605,21 @@ export class ChunkedFogManager {
       const h = (sh / scale) * 0.65;
       vp = { x0: pivot.x - w, y0: pivot.y - h, x1: pivot.x + w, y1: pivot.y + h };
     }
+    const cx0 = Math.floor(vp.x0 / CHUNK_WORLD_PX);
+    const cy0 = Math.floor(vp.y0 / CHUNK_WORLD_PX);
+    const cx1 = Math.floor(vp.x1 / CHUNK_WORLD_PX);
+    const cy1 = Math.floor(vp.y1 / CHUNK_WORLD_PX);
+    const n = this.chunks.size;
+    if (cx0 === this._lastCullCx0 && cy0 === this._lastCullCy0 && cx1 === this._lastCullCx1 && cy1 === this._lastCullCy1 && n === this._lastCullSize) {
+      return;
+    }
+    this._lastCullCx0 = cx0;
+    this._lastCullCy0 = cy0;
+    this._lastCullCx1 = cx1;
+    this._lastCullCy1 = cy1;
+    this._lastCullSize = n;
     for (const chunk of this.chunks.values()) {
-      const x0 = chunk.cx * CHUNK_WORLD_PX;
-      const y0 = chunk.cy * CHUNK_WORLD_PX;
-      chunk.sprite.visible = !(x0 + CHUNK_WORLD_PX < vp.x0 || x0 > vp.x1 || y0 + CHUNK_WORLD_PX < vp.y0 || y0 > vp.y1);
+      chunk.sprite.visible = !(chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1);
     }
   }
 
@@ -626,7 +637,7 @@ export class ChunkedFogManager {
       || targetScene.navigation
       || targetScene.testUserPermission?.(sender, "LIMITED")
       || targetScene.tokens?.some?.(t => {
-        if (!t?.testUserPermission?.(sender, "OBSERVER")) return false;
+        if (!hasTokenPermissionLazy(t, sender, "OBSERVER")) return false;
         if (targetLevelId && t.level && t.level !== targetLevelId) return false;
         return true;
       })
@@ -968,6 +979,9 @@ export class ChunkedFogManager {
     if (chunk.texture && !chunk.texture.destroyed) {
       try { chunk.texture.destroy(true); } catch {}
     }
+    if (chunk.canvas) { chunk.canvas.width = 0; chunk.canvas.height = 0; }
+    if (chunk.sharedCanvas) { chunk.sharedCanvas.width = 0; chunk.sharedCanvas.height = 0; }
+    if (chunk.privateCanvas) { chunk.privateCanvas.width = 0; chunk.privateCanvas.height = 0; }
   }
 
   // ===== Persistence (Server Flags + Fast Local Cache) =====
