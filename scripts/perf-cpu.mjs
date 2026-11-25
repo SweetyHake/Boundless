@@ -642,8 +642,10 @@ function patchFogAndOcclusion() {
 
 function getDragWindowMs() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce) return 0;
-  // Preserve silky 120–144 Hz responsiveness when drag recalc is fast; only throttle adaptively when heavy
-  return Math.min(50, Math.max(6, _dragRecalcMs * 2));
+  // Preserve zero-overhead native 144 Hz drag when recalc is fast (< 2.5 ms);
+  // engage adaptive coalescing automatically as soon as drag recalc becomes heavy (e.g. live vision+fog on large maps).
+  if (_dragRecalcMs < 2.5) return 0;
+  return Math.min(50, _dragRecalcMs * 2);
 }
 
 function clearDragPending() {
@@ -679,13 +681,15 @@ function flushDragDestination(forceSync = false, overrideEvent = null) {
 
 function patchDragAndMovement() {
   const okMove = wrapFoundryMethod("Token", "_onDragLeftMove", function (wrapped, event) {
-    const ms = getDragWindowMs();
     const dest = event?.interactionData?.destination;
-    if (!ms || !Number.isFinite(dest?.x) || !Number.isFinite(dest?.y)) return wrapped(event);
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce || !Number.isFinite(dest?.x) || !Number.isFinite(dest?.y)) {
+      return wrapped(event);
+    }
 
+    const ms = getDragWindowMs();
     const now = performance.now();
     const elapsed = now - _dragQ.last;
-    if (elapsed >= ms) {
+    if (ms === 0 || elapsed >= ms) {
       _dragQ.last = now;
       clearDragPending();
       perfStats.dragDestRun++;
@@ -728,9 +732,10 @@ function patchDragAndMovement() {
     return wrapped(...args);
   }, { type: "WRAPPER" });
 
-  // On cancel / finalize, simply cancel any stale pending timer without running extra recalc
+  // On cancel / finalize, simply cancel any stale pending timer and reset recalc EMA
   const okFinal = wrapFoundryMethod("Token", "_finalizeDragLeft", function (wrapped, ...args) {
     clearDragPending();
+    _dragRecalcMs = 0;
     return wrapped(...args);
   }, { type: "WRAPPER" });
 

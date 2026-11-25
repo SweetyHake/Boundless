@@ -2580,3 +2580,53 @@ test("TokenImpostorLayer evicts LRU atlas slots when full and resets atlas on fl
   assert.equal(atlasUpdates, 1, "forceAtlas flush must immediately upload atlasTexture");
   assert.equal(layer.atlasDirty, false);
 });
+
+test("overlayMethods.syncVirtualTiles deduplicates shared multi-level virtual tiles across visible levels", async () => {
+  installBaseGlobals();
+  const { overlayMethods } = await import("../scripts/boundless-overlays.mjs");
+
+  const sharedTile = {
+    src: "props/table.webp", x: 100, y: 100, w: 200, h: 200,
+    elevation: 0, rot: 0, sort: 0, alpha: 1
+  };
+  const mounted = [];
+  const ctrl = {
+    ...overlayMethods,
+    activeVirtualTiles: new Map(),
+    virtualTilePending: new Set(),
+    pendingVirtualTileMounts: [],
+    _pendingVirtualTileKeys: new Set(),
+    tileEditsRev: 0,
+    _mountGen: 1,
+    texMgr: {
+      getSync: () => ({ valid: true }),
+      load: async () => null
+    },
+    isActivelyMoving: () => false,
+    _shouldMountInteriorTiles: () => true,
+    _collectVirtualTileCandidates: () => [0],
+    resolveVirtualTile: (_lid, _tid, raw) => raw,
+    _isVirtualTileOccludedByUpper: () => false,
+    getViewportWorldRect: () => ({ x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 }),
+    _mountVirtualTileMesh: (fullId) => { mounted.push(fullId); }
+  };
+
+  const makeLayer = (id, isView) => ({
+    level: { id, isView, elevation: { bottom: 0, top: 20 } },
+    simGrid: 2,
+    simSectorPx: 1000,
+    zOffset: 0,
+    lastTileKey: "",
+    spec: { tiles: [sharedTile], sectors: { "0_0": { t: [0] } } }
+  });
+  const upper = makeLayer("lvlUpper", true);
+  const lower = makeLayer("lvlLower", false);
+  const vp = { x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 };
+  const sharedVtSeen = new Set();
+
+  ctrl.syncVirtualTiles(upper, 1, vp, sharedVtSeen);
+  ctrl.syncVirtualTiles(lower, 1, vp, sharedVtSeen);
+
+  assert.equal(ctrl.pendingVirtualTileMounts.length, 1, "shared multi-level virtual tile must only be queued once across visible levels");
+  assert.equal(ctrl.pendingVirtualTileMounts[0].fullId, "lvlUpper::0", "viewed level must win deduplication");
+});

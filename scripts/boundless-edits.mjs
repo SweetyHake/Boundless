@@ -665,6 +665,7 @@ export const editsMethods = {
       if (Number.isFinite(t.texture.scaleX) && t.texture.scaleX !== 1) tileSpec.scaleX = t.texture.scaleX;
       if (Number.isFinite(t.texture.scaleY) && t.texture.scaleY !== 1) tileSpec.scaleY = t.texture.scaleY;
       if (t.texture.fit && t.texture.fit !== "fill") tileSpec.fit = t.texture.fit;
+      if (t.levels?.size > 1 && t.id) tileSpec.gid = t.id;
       tiles.push(tileSpec);
       tileIdsToDelete.push(t.id);
 
@@ -789,6 +790,7 @@ export const editsMethods = {
       if (Number.isFinite(attenuation) && attenuation !== 0.5) extra.attenuation = attenuation;
       const luminosity = l.config?.luminosity;
       if (Number.isFinite(luminosity) && luminosity !== 0.5) extra.luminosity = luminosity;
+      if (l.levels?.size > 1 && l.id) extra.gid = l.id;
       const tuple = [
         l.x, l.y,
         l.config?.dim || 0,

@@ -1151,6 +1151,7 @@ export class MegaLightBatch {
     };
 
     const emptyRect = new PIXI.Rectangle(-1e9, -1e9, 1, 1);
+    const seenSharedLightKeys = visibleLevelLayers.length > 1 ? new Set() : null;
 
     for (const layerEntry of visibleLevelLayers) {
       const { level, spec } = layerEntry;
@@ -1514,6 +1515,13 @@ export class MegaLightBatch {
           if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
+          if (seenSharedLightKeys) {
+            const lk = extra?.gid
+              ? `g:${extra.gid}`
+              : `f:${lx}|${ly}|${dimFt}|${brightFt}|${elevation}|${colorHex || ""}|${alpha ?? 0.5}`;
+            if (seenSharedLightKeys.has(lk)) continue;
+            seenSharedLightKeys.add(lk);
+          }
           const effectiveRaw = [lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation];
           if (extra) effectiveRaw.push(extra);
           const ratio = Math.min(1, ((brightFt || 0) * pxPerFt) / dimPx);

@@ -925,6 +925,7 @@ export const pyramidMethods = {
     const orderedLayers = this.visibleLevelLayers.length > 1
       ? this.visibleLevelLayers.slice().sort((a, b) => (b.level?.isView ? 1 : 0) - (a.level?.isView ? 1 : 0))
       : this.visibleLevelLayers;
+    const sharedVtSeen = orderedLayers.length > 1 ? new Set() : null;
 
     for (const layer of orderedLayers) {
       const targetZ = this._computeTargetZ(layer, vp.scale, { hysteresis: true });
@@ -945,7 +946,7 @@ export const pyramidMethods = {
       }
 
       // 3. Virtual Streamed Tiles (`spec.tiles` + `sectors[sk].t`) for this level
-      if (this.syncVirtualTiles(layer, targetZ, vp)) {
+      if (this.syncVirtualTiles(layer, targetZ, vp, sharedVtSeen)) {
         anyTilesOrOverlaysChanged = true;
       }
     }

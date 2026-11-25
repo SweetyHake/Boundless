@@ -704,7 +704,7 @@ export const overlayMethods = {
    * Stream virtual tiles (`spec.tiles` indexed via `sectors[sk].t`) for a level.
    * Supports full Foundry v14 Tile semantics: elevation, occlusion modes, restrictsLight/Weather, sortLayer, LOD minZ.
    */
-  syncVirtualTiles(layer, targetZ, vp) {
+  syncVirtualTiles(layer, targetZ, vp, sharedVtSeen = null) {
     const tiles = layer.spec?.tiles;
     if (!tiles?.length) return false;
 
@@ -732,8 +732,9 @@ export const overlayMethods = {
     const moveBucket = isMoving
       ? `_m_${Math.floor(vp.x0 / vpCellW)}_${Math.floor(vp.y0 / vpCellH)}_${Math.floor(vp.x1 / vpCellW)}_${Math.floor(vp.y1 / vpCellH)}`
       : "_s";
-    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}`;
-    if (tileKey === layer.lastTileKey) return false;
+    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}_d${sharedVtSeen ? sharedVtSeen.size : 0}`;
+    if (tileKey === layer.lastTileKey && !sharedVtSeen) return false;
+    const canSkipSameKey = tileKey === layer.lastTileKey;
     layer.lastTileKey = tileKey;
     if (isMoving) this._vtIdleCleanupNeeded = true;
 
@@ -745,6 +746,18 @@ export const overlayMethods = {
       const { pivX, pivY, halfDiag } = getVirtualTileBounds(t);
       return pivX + halfDiag >= secX0 && pivX - halfDiag <= secX1 && pivY + halfDiag >= secY0 && pivY - halfDiag <= secY1;
     };
+    const vtDedupKey = (t) => t.gid
+      ? `g:${t.gid}`
+      : `f:${t.src}|${t.x}|${t.y}|${t.w}|${t.h}|${t.elevation ?? 0}|${t.rot || 0}|${t.sort || 0}`;
+
+    // When this layer's tileKey did not change on a multi-level scene, still register its active tiles into sharedVtSeen
+    // so lower levels continue deduplicating shared multi-level tiles without re-scanning sectors.
+    if (canSkipSameKey && sharedVtSeen) {
+      for (const [, vt] of this.activeVirtualTiles) {
+        if (vt.levelId === lid && vt.tSpec) sharedVtSeen.add(vtDedupKey(vt.tSpec));
+      }
+      return false;
+    }
 
     const needed = new Map();
     const checkUpperOcc = !level?.isView && !layer.isUpper;
@@ -757,6 +770,11 @@ export const overlayMethods = {
       if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
       if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, tSpec)) continue;
       if (tileIntersectsSectors(tSpec)) {
+        if (sharedVtSeen) {
+          const dk = vtDedupKey(tSpec);
+          if (sharedVtSeen.has(dk)) continue;
+          sharedVtSeen.add(dk);
+        }
         needed.set(`${lid}::${tid}`, { tid, tSpec });
       }
     }
