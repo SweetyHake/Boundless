@@ -1156,7 +1156,7 @@ function patchTokenUiCaching() {
           !ch.children?.length &&
           !ch.filters?.length &&
           !ch.customDnd5eBaseScale &&
-          (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")
+          (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive" || ch.eventMode === "auto")
         ) {
           statusIcons.push(ch);
         } else {
