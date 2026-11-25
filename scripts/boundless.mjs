@@ -1013,6 +1013,19 @@ class MegaWorld1000 {
     this._mounting = false;
     if (this._pendingSceneUpdates?.length) {
       const queued = this._pendingSceneUpdates.splice(0);
+      const fogMgr = this.fogManager;
+      if (fogMgr) {
+        const fogLid = fogMgr.levelId;
+        for (const q of queued) {
+          const fc = q.changes?.flags?.[MODULE_ID];
+          if (!fc || typeof fc !== "object") continue;
+          if (fc.fogBrush?.id) fogMgr._seenBrushIds?.delete?.(fc.fogBrush.id);
+          const qReset = Number(fc.fogResetAt?.[fogLid]) || 0;
+          if (qReset > 0 && fogMgr._lastHandledResetAt >= qReset) {
+            fogMgr._lastHandledResetAt = qReset - 1;
+          }
+        }
+      }
       for (const q of queued) {
         if (!this.active) break;
         this.onSceneUpdate(scene, q.changes, q.userId);
@@ -1279,7 +1292,8 @@ class MegaWorld1000 {
         tok.renderable = true;
         if (tok.mesh && !tok.mesh.destroyed) {
           tok.mesh.renderable = true;
-          if (tok.visible !== false && !tok._ssHideMesh && tok.mesh.visible === false) tok.mesh.visible = true;
+          const hiddenByShowstopper = typeof tok._ssOcclusionAlpha === "number" && Number.isFinite(tok._ssOcclusionAlpha) && tok._ssOcclusionAlpha <= 0.01;
+          if (tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) tok.mesh.visible = true;
         }
         if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
       }

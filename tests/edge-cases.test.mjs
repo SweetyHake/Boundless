@@ -1798,3 +1798,125 @@ test("LRUTextureManager._loadFallback caches repeated missing URLs in missingSrc
   tm.clear(true);
   assert.equal(tm.missingSrcs.size, 0);
 });
+
+test("hasAnyCustomChild ignores hidden/non-renderable children (e.g. vision-5e SpriteMesh) so UI culling stays active", async () => {
+  const { hasAnyCustomChild } = await import("../scripts/perf-gpu.mjs");
+  const lvlInd = { visible: true, renderable: true, worldAlpha: 1, destroyed: false };
+  const hiddenV5eMesh = { visible: true, renderable: false, worldAlpha: 1, destroyed: false };
+  const visibleAura = { visible: true, renderable: true, worldAlpha: 1, destroyed: false };
+  const tokHidden = { levelIndicator: lvlInd, children: [lvlInd, hiddenV5eMesh] };
+  const tokAura = { levelIndicator: lvlInd, children: [lvlInd, visibleAura] };
+
+  assert.equal(hasAnyCustomChild(tokHidden), false, "non-renderable custom child must not disable token UI frustum culling");
+  assert.equal(hasAnyCustomChild(tokAura), true, "active visible custom child must still opt out of culling");
+});
+
+test("syncSingleDecorativeTile releases batch override when a custom direct shader has pluginName === null", async () => {
+  installBaseGlobals();
+  const { syncSingleDecorativeTile } = await import("../scripts/perf-auto.mjs");
+  const mesh = { pluginName: "batchOcclusion", _shader: { pluginName: "batchOcclusion" }, unoccludedAlpha: 1, destroyed: false };
+  const tile = { mesh, document: { alpha: 1, occlusion: { modes: new Set() }, restrictions: {} }, isVideo: false };
+
+  syncSingleDecorativeTile(tile, true);
+  assert.equal(mesh.pluginName, "batch");
+  assert.equal(mesh._blFastBatch, true);
+
+  // Direct non-batched shader (static classPluginName = null)
+  mesh._shader = { pluginName: null };
+  syncSingleDecorativeTile(tile, true);
+  assert.equal(mesh.pluginName, null, "must release batch override for custom direct shaders with pluginName === null");
+  assert.equal(mesh._blFastBatch, false);
+});
+
+test("MegaAudioStreamer.update never materializes lazy ActorDelta on canvasPan", async () => {
+  installBaseGlobals();
+  globalThis.CONST.DOCUMENT_OWNERSHIP_LEVELS = { INHERIT: -1, NONE: 0, LIMITED: 1, OBSERVER: 2, OWNER: 3 };
+  const { MegaAudioStreamer } = await import("../scripts/audio-streamer.mjs");
+  let actorTouched = false;
+  const lazyDoc = {
+    id: "npc1",
+    level: "lvl1",
+    isLazyDelta: true,
+    _source: { delta: { ownership: {} } },
+    baseActor: { hasPlayerOwner: false, ownership: { default: 0 } },
+    get actor() { actorTouched = true; return null; },
+    get hasPlayerOwner() { actorTouched = true; return false; }
+  };
+  const tok = {
+    controlled: false,
+    destroyed: false,
+    center: { x: 100, y: 100 },
+    document: lazyDoc,
+    get isOwner() { actorTouched = true; return false; },
+    get actor() { actorTouched = true; return null; }
+  };
+  globalThis.foundry = { canvas: { sources: { PointSoundSource: class {} } } };
+  globalThis.canvas = {
+    ready: true,
+    dimensions: { size: 100, distance: 5 },
+    environment: { darknessLevel: 0 },
+    tokens: { placeables: [tok] },
+    sounds: { livePreview: null }
+  };
+
+  const streamer = new MegaAudioStreamer();
+  const layer = { level: { id: "lvl1", elevation: { base: 0 } }, simGrid: 2, simSectorPx: 1000, spec: { sectors: {} } };
+
+  // Test both GM and non-GM paths
+  globalThis.game.user = { id: "gm1", isGM: true };
+  streamer.update([layer], { x0: 0, y0: 0, x1: 500, y1: 500, scale: 0.05 });
+  globalThis.game.user = { id: "u1", isGM: false };
+  streamer.update([layer], { x0: 0, y0: 0, x1: 500, y1: 500, scale: 0.05 });
+  assert.equal(actorTouched, false, "MegaAudioStreamer must never trigger lazy ActorDelta materialization");
+});
+
+test("lightingMethods rejects non-canonical dKey syntax and toggles mmv_* edges for moved doors", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+
+  const edges = new Map();
+  class FakeEdge { constructor(a, b, opts) { this.a = a; this.b = b; Object.assign(this, opts); } }
+  globalThis.foundry = { canvas: { geometry: { edges: { Edge: FakeEdge } } } };
+  globalThis.canvas = { dimensions: { size: 100, distance: 5 }, perception: { update() {} } };
+
+  const layer = {
+    level: { id: "lvl1", edges },
+    simGrid: 4,
+    simSectorPx: 1000,
+    spec: { sectors: { "0_0": { d: [[100, 100, 200, 100, 1, 0]] } } }
+  };
+  const ctrl = {
+    ...lightingMethods,
+    levelLayers: new Map([["lvl1", layer]]),
+    doorStates: new Map(),
+    openDoors: new Map(),
+    simSectors: new Map([["lvl1::2_0", { level: layer.level, edgeIds: [] }]]),
+    closingDoorTimers: new Map(),
+    wallEditor: { mountedByDoorKey: new Map(), applyDoorStateToMounted: () => false },
+    resolveVirtualWall: () => ({
+      c: [2100, 100, 2200, 100], // moved from sector 0_0 into sector 2_0
+      move: 20, sight: 20, light: 20, sound: 20, dir: 0, door: 1, ds: 0
+    })
+  };
+
+  // Crafted dot-injection key must be rejected
+  assert.equal(ctrl._resolveDoorByKey("lvl1::0.0_0_0"), null, "non-canonical float dKey must be rejected");
+  assert.equal(ctrl._resolveDoorByKey("lvl1::0_0_w0.0"), null);
+
+  const info = ctrl._resolveDoorByKey("lvl1::0_0_0");
+  assert.ok(info);
+  assert.equal(info.kind, "d");
+  assert.equal(info.sk, "0_0");
+
+  // Simulate moved-door edge in destination sector 2_0
+  const mEid = "mmv_lvl1_2_0_d_0_0_0";
+  edges.set(mEid, { id: mEid });
+
+  // Open moved door -> mmv_* edge must be removed
+  ctrl._applyDoorStateLocal(info, 1, { playSound: false, deferRefresh: true });
+  assert.equal(edges.has(mEid), false, "opening a moved door must delete its mmv_* edge");
+
+  // Close moved door while only destination sector 2_0 (not home 0_0) is in simSectors -> mmv_* edge must be restored
+  ctrl._applyDoorStateLocal(info, 0, { playSound: false, deferRefresh: true });
+  assert.equal(edges.has(mEid), true, "closing a moved door must restore its mmv_* edge in active destination sector");
+});

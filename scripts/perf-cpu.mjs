@@ -1413,13 +1413,15 @@ function patchMiscCpuGuards() {
         perfStats.lightingPartialRebuilds++;
         Hooks.callAll("lightingRefresh", this);
         // If a third-party lightingRefresh hook injected custom children, force a clean full rebuild next time
-        const afterCounts = countNonVisionChildren(this);
-        if (
-          afterCounts.bg !== _expectedNonVisionCounts.bg ||
-          afterCounts.il !== _expectedNonVisionCounts.il ||
-          afterCounts.co !== _expectedNonVisionCounts.co
-        ) {
-          _expectedNonVisionCounts = null;
+        if (_expectedNonVisionCounts) {
+          const afterCounts = countNonVisionChildren(this);
+          if (
+            afterCounts.bg !== _expectedNonVisionCounts.bg ||
+            afterCounts.il !== _expectedNonVisionCounts.il ||
+            afterCounts.co !== _expectedNonVisionCounts.co
+          ) {
+            _expectedNonVisionCounts = null;
+          }
         }
         return;
       } catch {

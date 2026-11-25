@@ -594,12 +594,20 @@ export class VirtualLayerEditors {
 
     for (const entry of Array.from(this.lightsByKey.values())) {
       const wrongLevel = entry.levelId !== lid;
-      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const raw = !wrongLevel ? layer.spec.sectors?.[entry.sk]?.l?.[entry.idx] : null;
+      const resolved = (!wrongLevel && !needed.has(entry.key) && raw && lvlEdits?.get(entry.key) !== null)
+        ? this.controller.resolveVirtualLight(lid, entry.sk, entry.idx, raw, level)
+        : null;
+      const isDeleted = !wrongLevel && (lvlEdits?.get(entry.key) === null || (!needed.has(entry.key) && !resolved));
       const sheet = getExistingSheet(entry.doc);
       if (wrongLevel || isDeleted) {
         this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
-      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
-        this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
+      } else if (!needed.has(entry.key)) {
+        if (!entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
+          this._destroyPlaceable(canvas.lighting, entry, this.lightsByKey, this.lightsById);
+        } else if (resolved) {
+          needed.set(entry.key, resolved);
+        }
       }
     }
 
@@ -682,9 +690,17 @@ export class VirtualLayerEditors {
       delete patch._id;
       delete patch.id;
       const prevAngle = entry.doc.config?.angle ?? 360;
-      entry.doc.updateSource(patch);
+      const diff = entry.doc.updateSource(patch);
       const nextAngle = entry.doc.config?.angle ?? 360;
       const shapeTypeChanged = (prevAngle >= 360) !== (nextAngle >= 360);
+      const sheet = getExistingSheet(entry.doc);
+      if (sheet?.rendered && diff && !foundry.utils.isEmpty(diff)) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(diff);
+          else sheet._preview?.updateSource?.(diff);
+          sheet.render(false);
+        } catch {}
+      }
 
       const cfg = entry.doc.config || {};
       const colorCss = cfg.color ? foundry.utils.Color.from(cfg.color).css : null;
@@ -960,12 +976,20 @@ export class VirtualLayerEditors {
 
     for (const entry of Array.from(this.soundsByKey.values())) {
       const wrongLevel = entry.levelId !== lid;
-      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const raw = !wrongLevel ? layer.spec.sectors?.[entry.sk]?.s?.[entry.idx] : null;
+      const resolved = (!wrongLevel && !needed.has(entry.key) && raw && lvlEdits?.get(entry.key) !== null)
+        ? this.controller.resolveVirtualSound(lid, entry.sk, entry.idx, raw, level)
+        : null;
+      const isDeleted = !wrongLevel && (lvlEdits?.get(entry.key) === null || (!needed.has(entry.key) && !resolved));
       const sheet = getExistingSheet(entry.doc);
       if (wrongLevel || isDeleted) {
         this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
-      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
-        this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
+      } else if (!needed.has(entry.key)) {
+        if (!entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
+          this._destroyPlaceable(canvas.sounds, entry, this.soundsByKey, this.soundsById);
+        } else if (resolved) {
+          needed.set(entry.key, resolved);
+        }
       }
     }
 
@@ -1033,7 +1057,15 @@ export class VirtualLayerEditors {
       const patch = foundry.utils.deepClone(u);
       delete patch._id;
       delete patch.id;
-      entry.doc.updateSource(patch);
+      const diff = entry.doc.updateSource(patch);
+      const sheet = getExistingSheet(entry.doc);
+      if (sheet?.rendered && diff && !foundry.utils.isEmpty(diff)) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(diff);
+          else sheet._preview?.updateSource?.(diff);
+          sheet.render(false);
+        } catch {}
+      }
 
       const nextState = {
         x: Math.round(entry.doc.x),
@@ -1336,14 +1368,22 @@ export class VirtualLayerEditors {
 
     for (const entry of Array.from(this.tilesByKey.values())) {
       const wrongLevel = entry.levelId !== lid;
-      const isDeleted = !wrongLevel && lvlEdits?.get(entry.key) === null;
+      const raw = !wrongLevel ? specTiles[entry.tid] : null;
+      const resolved = (!wrongLevel && !needed.has(entry.key) && raw && lvlEdits?.get(entry.key) !== null)
+        ? this.controller.resolveVirtualTile(lid, entry.tid, raw, level)
+        : null;
+      const isDeleted = !wrongLevel && (lvlEdits?.get(entry.key) === null || (!needed.has(entry.key) && !resolved));
       const sheet = getExistingSheet(entry.doc);
       if (wrongLevel || isDeleted) {
         this._setRawVirtualTileVisible(entry.fullId, true);
         this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById, { closeSheet: true });
-      } else if (!needed.has(entry.key) && !entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
-        this._setRawVirtualTileVisible(entry.fullId, true);
-        this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
+      } else if (!needed.has(entry.key)) {
+        if (!entry.placeable?.controlled && !isSheetActiveOrRendering(sheet, entry.placeable)) {
+          this._setRawVirtualTileVisible(entry.fullId, true);
+          this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
+        } else if (resolved) {
+          needed.set(entry.key, resolved);
+        }
       }
     }
 
@@ -1435,7 +1475,15 @@ export class VirtualLayerEditors {
       delete patch._id;
       delete patch.id;
       const prevSrc = entry.doc.texture?.src || "";
-      entry.doc.updateSource(patch);
+      const diff = entry.doc.updateSource(patch);
+      const sheet = getExistingSheet(entry.doc);
+      if (sheet?.rendered && diff && !foundry.utils.isEmpty(diff)) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(diff);
+          else sheet._preview?.updateSource?.(diff);
+          sheet.render(false);
+        } catch {}
+      }
 
       const d = entry.doc;
       const nextSrc = d.texture?.src || "";

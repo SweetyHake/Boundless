@@ -594,10 +594,12 @@ export function isStandardTokenChild(t, c) {
   );
 }
 
-function hasAnyCustomChild(t) {
+export function hasAnyCustomChild(t) {
   const kids = t.children;
   for (let j = 0; j < kids.length; j++) {
-    if (!isStandardTokenChild(t, kids[j])) return true;
+    const c = kids[j];
+    if (!c || c.destroyed || !c.visible || !c.renderable || c.worldAlpha <= 0) continue;
+    if (!isStandardTokenChild(t, c)) return true;
   }
   return false;
 }
@@ -606,6 +608,7 @@ function hasCustomUnderlayChild(t) {
   const kids = t.children;
   for (let j = 0; j < kids.length; j++) {
     const c = kids[j];
+    if (!c || c.destroyed || !c.visible || !c.renderable || c.worldAlpha <= 0) continue;
     if (!isStandardTokenChild(t, c) && (c.zIndex ?? 0) < 0) return true;
   }
   return false;

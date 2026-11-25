@@ -354,6 +354,45 @@ export const lightingMethods = {
         }
       }
 
+      // Pre-index moved virtual walls (wallEdits dragged outside their original home sector) BEFORE addSimBubble
+      // so walls moved into previously empty sectors still enter neededSim and mount physics/LOS edges.
+      const movedWallsByLevelSk = new Map();
+      for (const layer of this.visibleLevelLayers) {
+        const lid = layer.level?.id;
+        const lvlEdits = lid ? this.wallEdits?.get?.(lid) : null;
+        const sectors = layer.spec?.sectors;
+        const simSectorPx = layer.simSectorPx;
+        const simGrid = layer.simGrid;
+        if (!lvlEdits?.size || !sectors || !simSectorPx || !simGrid) continue;
+        const bySk = new Map();
+        for (const [wKey, ov] of lvlEdits) {
+          if (!ov) continue;
+          const parts = wKey.split(":");
+          if (parts.length !== 3) continue;
+          const [origSk, kind, idxStr] = parts;
+          const idx = Number(idxStr);
+          const raw = sectors[origSk]?.[kind]?.[idx];
+          if (!raw) continue;
+          const seg = this.resolveVirtualWall(lid, kind, origSk, idx, raw);
+          if (!seg || !Array.isArray(seg.c) || seg.c.length < 4) continue;
+          const [x1, y1, x2, y2] = seg.c;
+          const sx0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(x1, x2) / simSectorPx)));
+          const sy0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(y1, y2) / simSectorPx)));
+          const sx1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(x1, x2) / simSectorPx)));
+          const sy1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(y1, y2) / simSectorPx)));
+          for (let sy = sy0; sy <= sy1; sy++) {
+            for (let sx = sx0; sx <= sx1; sx++) {
+              const tSk = `${sx}_${sy}`;
+              if (tSk === origSk) continue;
+              let list = bySk.get(tSk);
+              if (!list) { list = []; bySk.set(tSk, list); }
+              list.push({ kind, origSk, idx, seg });
+            }
+          }
+        }
+        if (bySk.size) movedWallsByLevelSk.set(lid, bySk);
+      }
+
       // 2. Physics Wall Edges per Level (`level.edges`): around active tokens (controlled, player-owned,
       //    light-emitting, active visionSources), open doors, and every active dynamic PointLightSource
       const neededSim = new Map(); // "${levelId}::${sx}_${sy}" -> { layer, sk }
@@ -361,6 +400,7 @@ export const lightingMethods = {
         const layer = this.levelLayers.get(levelId);
         if (!layer?.spec?.sectors) return;
         const { simGrid, simSectorPx, spec } = layer;
+        const movedBySk = movedWallsByLevelSk.get(levelId);
         const effRad = Math.max(simSectorPx, radiusPx || 0);
         const sx0 = Math.max(0, Math.floor((wx - effRad) / simSectorPx));
         const sy0 = Math.max(0, Math.floor((wy - effRad) / simSectorPx));
@@ -369,7 +409,7 @@ export const lightingMethods = {
         for (let y = sy0; y <= sy1; y++) {
           for (let x = sx0; x <= sx1; x++) {
             const sk = `${x}_${y}`;
-            if (spec.sectors[sk]) {
+            if (spec.sectors[sk] || movedBySk?.has(sk)) {
               neededSim.set(`${levelId}::${sk}`, { layer, sk });
             }
           }
@@ -453,44 +493,6 @@ export const lightingMethods = {
             changedSectors.add(fullKey);
             edgesChanged = true;
           }
-        }
-
-        // Pre-index moved virtual walls (wallEdits dragged outside their original home sector) per visible level
-        const movedWallsByLevelSk = new Map();
-        for (const layer of this.visibleLevelLayers) {
-          const lid = layer.level?.id;
-          const lvlEdits = lid ? this.wallEdits?.get?.(lid) : null;
-          const sectors = layer.spec?.sectors;
-          const simSectorPx = layer.simSectorPx;
-          const simGrid = layer.simGrid;
-          if (!lvlEdits?.size || !sectors || !simSectorPx || !simGrid) continue;
-          const bySk = new Map();
-          for (const [wKey, ov] of lvlEdits) {
-            if (!ov) continue;
-            const parts = wKey.split(":");
-            if (parts.length !== 3) continue;
-            const [origSk, kind, idxStr] = parts;
-            const idx = Number(idxStr);
-            const raw = sectors[origSk]?.[kind]?.[idx];
-            if (!raw) continue;
-            const seg = this.resolveVirtualWall(lid, kind, origSk, idx, raw);
-            if (!seg || !Array.isArray(seg.c) || seg.c.length < 4) continue;
-            const [x1, y1, x2, y2] = seg.c;
-            const sx0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(x1, x2) / simSectorPx)));
-            const sy0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(y1, y2) / simSectorPx)));
-            const sx1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(x1, x2) / simSectorPx)));
-            const sy1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(y1, y2) / simSectorPx)));
-            for (let sy = sy0; sy <= sy1; sy++) {
-              for (let sx = sx0; sx <= sx1; sx++) {
-                const tSk = `${sx}_${sy}`;
-                if (tSk === origSk) continue;
-                let list = bySk.get(tSk);
-                if (!list) { list = []; bySk.set(tSk, list); }
-                list.push({ kind, origSk, idx, seg });
-              }
-            }
-          }
-          if (bySk.size) movedWallsByLevelSk.set(lid, bySk);
         }
 
         for (const [fullKey, { layer, sk }] of neededSim) {
@@ -892,23 +894,26 @@ export const lightingMethods = {
     const sep = dKey.indexOf("::");
     const levelId = dKey.slice(0, sep);
     const rest = dKey.slice(sep + 2);
+    if (!/^\d+_\d+_w?\d+$/.test(rest)) return null;
     const parts = rest.split("_");
-    if (parts.length !== 3) return null;
     const sx = Number(parts[0]), sy = Number(parts[1]);
     const isConvertedWall = parts[2].startsWith("w");
     const idx = Number(isConvertedWall ? parts[2].slice(1) : parts[2]);
-    if (!Number.isInteger(sx) || !Number.isInteger(sy) || !Number.isInteger(idx) || sx < 0 || sy < 0 || idx < 0) return null;
     const sk = `${sx}_${sy}`;
+    const kind = isConvertedWall ? "w" : "d";
     const layer = this.levelLayers.get(levelId);
     const sec = layer?.spec?.sectors?.[sk];
     const raw = isConvertedWall ? sec?.w?.[idx] : sec?.d?.[idx];
     if (!raw) return null;
-    const seg = this.resolveVirtualWall(levelId, isConvertedWall ? "w" : "d", sk, idx, raw);
+    const seg = this.resolveVirtualWall(levelId, kind, sk, idx, raw);
     if (!seg || !seg.door) return null;
     const [x1, y1, x2, y2] = seg.c;
     return {
       dKey,
       eid: isConvertedWall ? `mw_${levelId}_${sk}_${idx}` : `md_${dKey}`,
+      kind,
+      sk,
+      idx,
       levelId,
       sx,
       sy,
@@ -993,13 +998,35 @@ export const lightingMethods = {
     const wasOpen = curDs === 1;
     const differsFromBaked = isOpen !== (defaultDs === 1);
 
+    // Collect moved-wall edge keys (mmv_*) when a door was dragged via wallEdits outside its original home sector
+    const movedTargets = [];
+    const origSk = info.sk ?? `${sx}_${sy}`;
+    if (layer?.simGrid && layer?.simSectorPx && info.kind && Number.isInteger(info.idx)) {
+      const { simGrid, simSectorPx } = layer;
+      const msx0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(ptA.x, ptB.x) / simSectorPx)));
+      const msy0 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.min(ptA.y, ptB.y) / simSectorPx)));
+      const msx1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(ptA.x, ptB.x) / simSectorPx)));
+      const msy1 = Math.max(0, Math.min(simGrid - 1, Math.floor(Math.max(ptA.y, ptB.y) / simSectorPx)));
+      for (let ty = msy0; ty <= msy1; ty++) {
+        for (let tx = msx0; tx <= msx1; tx++) {
+          const tSk = `${tx}_${ty}`;
+          if (tSk !== origSk) {
+            movedTargets.push({ tSk, mEid: `mmv_${levelId}_${tSk}_${info.kind}_${origSk}_${info.idx}` });
+          }
+        }
+      }
+    }
+
     if (isOpen) {
       level?.edges?.delete(eid);
-    } else if (this.simSectors.has(`${levelId}::${sx}_${sy}`)) {
+      for (let i = 0; i < movedTargets.length; i++) {
+        level?.edges?.delete(movedTargets[i].mEid);
+      }
+    } else {
       const pxPerFt = (canvas.dimensions?.size || 100) / Math.max(0.001, Number(canvas.dimensions?.distance) || 5);
       const threshold = buildEdgeThresholdPx(info.threshold, pxPerFt);
-      level?.edges?.set(eid, new EdgeCls(ptA, ptB, {
-        id: eid, type: "wall",
+      const makeDoorEdge = (edgeId) => new EdgeCls(ptA, ptB, {
+        id: edgeId, type: "wall",
         move: info.move ?? 20,
         sight: info.sight ?? 20,
         light: info.light ?? 20,
@@ -1007,7 +1034,16 @@ export const lightingMethods = {
         sound: info.sound ?? 20,
         direction: info.dir || 0,
         ...(threshold ? { threshold } : {})
-      }));
+      });
+      if (this.simSectors.has(`${levelId}::${origSk}`)) {
+        level?.edges?.set(eid, makeDoorEdge(eid));
+      }
+      for (let i = 0; i < movedTargets.length; i++) {
+        const { tSk, mEid } = movedTargets[i];
+        if (this.simSectors.has(`${levelId}::${tSk}`)) {
+          level?.edges?.set(mEid, makeDoorEdge(mEid));
+        }
+      }
     }
 
     const prevCloseTimer = this.closingDoorTimers.get(dKey);
@@ -1148,15 +1184,16 @@ export const lightingMethods = {
     const sep = dKey.indexOf("::");
     const levelId = dKey.slice(0, sep);
     const rest = dKey.slice(sep + 2);
+    if (!/^\d+_\d+_w?\d+$/.test(rest)) return;
     const parts = rest.split("_");
-    if (parts.length !== 3) return;
     const sx = Number(parts[0]), sy = Number(parts[1]);
     const isConvertedWall = parts[2].startsWith("w");
     const idx = Number(isConvertedWall ? parts[2].slice(1) : parts[2]);
-    if (!Number.isInteger(sx) || !Number.isInteger(sy) || !Number.isInteger(idx) || sx < 0 || sy < 0 || idx < 0) return;
 
     const lvl = targetScene.levels?.get?.(levelId);
     if (targetScene.levels?.size && !lvl) return;
+    const lvlCfg = lvl?.flags?.[MODULE_ID] || {};
+    if (lvlCfg.enabled === false) return;
 
     const sk = `${sx}_${sy}`;
     const kind = isConvertedWall ? "w" : "d";
@@ -1171,11 +1208,12 @@ export const lightingMethods = {
       defaultDs = this._normalizeDoorState(wallEdit.ds, 0);
     } else if (!isConvertedWall) {
       // Resolve raw door entry from inlineManifest, cached/fetched manifest, or chunk JSON
-      let spec = lvl?.flags?.[MODULE_ID]?.inlineManifest || null;
+      let spec = lvlCfg.inlineManifest || null;
       if (!spec) {
         const sceneCfg = targetScene.flags?.[MODULE_ID] || {};
-        const lvlCfg = lvl?.flags?.[MODULE_ID] || {};
-        const url = lvlCfg.manifestUrl || sceneCfg.manifestUrl;
+        const url = lvlCfg.manifestUrl
+          || sceneCfg.manifestUrl
+          || (sceneCfg.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : null);
         if (url && typeof this._fetchManifest === "function") {
           try {
             const m = await this._fetchManifest(url);
@@ -1185,9 +1223,10 @@ export const lightingMethods = {
       }
       let raw = spec?.sectors?.[sk]?.d?.[idx];
       if (!raw && spec?.chunks?.baseUrl && spec.chunks.chunkWorldPx > 0) {
-        const simSectorPx = spec.simSectorPx || ((spec.worldPx || 100000) / Math.max(1, spec.simGrid || 1));
-        const cx = Math.floor((sx * simSectorPx) / spec.chunks.chunkWorldPx);
-        const cy = Math.floor((sy * simSectorPx) / spec.chunks.chunkWorldPx);
+        const simGrid = spec.simGrid || 40;
+        const simSectorPx = spec.simSectorPx || Math.ceil((spec.worldPx || 100000) / simGrid);
+        const cx = Math.floor(((sx + 0.5) * simSectorPx) / spec.chunks.chunkWorldPx);
+        const cy = Math.floor(((sy + 0.5) * simSectorPx) / spec.chunks.chunkWorldPx);
         if (cx >= 0 && cy >= 0) {
           try {
             const resp = await fetch(resolveFoundryRoute(`${spec.chunks.baseUrl}/${cx}_${cy}.json`));

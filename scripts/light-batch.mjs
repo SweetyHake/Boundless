@@ -2034,65 +2034,24 @@ export class MegaLightBatch {
     const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
     const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId));
 
-    // Include walls from chunk sectors AND already-loaded neighboring sectors so chunk borders stay seamless
-    const neededWallSectors = new Set(Object.keys(sectors));
-    for (const [sk] of sectorEntries) {
-      const [sx, sy] = sk.split("_").map(Number);
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          const nsk = `${sx + dx}_${sy + dy}`;
-          if (allLevelSectors[nsk]) neededWallSectors.add(nsk);
-        }
-      }
-    }
-
     const pxPerFt = this._buildPxPerFt || 20;
     const simSectorPx = layer.simSectorPx || layer.spec?.simSectorPx || ((layer.worldPx && layer.simGrid) ? (layer.worldPx / layer.simGrid) : 0);
-    const sectorEdges = new Map();
-    for (const sk of neededWallSectors) {
-      const sec = sectors[sk] || allLevelSectors[sk];
-      if (!sec) continue;
-      if (sec.w) {
-        for (let wi = 0; wi < sec.w.length; wi++) {
-          const seg = this._resolveWallFn
-            ? this._resolveWallFn(levelId, "w", sk, wi, sec.w[wi])
-            : { c: sec.w[wi].slice(0, 4), move: sec.w[wi][4], sight: sec.w[wi][5], light: sec.w[wi][6], sound: sec.w[wi][7], dir: sec.w[wi][8] || 0, door: 0, ds: 0 };
-          if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
-          const [x1, y1, x2, y2] = seg.c;
-          const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-          const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-            id: `cw_${levelId}_${sk}_${wi}`, type: "wall",
-            move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
-            ...(threshold ? { threshold } : {})
-          });
-          indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
-        }
-      }
-      if (sec.d) {
-        for (let di = 0; di < sec.d.length; di++) {
-          const seg = this._resolveWallFn
-            ? this._resolveWallFn(levelId, "d", sk, di, sec.d[di])
-            : { c: sec.d[di].slice(0, 4), move: 20, sight: 20, light: 20, sound: 20, dir: 0, door: sec.d[di][4] || 1, ds: sec.d[di][5] || 0 };
-          if (!seg || seg.light === 0 || (seg.door && seg.ds === 1)) continue;
-          const [x1, y1, x2, y2] = seg.c;
-          const threshold = buildEdgeThresholdPx(seg.threshold, pxPerFt);
-          const edge = new EdgeCls({ x: x1, y: y1 }, { x: x2, y: y2 }, {
-            id: `cd_${levelId}_${sk}_${di}`, type: "wall",
-            move: seg.move, sight: seg.sight, light: seg.light, darkness: seg.darkness ?? seg.light, sound: seg.sound, direction: seg.dir || 0,
-            ...(threshold ? { threshold } : {})
-          });
-          indexEdgeByAabb(sectorEdges, sk, edge, simSectorPx);
-        }
-      }
-    }
+    // Index all resident chunk sectors via buildSectorEdgeMap so moved walls, wide lights, and door extra fields stay 100% exact
+    const wallSourceSectors = allLevelSectors === sectors ? sectors : { ...allLevelSectors, ...sectors };
+    const sectorEdges = buildSectorEdgeMap(wallSourceSectors, levelId, pxPerFt, EdgeCls, this._resolveWallFn, simSectorPx);
 
-    const b = chunkData.bounds || { x: 0, y: 0, w: layer.worldPx || 100000, h: layer.worldPx || 100000 };
+    const worldSpan = layer.worldPx || 100000;
+    const b = chunkData.bounds || { x: 0, y: 0, w: worldSpan, h: worldSpan };
     const padB = LIGHT_PAD_WORLD_PX;
+    const obMinX = Math.min(-padB, b.x - padB);
+    const obMinY = Math.min(-padB, b.y - padB);
+    const obMaxX = Math.max(worldSpan + padB, b.x + b.w + padB);
+    const obMaxY = Math.max(worldSpan + padB, b.y + b.h + padB);
     const outerBounds = [
-      new EdgeCls({ x: b.x - padB, y: b.y - padB }, { x: b.x + b.w + padB, y: b.y - padB }, { id: "cb_t", type: "outerBounds" }),
-      new EdgeCls({ x: b.x + b.w + padB, y: b.y - padB }, { x: b.x + b.w + padB, y: b.y + b.h + padB }, { id: "cb_r", type: "outerBounds" }),
-      new EdgeCls({ x: b.x + b.w + padB, y: b.y + b.h + padB }, { x: b.x - padB, y: b.y + b.h + padB }, { id: "cb_b", type: "outerBounds" }),
-      new EdgeCls({ x: b.x - padB, y: b.y + b.h + padB }, { x: b.x - padB, y: b.y - padB }, { id: "cb_l", type: "outerBounds" })
+      new EdgeCls({ x: obMinX, y: obMinY }, { x: obMaxX, y: obMinY }, { id: "cb_t", type: "outerBounds" }),
+      new EdgeCls({ x: obMaxX, y: obMinY }, { x: obMaxX, y: obMaxY }, { id: "cb_r", type: "outerBounds" }),
+      new EdgeCls({ x: obMaxX, y: obMaxY }, { x: obMinX, y: obMaxY }, { id: "cb_b", type: "outerBounds" }),
+      new EdgeCls({ x: obMinX, y: obMaxY }, { x: obMinX, y: obMinY }, { id: "cb_l", type: "outerBounds" })
     ];
     const localEdgeStore = {
       _list: [],

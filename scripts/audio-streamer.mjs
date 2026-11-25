@@ -1,4 +1,4 @@
-import { getEffectiveScale, getLevelBaseElevation } from "./utils.mjs";
+import { getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy } from "./utils.mjs";
 
 const SOUND_PAD_WORLD_PX = 1600;
 const SOUND_VP_MIN_SCALE = 0.25;
@@ -48,10 +48,15 @@ export class MegaAudioStreamer {
     }
     for (const tok of canvas.tokens?.placeables || []) {
       if (!tok || tok.destroyed || !tok.center) continue;
+      const doc = tok.document;
       const isActiveListener = tok.controlled || (
         game.user?.isGM
-          ? Boolean(tok.document?.hasPlayerOwner)
-          : (tok.isOwner || Boolean(tok.actor?.testUserPermission?.(game.user, "OBSERVER")))
+          ? Boolean(
+              doc?.baseActor?.hasPlayerOwner ||
+              (!doc?.baseActor && doc?.hasPlayerOwner) ||
+              (doc?._source?.delta?.ownership && game.users?.some?.(u => !u.isGM && hasTokenPermissionLazy(doc, u, "OWNER")))
+            )
+          : hasTokenPermissionLazy(doc, game.user, "OBSERVER")
       );
       if (!isActiveListener) continue;
       anchors.push({

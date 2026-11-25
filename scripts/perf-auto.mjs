@@ -391,8 +391,8 @@ export function syncSingleDecorativeTile(t, allow) {
     }
     return;
   }
-  // If a third-party module replaced the tile's shader (setShaderClass), release our `"batch"` override
-  if (m._blFastBatch && m._shader?.pluginName && m._shader.pluginName !== "batchOcclusion") {
+  // If a third-party module replaced the tile's shader (setShaderClass, including custom direct shaders where pluginName === null), release our `"batch"` override
+  if (m._blFastBatch && m._shader && m._shader.pluginName !== "batchOcclusion") {
     m.pluginName = null;
     m._blFastBatch = false;
     return;
