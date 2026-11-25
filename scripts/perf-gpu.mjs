@@ -1793,30 +1793,6 @@ function patchV14CoreRenderPasses() {
     });
   }
 
-  // Fast-path PrimarySpriteMesh#_renderVoid: ERASE only uses alpha, so non-occluded tokens can use lightweight "batch" instead of "batchOcclusion"
-  const VoidMeshCls = globalThis.foundry?.canvas?.primary?.PrimarySpriteMesh;
-  if (VoidMeshCls?.prototype && typeof VoidMeshCls.prototype._renderVoid === "function") {
-    results.push(wrapTargetMethod(VoidMeshCls.prototype, "_renderVoid", "PrimarySpriteMesh.prototype._renderVoid", function (wrapped, renderer) {
-      if (
-        PERF_CONFIG.perfEnabled &&
-        PERF_CONFIG.perfAutoCulling &&
-        !this._mask &&
-        !this.filters?.length &&
-        !this.occlusionMode &&
-        !this.occluded &&
-        this.pluginName === "batchOcclusion"
-      ) {
-        this.pluginName = "batch";
-        try {
-          return wrapped(renderer);
-        } finally {
-          this.pluginName = "batchOcclusion";
-        }
-      }
-      return wrapped(renderer);
-    }));
-  }
-
   return results;
 }
 
