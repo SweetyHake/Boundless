@@ -1506,11 +1506,28 @@ function patchV14CoreRenderPasses() {
           return wrapped();
         }
         const hud = this.element;
-        let hasActiveHud = Boolean(this.token?.rendered || this.tile?.rendered || this.drawing?.rendered);
+        let hasActiveHud = Boolean(
+          this.token?.rendered ||
+          this.tile?.rendered ||
+          this.drawing?.rendered ||
+          globalThis.canvas?.controls?.ruler?.active
+        );
         if (!hasActiveHud && hud?.children?.length) {
           const kids = hud.children;
           for (let i = 0; i < kids.length; i++) {
-            if (kids[i].childElementCount > 0) { hasActiveHud = true; break; }
+            const el = kids[i];
+            if (el.id === "measurement") {
+              const mKids = el.children;
+              for (let j = 0; j < mKids.length; j++) {
+                if (!mKids[j].classList?.contains("hidden") || mKids[j].childElementCount > 0) {
+                  hasActiveHud = true;
+                  break;
+                }
+              }
+              if (hasActiveHud) break;
+              continue;
+            }
+            if (el.childElementCount > 0) { hasActiveHud = true; break; }
           }
         }
         if (!hasActiveHud) {
