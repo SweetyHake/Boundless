@@ -18,7 +18,26 @@ const TILE_PX = 1024;
 const UPLOAD_CONCURRENCY = 4;
 const DOC_CREATE_BATCH_SIZE = 250;
 const UNBAKE_MAX_IMAGE_PX = 8192;
-const VIDEO_EXT_RE = /\.(webm|mp4|m4v|ogv)(\?|$)/i;
+const VIDEO_EXT_RE = /\.(webm|mp4|m4v|ogv)([?#]|$)/i;
+
+function isVideoPath(src) {
+  if (!src) return false;
+  return VIDEO_EXT_RE.test(src) || Boolean(globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(src));
+}
+
+function encodePathSegments(rawPath) {
+  return String(rawPath || "")
+    .split("/")
+    .map(seg => {
+      if (!seg) return seg;
+      try {
+        return encodeURIComponent(decodeURIComponent(seg));
+      } catch {
+        return encodeURIComponent(seg);
+      }
+    })
+    .join("/");
+}
 
 function getFilePickerImpl() {
   return foundry.applications?.apps?.FilePicker?.implementation
@@ -112,10 +131,10 @@ async function canvasToWebpBlob(work, quality) {
   });
 }
 
-async function loadImageSource(src, signal = null) {
+async function loadImageSource(src, signal = null, { fallbackW = 0, fallbackH = 0 } = {}) {
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   const resolvedSrc = resolveFoundryRoute(src);
-  const lower = String(resolvedSrc || "").split("?")[0].toLowerCase();
+  const lower = String(resolvedSrc || "").split(/[?#]/)[0].toLowerCase();
   const isSvg = lower.endsWith(".svg");
   if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
     try {
@@ -153,10 +172,27 @@ async function loadImageSource(src, signal = null) {
     }
     img.onload = () => {
       cleanup();
+      let w = img.naturalWidth || img.width || 0;
+      let h = img.naturalHeight || img.height || 0;
+      if (isSvg) {
+        if (!w || !h) {
+          w = fallbackW || 1024;
+          h = fallbackH || 1024;
+        } else if (fallbackW > 0 && fallbackH > 0 && (w < fallbackW || h < fallbackH)) {
+          // Vector SVG with tiny viewBox (e.g. 100x100 on a 4000x4000 scene) should bake at scene resolution
+          const scale = Math.max(fallbackW / w, fallbackH / h);
+          w = Math.round(w * scale);
+          h = Math.round(h * scale);
+        }
+        try {
+          if (!img.width) img.width = w;
+          if (!img.height) img.height = h;
+        } catch {}
+      }
       resolve({
         source: img,
-        width: img.naturalWidth || img.width,
-        height: img.naturalHeight || img.height,
+        width: w,
+        height: h,
         close: () => {}
       });
     };
@@ -193,9 +229,11 @@ function computeFitDrawDimensions(fit, boundsW, boundsH, srcW, srcH) {
  * Compute exact non-empty tile grid bounds for a (possibly rectangular) map across zoom levels `0..maxZoomZ`.
  */
 export function computePyramidPlan(boundsW, boundsH, imgW, imgH, tilePx = TILE_PX) {
-  const maxDim = Math.max(imgW || boundsW, imgH || boundsH, tilePx);
+  const pyramidSpan = Math.max(1, boundsW || 0, boundsH || 0);
+  const effW = imgW ? imgW * (pyramidSpan / Math.max(1, boundsW || pyramidSpan)) : (boundsW || tilePx);
+  const effH = imgH ? imgH * (pyramidSpan / Math.max(1, boundsH || pyramidSpan)) : (boundsH || tilePx);
+  const maxDim = Math.max(effW, effH, tilePx);
   const maxZoomZ = Math.max(0, Math.min(7, Math.ceil(Math.log2(Math.max(1, maxDim / tilePx)))));
-  const pyramidSpan = Math.max(boundsW, boundsH);
   const levels = [];
   let totalTiles = 0;
 
@@ -271,6 +309,7 @@ async function sliceAndUploadPyramid({
   const mipProxy = buildMipProxy(loadedImg.source, loadedImg.width, loadedImg.height, 4096);
   const work = createWorkCanvas(TILE_PX, TILE_PX, { willReadFrequently: skipEmptyAlpha });
   const sparseTiles = skipEmptyAlpha ? {} : null;
+  let uploadedBaseUrl = null;
 
   await ensureDirectoryRecursive(pyramidDir);
 
@@ -356,7 +395,13 @@ async function sliceAndUploadPyramid({
       const blob = await canvasToWebpBlob(work, quality);
       const file = new File([blob], `${tx}_${ty}.webp`, { type: "image/webp" });
 
-      const upPromise = uploadFileSilent(zDir, file).then(() => {
+      const upPromise = uploadFileSilent(zDir, file).then((res) => {
+        if (!uploadedBaseUrl && res?.path) {
+          const suffix = `/${lvl.z}/${tx}_${ty}.webp`;
+          if (res.path.endsWith(suffix)) {
+            uploadedBaseUrl = res.path.slice(0, -suffix.length);
+          }
+        }
         onTileProgress?.(lvl.z, true);
       });
       // Prevent spurious UnhandledPromiseRejection if a later concurrent upload rejects before FIFO shift() awaits it
@@ -370,7 +415,10 @@ async function sliceAndUploadPyramid({
     await flushUploads(0);
   }
 
-  return sparseTiles;
+  return {
+    sparseTiles,
+    baseUrl: uploadedBaseUrl || encodePathSegments(pyramidDir)
+  };
 }
 
 /**
@@ -482,8 +530,8 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       const level = chosenLevels[idx];
       const bgSrc = level.background?.src || "";
       const fgSrc = level.foreground?.src || "";
-      const hasRasterBg = Boolean(bgSrc && !VIDEO_EXT_RE.test(bgSrc));
-      const hasRasterFg = Boolean(fgSrc && !VIDEO_EXT_RE.test(fgSrc));
+      const hasRasterBg = Boolean(bgSrc && !isVideoPath(bgSrc));
+      const hasRasterFg = Boolean(fgSrc && !isVideoPath(fgSrc));
       const levelSlug = targetLevels.length <= 1
         ? "pyramid"
         : `lvl_${idx}_${slugifyPathPart(level.name, "lvl")}_${level.id.slice(0, 6)}`;
@@ -494,7 +542,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       let plan = null;
       if (hasRasterBg) {
         report(5, game.i18n.format("BOUNDLESS.Baker.StepLoadingBg", { level: level.name || level.id }));
-        loadedImg = await loadImageSource(bgSrc, signal);
+        loadedImg = await loadImageSource(bgSrc, signal, { fallbackW: sceneBounds.w, fallbackH: sceneBounds.h });
         plan = computePyramidPlan(sceneBounds.w, sceneBounds.h, loadedImg.width, loadedImg.height, TILE_PX);
         grandTotalTiles += plan.totalTiles;
       }
@@ -504,7 +552,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       if (hasRasterFg) {
         report(7, game.i18n.format("BOUNDLESS.Baker.StepLoadingBg", { level: `${level.name || level.id} (foreground)` }));
         try {
-          loadedFgImg = await loadImageSource(fgSrc, signal);
+          loadedFgImg = await loadImageSource(fgSrc, signal, { fallbackW: sceneBounds.w, fallbackH: sceneBounds.h });
         } catch (err) {
           loadedImg?.close?.();
           throw err;
@@ -548,8 +596,9 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       const hasBg = Boolean(loadedImg && plan);
       const hasFg = Boolean(loadedFgImg && fgPlan);
 
+      let bgBaseUrl = null;
       if (hasBg) {
-        await sliceAndUploadPyramid({
+        const bgRes = await sliceAndUploadPyramid({
           level,
           loadedImg,
           plan,
@@ -561,14 +610,16 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           allPendingUploads,
           onTileProgress
         });
+        bgBaseUrl = bgRes?.baseUrl || encodePathSegments(levelPyramidDir);
         job.loadedImg?.close?.();
         job.loadedImg = null;
         if (clearBackground) levelsToClearBg.push(level);
       }
 
       let fgSparseTiles = null;
+      let fgBaseUrl = null;
       if (hasFg) {
-        fgSparseTiles = await sliceAndUploadPyramid({
+        const fgRes = await sliceAndUploadPyramid({
           level,
           loadedImg: loadedFgImg,
           plan: fgPlan,
@@ -580,6 +631,8 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           allPendingUploads,
           onTileProgress
         });
+        fgSparseTiles = fgRes?.sparseTiles || null;
+        fgBaseUrl = fgRes?.baseUrl || encodePathSegments(levelFgPyramidDir);
         job.loadedFgImg?.close?.();
         job.loadedFgImg = null;
         if (clearBackground) levelsToClearFg.push(level);
@@ -605,14 +658,29 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
         tiles: spatial.tiles,
         sectors: spatial.sectors
       };
+      const normalizeColorCss = (raw) => {
+        if (raw === undefined || raw === null || raw === "") return null;
+        const c = foundry.utils.Color.from(raw);
+        return c?.valid && c.valueOf() !== 0xffffff ? c.css : null;
+      };
       if (hasBg) {
-        spec.pyramidBaseUrl = levelPyramidDir;
+        spec.pyramidBaseUrl = bgBaseUrl;
         spec.maxZoomZ = plan.maxZoomZ;
+        const bgTint = normalizeColorCss(level.background?.tint);
+        if (bgTint) spec.backgroundTint = bgTint;
+        if (Number.isFinite(level.background?.alphaThreshold) && level.background.alphaThreshold !== 0.75) {
+          spec.backgroundAlphaThreshold = level.background.alphaThreshold;
+        }
       }
       if (hasFg) {
-        spec.foregroundPyramidBaseUrl = levelFgPyramidDir;
+        spec.foregroundPyramidBaseUrl = fgBaseUrl;
         spec.foregroundMaxZoomZ = fgPlan.maxZoomZ;
         if (fgSparseTiles) spec.foregroundTiles = fgSparseTiles;
+        const fgTint = normalizeColorCss(level.foreground?.tint);
+        if (fgTint) spec.foregroundTint = fgTint;
+        if (Number.isFinite(level.foreground?.alphaThreshold) && level.foreground.alphaThreshold !== 0.75) {
+          spec.foregroundAlphaThreshold = level.foreground.alphaThreshold;
+        }
       }
       attachBakedPolysIfPossible(spec, targetScene, level);
       levelSpecs[level.id] = spec;
@@ -657,11 +725,13 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       { type: "application/json" }
     );
     const manifestUpRes = await uploadFileSilent(outDir, manifestFile);
-    const manifestUrl = manifestUpRes?.path || `${outDir}/${manifestName}`;
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const manifestUrl = manifestUpRes?.path || `${encodePathSegments(outDir)}/${manifestName}`;
     controller.manifestCache?.delete?.(manifestUrl);
 
     // 6. Clean up original embedded documents & background on targetScene if requested
     report(94, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     if (removeOriginals) {
       const bakedLevelIdSet = new Set(chosenLevels.map(l => l.id));
       const unbakedLevelIds = targetLevels.map(l => l.id).filter(lid => !bakedLevelIdSet.has(lid));
@@ -1219,7 +1289,7 @@ export function virtualTileToDocData(item, levelId) {
     levels: [levelId],
     texture: {
       src: item.src,
-      tint: item.tint || "#ffffff",
+      tint: (item.tint !== undefined && item.tint !== null && item.tint !== "") ? item.tint : "#ffffff",
       alphaThreshold: item.alphaThreshold ?? 0.75,
       anchorX: ax,
       anchorY: ay,
@@ -1454,7 +1524,7 @@ function getSceneManifestInfo(scene) {
   const cfg = scene?.flags?.[MODULE_ID] || {};
   return {
     cfg,
-    sceneManifestUrl: cfg.manifestUrl || "",
+    sceneManifestUrl: cfg.manifestUrl || (cfg.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : ""),
     sceneLevelId: cfg.levelId || null
   };
 }
@@ -1473,9 +1543,13 @@ export function getDirAndFilename(url, fallbackDir) {
   if (slash <= 0 || !isWritableDataPath(clean)) {
     return { dir: fallbackDir, filename: "pyramid_manifest.json", redirected: true };
   }
-  let dir = clean.slice(0, slash);
+  let dir = clean.slice(0, slash)
+    .split("/")
+    .map(seg => {
+      try { return decodeURIComponent(seg); } catch { return seg; }
+    })
+    .join("/");
   let filename = clean.slice(slash + 1) || "pyramid_manifest.json";
-  try { dir = decodeURIComponent(dir); } catch {}
   try { filename = decodeURIComponent(filename); } catch {}
   return {
     dir,
@@ -1555,7 +1629,9 @@ export function computeStitchPyramidPlan({
       break;
     }
   }
-  const scaleZ = (tilePx * (1 << chosenZ)) / pyramidSpan;
+  const rawScaleZ = (tilePx * (1 << chosenZ)) / pyramidSpan;
+  const maxSpan = Math.max(1, Number(b.w) || 0, Number(b.h) || 0);
+  const scaleZ = Math.min(rawScaleZ, maxDim / maxSpan);
   const outW = Math.max(1, Math.min(maxDim, Math.round(b.w * scaleZ)));
   const outH = Math.max(1, Math.min(maxDim, Math.round(b.h * scaleZ)));
   const tileWorld = pyramidSpan / (1 << chosenZ);
@@ -1641,6 +1717,7 @@ async function stitchPyramidToWebp({
         drawn++;
       } catch (err) {
         if (err?.name === "AbortError") throw err;
+        console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
       } finally {
         img?.close?.();
       }
@@ -1907,6 +1984,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   // Stage 2: Commit validated manifests now that all levels passed validation
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   for (const w of pendingWrites) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     if (w.kind === "inline") {
       // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
       await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
@@ -1931,6 +2009,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   }
 
   // 3. Remove or prune absorbed native documents (preserving unbaked levels on multi-level scenes)
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   report(85, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
   if (absorbNative) {
     const editedLevelIdSet = new Set(editedLevelIds);
@@ -2063,8 +2142,10 @@ export async function unbakeSceneFromBoundless(controller, scene, {
   let targetScene = scene;
   let createdClone = false;
   const levelIdMap = new Map();
+  const createdDocIds = { Tile: [], Wall: [], AmbientLight: [], AmbientSound: [] };
 
   try {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     if (createCopy) {
       const cloneName = `${scene.name} (Native)`;
       targetScene = await scene.clone({ name: cloneName }, { save: true });
@@ -2083,6 +2164,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     const allLights = [];
     const allSounds = [];
     const allTiles = [];
+    const pendingLevelPatches = [];
 
     // 3. Extract native documents and optionally stitch pyramid textures back into background/foreground
     for (let i = 0; i < levelSpecEntries.length; i++) {
@@ -2128,6 +2210,8 @@ export async function unbakeSceneFromBoundless(controller, scene, {
             const fname = `bg_${i}_${lvlSlug}.webp`;
             const res = await uploadFileSilent(outDir, new File([blob], fname, { type: "image/webp" }));
             lvlPatch["background.src"] = res.path;
+            if (spec.backgroundTint) lvlPatch["background.tint"] = spec.backgroundTint;
+            if (Number.isFinite(spec.backgroundAlphaThreshold)) lvlPatch["background.alphaThreshold"] = spec.backgroundAlphaThreshold;
           }
         }
         if (!dstLevel.foreground?.src && spec.foregroundPyramidBaseUrl) {
@@ -2146,13 +2230,15 @@ export async function unbakeSceneFromBoundless(controller, scene, {
             const fname = `fg_${i}_${lvlSlug}.webp`;
             const res = await uploadFileSilent(outDir, new File([fgBlob], fname, { type: "image/webp" }));
             lvlPatch["foreground.src"] = res.path;
+            if (spec.foregroundTint) lvlPatch["foreground.tint"] = spec.foregroundTint;
+            if (Number.isFinite(spec.foregroundAlphaThreshold)) lvlPatch["foreground.alphaThreshold"] = spec.foregroundAlphaThreshold;
           }
         }
         if (Object.keys(lvlPatch).length) {
           // Baked pyramids already incorporate `level.textures` transforms (offset/scale/rotation/anchor/fit);
           // reset them when restoring stitched images, unless an untouched video layer still depends on them.
-          const hasUntouchedVideoBg = Boolean(dstLevel.background?.src && VIDEO_EXT_RE.test(dstLevel.background.src));
-          const hasUntouchedVideoFg = Boolean(dstLevel.foreground?.src && VIDEO_EXT_RE.test(dstLevel.foreground.src));
+          const hasUntouchedVideoBg = Boolean(dstLevel.background?.src && isVideoPath(dstLevel.background.src));
+          const hasUntouchedVideoFg = Boolean(dstLevel.foreground?.src && isVideoPath(dstLevel.foreground.src));
           if (dstLevel.textures && !hasUntouchedVideoBg && !hasUntouchedVideoFg) {
             lvlPatch["textures.offsetX"] = 0;
             lvlPatch["textures.offsetY"] = 0;
@@ -2163,7 +2249,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
             lvlPatch["textures.anchorY"] = 0.5;
             lvlPatch["textures.fit"] = "fill";
           }
-          await dstLevel.update(lvlPatch);
+          pendingLevelPatches.push({ dstLevel, lvlPatch });
         }
       }
     }
@@ -2179,14 +2265,17 @@ export async function unbakeSceneFromBoundless(controller, scene, {
 
     const runBatched = async (docName, list) => {
       if (!list.length) return;
-      let prev = 0;
-      await createEmbeddedBatched(targetScene, docName, list, {
-        signal,
-        onBatch: (done) => {
-          onDocs(done - prev);
-          prev = done;
+      for (let i = 0; i < list.length; i += DOC_CREATE_BATCH_SIZE) {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        const chunk = list.slice(i, i + DOC_CREATE_BATCH_SIZE);
+        const created = await targetScene.createEmbeddedDocuments(docName, chunk);
+        if (Array.isArray(created)) {
+          for (const d of created) {
+            if (d?.id) createdDocIds[docName].push(d.id);
+          }
         }
-      });
+        onDocs(chunk.length);
+      }
     };
 
     await runBatched("Tile", allTiles);
@@ -2194,8 +2283,13 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     await runBatched("AmbientLight", allLights);
     await runBatched("AmbientSound", allSounds);
 
-    // 5. Clear Boundless flags from levels & scene
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+    // 5. Commit restored level textures and clear Boundless flags from levels & scene
     report(93, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
+    for (const { dstLevel, lvlPatch } of pendingLevelPatches) {
+      await dstLevel.update(lvlPatch);
+    }
     for (const lvl of targetScene.levels || []) {
       if (lvl.flags?.[MODULE_ID]) {
         await lvl.update({ [`flags.-=${MODULE_ID}`]: null });
@@ -2230,6 +2324,12 @@ export async function unbakeSceneFromBoundless(controller, scene, {
   } catch (err) {
     if (createdClone && targetScene?.id) {
       try { await targetScene.delete(); } catch {}
+    } else if (!createdClone && targetScene?.deleteEmbeddedDocuments) {
+      for (const docName of ["AmbientSound", "AmbientLight", "Wall", "Tile"]) {
+        if (createdDocIds[docName].length) {
+          try { await targetScene.deleteEmbeddedDocuments(docName, createdDocIds[docName]); } catch {}
+        }
+      }
     }
     throw err;
   }

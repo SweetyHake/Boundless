@@ -307,6 +307,27 @@ function collectVisionRanges() {
     if (ls.data?.vision) sources.push({ x: ls.data.x, y: ls.data.y, r: ls.data.radius ?? 0 });
     if (sawUnboundedLightPerception) lights.push({ x: ls.data.x, y: ls.data.y, r: ls.data.radius ?? 0 });
   }
+  // On Boundless scenes, virtual GPU lights live in MegaLightBatch rather than canvas.effects.lightSources;
+  // include virtual lights within LOS reach of any active vision source so enemies standing under them stay visible.
+  if (sawUnboundedLightPerception && sources.length > 0) {
+    const lb = globalThis.Boundless?.active ? globalThis.Boundless.lightBatch : null;
+    const metaMap = lb?.lightMetaById;
+    if (metaMap?.size) {
+      const activeLvlId = canvas.level?.id;
+      const maxLosSq = 4600 * 4600;
+      for (const meta of metaMap.values()) {
+        if (!meta || meta.dimPx <= 0) continue;
+        if (activeLvlId && meta.levelId && meta.levelId !== activeLvlId) continue;
+        let nearVision = false;
+        for (let i = 0; i < sources.length; i++) {
+          const dx = meta.lx - sources[i].x;
+          const dy = meta.ly - sources[i].y;
+          if (dx * dx + dy * dy <= maxLosSq) { nearVision = true; break; }
+        }
+        if (nearVision) lights.push({ x: meta.lx, y: meta.ly, r: meta.dimPx });
+      }
+    }
+  }
   return { sources, lights };
 }
 
@@ -343,7 +364,7 @@ function pruneOutOfSight() {
   };
 
   for (const t of canvas.tokens?.placeables ?? []) {
-    if (t.visible || t.controlled || t.document?.hidden) continue;
+    if (t.visible || t.controlled || t.document?.hidden || t.isOwner || t.document?.testUserPermission?.(game.user, "OBSERVER")) continue;
     if (t.isPreview || t._preview?._previewType === "config") continue;
     if (!t.bounds) continue;
     if (anyIn(t.bounds, sources)) continue;
@@ -642,14 +663,21 @@ function flushDragDestination(forceSync = false) {
   if (!pending) return;
   _dragQ.pending = null;
   _dragQ.last = performance.now();
-  const { token, point, snap } = pending;
+  const { token, point, snap, event, wrapped } = pending;
   if (!token || token.destroyed || !globalThis.canvas?.ready) return;
   if (token.layer?._draggedToken && token.layer._draggedToken !== token) return;
   if (!token.mouseInteractionManager?.interactionData?.contexts) return;
   perfStats.dragDestFlushed++;
   const t0 = performance.now();
-  try { token._updateDragDestination(point, { snap }); }
-  catch (err) { console.error(`${MODULE_ID} | drag flush error:`, err); }
+  try {
+    if (typeof wrapped === "function" && event?.interactionData?.destination) {
+      event.interactionData.destination.x = point.x;
+      event.interactionData.destination.y = point.y;
+      wrapped.call(token, event);
+    } else {
+      token._updateDragDestination(point, { snap });
+    }
+  } catch (err) { console.error(`${MODULE_ID} | drag flush error:`, err); }
   _dragRecalcMs = performance.now() - t0;
 }
 
@@ -672,7 +700,7 @@ function patchDragAndMovement() {
     }
 
     try { canvas._onDragCanvasPan(event); } catch {}
-    _dragQ.pending = { token: this, point: { x: dest.x, y: dest.y }, snap: !event.shiftKey };
+    _dragQ.pending = { token: this, point: { x: dest.x, y: dest.y }, snap: !event.shiftKey, event, wrapped };
     perfStats.dragDestSkipped++;
     if (_dragQ.timerId === null) {
       const delay = Math.max(1, Math.ceil(ms - elapsed));
@@ -885,6 +913,8 @@ function patchMiscCpuGuards() {
     return out;
   };
 
+  let _priorityEnvVersion = 0;
+
   const sourceInitWrapper = function (wrapped, data = {}, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) {
       this.__blSweepV = null;
@@ -899,17 +929,23 @@ function patchMiscCpuGuards() {
         }
       }
     }
+    const env = globalThis.canvas?.environment;
+    const darkLevel = Number(((env?.darknessLevel ?? 0)).toFixed(4));
+    const globalLightActive = env?.globalLightSource?.active ? 1 : 0;
+    const darkSrcCount = globalThis.canvas?.effects?.darknessSources?.size || 0;
+    const isPriorityOrDarkness = Boolean(this.requiresEdges === true || (this.data?.priority ?? 0) > 0 || this.constructor?.name?.includes?.("Darkness"));
     const stateSig = quickStateSig(this);
-    const curV = `${_geometryVersion}|${_edgeVersion}|${stateSig}`;
+    const curV = `${_geometryVersion}|${_edgeVersion}|${_priorityEnvVersion}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${stateSig}`;
     const hasValidGeom = !this.attached || this.data?.disabled || isCompatibleSourceGeom(this._geometry) || Boolean(this._geometry && !this._geometry.destroyed);
     if (!options?.reset && this.shape && hasValidGeom && dataSame && this.__blSweepV === curV) {
       perfStats.sweepSkipped++;
       return this;
     }
     if (this.requiresEdges === true && (!dataSame || options?.reset)) _edgeVersion++;
+    if (isPriorityOrDarkness) _priorityEnvVersion++;
     perfStats.sweepRun++;
     const result = wrapped(data, options);
-    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${quickStateSig(this)}`;
+    this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${_priorityEnvVersion}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
     return result;
   };
 

@@ -1096,7 +1096,24 @@ export const pyramidMethods = {
       : `Level.${layer.level?.index ?? 0}.BoundlessTile.${e.key}`;
     m.anchor.set(0, 0);
     m.texture = tex;
-    m.tint = e.tint ?? 0xffffff;
+    const rawSpecTint = isFg
+      ? (layer.spec?.foregroundTint ?? layer.level?.foreground?.tint)
+      : (layer.spec?.backgroundTint ?? layer.level?.background?.tint);
+    let resolvedTint = 0xffffff;
+    if (e.tint !== undefined && e.tint !== null) {
+      resolvedTint = e.tint;
+    } else if (rawSpecTint !== undefined && rawSpecTint !== null && rawSpecTint !== "") {
+      if (typeof rawSpecTint === "number" && Number.isFinite(rawSpecTint)) resolvedTint = rawSpecTint;
+      else {
+        const c = foundry.utils.Color.from(rawSpecTint);
+        if (c?.valid) resolvedTint = c.valueOf();
+      }
+    }
+    m.tint = resolvedTint;
+    const rawAlphaThresh = isFg
+      ? (layer.spec?.foregroundAlphaThreshold ?? layer.level?.foreground?.alphaThreshold)
+      : (layer.spec?.backgroundAlphaThreshold ?? layer.level?.background?.alphaThreshold);
+    if (Number.isFinite(rawAlphaThresh)) m.textureAlphaThreshold = rawAlphaThresh;
     m.position.set(e.x0, e.y0);
     m.width = e.sizePx + 0.5;
     m.height = e.sizePx + 0.5;
@@ -1465,13 +1482,13 @@ export const pyramidMethods = {
         }
       }
     }
-    // Track light-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
+    // Track light/weather-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
     if (this.activeVirtualTiles.size > 0) {
       let vtIdx = 0;
       for (const vt of this.activeVirtualTiles.values()) {
         vtIdx++;
         const m = vt?.mesh;
-        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        if (!m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
         const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
         occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
         occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
@@ -1482,7 +1499,7 @@ export const pyramidMethods = {
     if (nativeTiles?.length) {
       for (let i = 0; i < nativeTiles.length; i++) {
         const m = nativeTiles[i]?.mesh;
-        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+        if (!m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
         const v = (0x200000 ^ (i << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
         occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
         occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;

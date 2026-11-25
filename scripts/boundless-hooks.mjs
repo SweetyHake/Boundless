@@ -3,7 +3,7 @@ import { installLazyTokenLayerPatch } from "./token-streamer.mjs";
 import { installGlobalSelectionPatches } from "./boundless-selection.mjs";
 import { PERF_CONFIG } from "./perf-patcher.mjs";
 import { installGpuPerfEngine, refreshGpuPerfSettings } from "./perf-gpu.mjs";
-import { installCpuPerfEngine } from "./perf-cpu.mjs";
+import { installCpuPerfEngine, resetCpuCaches } from "./perf-cpu.mjs";
 import { installAutoPerfEngine, updateStandardSceneCulling, restoreAllStandardCulling } from "./perf-auto.mjs";
 import { MAX_LOS_RADIUS_PX } from "./boundless-lighting.mjs";
 import { MODULE_ID } from "./utils.mjs";
@@ -18,7 +18,12 @@ export function installLosHorizonPatch() {
     const cfg = orig.apply(this, args);
     const megaCfg = globalThis.canvas?.scene?.flags?.[MODULE_ID];
     const lvlCfg = globalThis.canvas?.level?.flags?.[MODULE_ID];
-    if (megaCfg?.enabled || lvlCfg?.enabled || globalThis.Boundless?.active) {
+    const activeForLevel = Boolean(
+      globalThis.Boundless?.active
+      || lvlCfg?.enabled === true
+      || (megaCfg?.enabled && lvlCfg?.enabled !== false)
+    );
+    if (activeForLevel) {
       const maxLos = lvlCfg?.maxLosPx || megaCfg?.maxLosPx || MAX_LOS_RADIUS_PX;
       if (cfg.radius > maxLos) cfg.radius = maxLos;
     }
@@ -64,12 +69,13 @@ export function installHoverFadeHitTestPatch(controller) {
         if (this._boundlessTile && !this.hoverFade) return false;
         if (controller.isActivelyMoving()) return false;
       } else if (PERF_CONFIG.perfEnabled) {
-        // On standard scenes, skip synchronous gl.readPixels() alpha-map stall for non-hoverFade, non-occludable ground/background meshes,
-        // while preserving opaque upper tiles/platforms that intentionally block hoverFade from bleeding through to roofs below.
+        // On standard scenes, skip synchronous gl.readPixels() alpha-map stall only for non-hoverFade, non-occludable
+        // scene background meshes (SORT_LAYERS.SCENE), preserving opaque native tiles that block hoverFade to lower roofs.
+        const sceneSortLayer = PCG.SORT_LAYERS?.SCENE ?? 0;
         const baseElev = Number.isFinite(canvas?.level?.elevation?.base)
           ? canvas.level.elevation.base
           : (Number.isFinite(canvas?.level?.elevation?.bottom) ? canvas.level.elevation.bottom : 0);
-        if (!this.hoverFade && !this.occlusionMode && (this.elevation ?? 0) <= baseElev) return false;
+        if (!this.hoverFade && !this.occlusionMode && (this.sortLayer ?? 0) <= sceneSortLayer && (this.elevation ?? 0) <= baseElev) return false;
       }
     }
     return origContainsCanvasPoint.apply(this, args);
@@ -113,6 +119,7 @@ export function registerBoundlessHooks(controller) {
     if (game.settings?.register) {
       const onPerfChange = () => {
         syncPerfConfigFromSettings();
+        resetCpuCaches();
         refreshGpuPerfSettings();
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleLevelPrewarm) {
           controller._cancelIdleLevelPrewarm?.();
@@ -351,12 +358,14 @@ export function registerBoundlessHooks(controller) {
   let _tokBatchVoidFilter = false;
   let _tokBatchVoidFilterForce = false;
   let _tokBatchOcclusion = false;
-  const queueTokenBatchFlush = ({ bubbles = false, selection = false, voidFilter = false, voidFilterForce = false, occlusion = false } = {}) => {
+  let _tokBatchChunks = false;
+  const queueTokenBatchFlush = ({ bubbles = false, selection = false, voidFilter = false, voidFilterForce = false, occlusion = false, chunks = false } = {}) => {
     if (bubbles) _tokBatchBubbles = true;
     if (selection) _tokBatchSelection = true;
     if (voidFilter) _tokBatchVoidFilter = true;
     if (voidFilterForce) _tokBatchVoidFilterForce = true;
     if (occlusion) _tokBatchOcclusion = true;
+    if (chunks) _tokBatchChunks = true;
     if (_tokBatchQueued) return;
     _tokBatchQueued = true;
     queueMicrotask(() => {
@@ -365,13 +374,19 @@ export function registerBoundlessHooks(controller) {
       const doVoidFilter = _tokBatchVoidFilter;
       const doVoidForce = _tokBatchVoidFilterForce;
       const doOcclusion = _tokBatchOcclusion;
+      const doChunks = _tokBatchChunks;
       _tokBatchQueued = false;
       _tokBatchBubbles = false;
       _tokBatchSelection = false;
       _tokBatchVoidFilter = false;
       _tokBatchVoidFilterForce = false;
       _tokBatchOcclusion = false;
+      _tokBatchChunks = false;
       if (!isRuntimeReady()) return;
+      if (doChunks && controller.chunkStreamer?.states?.size) {
+        const vp = controller.getViewportWorldRect?.(0.18);
+        controller.chunkStreamer.update(vp);
+      }
       if (doVoidFilter) controller._syncInterfaceVoidFilter(doVoidForce);
       if (doBubbles) controller.updateSimAndLightBubbles(false);
       if (doSelection) controller.selectionOverlay?.refresh?.(true);
@@ -389,6 +404,13 @@ export function registerBoundlessHooks(controller) {
     const sizeChanged = "width" in changes || "height" in changes;
     const elevChanged = "elevation" in changes;
     const lightChanged = "light" in changes || "sight" in changes;
+    if (posChanged && controller.chunkStreamer?.states?.size) {
+      const tx = Number(doc._source?.x ?? doc.x ?? 0);
+      const ty = Number(doc._source?.y ?? doc.y ?? 0);
+      if (Number.isFinite(tx) && Number.isFinite(ty)) {
+        controller.chunkStreamer.prewarmPoint?.(tx, ty);
+      }
+    }
     if (posChanged || sizeChanged || elevChanged || lightChanged) {
       if ((posChanged || elevChanged) && !controller._depthDirty && controller._hasMultiElevationDepth()) controller._depthDirty = true;
       if (posChanged || sizeChanged || elevChanged) controller._roofTokenOccDirty = true;
@@ -396,7 +418,8 @@ export function registerBoundlessHooks(controller) {
       queueTokenBatchFlush({
         bubbles: posChanged || lightChanged,
         selection: posChanged || sizeChanged || elevChanged,
-        occlusion: needOcc
+        occlusion: needOcc,
+        chunks: posChanged
       });
     }
   });
@@ -466,12 +489,17 @@ export function registerBoundlessHooks(controller) {
   Hooks.on("updateActiveEffect", (e, ch) => onEffectVisibilityChange(e, ch));
   Hooks.on("deleteActiveEffect", (e) => onEffectVisibilityChange(e));
 
+  let sidebarSyncTimer = null;
   Hooks.on("collapseSidebar", () => {
     if (!isRuntimeReady()) return;
     controller.charPins._lastSidebarCheckMs = 0;
-    setTimeout(() => {
-      if (isRuntimeReady()) controller.charPins.updateViewport();
-    }, 120);
+    if (sidebarSyncTimer !== null) clearTimeout(sidebarSyncTimer);
+    sidebarSyncTimer = setTimeout(() => {
+      sidebarSyncTimer = null;
+      if (!isRuntimeReady()) return;
+      controller.charPins._lastSidebarCheckMs = 0;
+      controller.charPins.updateViewport();
+    }, 180);
   });
 
   const onResizeSync = (syncPyramid = false) => {
@@ -486,7 +514,7 @@ export function registerBoundlessHooks(controller) {
       controller.selectionOverlay?.refresh?.(true);
     }
   };
-  window.addEventListener("resize", () => onResizeSync(false));
+  globalThis.window?.addEventListener?.("resize", () => onResizeSync(false));
   Hooks.on("canvasResize", () => onResizeSync(true));
 
   for (const hookName of ["createCombatant", "deleteCombatant", "updateCombat", "deleteCombat"]) {
@@ -500,6 +528,9 @@ export function registerBoundlessHooks(controller) {
     if (!scene?.id) return;
     const sid = scene.id;
     const worldId = game.world?.id || "world";
+    if (controller.active && controller._mountedSceneId === sid) {
+      controller.unmount();
+    }
     if (controller._cachedSceneId === sid || controller._mountedSceneId === sid) {
       controller.clearSceneCache();
     }
@@ -544,7 +575,14 @@ export function registerBoundlessHooks(controller) {
     if (!parentScene?.id || !level?.id) return;
     const worldId = game.world?.id || "world";
     try {
-      localStorage.removeItem(`boundless.fog.v2.${worldId}.${parentScene.id}.${level.id}`);
+      const exactKey = `boundless.fog.v2.${worldId}.${parentScene.id}.${level.id}`;
+      const prefix = `${exactKey}.`;
+      const keysToDel = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k === exactKey || k.startsWith(prefix))) keysToDel.push(k);
+      }
+      for (const k of keysToDel) localStorage.removeItem(k);
     } catch {}
     if (globalThis.canvas?.ready && parentScene.id === globalThis.canvas.scene?.id && controller.levelLayers?.has?.(level.id)) {
       controller.mount(parentScene);

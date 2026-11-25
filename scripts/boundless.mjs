@@ -725,6 +725,13 @@ class MegaWorld1000 {
     }
     const switchingScene = Boolean(this._cachedSceneId && scene?.id !== this._cachedSceneId);
     this.unmount({ clearTextures: switchingScene });
+    const cfg = scene?.flags?.[MODULE_ID];
+    const anyLevelFlag = Boolean(scene?.levels?.some?.(l => l.flags?.[MODULE_ID]?.enabled));
+    if (!cfg?.enabled && !anyLevelFlag) {
+      if (switchingScene) this.clearSceneCache();
+      return Promise.resolve();
+    }
+    this._restoreStandardCulling?.();
     const mountGen = ++this._mountGen;
     this._mounting = true;
     const p = this._mountImpl(scene, mountGen).catch((err) => {

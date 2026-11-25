@@ -318,6 +318,15 @@ export class TileWorkerPool {
         }
       }
       if (!anyAlive) {
+        if (this._canRespawnAny() && !this._respawnAttemptedInDispatch) {
+          this._respawnAttemptedInDispatch = true;
+          try {
+            this._ensureWorkers();
+          } finally {
+            this._respawnAttemptedInDispatch = false;
+          }
+          if (this._workers.some(Boolean)) continue;
+        }
         if (!this._canRespawnAny()) this._supported = false;
         while (this._queue.length > 0) {
           const job = this._queue.shift();

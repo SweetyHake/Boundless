@@ -205,7 +205,7 @@ export class ChunkedFogManager {
 
     patchMethod(fog, "reset", (origReset) => async () => {
       if (this.enabled) {
-        await this.reset({ broadcast: true, persist: true });
+        await this.reset({ broadcast: true, persist: true, allLevels: true });
       }
       return origReset.call(fog);
     });
@@ -213,7 +213,7 @@ export class ChunkedFogManager {
     // Server-initiated fog reset broadcasts hit FogManager#_handleReset on all clients
     patchMethod(fog, "_handleReset", (origHandleReset) => async (...args) => {
       if (this.enabled) {
-        await this.reset({ broadcast: false, persist: false });
+        await this.reset({ broadcast: false, persist: false, clearOwnFlags: !game.user?.isGM });
       }
       return origHandleReset.apply(fog, args);
     });
@@ -551,6 +551,7 @@ export class ChunkedFogManager {
     }
 
     if (sharedPolys.length) {
+      this._lastLocalRevealMs = performance.now();
       this._applyPolygons(sharedPolys, { target: "shared", markDirty: true });
       if (broadcast && this.isSharedMode) {
         game.socket?.emit(SOCKET_NAME, {
@@ -614,6 +615,49 @@ export class ChunkedFogManager {
 
   // ===== Socket & Scene Flag Sync =====
 
+  _isAuthorizedFogSender(senderId, targetScene, targetLevelId = null) {
+    if (!targetScene) return false;
+    if (!game.users?.get) return true;
+    if (!senderId) return false;
+    const sender = game.users.get(senderId);
+    if (!sender || sender.active === false) return false;
+    if (sender.isGM) return true;
+    const hasSceneAccess = Boolean(
+      targetScene.active
+      || targetScene.navigation
+      || targetScene.testUserPermission?.(sender, "LIMITED")
+      || targetScene.tokens?.some?.(t => {
+        if (!t?.testUserPermission?.(sender, "OBSERVER")) return false;
+        if (targetLevelId && t.level && t.level !== targetLevelId) return false;
+        return true;
+      })
+    );
+    return hasSceneAccess;
+  }
+
+  _filterReasonablePolygons(polygons) {
+    const MAX_SPAN = 12000;
+    const out = [];
+    const cap = Math.min(polygons.length, 64);
+    for (let i = 0; i < cap; i++) {
+      const pts = polygons[i];
+      if (!Array.isArray(pts) || pts.length < 6) continue;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      let valid = true;
+      for (let j = 0; j < pts.length; j += 2) {
+        const x = pts[j], y = pts[j + 1];
+        if (!Number.isFinite(x) || !Number.isFinite(y)) { valid = false; break; }
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      if (!valid || (maxX - minX) > MAX_SPAN || (maxY - minY) > MAX_SPAN) continue;
+      out.push(pts);
+    }
+    return out;
+  }
+
   handleSocketMessage(payload) {
     if (!payload) return false;
 
@@ -638,10 +682,13 @@ export class ChunkedFogManager {
 
     if (payload.type === "fogReveal") {
       if (!this.isSharedMode || !Array.isArray(payload.polygons)) return true;
+      const curScene = game.scenes?.get?.(this.sceneId) ?? canvas?.scene;
+      if (!this._isAuthorizedFogSender(payload.senderId, curScene, this.levelId)) return true;
+      const safePolys = this._filterReasonablePolygons(payload.polygons);
+      if (!safePolys.length) return true;
       // Only activeGM needs to mark shared chunks dirty for DB persistence
       const isAuthoritativeGM = game.users?.activeGM?.id === game.user?.id;
-      const cappedPolys = payload.polygons.length > 64 ? payload.polygons.slice(0, 64) : payload.polygons;
-      this._applyPolygons(cappedPolys, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
+      this._applyPolygons(safePolys, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
       return true;
     }
 
@@ -683,6 +730,9 @@ export class ChunkedFogManager {
         || targetScene.firstLevel?.id
         || "default";
     }
+    if (!this._isAuthorizedFogSender(payload.senderId, targetScene, targetLevelId)) return Promise.resolve();
+    const safePolys = this._filterReasonablePolygons(payload.polygons);
+    if (!safePolys.length) return Promise.resolve();
     const queueKey = `${sceneId}::${targetLevelId}`;
 
     let q = this._remoteRevealQueues.get(queueKey);
@@ -690,9 +740,9 @@ export class ChunkedFogManager {
       q = { polygons: [], running: null };
       this._remoteRevealQueues.set(queueKey, q);
     }
-    for (const pts of payload.polygons) {
+    for (const pts of safePolys) {
       if (q.polygons.length >= 512) break;
-      if (Array.isArray(pts) && pts.length >= 6) q.polygons.push(pts);
+      q.polygons.push(pts);
     }
     if (!q.running) {
       const run = async () => {
@@ -856,7 +906,10 @@ export class ChunkedFogManager {
     }
     const levelPatch = sharedFogChanges[this.levelId];
     if (!levelPatch || typeof levelPatch !== "object") return;
-    this._mergeChunkMap(levelPatch, { intoShared: true, replace: true });
+    // In SHARED mode, if this player just revealed fog locally within the last 5s, merge additively so an older
+    // in-flight GM snapshot doesn't snap back freshly walked edges (deletions still clear explicitly).
+    const recentLocalReveal = !game.user?.isGM && this._lastLocalRevealMs > 0 && (performance.now() - this._lastLocalRevealMs) < 5000;
+    this._mergeChunkMap(levelPatch, { intoShared: true, replace: !recentLocalReveal });
   }
 
   onSceneFogResetChanged(scene, fogResetAtChanges) {
@@ -886,6 +939,7 @@ export class ChunkedFogManager {
     const strokes = Array.isArray(brushPayload.strokes) ? brushPayload.strokes : fullBrush?.strokes;
     if (levelId && levelId !== this.levelId) return;
     if (!Array.isArray(strokes) || !strokes.length) return;
+    this._lastLocalRevealMs = 0;
     const shouldPersist = !this.isSharedMode;
     this._applyBrushStrokes(strokes, { markDirty: shouldPersist });
     if (!shouldPersist) this._scheduleLocalCacheSave();
@@ -1015,7 +1069,13 @@ export class ChunkedFogManager {
           update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.${key}`] = encodeCanvas(privCanvas);
         }
       }
-      if (Object.keys(update).length) privateUpdate = update;
+      if (Object.keys(update).length) {
+        update[`flags.${MODULE_ID}.fogMeta.${sceneId}.${levelId}`] = {
+          resetId: scene?.flags?.[MODULE_ID]?.fogResetId?.[levelId] || "",
+          savedAt: Date.now()
+        };
+        privateUpdate = update;
+      }
     }
 
     // 3. Persist to server asynchronously with per-level re-entrancy guard & retry-on-failure requeue
@@ -1151,7 +1211,23 @@ export class ChunkedFogManager {
 
   _loadPersistedFog(scene) {
     const sharedFromScene = scene?.flags?.[MODULE_ID]?.sharedFog?.[this.levelId];
-    const personalFromUser = game.user?.flags?.[MODULE_ID]?.fog?.[this.sceneId]?.[this.levelId];
+    let personalFromUser = game.user?.flags?.[MODULE_ID]?.fog?.[this.sceneId]?.[this.levelId];
+    const resetAt = Number(scene?.flags?.[MODULE_ID]?.fogResetAt?.[this.levelId]) || 0;
+    const sceneResetId = scene?.flags?.[MODULE_ID]?.fogResetId?.[this.levelId] || "";
+
+    // Discard stale user-flag exploration written before the latest GM fog reset (e.g. Assistant GM or in-flight race)
+    if (personalFromUser && (sceneResetId || resetAt > 0)) {
+      const meta = game.user?.flags?.[MODULE_ID]?.fogMeta?.[this.sceneId]?.[this.levelId];
+      const staleById = Boolean(sceneResetId && meta?.resetId !== sceneResetId);
+      const staleByTime = Boolean(resetAt > 0 && (Number(meta?.savedAt) || 0) < resetAt);
+      if (staleById || staleByTime) {
+        personalFromUser = null;
+        game.user?.update?.({
+          [`flags.${MODULE_ID}.fog.${this.sceneId}.-=${this.levelId}`]: null,
+          [`flags.${MODULE_ID}.fogMeta.${this.sceneId}.-=${this.levelId}`]: null
+        })?.catch?.(() => {});
+      }
+    }
 
     if (this.isSharedMode) {
       if (sharedFromScene) {
@@ -1170,8 +1246,6 @@ export class ChunkedFogManager {
           const raw = localStorage.getItem(this._storageKey);
           if (raw) {
             const parsed = JSON.parse(raw);
-            const resetAt = Number(scene?.flags?.[MODULE_ID]?.fogResetAt?.[this.levelId]) || 0;
-            const sceneResetId = scene?.flags?.[MODULE_ID]?.fogResetId?.[this.levelId] || "";
             const isWrapped = parsed && typeof parsed === "object" && "chunks" in parsed && typeof parsed.chunks === "object";
             const savedAt = isWrapped ? (Number(parsed.savedAt) || 0) : 0;
             const cachedResetId = isWrapped ? (parsed.resetId || "") : "";
@@ -1187,7 +1261,7 @@ export class ChunkedFogManager {
     }
   }
 
-  async reset({ broadcast = true, persist = true } = {}) {
+  async reset({ broadcast = true, persist = true, allLevels = false, clearOwnFlags = false } = {}) {
     if (this._saveTimer !== null) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
@@ -1201,6 +1275,7 @@ export class ChunkedFogManager {
       this._brushFlushTimer = null;
     }
     this._brushPendingStrokes = [];
+    this._lastLocalRevealMs = 0;
     this._fogGen++;
     this._chunkLoadSeq.clear();
     this._pendingChunkLoads.clear();
@@ -1222,18 +1297,36 @@ export class ChunkedFogManager {
 
     const sceneId = this.sceneId;
     const levelId = this.levelId;
+    if (clearOwnFlags && sceneId && game.user?.flags?.[MODULE_ID]?.fog?.[sceneId]) {
+      try {
+        await game.user.update({
+          [`flags.${MODULE_ID}.fog.-=${sceneId}`]: null,
+          [`flags.${MODULE_ID}.fogMeta.-=${sceneId}`]: null
+        });
+      } catch {}
+    }
     if (persist && sceneId && levelId) {
       const scene = game.scenes?.get?.(sceneId) ?? (canvas?.scene?.id === sceneId ? canvas.scene : null);
+      const targetLevelIds = new Set([levelId]);
+      if (allLevels && scene) {
+        for (const lvl of scene.levels || []) {
+          if (lvl?.id) targetLevelIds.add(lvl.id);
+        }
+        const sharedMap = scene.flags?.[MODULE_ID]?.sharedFog;
+        if (sharedMap && typeof sharedMap === "object") {
+          for (const lid of Object.keys(sharedMap)) targetLevelIds.add(lid);
+        }
+      }
       if (game.user?.isGM && scene) {
         const resetAt = Date.now();
-        const resetId = foundry.utils.randomID();
         this._lastHandledResetAt = resetAt;
-        const scenePatch = {
-          [`flags.${MODULE_ID}.fogResetAt.${levelId}`]: resetAt,
-          [`flags.${MODULE_ID}.fogResetId.${levelId}`]: resetId
-        };
-        if (scene.flags?.[MODULE_ID]?.sharedFog?.[levelId]) {
-          scenePatch[`flags.${MODULE_ID}.sharedFog.-=${levelId}`] = null;
+        const scenePatch = {};
+        for (const lid of targetLevelIds) {
+          scenePatch[`flags.${MODULE_ID}.fogResetAt.${lid}`] = resetAt;
+          scenePatch[`flags.${MODULE_ID}.fogResetId.${lid}`] = foundry.utils.randomID();
+          if (scene.flags?.[MODULE_ID]?.sharedFog?.[lid]) {
+            scenePatch[`flags.${MODULE_ID}.sharedFog.-=${lid}`] = null;
+          }
         }
         this._incSavingShared(levelId);
         try {
@@ -1248,28 +1341,52 @@ export class ChunkedFogManager {
         // Clear per-user INDIVIDUAL / GM-private fog flags across all users (online & offline) so F5 never revives reset fog
         const updates = [];
         for (const u of game.users) {
-          if (u?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
-            updates.push({ _id: u.id, [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
+          const uFog = u?.flags?.[MODULE_ID]?.fog?.[sceneId];
+          if (!uFog) continue;
+          const patch = { _id: u.id };
+          let any = false;
+          if (allLevels) {
+            patch[`flags.${MODULE_ID}.fog.-=${sceneId}`] = null;
+            patch[`flags.${MODULE_ID}.fogMeta.-=${sceneId}`] = null;
+            any = true;
+          } else if (uFog[levelId]) {
+            patch[`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`] = null;
+            patch[`flags.${MODULE_ID}.fogMeta.${sceneId}.-=${levelId}`] = null;
+            any = true;
           }
+          if (any) updates.push(patch);
         }
         if (updates.length) {
           try {
             if (typeof User?.updateDocuments === "function") {
               await User.updateDocuments(updates);
             } else {
-              for (const u of game.users) {
-                if (u?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
-                  await u.update({ [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
-                }
+              for (const patch of updates) {
+                const u = game.users.get?.(patch._id);
+                if (!u) continue;
+                const { _id, ...rest } = patch;
+                await u.update(rest);
               }
             }
           } catch (err) {
+            // Assistant GM may be denied updating other users; clear own flags and rely on fogResetId guard on clients
             console.warn(`${MODULE_ID} | Failed to clear user fog flags:`, err);
+            if (game.user?.flags?.[MODULE_ID]?.fog?.[sceneId]) {
+              try {
+                const ownPatch = allLevels
+                  ? { [`flags.${MODULE_ID}.fog.-=${sceneId}`]: null, [`flags.${MODULE_ID}.fogMeta.-=${sceneId}`]: null }
+                  : { [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null, [`flags.${MODULE_ID}.fogMeta.${sceneId}.-=${levelId}`]: null };
+                await game.user.update(ownPatch);
+              } catch {}
+            }
           }
         }
       } else if (game.user?.flags?.[MODULE_ID]?.fog?.[sceneId]?.[levelId]) {
         try {
-          await game.user.update({ [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null });
+          await game.user.update({
+            [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null,
+            [`flags.${MODULE_ID}.fogMeta.${sceneId}.-=${levelId}`]: null
+          });
         } catch (err) {
           console.warn(`${MODULE_ID} | Failed to clear user fog flags:`, err);
         }

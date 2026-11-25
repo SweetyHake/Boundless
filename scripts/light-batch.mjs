@@ -2037,16 +2037,27 @@ export class MegaLightBatch {
     const pxPerFt = this._buildPxPerFt || 20;
     const simSectorPx = layer.simSectorPx || layer.spec?.simSectorPx || ((layer.worldPx && layer.simGrid) ? (layer.worldPx / layer.simGrid) : 0);
     // Avoid rebuilding walls across all 8 chunks when there are no wallEdits on this level:
-    // index this chunk's sectors + its 1-sector neighbor ring (or all resident sectors when wallEdits exist)
+    // index this chunk's sectors + a neighbor ring sized to cover the widest light in the chunk (min 2 sectors)
+    let maxLightDimPx = 0;
+    for (let si = 0; si < sectorEntries.length; si++) {
+      const lights = sectorEntries[si][1]?.l;
+      if (!lights) continue;
+      for (let li = 0; li < lights.length; li++) {
+        const raw = lights[li];
+        const dPx = Math.max(raw[2] || 0, raw[3] || 0) * pxPerFt;
+        if (dPx > maxLightDimPx) maxLightDimPx = dPx;
+      }
+    }
+    const wallRing = simSectorPx > 0 ? Math.max(2, Math.ceil(maxLightDimPx / simSectorPx)) : 2;
     let wallSourceSectors;
-    if (hasEditsOnLevel || allLevelSectors === sectors) {
+    if (hasEditsOnLevel || allLevelSectors === sectors || wallRing >= 4) {
       wallSourceSectors = allLevelSectors === sectors ? sectors : { ...allLevelSectors, ...sectors };
     } else {
       wallSourceSectors = { ...sectors };
       for (const [sk] of sectorEntries) {
         const [sx, sy] = sk.split("_").map(Number);
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -wallRing; dy <= wallRing; dy++) {
+          for (let dx = -wallRing; dx <= wallRing; dx++) {
             const nsk = `${sx + dx}_${sy + dy}`;
             if (!wallSourceSectors[nsk] && allLevelSectors[nsk]) wallSourceSectors[nsk] = allLevelSectors[nsk];
           }

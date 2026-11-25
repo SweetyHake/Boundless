@@ -75,7 +75,11 @@ export class MegaAudioStreamer {
     }
 
     // Fast quantized early-exit on 120 FPS panning: skip full sector/Map/sort rebuild when listener grid cells are unchanged
-    let fastKey = `${Math.round(darkness * 100)}|${globalThis.Boundless?.soundEditsRev || 0}|${this.activeSources.size}|${visibleLevelLayers.length}`;
+    let attachedCount = 0;
+    for (const src of this.activeSources.values()) {
+      if (src?.attached !== false) attachedCount++;
+    }
+    let fastKey = `${Number(darkness.toFixed(4))}|${globalThis.Boundless?.soundEditsRev || 0}|${this.activeSources.size}:${attachedCount}|${visibleLevelLayers.length}`;
     for (let i = 0; i < visibleLevelLayers.length; i++) {
       fastKey += `,${visibleLevelLayers[i]?.level?.id || ""}`;
     }

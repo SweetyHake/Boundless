@@ -748,10 +748,11 @@ export const overlayMethods = {
 
     const needed = new Map();
     const checkUpperOcc = !level?.isView && !layer.isUpper;
+    const isGM = Boolean(game.user?.isGM);
     const candidateTids = this._collectVirtualTileCandidates(lid, spec, sx0, sy0, sx1, sy1);
     for (const tid of candidateTids) {
       const tSpec = this.resolveVirtualTile(lid, tid, tiles[tid], level);
-      if (!tSpec || tSpec.hidden) continue;
+      if (!tSpec || (tSpec.hidden && !isGM)) continue;
       if (tSpec.minZ !== undefined && effectiveZ < tSpec.minZ) continue;
       if (tSpec.maxZ !== undefined && targetZ > tSpec.maxZ) continue;
       if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, tSpec)) continue;
@@ -771,7 +772,7 @@ export const overlayMethods = {
         // to avoid mount/retire thrashing and 3rd-party shadow rebuild storms (`burn-living-map`); `_vtIdleCleanupNeeded` trims offscreen once idle.
         if (isMoving) {
           const ts = vt.tSpec;
-          const stillValidByLod = Boolean(ts && !ts.hidden
+          const stillValidByLod = Boolean(ts && (!ts.hidden || isGM)
             && (ts.minZ === undefined || effectiveZ >= ts.minZ)
             && (ts.maxZ === undefined || targetZ <= ts.maxZ)
             && !(checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, ts)));
@@ -802,7 +803,7 @@ export const overlayMethods = {
     };
     for (const [fullId, { tid, tSpec }] of needed) {
       if (this.activeVirtualTiles.has(fullId) || this.virtualTilePending.has(fullId) || this._pendingVirtualTileKeys.has(fullId)) continue;
-      if (!tSpec?.src || tSpec.hidden) continue;
+      if (!tSpec?.src || (tSpec.hidden && !isGM)) continue;
 
       const inVisRect = isInRect(tSpec, visVp);
       // During active zoom/pan stream everything inside the predictive prefetch viewport (`vp`) so props
@@ -905,12 +906,24 @@ export const overlayMethods = {
       ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
       : CONST.OCCLUSION_MODES.NONE;
     m.occlusionMode = resolveOcclusionMode(tSpec.occlusionMode, defaultOcc);
-    m.alpha = tSpec.alpha ?? 1.0;
-    m.unoccludedAlpha = tSpec.alpha ?? 1.0;
-    m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
-    m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && m.occlusionMode !== CONST.OCCLUSION_MODES.SURFACE);
+    const baseAlpha = tSpec.alpha ?? 1.0;
+    const hiddenMult = tSpec.hidden ? 0.5 : 1.0;
+    m.hoverFade = tSpec.hoverFade ?? (m.occlusionMode !== CONST.OCCLUSION_MODES.NONE && !(m.occlusionMode & CONST.OCCLUSION_MODES.SURFACE));
     m.restrictsLight = Boolean(tSpec.restrictsLight);
     m.restrictsWeather = Boolean(tSpec.restrictsWeather);
+    const isDecorative = m.occlusionMode === CONST.OCCLUSION_MODES.NONE && !m.hoverFade && !m.restrictsLight && !m.restrictsWeather;
+    if (isDecorative) {
+      // Decorative tiles switch to PIXI "batch" shader which reads only m.alpha (ignores unoccludedAlpha)
+      m.alpha = baseAlpha * hiddenMult;
+      m.unoccludedAlpha = 1.0;
+      m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
+    } else {
+      // OccludableSamplerShader ("batchOcclusion") multiplies m.alpha * mix(unoccludedAlpha, occludedAlpha, occ),
+      // so keep m.alpha at 1.0 (or 0.5 for hidden GM preview) like native Foundry Tile to prevent alpha^2 darkening.
+      m.alpha = hiddenMult;
+      m.unoccludedAlpha = baseAlpha;
+      m.occludedAlpha = tSpec.occludedAlpha ?? (layer.isUpper ? 0.08 : 0.2);
+    }
     m.textureAlphaThreshold = tSpec.alphaThreshold ?? 0.75;
     if (tSpec.tint !== undefined && tSpec.tint !== null && tSpec.tint !== "") {
       if (typeof tSpec.tint === "number" && Number.isFinite(tSpec.tint)) {

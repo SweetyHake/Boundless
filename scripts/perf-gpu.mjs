@@ -867,7 +867,7 @@ function patchTokenUiCaching() {
       !this.isPreview &&
       !this.effects.overlay &&
       this.effects.children?.length >= 5 &&
-      this.effects.children.every(ch => ch === this.effects.bg || (ch instanceof PIXI.Sprite && !ch.children?.length))
+      this.effects.children.every(ch => ch === this.effects.bg || (ch instanceof PIXI.Sprite && !ch.children?.length && (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive")))
     ) {
       this.effects.cacheAsBitmapResolution = getBitmapCacheResolution();
       this.effects.cacheAsBitmap = true;
@@ -1243,9 +1243,8 @@ export function refreshGpuPerfSettings() {
   const sounds = globalThis.canvas?.sounds?.placeables;
   if (sounds?.length) {
     for (const s of sounds) {
-      const ctrl = s.controlIcon ?? s.controls;
-      if (ctrl && !ctrl.destroyed) {
-        try { ctrl._refresh?.(); } catch {}
+      if (s.controlIcon && !s.controlIcon.destroyed) {
+        try { s.controlIcon._refresh?.(); } catch {}
       }
     }
   }

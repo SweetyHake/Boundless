@@ -202,15 +202,30 @@ export class ChunkStreamer {
     if (this._updating || this.states.size === 0) return;
     // Fast quantized early-exit on 120 Hz panning inside the same chunk grid cell
     if (vp) {
-      let qKey = `${this._gen}|${Math.floor(vp.x0 / 2500)}_${Math.floor(vp.y0 / 2500)}_${Math.floor(vp.x1 / 2500)}_${Math.floor(vp.y1 / 2500)}_${(vp.scale ?? 1) >= 0.022 ? 1 : 0}`;
+      let retryBucket = 0;
+      for (const [, st] of this.states) {
+        if (!st.failed?.size) continue;
+        for (const until of st.failed.values()) {
+          if (until !== Infinity) {
+            retryBucket = (Math.floor(performance.now() / 5000) | 0) + 1;
+            break;
+          }
+        }
+        if (retryBucket) break;
+      }
+      let qKey = `${this._gen}|${retryBucket}|${Math.floor(vp.x0 / 2500)}_${Math.floor(vp.y0 / 2500)}_${Math.floor(vp.x1 / 2500)}_${Math.floor(vp.y1 / 2500)}_${getEffectiveScale(vp.scale) >= CHUNK_STREAM_MIN_SCALE ? 1 : 0}`;
       const toks = globalThis.canvas?.tokens?.placeables;
       if (toks?.length) {
         let th = toks.length | 0;
         for (let i = 0; i < toks.length; i++) {
           const t = toks[i];
-          if (!t || t.destroyed || !t.center) continue;
-          if (!t.controlled && !t.document?.baseActor?.hasPlayerOwner) continue;
-          th = (Math.imul(th, 31) ^ (Math.floor(t.center.x / 2500) + Math.imul(Math.floor(t.center.y / 2500), 131))) | 0;
+          if (!t || t.destroyed || t.isPreview) continue;
+          const tx = t.center?.x ?? t.document?.x ?? 0;
+          const ty = t.center?.y ?? t.document?.y ?? 0;
+          const lid = t.document?.level || "";
+          let lh = 0;
+          for (let ci = 0; ci < lid.length; ci++) lh = (Math.imul(lh, 31) + lid.charCodeAt(ci)) | 0;
+          th = (Math.imul(th, 31) ^ (Math.floor(tx / 2500) + Math.imul(Math.floor(ty / 2500), 131) ^ lh)) | 0;
         }
         qKey += `|${th}`;
       }

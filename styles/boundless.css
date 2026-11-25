@@ -341,6 +341,10 @@ body.boundless-ui-perf .directory .directory-list .directory-item:not(.folder) {
   contain-intrinsic-size: auto 48px;
 }
 
+body.boundless-ui-perf .directory .directory-list .directory-item.scene {
+  contain-intrinsic-size: auto 100px;
+}
+
 body.boundless-ui-perf .dnd5e2 .items-list .item {
   content-visibility: auto;
   contain-intrinsic-size: auto 38px;

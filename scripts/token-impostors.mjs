@@ -428,7 +428,7 @@ export class TokenImpostorLayer {
       this.mesh = null;
     }
     if (this.geometry) {
-      try { this.geometry.destroy(); } catch {}
+      this._destroyGeometry(this.geometry);
       this.geometry = null;
     }
     this.shader = null;
@@ -636,7 +636,7 @@ export class TokenImpostorLayer {
       try { oldMesh.destroy({ children: false }); } catch {}
     }
     if (oldGeom) {
-      try { oldGeom.destroy(); } catch {}
+      this._destroyGeometry(oldGeom);
     }
 
     this.mesh = mesh;
@@ -644,6 +644,18 @@ export class TokenImpostorLayer {
       canvas.primary.addChild(mesh);
       canvas.primary.sortDirty = true;
     }
+  }
+
+  _destroyGeometry(geom) {
+    if (!geom) return;
+    try {
+      if (Array.isArray(geom.buffers)) {
+        for (let i = 0; i < geom.buffers.length; i++) {
+          try { geom.buffers[i]?.destroy?.(); } catch {}
+        }
+      }
+      geom.destroy();
+    } catch {}
   }
 
   _writeQuad2(arr, slotIdx, a, b) {

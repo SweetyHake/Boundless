@@ -243,7 +243,8 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
               // Skip blind NPCs that have no vision source instance and no sight enabled
               const hasSight = Boolean(t.vision || t.document?._source?.sight?.enabled || t.document?.sight?.enabled);
               if (hasSight) {
-                try { origInitVision.call(t); } catch {}
+                // Call the full prototype chain so 3rd-party libWrapper wrappers (vision-5e, levels) still run
+                try { t.initializeVisionSource(); } catch {}
               }
             }
           }
@@ -388,6 +389,9 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
       }
 
       const isBoundless = Boolean(controller?.active);
+      if (!isBoundless && !PERF_CONFIG?.perfEnabled) {
+        return origSelectAllKey.call(this, event);
+      }
       const layerName = this.options?.name || this.constructor?.name || "";
       const levelId = canvas?.level?.id || "";
       const nowMs = performance.now();
@@ -529,7 +533,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         !streamer._nativeTokensActive &&
         !this._draggedToken &&
         !this.hover &&
-        game.activeTool === "select" &&
+        (game.activeTool === "select" || game.activeTool === "target") &&
         !event?.ctrlKey &&
         !event?.metaKey &&
         !canvas.controls?.ruler?.active &&
@@ -539,25 +543,37 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
           const rawScale = Math.max(0.0005, canvas.stage?.scale?.x || 1);
           const minHitRadius = Math.max(40, 14 / rawScale);
-          const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
-          if (hitDoc) {
-            this.hud?.close?.();
-            if (event.shiftKey && hitDoc._object?.controlled) {
-              hitDoc._object.release();
-              controller?.selectionOverlay?.refresh?.();
-              queueMicrotask(() => {
-                if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
-                  streamer.scheduleSync(null, true);
-                }
+          if (game.activeTool === "target") {
+            const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius, { minPermission: null });
+            if (hitDoc) {
+              const releaseOthers = !event.shiftKey;
+              Promise.resolve(streamer.materializeDoc?.(hitDoc)).then((tok) => {
+                if (!tok || tok.destroyed) return;
+                tok.setTarget?.(!tok.isTargeted, { releaseOthers });
               });
               return;
             }
-            streamer.materializeAndSelect([hitDoc], {
-              releaseOthers: !event.shiftKey,
-              maxCount: 1,
-              bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
-            });
-            return;
+          } else {
+            const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
+            if (hitDoc) {
+              this.hud?.close?.();
+              if (event.shiftKey && hitDoc._object?.controlled) {
+                hitDoc._object.release();
+                controller?.selectionOverlay?.refresh?.();
+                queueMicrotask(() => {
+                  if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
+                    streamer.scheduleSync(null, true);
+                  }
+                });
+                return;
+              }
+              streamer.materializeAndSelect([hitDoc], {
+                releaseOthers: !event.shiftKey,
+                maxCount: 1,
+                bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
+              });
+              return;
+            }
           }
         }
       }

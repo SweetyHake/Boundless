@@ -419,6 +419,15 @@ export const lightingMethods = {
       const controlledCount = canvas.tokens?.controlled?.length || 0;
       const isBulkSelection = controlledCount > 8;
       let bulkControlledAdded = 0;
+      // In Foundry v14, humans without darkvision have `vs.radius === 0`, yet `vs.los` still reaches
+      // MAX_LOS_RADIUS_PX under globalLight or toward distant lights. Always load virtual wall edges
+      // out to MAX_LOS_RADIUS_PX for active vision sources whenever external light exists so players
+      // can never see or burn fog through virtual walls and closed doors.
+      const hasExternalLight = Boolean(
+        canvas.environment?.globalLightSource?.active
+        || this.lightBatch?.lightMetaById?.size > 0
+        || (canvas.effects?.lightSources?.size || 0) > 0
+      );
 
       for (const tok of canvas.tokens.placeables) {
         if (!tok || tok.destroyed || tok.isPreview || !tok.center) continue;
@@ -435,14 +444,29 @@ export const lightingMethods = {
           }
         }
         if (!isActiveActor) continue;
-        const visRadPx = tok.vision?.active ? Math.min(MAX_LOS_RADIUS_PX, tok.vision.radius || 0) : 0;
+        let visRadPx = 0;
+        if (tok.vision?.active) {
+          const rawTokRad = Math.max(
+            tok.vision.radius || 0,
+            tok.vision.data?.radius || 0,
+            tok.vision.data?.externalRadius || 0,
+            tok.vision.data?.lightRadius || 0
+          );
+          visRadPx = hasExternalLight ? MAX_LOS_RADIUS_PX : Math.min(MAX_LOS_RADIUS_PX, rawTokRad);
+        }
         addSimBubble(doc?.level || canvas.level?.id, tok.center.x, tok.center.y, Math.max(lightRadPx, visRadPx));
       }
 
       if (canvas.effects?.visionSources?.size) {
         for (const vs of canvas.effects.visionSources) {
           if (!vs?.active) continue;
-          const vRad = Math.min(MAX_LOS_RADIUS_PX, vs.radius || 0);
+          const rawVisRad = Math.max(
+            vs.radius || 0,
+            vs.data?.radius || 0,
+            vs.data?.externalRadius || 0,
+            vs.data?.lightRadius || 0
+          );
+          const vRad = hasExternalLight ? MAX_LOS_RADIUS_PX : Math.min(MAX_LOS_RADIUS_PX, rawVisRad);
           addSimBubble(vs.data?.level || canvas.level?.id, vs.x, vs.y, vRad);
         }
       }
@@ -1174,12 +1198,32 @@ export const lightingMethods = {
     return true;
   },
 
+  _isAuthorizedDoorRequester(payload, targetScene) {
+    if (!targetScene) return false;
+    const senderId = payload?.senderId;
+    if (game.users?.get) {
+      if (!senderId) return false;
+      const sender = game.users.get(senderId);
+      if (!sender || sender.active === false) return false;
+      if (sender.isGM) return true;
+      if (game.paused) return false;
+      const hasSceneAccess = Boolean(
+        targetScene.active
+        || targetScene.navigation
+        || targetScene.testUserPermission?.(sender, "LIMITED")
+        || targetScene.tokens?.some?.(t => t?.testUserPermission?.(sender, "OBSERVER"))
+      );
+      return hasSceneAccess;
+    }
+    return !game.paused;
+  },
+
   async _handleRemoteDoorRequest(payload) {
     const dKey = payload?.dKey;
     const sceneId = payload?.sceneId;
     if (typeof dKey !== "string" || !dKey.includes("::") || !sceneId) return;
     const targetScene = game.scenes?.get?.(sceneId);
-    if (!targetScene) return;
+    if (!this._isAuthorizedDoorRequester(payload, targetScene)) return;
 
     const sep = dKey.indexOf("::");
     const levelId = dKey.slice(0, sep);
@@ -1272,6 +1316,7 @@ export const lightingMethods = {
     if (game.users?.activeGM?.id !== game.user?.id) return;
 
     if (this.active && payload.sceneId === canvas.scene?.id) {
+      if (!this._isAuthorizedDoorRequester(payload, canvas.scene)) return;
       const info = this._resolveDoorByKey(payload.dKey);
       if (info) {
         const targetDs = payload.ds !== undefined
@@ -1316,6 +1361,17 @@ export const lightingMethods = {
         .finally(() => {
           if (this._pendingDoorCommits?.get(dKey) === seq) {
             this._pendingDoorCommits.delete(dKey);
+            // Reconcile with final authoritative scene flag if another GM/player toggled concurrently while in-flight
+            if (this.active) {
+              const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
+              if (persisted !== undefined) {
+                const authDs = this._normalizeDoorState(persisted, info.defaultDs);
+                const curLocalDs = this.getCurrentDoorState(dKey, info.defaultDs);
+                if (authDs !== curLocalDs) {
+                  this._applyDoorStateLocal(info, authDs, { playSound: false });
+                }
+              }
+            }
           }
         });
     } else {

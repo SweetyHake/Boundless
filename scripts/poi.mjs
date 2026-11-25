@@ -721,6 +721,10 @@ export class PoiManager {
   _clearSuperGridSubPins() {
     this._subPinGen++;
     this._pendingSubPins = [];
+    if (this._subPinEvictTimer !== null && this._subPinEvictTimer !== undefined) {
+      clearTimeout(this._subPinEvictTimer);
+      this._subPinEvictTimer = null;
+    }
     if (this._subPinRaf !== null) {
       if (typeof cancelAnimationFrame === "function") {
         try { cancelAnimationFrame(this._subPinRaf); } catch {}
@@ -736,6 +740,22 @@ export class PoiManager {
       }
     }
     this._superGridSubProvinces.clear();
+  }
+
+  _evictSuperGridSubPins(maxKeep) {
+    if (this._superGridSubProvinces.size <= maxKeep) return;
+    const sorted = Array.from(this._superGridSubProvinces.entries()).sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
+    while (sorted.length > maxKeep) {
+      const [evictKey, bucket] = sorted.shift();
+      for (const p of bucket.entries) {
+        p.root.parent?.removeChild(p.root);
+        p.root.destroy({ children: true });
+      }
+      this._superGridSubProvinces.delete(evictKey);
+    }
+    if (this._pendingSubPins.length > 0) {
+      this._pendingSubPins = this._pendingSubPins.filter(j => this._superGridSubProvinces.has(j.key));
+    }
   }
 
   _scheduleSubPinPump() {
@@ -820,7 +840,10 @@ export class PoiManager {
   _syncSuperGridSubPins(stageScale, wt, sw, sh) {
     if (!this._superGridInfo || !this.container) return;
     // Only materialize sub-location pins for provinces currently on screen when descending below 0.022x
-    if (stageScale < 0.022 && !this.placementActive) return;
+    if (stageScale < 0.022 && !this.placementActive) {
+      if (this._pendingSubPins.length > 0) this._pendingSubPins.length = 0;
+      return;
+    }
 
     const { cols, rows, regionPx } = this._superGridInfo;
     const xMinWorld = (0 - wt.tx) / Math.max(wt.a, 1e-5);
@@ -876,18 +899,24 @@ export class PoiManager {
 
     // LRU evict distant province sub-pins when not actively mid-pan (avoids WebGL texture destroy stalls)
     const maxKeep = Math.max(6, visibleCount);
-    if (this._superGridSubProvinces.size > maxKeep && !this.controller?.isActivelyMoving?.()) {
-      const sorted = Array.from(this._superGridSubProvinces.entries()).sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
-      while (sorted.length > maxKeep) {
-        const [evictKey, bucket] = sorted.shift();
-        for (const p of bucket.entries) {
-          p.root.parent?.removeChild(p.root);
-          p.root.destroy({ children: true });
-        }
-        this._superGridSubProvinces.delete(evictKey);
-      }
-      if (this._pendingSubPins.length > 0) {
-        this._pendingSubPins = this._pendingSubPins.filter(j => this._superGridSubProvinces.has(j.key));
+    if (this._superGridSubProvinces.size > maxKeep) {
+      if (!this.controller?.isActivelyMoving?.()) {
+        this._evictSuperGridSubPins(maxKeep);
+      } else if (!this._subPinEvictTimer) {
+        const gen = this._subPinGen;
+        this._subPinEvictTimer = setTimeout(() => {
+          this._subPinEvictTimer = null;
+          if (gen !== this._subPinGen || !this.container) return;
+          if (this.controller?.isActivelyMoving?.()) {
+            // Still panning: defer once more
+            this._subPinEvictTimer = setTimeout(() => {
+              this._subPinEvictTimer = null;
+              if (gen === this._subPinGen && this.container) this._evictSuperGridSubPins(maxKeep);
+            }, 250);
+            return;
+          }
+          this._evictSuperGridSubPins(maxKeep);
+        }, 220);
       }
     }
   }

@@ -23,8 +23,10 @@ const _hintedScenes = new Set();
 
 function isStandardSceneActive() {
   if (!globalThis.canvas?.ready || !globalThis.canvas?.scene) return false;
-  if (_controllerRef?.active) return false;
-  if (globalThis.canvas.scene.flags?.[MODULE_ID]?.enabled) return false;
+  if (_controllerRef?.active || _controllerRef?._mounting) return false;
+  const lvlCfg = globalThis.canvas.level?.flags?.[MODULE_ID];
+  if (lvlCfg?.enabled === true) return false;
+  if (globalThis.canvas.scene.flags?.[MODULE_ID]?.enabled && lvlCfg?.enabled !== false) return false;
   return true;
 }
 
@@ -714,6 +716,7 @@ export function installAutoPerfEngine(controller) {
   if (_autoInstalled) return;
   _autoInstalled = true;
   _controllerRef = controller;
+  if (controller) controller._restoreStandardCulling = restoreAllStandardCulling;
 
   if (globalThis.game?.settings?.get?.("core", "noCanvas")) return;
 

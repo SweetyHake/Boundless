@@ -192,6 +192,7 @@ export class CharacterPinManager {
 
   mount(scene) {
     this.unmount();
+    this._lastSidebarCheckMs = 0;
     const cfg = scene?.flags?.[MODULE_ID] || {};
     this.enabled = cfg.showCharacterPins !== false;
     if (!this.enabled || !canvas?.controls) return;

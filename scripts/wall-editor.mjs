@@ -303,81 +303,96 @@ export class VirtualWallEditor {
       : `${seg.levelId}::${seg.sk}_${seg.idx}`;
   }
 
-  _collectViewportSegments(vp, { doorsOnly = false, limit = Infinity } = {}) {
-    const layer = this._getViewedLayer();
-    if (!layer?.spec?.sectors) return [];
+  _entryKey(seg) {
+    return `${seg.levelId}::${seg.wKey}`;
+  }
 
-    const { simGrid, simSectorPx, spec, level } = layer;
-    const lid = level.id;
+  _getDoorLayers(doorsOnly = false) {
+    if (doorsOnly && this.controller?.visibleLevelLayers?.length) {
+      return this.controller.visibleLevelLayers.filter(l => l?.spec?.sectors);
+    }
+    const viewed = this._getViewedLayer();
+    return viewed?.spec?.sectors ? [viewed] : [];
+  }
+
+  _collectViewportSegments(vp, { doorsOnly = false, limit = Infinity } = {}) {
+    const layers = this._getDoorLayers(doorsOnly);
+    if (!layers.length) return [];
+
     const pad = 250;
     const vx0 = vp.x0 - pad, vy0 = vp.y0 - pad, vx1 = vp.x1 + pad, vy1 = vp.y1 + pad;
-    const sx0 = Math.max(0, Math.floor(vx0 / simSectorPx));
-    const sy0 = Math.max(0, Math.floor(vy0 / simSectorPx));
-    const sx1 = Math.min(simGrid - 1, Math.floor(vx1 / simSectorPx));
-    const sy1 = Math.min(simGrid - 1, Math.floor(vy1 / simSectorPx));
-    const levelEdits = this.controller.wallEdits.get(lid);
     const segments = [];
 
-    const seenKeys = new Set();
-    for (let sy = sy0; sy <= sy1; sy++) {
-      for (let sx = sx0; sx <= sx1; sx++) {
-        const sk = `${sx}_${sy}`;
-        const sec = spec.sectors[sk];
-        if (!sec) continue;
+    for (const layer of layers) {
+      const { simGrid, simSectorPx, spec, level } = layer;
+      const lid = level.id;
+      const sx0 = Math.max(0, Math.floor(vx0 / simSectorPx));
+      const sy0 = Math.max(0, Math.floor(vy0 / simSectorPx));
+      const sx1 = Math.min(simGrid - 1, Math.floor(vx1 / simSectorPx));
+      const sy1 = Math.min(simGrid - 1, Math.floor(vy1 / simSectorPx));
+      const levelEdits = this.controller.wallEdits.get(lid);
+      const seenKeys = new Set();
 
-        if (sec.d) {
-          for (let di = 0; di < sec.d.length; di++) {
-            const resolved = this.controller.resolveVirtualWall(lid, "d", sk, di, sec.d[di]);
-            if (!resolved) continue;
-            seenKeys.add(resolved.wKey);
-            if (doorsOnly && !resolved.door) continue;
-            const [x1, y1, x2, y2] = resolved.c;
-            if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
-                (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
-            segments.push(resolved);
-            if (segments.length >= limit) return segments;
-          }
-        }
+      for (let sy = sy0; sy <= sy1; sy++) {
+        for (let sx = sx0; sx <= sx1; sx++) {
+          const sk = `${sx}_${sy}`;
+          const sec = spec.sectors[sk];
+          if (!sec) continue;
 
-        if (sec.w) {
-          if (doorsOnly && !levelEdits?.size) continue;
-          for (let wi = 0; wi < sec.w.length; wi++) {
-            if (doorsOnly) {
-              const ov = levelEdits.get(`${sk}:w:${wi}`);
-              if (!ov || !ov.door) continue;
+          if (sec.d) {
+            for (let di = 0; di < sec.d.length; di++) {
+              const resolved = this.controller.resolveVirtualWall(lid, "d", sk, di, sec.d[di]);
+              if (!resolved) continue;
+              seenKeys.add(resolved.wKey);
+              if (doorsOnly && !resolved.door) continue;
+              const [x1, y1, x2, y2] = resolved.c;
+              if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
+                  (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
+              segments.push(resolved);
+              if (segments.length >= limit) return segments;
             }
-            const resolved = this.controller.resolveVirtualWall(lid, "w", sk, wi, sec.w[wi]);
-            if (!resolved) continue;
-            seenKeys.add(resolved.wKey);
-            if (doorsOnly && !resolved.door) continue;
-            const [x1, y1, x2, y2] = resolved.c;
-            if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
-                (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
-            segments.push(resolved);
-            if (segments.length >= limit) return segments;
+          }
+
+          if (sec.w) {
+            if (doorsOnly && !levelEdits?.size) continue;
+            for (let wi = 0; wi < sec.w.length; wi++) {
+              if (doorsOnly) {
+                const ov = levelEdits.get(`${sk}:w:${wi}`);
+                if (!ov || !ov.door) continue;
+              }
+              const resolved = this.controller.resolveVirtualWall(lid, "w", sk, wi, sec.w[wi]);
+              if (!resolved) continue;
+              seenKeys.add(resolved.wKey);
+              if (doorsOnly && !resolved.door) continue;
+              const [x1, y1, x2, y2] = resolved.c;
+              if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
+                  (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
+              segments.push(resolved);
+              if (segments.length >= limit) return segments;
+            }
           }
         }
       }
-    }
 
-    // Also include walls/doors edited and dragged outside their original home sector
-    if (levelEdits?.size) {
-      for (const [wKey, ov] of levelEdits) {
-        if (!ov || seenKeys.has(wKey)) continue;
-        const parts = wKey.split(":");
-        if (parts.length !== 3) continue;
-        const [sk, kind, idxStr] = parts;
-        const idx = Number(idxStr);
-        const raw = spec.sectors[sk]?.[kind]?.[idx];
-        if (!raw) continue;
-        const resolved = this.controller.resolveVirtualWall(lid, kind, sk, idx, raw);
-        if (!resolved) continue;
-        if (doorsOnly && !resolved.door) continue;
-        const [x1, y1, x2, y2] = resolved.c;
-        if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
-            (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
-        segments.push(resolved);
-        if (segments.length >= limit) return segments;
+      // Also include walls/doors edited and dragged outside their original home sector
+      if (levelEdits?.size) {
+        for (const [wKey, ov] of levelEdits) {
+          if (!ov || seenKeys.has(wKey)) continue;
+          const parts = wKey.split(":");
+          if (parts.length !== 3) continue;
+          const [sk, kind, idxStr] = parts;
+          const idx = Number(idxStr);
+          const raw = spec.sectors[sk]?.[kind]?.[idx];
+          if (!raw) continue;
+          const resolved = this.controller.resolveVirtualWall(lid, kind, sk, idx, raw);
+          if (!resolved) continue;
+          if (doorsOnly && !resolved.door) continue;
+          const [x1, y1, x2, y2] = resolved.c;
+          if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
+              (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
+          segments.push(resolved);
+          if (segments.length >= limit) return segments;
+        }
       }
     }
     return segments;
@@ -387,7 +402,8 @@ export class VirtualWallEditor {
     if (!entry) return;
     const wallsLayer = canvas?.walls;
     const w = entry.wall;
-    if (this.mountedByKey.get(entry.wKey) === entry) this.mountedByKey.delete(entry.wKey);
+    const mKey = entry.mKey || `${entry.levelId}::${entry.wKey}`;
+    if (this.mountedByKey.get(mKey) === entry) this.mountedByKey.delete(mKey);
     if (this.mountedById.get(entry.id) === entry) this.mountedById.delete(entry.id);
     if (entry.dKey && this.mountedByDoorKey.get(entry.dKey) === entry) this.mountedByDoorKey.delete(entry.dKey);
     const sheet = getExistingSheet(entry.doc);
@@ -445,9 +461,10 @@ export class VirtualWallEditor {
     while (this._pendingMounts.length > 0 && count < maxPerFrame) {
       if (count > 0 && (performance.now() - t0) >= WALL_MOUNT_BUDGET_MS) break;
       const seg = this._pendingMounts.shift();
-      this._pendingMountKeys.delete(seg.wKey);
-      if (this.mountedByKey.has(seg.wKey)) continue;
-      if (this._lastNeededKeys && !this._lastNeededKeys.has(seg.wKey)) continue;
+      const mKey = this._entryKey(seg);
+      this._pendingMountKeys.delete(mKey);
+      if (this.mountedByKey.has(mKey)) continue;
+      if (this._lastNeededKeys && !this._lastNeededKeys.has(mKey)) continue;
       this._mountNativeWall(seg, gen);
       count++;
     }
@@ -467,8 +484,9 @@ export class VirtualWallEditor {
   }
 
   async _mountNativeWall(seg, gen) {
+    const mKey = this._entryKey(seg);
     if (gen !== this._clearGen || !canvas?.walls?.objects || !canvas.scene) return;
-    if (this.mountedByKey.has(seg.wKey)) return;
+    if (this.mountedByKey.has(mKey)) return;
 
     // Preload animated door texture before creating Wall so Foundry's fire-and-forget createDoorMeshes()
     // cannot leak an orphaned DoorMesh into canvas.primary if this wall is unmounted mid-load.
@@ -476,8 +494,11 @@ export class VirtualWallEditor {
     if (seg.animation?.type && seg.animation?.texture && typeof foundry.canvas?.loadTexture === "function") {
       try { await foundry.canvas.loadTexture(seg.animation.texture); } catch {}
       if (gen !== this._clearGen || (this.controller.wallEditsRev || 0) !== editRev || !canvas?.walls?.objects || !canvas.scene) return;
-      if (this._getViewedLayer()?.level?.id !== seg.levelId) return;
-      if ((this._lastNeededKeys && !this._lastNeededKeys.has(seg.wKey)) || this.mountedByKey.has(seg.wKey)) return;
+      const isAllowedLevel = this.active
+        ? (this._getViewedLayer()?.level?.id === seg.levelId)
+        : this._getDoorLayers(true).some(l => l.level?.id === seg.levelId);
+      if (!isAllowedLevel) return;
+      if ((this._lastNeededKeys && !this._lastNeededKeys.has(mKey)) || this.mountedByKey.has(mKey)) return;
     }
 
     const id = makeVirtualWallId(seg.levelId, seg.wKey);
@@ -593,6 +614,7 @@ export class VirtualWallEditor {
     const sig = this._wallSig(seg, liveDs);
     const entry = {
       id,
+      mKey,
       wKey: seg.wKey,
       dKey,
       levelId: seg.levelId,
@@ -604,7 +626,7 @@ export class VirtualWallEditor {
       wall,
       doc
     };
-    this.mountedByKey.set(seg.wKey, entry);
+    this.mountedByKey.set(mKey, entry);
     this.mountedById.set(id, entry);
     if (dKey) this.mountedByDoorKey.set(dKey, entry);
 
@@ -704,14 +726,14 @@ export class VirtualWallEditor {
     if (force) this._lastKey = "";
 
     const curVp = vp || this.controller.getViewportWorldRect(0.18);
-    const layer = this._getViewedLayer();
-    if (!layer?.spec?.sectors) {
+    const isWallsEditMode = this.active && Boolean(game.user?.isGM);
+    const activeLayers = this._getDoorLayers(!isWallsEditMode);
+    if (!activeLayers.length) {
       this._clearMountedWalls();
       if (this.macroGfx) { this.macroGfx.clear(); this.macroGfx.visible = false; }
       return;
     }
 
-    const isWallsEditMode = this.active && Boolean(game.user?.isGM);
     const effScale = getEffectiveScale(curVp.scale);
     if (effScale >= NATIVE_DOORS_ENTER_SCALE) this._doorsZoomActive = true;
     else if (effScale < NATIVE_DOORS_EXIT_SCALE) this._doorsZoomActive = false;
@@ -727,7 +749,8 @@ export class VirtualWallEditor {
     const rev = this.controller.wallEditsRev || 0;
     const prevShowDoorControls = this._showDoorControls;
     this._showDoorControls = showDoorControls;
-    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
+    const levelSig = activeLayers.map(l => l.level.id).join(",");
+    const key = `${levelSig}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
     if (key === this._lastKey) return;
     this._lastKey = key;
     if (prevShowDoorControls !== showDoorControls) this.refreshDoorVisibility();
@@ -764,19 +787,23 @@ export class VirtualWallEditor {
       this.macroGfx.visible = false;
     }
 
+    const activeLayersById = new Map();
+    for (const l of activeLayers) activeLayersById.set(l.level.id, l);
     const needed = new Map();
-    for (const seg of segments) needed.set(seg.wKey, seg);
+    for (const seg of segments) needed.set(this._entryKey(seg), seg);
     this._lastNeededKeys = new Set(needed.keys());
-    const lvlWallEdits = this.controller.wallEdits?.get(layer.level.id);
 
-    // Unmount walls from other levels, deleted walls, or doors converted/reverted to plain walls in gameplay unconditionally (with closeSheet)
+    // Unmount walls from non-visible levels, deleted walls, or doors converted/reverted to plain walls in gameplay unconditionally (with closeSheet)
     for (const entry of Array.from(this.mountedByKey.values())) {
-      const wrongLevel = entry.levelId !== layer.level.id;
+      const mKey = entry.mKey || `${entry.levelId}::${entry.wKey}`;
+      const entryLayer = activeLayersById.get(entry.levelId);
+      const wrongLevel = !entryLayer;
+      const lvlWallEdits = !wrongLevel ? this.controller.wallEdits?.get(entry.levelId) : undefined;
       const ov = !wrongLevel ? lvlWallEdits?.get(entry.wKey) : undefined;
-      const neededSeg = !wrongLevel ? needed.get(entry.wKey) : null;
-      const raw = (!wrongLevel && !neededSeg) ? layer.spec.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] : null;
+      const neededSeg = !wrongLevel ? needed.get(mKey) : null;
+      const raw = (!wrongLevel && !neededSeg) ? entryLayer.spec.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] : null;
       const resolved = neededSeg || ((!wrongLevel && ov !== null && raw)
-        ? this.controller.resolveVirtualWall(layer.level.id, entry.kind, entry.sk, entry.idx, raw)
+        ? this.controller.resolveVirtualWall(entry.levelId, entry.kind, entry.sk, entry.idx, raw)
         : null);
       const isDeleted = ov === null || (!wrongLevel && !resolved);
       const lostDoorInGameplay = !wrongLevel && !isWallsEditMode && Boolean(resolved && !resolved.door);
@@ -805,18 +832,18 @@ export class VirtualWallEditor {
     const maxSyncMounts = force ? (isWallsEditMode ? 24 : 8) : (isWallsEditMode ? 8 : 3);
     const tMountStart = performance.now();
     let syncMounted = 0;
-    for (const seg of needed.values()) {
-      const existing = this.mountedByKey.get(seg.wKey);
+    for (const [mKey, seg] of needed) {
+      const existing = this.mountedByKey.get(mKey);
       if (!existing) {
         if (syncMounted < maxSyncMounts && (syncMounted === 0 || (performance.now() - tMountStart) < WALL_MOUNT_BUDGET_MS)) {
           this._mountNativeWall(seg, gen);
           syncMounted++;
-        } else if (!this._pendingMountKeys.has(seg.wKey)) {
-          this._pendingMountKeys.add(seg.wKey);
+        } else if (!this._pendingMountKeys.has(mKey)) {
+          this._pendingMountKeys.add(mKey);
           this._pendingMounts.push(seg);
         } else {
           for (let pi = 0; pi < this._pendingMounts.length; pi++) {
-            if (this._pendingMounts[pi].wKey === seg.wKey) {
+            if (this._entryKey(this._pendingMounts[pi]) === mKey) {
               this._pendingMounts[pi] = seg;
               break;
             }
@@ -838,12 +865,12 @@ export class VirtualWallEditor {
             if (syncMounted < maxSyncMounts && (performance.now() - tMountStart) < WALL_MOUNT_BUDGET_MS) {
               this._mountNativeWall(seg, gen);
               syncMounted++;
-            } else if (!this._pendingMountKeys.has(seg.wKey)) {
-              this._pendingMountKeys.add(seg.wKey);
+            } else if (!this._pendingMountKeys.has(mKey)) {
+              this._pendingMountKeys.add(mKey);
               this._pendingMounts.push(seg);
             } else {
               for (let pi = 0; pi < this._pendingMounts.length; pi++) {
-                if (this._pendingMounts[pi].wKey === seg.wKey) {
+                if (this._entryKey(this._pendingMounts[pi]) === mKey) {
                   this._pendingMounts[pi] = seg;
                   break;
                 }

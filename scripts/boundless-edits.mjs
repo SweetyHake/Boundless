@@ -638,7 +638,7 @@ export const editsMethods = {
       if (t.levels?.size && !t.levels.has(levelId)) continue;
       if (!t.texture?.src) continue;
       // Leave video tiles native so Foundry preserves game.video playback, looping, and audio
-      if (/\.(webm|mp4|m4v|ogv)(\?|$)/i.test(t.texture.src) || globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(t.texture.src)) continue;
+      if (/\.(webm|mp4|m4v|ogv)([?#]|$)/i.test(t.texture.src) || globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(t.texture.src)) continue;
       const tid = tiles.length;
       const occModes = Array.from(t.occlusion?.modes || []);
       const rot = t.rotation || 0;
@@ -654,7 +654,7 @@ export const editsMethods = {
         sort: t.sort || 0,
         alpha: t.alpha ?? 1,
         hidden: Boolean(t.hidden),
-        tint: t.texture.tint ? foundry.utils.Color.from(t.texture.tint).css : null,
+        tint: (t.texture.tint !== undefined && t.texture.tint !== null && t.texture.tint !== "") ? foundry.utils.Color.from(t.texture.tint).css : null,
         alphaThreshold: t.texture.alphaThreshold ?? 0.75,
         occlusionMode: occModes.length ? occModes : CONST.OCCLUSION_MODES.NONE,
         occludedAlpha: t.occlusion?.alpha ?? 0.2,
@@ -767,7 +767,8 @@ export const editsMethods = {
       // Keep negative (darkness), vision-providing, and priority (> 0, e.g. Daylight) sources as native AmbientLightDocuments
       if (l.config?.negative || l.vision || (l.config?.priority ?? 0) > 0) continue;
       const sec = ensureSec(Math.floor(l.x / simSectorPx), Math.floor(l.y / simSectorPx));
-      const colorCss = l.config?.color ? foundry.utils.Color.from(l.config.color).css : null;
+      const rawColor = l.config?.color;
+      const colorCss = (rawColor !== undefined && rawColor !== null && rawColor !== "") ? foundry.utils.Color.from(rawColor).css : null;
       const extra = {};
       if (l.hidden) extra.hidden = true;
       if (l.walls === false) extra.walls = false;
@@ -808,7 +809,7 @@ export const editsMethods = {
       const sec = ensureSec(Math.floor(snd.x / simSectorPx), Math.floor(snd.y / simSectorPx));
       const row = [
         snd.x, snd.y,
-        snd.radius || 20,
+        Number.isFinite(snd.radius) ? snd.radius : 20,
         snd.path,
         snd.volume ?? 0.6,
         snd.walls !== false,

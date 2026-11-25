@@ -2053,3 +2053,182 @@ test("bakeSceneToBoundless rejects direct API re-baking of an already-baked scen
     /already baked/i
   );
 });
+
+test("TokenStreamer.onCombatChanged queues unmounted combatants using _queuedIds and { doc, distSq } format", async () => {
+  installBaseGlobals();
+  const { TokenStreamer } = await import("../scripts/token-streamer.mjs");
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  const doc = { id: "npcCombat1", viewed: true, _source: { x: 200, y: 200, width: 1, height: 1 }, _object: null };
+  globalThis.game.combat = {
+    combatants: [{ sceneId: "sc1", tokenId: "npcCombat1" }]
+  };
+  globalThis.canvas = {
+    ready: true,
+    scene: { id: "sc1", tokens: new Map([["npcCombat1", doc]]) },
+    tokens: { objects: { children: [] } }
+  };
+
+  const streamer = new TokenStreamer({ active: true });
+  streamer.enabled = true;
+  streamer.impostors = new TokenImpostorLayer({}, streamer);
+  streamer._pumping = true; // prevent rAF scheduling in unit test
+
+  assert.doesNotThrow(() => streamer.onCombatChanged());
+  assert.equal(streamer._queuedIds.has("npcCombat1"), true);
+  assert.equal(streamer._drawQueue.length, 1);
+  assert.equal(streamer._drawQueue[0].doc, doc);
+  assert.equal(streamer._drawQueue[0].distSq, 0);
+});
+
+test("lightingMethods enforces player doorRequest authorization and pause guard", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+
+  const hiddenScene = { id: "scHidden", active: false, navigation: false, testUserPermission: () => false, tokens: [] };
+  const activeScene = { id: "scActive", active: true, navigation: true, testUserPermission: () => true, tokens: [] };
+  const player = { id: "p1", isGM: false, active: true };
+  const gm = { id: "gm1", isGM: true, active: true };
+  globalThis.game.users = { get: (id) => (id === "p1" ? player : id === "gm1" ? gm : null) };
+
+  globalThis.game.paused = false;
+  assert.equal(lightingMethods._isAuthorizedDoorRequester({ senderId: "p1" }, hiddenScene), false, "player must not toggle doors on hidden scene");
+  assert.equal(lightingMethods._isAuthorizedDoorRequester({ senderId: "p1" }, activeScene), true, "player can toggle doors on active scene when unpaused");
+  globalThis.game.paused = true;
+  assert.equal(lightingMethods._isAuthorizedDoorRequester({ senderId: "p1" }, activeScene), false, "player must not toggle doors while game is paused");
+  assert.equal(lightingMethods._isAuthorizedDoorRequester({ senderId: "gm1" }, hiddenScene), true, "GM remains authorized");
+});
+
+test("ChunkedFogManager discards stale user-flag fog via fogResetId and rejects oversized/unauthorized fogReveal", async () => {
+  installBaseGlobals();
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+
+  let mergedCount = 0;
+  let userCleaned = false;
+  globalThis.game.user = {
+    id: "u1",
+    isGM: false,
+    flags: {
+      boundless: {
+        fog: { sc1: { lvl1: { "0_0": "data:image/png;base64,AA==" } } },
+        fogMeta: { sc1: { lvl1: { resetId: "oldReset", savedAt: 100 } } }
+      }
+    },
+    update: async () => { userCleaned = true; }
+  };
+  const mgr = new ChunkedFogManager();
+  mgr.sceneId = "sc1";
+  mgr.levelId = "lvl1";
+  mgr.fogMode = 0;
+  mgr._mergeChunkMap = () => { mergedCount++; };
+
+  const scene = {
+    id: "sc1",
+    flags: { boundless: { fogResetId: { lvl1: "newReset" }, fogResetAt: { lvl1: 500 } } }
+  };
+  mgr._loadPersistedFog(scene);
+  assert.equal(mergedCount, 0, "stale user-flag fog written before latest reset must be discarded");
+  assert.equal(userCleaned, true, "stale user-flag fog should be pruned asynchronously");
+
+  // Polygon size cap rejects continent-wide spoofed reveal polygons
+  const filtered = mgr._filterReasonablePolygons([
+    [0, 0, 500, 0, 500, 500],
+    [0, 0, 50000, 0, 50000, 50000]
+  ]);
+  assert.equal(filtered.length, 1, "oversized spoofed fogReveal polygon must be dropped");
+});
+
+test("scene-baker handles elongated aspect ratio, maxDim < tilePx stitch scaling, and literal % in getDirAndFilename", async () => {
+  const { computePyramidPlan, computeStitchPyramidPlan, getDirAndFilename } = await import("../scripts/scene-baker.mjs");
+
+  // 8000x2000 bounds with 4000x4000 fill image -> vertical density needs z=4 (not z=2)
+  const plan = computePyramidPlan(8000, 2000, 4000, 4000, 1024);
+  assert.equal(plan.maxZoomZ, 4, "elongated bounds with high vertical source resolution must preserve vertical zoom detail");
+
+  // Stitch when maxDim < tilePx must scale down instead of cropping 75%
+  const stitch = computeStitchPyramidPlan({ maxZoomZ: 0, worldPx: 4000, tilePx: 1024, bounds: { x: 0, y: 0, w: 4000, h: 4000 }, maxDim: 512 });
+  assert.equal(stitch.outW, 512);
+  assert.equal(stitch.outH, 512);
+  assert.ok(Math.abs(stitch.tileWorld * stitch.scaleZ - 512) < 0.01, "stitched tile width must fit maxDim when maxDim < tilePx");
+
+  // Literal % in one path segment must not prevent decoding %20 in other segments
+  const parsed = getDirAndFilename("worlds/my%20world/100%_map/pyramid_manifest.json", "fallback");
+  assert.equal(parsed.dir, "worlds/my world/100%_map");
+  assert.equal(parsed.filename, "pyramid_manifest.json");
+});
+
+test("Boundless.mount does not set _mounting on standard scenes, and TokenImpostorLayer destroys VBO buffers", async () => {
+  installBaseGlobals();
+  globalThis.Hooks = { on() {}, once() {} };
+  const { Boundless } = await import("../scripts/boundless.mjs");
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  const standardScene = { id: "std1", name: "Tavern", flags: {}, levels: [] };
+  const p = Boundless.mount(standardScene);
+  assert.equal(Boundless._mounting, false, "mounting a standard non-Boundless scene must not block applyLightingRenderScale with _mounting");
+  await p;
+
+  const imp = new TokenImpostorLayer({}, {});
+  let bufDestroyed = 0;
+  let geomDestroyed = false;
+  const fakeGeom = {
+    buffers: [{ destroy() { bufDestroyed++; } }, { destroy() { bufDestroyed++; } }],
+    destroy() { geomDestroyed = true; }
+  };
+  imp._destroyGeometry(fakeGeom);
+  assert.equal(bufDestroyed, 2, "all PIXI.Buffer VBOs must be destroyed explicitly");
+  assert.equal(geomDestroyed, true);
+});
+
+test("overlayMethods renders hidden tiles at 0.5x for GM without alpha^2 on batchOcclusion and masks hoverFade with SURFACE", async () => {
+  installBaseGlobals();
+  globalThis.CONST.OCCLUSION_MODES = { NONE: 0, FADE: 1, RADIAL: 2, VISION: 4, SURFACE: 8 };
+  globalThis.foundry = {
+    canvas: { groups: { PrimaryCanvasGroup: { SORT_LAYERS: { TILES: 500 } } } },
+    utils: { Color: { from: () => ({ valid: true, valueOf: () => 0xffffff }) } }
+  };
+  const { overlayMethods } = await import("../scripts/boundless-overlays.mjs");
+
+  const makeMesh = () => ({
+    anchor: { set() {} },
+    position: { set() {} },
+    scale: { x: 1, y: 1 },
+    pluginName: "batchOcclusion",
+    updateCanvasTransform() {}
+  });
+  const added = [];
+  globalThis.canvas = { primary: { addChild(m) { added.push(m); } } };
+
+  const ctrl = {
+    ...overlayMethods,
+    active: true,
+    _mountGen: 1,
+    tileEditsRev: 0,
+    levelLayers: new Map([["lvl1", { level: { id: "lvl1", isView: true }, isUpper: false, lastTargetZ: 2, zOffset: 0, simGrid: 4, simSectorPx: 1000 }]]),
+    activeVirtualTiles: new Map(),
+    texMgr: { getSync: () => ({ width: 100, height: 100, baseTexture: { valid: true, destroyed: false }, destroyed: false }) },
+    acquireMesh: makeMesh,
+    _shouldMountInteriorTiles: () => true,
+    _syncShowstopperMeshDof: () => {},
+    _emit: () => {}
+  };
+  const layer = ctrl.levelLayers.get("lvl1");
+  const tex = { width: 100, height: 100, baseTexture: { valid: true, destroyed: false }, destroyed: false };
+
+  // Semi-transparent tile with FADE | SURFACE occlusion: m.alpha must stay 1.0 (not 0.5^2) and hoverFade must be false
+  const occMesh = ctrl._mountVirtualTileMesh({
+    fullId: "lvl1::0", lid: "lvl1", tid: 0, layer, defaultElev: 0, reqRev: 0, gen: 1, tex,
+    tSpec: { src: "a.webp", x: 100, y: 100, w: 200, h: 200, alpha: 0.5, hidden: false, occlusionMode: 1 | 8 }
+  }, { x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 });
+  assert.equal(occMesh.alpha, 1.0, "batchOcclusion mesh must keep m.alpha=1.0 to avoid alpha^2 darkening");
+  assert.equal(occMesh.unoccludedAlpha, 0.5);
+  assert.equal(occMesh.hoverFade, false, "combined FADE | SURFACE occlusion must not enable hoverFade");
+
+  // Hidden decorative tile for GM: uses batch shader with alpha * 0.5
+  const decMesh = ctrl._mountVirtualTileMesh({
+    fullId: "lvl1::1", lid: "lvl1", tid: 1, layer, defaultElev: 0, reqRev: 0, gen: 1, tex,
+    tSpec: { src: "b.webp", x: 100, y: 100, w: 200, h: 200, alpha: 0.8, hidden: true, occlusionMode: 0 }
+  }, { x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 });
+  assert.equal(decMesh.pluginName, "batch");
+  assert.ok(Math.abs(decMesh.alpha - 0.4) < 1e-6, "hidden decorative tile for GM must render at 0.5x alpha");
+});

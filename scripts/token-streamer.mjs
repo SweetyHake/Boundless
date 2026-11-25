@@ -51,6 +51,7 @@ function isAlwaysMountedTokenDoc(doc) {
   if (doc.actorLink) return true;
   const base = doc.baseActor;
   if (base?.hasPlayerOwner || base?.type === "character") return true;
+  if (!game.user?.isGM && hasTokenPermissionLazy(doc, game.user, "OWNER")) return true;
   if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && hasTokenPermissionLazy(doc, game.user, "OBSERVER")) return true;
   if (doc.flags?.[MODULE_ID]?.pinned) return true;
   if (doc.combatant) return true;
@@ -689,8 +690,10 @@ export class TokenStreamer {
       invalidateTokenLayerCache();
     }
     if (anyRenderableToggled) {
-      // Update ONLY the toggled tokens in O(K) instead of O(N) full-scene scan so pan frames stay 120 FPS smooth
-      if (typeof this.impostors.refreshTokenStates === "function") {
+      // Update ONLY the toggled tokens in O(K) on pan frames; on force sync, refresh all impostors too
+      if (force) {
+        this.impostors.refreshVisibility(true);
+      } else if (typeof this.impostors.refreshTokenStates === "function") {
         this.impostors.refreshTokenStates(toggledDocs);
       } else {
         this.impostors.refreshVisibility(true);
@@ -1263,9 +1266,9 @@ export class TokenStreamer {
         const doc = canvas.scene.tokens.get(c.tokenId);
         if (!doc || !doc.viewed) continue;
         const mounted = doc._object && !doc._object.destroyed && doc._object.parent === canvas.tokens?.objects;
-        if (!mounted && !this._drawQueuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
-          this._drawQueuedIds.add(doc.id);
-          this._drawQueue.push(doc);
+        if (!mounted && !this._queuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
+          this._queuedIds.add(doc.id);
+          this._drawQueue.unshift({ doc, distSq: 0 });
         }
       }
       if (this._drawQueue.length > 0 && !this._pumping && this._rafId === null) {
@@ -1302,20 +1305,66 @@ export class TokenStreamer {
     const isGM = Boolean(game.user?.isGM);
     if (!isGM) {
       if (doc._source?.hidden ?? doc.hidden) return false;
-      if (!hasTokenPermissionLazy(doc, game.user, minPermission)) return false;
+      if (minPermission && !hasTokenPermissionLazy(doc, game.user, minPermission)) return false;
     }
     const existing = doc._object;
     if (existing && !existing.destroyed) {
       if (existing.visible === false || existing.isPreview) return false;
       if (existing._ssHitboxRect?.occluded) return false;
-    } else if (!isGM && this.controller?.isPointUnderBakedRoof) {
+    } else if (!isGM) {
       const grid = canvas.grid?.size || 100;
       const b = getTokenDocBounds(doc, grid);
       const lid = doc._source?.level ?? doc.level ?? canvas.level?.id;
       const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
-      if (this.controller.isPointUnderBakedRoof(lid, b.cx, b.cy, elev)) return false;
+      if (this.controller?.isPointUnderBakedRoof?.(lid, b.cx, b.cy, elev)) return false;
+      const isOwner = hasTokenPermissionLazy(doc, game.user, "OWNER");
+      if (!isOwner) {
+        // Prevent double-click / target leaks through fog of war or invisible/burrowed status
+        const inv = globalThis.CONFIG?.specialStatusEffects?.INVISIBLE || "invisible";
+        const bur = globalThis.CONFIG?.specialStatusEffects?.BURROW || "burrow";
+        if (doc.hasStatusEffect?.(inv) || doc.hasStatusEffect?.(bur)) return false;
+        if (canvas?.visibility?.tokenVision && typeof canvas.visibility.testVisibility === "function") {
+          const tol = Math.min(grid * 0.5, Math.max(b.w, b.h) * 0.45);
+          if (!canvas.visibility.testVisibility({ x: b.cx, y: b.cy }, { tolerance: tol })) return false;
+        }
+      }
     }
     return true;
+  }
+
+  async materializeDoc(doc) {
+    if (!this.enabled || !doc || !canvas?.ready || !canvas.tokens?.objects) return null;
+    if (doc.parent?.id !== this.sceneId || !doc.viewed) return null;
+    let obj = doc._object;
+    if (obj && !obj.destroyed && obj.parent === canvas.tokens.objects) return obj;
+    const gen = this._gen;
+    const layer = canvas.tokens;
+    this._drawingIds.add(doc.id);
+    try {
+      const texSrc = this._getDocTexSrc(doc);
+      const loadTexFn = globalThis.foundry?.canvas?.loadTexture ?? globalThis.loadTexture;
+      if (texSrc && !this._isTexReady(texSrc) && typeof loadTexFn === "function") {
+        await loadTexFn(texSrc);
+        if (gen === this._gen) this._decodedTexSrcs.add(texSrc);
+      }
+      if (!this.enabled || gen !== this._gen || !canvas?.ready) return null;
+      if (!canvas.scene?.tokens?.has?.(doc.id) || !doc.viewed) return null;
+      doc._destroyed = false;
+      obj = (doc._object && !doc._object.destroyed) ? doc._object : layer.createObject(doc);
+      doc._object = obj;
+      if (obj.parent !== layer.objects) layer.objects.addChild(obj);
+      await obj.draw();
+      obj.applyRenderFlags?.();
+      this.lastSeenMs.set(doc.id, performance.now());
+      this.impostors.upsertToken(doc);
+      this.impostors.flush();
+      return obj;
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to materialize Token ${doc.id}:`, err);
+      return null;
+    } finally {
+      if (gen === this._gen) this._drawingIds.delete(doc.id);
+    }
   }
 
   /**

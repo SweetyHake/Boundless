@@ -1217,7 +1217,7 @@ export class VirtualLayerEditors {
         levels: [item.levelId],
         texture: {
           src: item.src,
-          tint: item.tint || "#ffffff",
+          tint: (item.tint !== undefined && item.tint !== null && item.tint !== "") ? item.tint : "#ffffff",
           alphaThreshold: item.alphaThreshold ?? 0.75,
           anchorX: ax,
           anchorY: ay,
@@ -1418,7 +1418,7 @@ export class VirtualLayerEditors {
           width: it.w, height: it.h, rotation: it.rot || 0, elevation: it.elevation,
           sort: it.sort || 0, alpha: it.alpha ?? 1, hidden: Boolean(it.hidden),
           texture: {
-            src: it.src, tint: it.tint || "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
+            src: it.src, tint: (it.tint !== undefined && it.tint !== null && it.tint !== "") ? it.tint : "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
             anchorX: ax, anchorY: ay, scaleX: it.scaleX ?? 1, scaleY: it.scaleY ?? 1, fit: it.fit ?? "fill"
           },
           occlusion: { modes: resolveOcclusionModeArray(it.occlusionMode), alpha: it.occludedAlpha ?? 0.2 },
@@ -1499,7 +1499,7 @@ export class VirtualLayerEditors {
         sort: d.sort || 0,
         alpha: d.alpha ?? 1,
         hidden: Boolean(d.hidden),
-        tint: d.texture?.tint ? foundry.utils.Color.from(d.texture.tint).css : null,
+        tint: (d.texture?.tint !== undefined && d.texture?.tint !== null && d.texture?.tint !== "") ? foundry.utils.Color.from(d.texture.tint).css : null,
         alphaThreshold: d.texture?.alphaThreshold ?? 0.75,
         anchorX: d.texture?.anchorX ?? 0.5,
         anchorY: d.texture?.anchorY ?? 0.5,
