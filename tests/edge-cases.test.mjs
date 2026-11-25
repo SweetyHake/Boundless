@@ -2803,3 +2803,129 @@ test("ChunkedFogManager.updateViewportCulling caches chunk coordinates and updat
   assert.equal(s0.visible, false);
   assert.equal(s2.visible, true);
 });
+
+test("ChunkStreamer skips mounting stale out-of-viewport fetch response while keeping prewarm chunks", async () => {
+  installBaseGlobals();
+  globalThis.canvas = { tokens: { placeables: [] }, level: { id: "lvl1" }, grid: { size: 100 } };
+  const origFetch = globalThis.fetch;
+  const resolvers = new Map();
+  globalThis.fetch = (url) => new Promise((resolve) => {
+    resolvers.set(url, () => resolve({ ok: true, json: async () => ({ sectors: { s1: { w: [1] } }, overlays: {} }) }));
+  });
+  try {
+    const { ChunkStreamer } = await import("../scripts/chunk-streamer.mjs");
+    const mounted = [];
+    const cs = new ChunkStreamer({ onChunkLoaded(_l, ck) { mounted.push(ck); }, onChunkUnloaded() {} });
+    const layer = {
+      level: { id: "lvl1" },
+      worldPx: 200000,
+      spec: { chunks: { baseUrl: "/chunks", chunkWorldPx: 50000, cols: 4, rows: 4, populated: [] }, sectors: {}, overlays: {} }
+    };
+    cs.mount([layer]);
+    const st = cs.states.get("lvl1");
+
+    // Start fetch for 0_0, then shift lastNeeded away before fetch resolves -> must NOT mount
+    const pStale = cs._fetchChunk(st, "0_0");
+    st.lastNeeded = new Set(["3_3"]);
+    resolvers.get("/chunks/0_0.json")();
+    await pStale;
+    assert.equal(st.loaded.has("0_0"), false, "stale out-of-viewport fetch must not mount");
+
+    // Prewarm chunk 1_0 even though lastNeeded is 3_3 -> MUST mount
+    st.prewarmKeys.add("1_0");
+    const pWarm = cs._fetchChunk(st, "1_0");
+    resolvers.get("/chunks/1_0.json")();
+    await pWarm;
+    assert.equal(st.loaded.has("1_0"), true, "prewarm chunk must mount even outside current lastNeeded");
+    assert.deepEqual(mounted, ["1_0"]);
+    cs.unmount();
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("pyramidMethods._mountTileMesh uses OCCLUSION_MODES.NONE on ground tiles without defineSurface regions", async () => {
+  installBaseGlobals();
+  globalThis.CONST = {
+    OCCLUSION_MODES: { NONE: 0, FADE: 1, RADIAL: 2, VISION: 4, SURFACE: 8 }
+  };
+  class FakePrimarySpriteMesh {
+    constructor() {
+      this.position = { x: 0, y: 0, set(x, y) { this.x = x; this.y = y; } };
+      this.anchor = { set() {} };
+      this.scale = { set() {} };
+      this.texture = {};
+      this.visible = true;
+      this.alpha = 1;
+      this.occlusionMode = 0;
+    }
+  }
+  globalThis.foundry = {
+    utils: { Color: { from: () => ({ valid: false }) } },
+    canvas: {
+      groups: { PrimaryCanvasGroup: { SORT_LAYERS: { SCENE: 0, TILES: 500 } } },
+      primary: { PrimarySpriteMesh: FakePrimarySpriteMesh }
+    }
+  };
+  globalThis.canvas = {
+    primary: { addChild(m) { return m; }, sortDirty: false },
+    regions: { placeables: [] }
+  };
+
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+  const layer = {
+    level: { id: "l0", index: 0, isView: true, elevation: { bottom: 0, top: 20 } },
+    spec: {},
+    isUpper: false,
+    tiles: new Map()
+  };
+  const ctrl = {
+    ...pyramidMethods,
+    meshPool: [],
+    tilesByKey: new Map(),
+    visibleLevelLayers: [layer],
+    active: true,
+    acquireMesh() { return new FakePrimarySpriteMesh(); }
+  };
+  const tex = { valid: true, baseTexture: { valid: true, destroyed: false }, width: 512, height: 512 };
+  const e1 = { key: "l0:bg:1:0:0", z: 1, x0: 0, y0: 0, sizePx: 512, channel: "bg", layer, desired: true, ready: false };
+
+  // 1. No defineSurface regions -> ground tile gets OCCLUSION_MODES.NONE (fast "batch" shader)
+  assert.equal(ctrl._mountTileMesh(e1, tex, true), true);
+  assert.equal(e1.mesh.occlusionMode, 0);
+
+  // 2. Scene with active defineSurface region -> ground tile gets OCCLUSION_MODES.SURFACE
+  globalThis.canvas.regions.placeables = [{ document: { behaviors: new Set([{ disabled: false, type: "defineSurface" }]) } }];
+  const e2 = { key: "l0:bg:1:1:0", z: 1, x0: 512, y0: 0, sizePx: 512, channel: "bg", layer, desired: true, ready: false };
+  assert.equal(ctrl._mountTileMesh(e2, tex, true), true);
+  assert.equal(e2.mesh.occlusionMode, 8);
+});
+
+test("refreshTokenBars and clearTokenUiBitmapCaches reset cached bars and redraw cleanly", async () => {
+  installBaseGlobals();
+  const { refreshTokenBars, clearTokenUiBitmapCaches } = await import("../scripts/perf-gpu.mjs");
+  const spr = { visible: true };
+  let drawCalls = 0;
+  const tok = {
+    destroyed: false,
+    bars: {
+      destroyed: false,
+      cacheAsBitmap: true,
+      bar1: { cacheAsBitmap: true, _blBarSprites: { all: [spr] } },
+      bar2: { cacheAsBitmap: true }
+    },
+    effects: { cacheAsBitmap: true },
+    drawBars() { drawCalls++; }
+  };
+  globalThis.canvas = { tokens: { placeables: [tok] } };
+
+  clearTokenUiBitmapCaches();
+  assert.equal(tok.bars.cacheAsBitmap, false);
+  assert.equal(tok.bars.bar1.cacheAsBitmap, false);
+  assert.equal(tok.effects.cacheAsBitmap, false);
+  assert.equal(spr.visible, false);
+  assert.equal(drawCalls, 1);
+
+  refreshTokenBars();
+  assert.equal(drawCalls, 2);
+});

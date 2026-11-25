@@ -773,7 +773,24 @@ export class VirtualWallEditor {
 
     const curVp = vp || this.controller.getViewportWorldRect(0.18);
     const isWallsEditMode = this.active && Boolean(game.user?.isGM);
-    const activeLayers = this._getDoorLayers(!isWallsEditMode);
+    const viewedLvlId = canvas.level?.id || "";
+    const visLayers = this.controller.visibleLevelLayers;
+    const visLen = visLayers?.length || 0;
+    const visFirstId = visLen > 0 ? (visLayers[0]?.level?.id || "") : "";
+    const visLastId = visLen > 1 ? (visLayers[visLen - 1]?.level?.id || "") : visFirstId;
+    const cacheTag = `${isWallsEditMode ? 1 : 0}:${viewedLvlId}:${visLen}:${visFirstId}:${visLastId}:${this.controller._mountGen || 0}`;
+    let activeLayers;
+    let levelSig;
+    if (this._doorLayersCacheTag === cacheTag && this._doorLayersCache) {
+      activeLayers = this._doorLayersCache;
+      levelSig = this._doorLevelSigCache;
+    } else {
+      activeLayers = this._getDoorLayers(!isWallsEditMode);
+      levelSig = activeLayers.map(l => l.level.id).join(",");
+      this._doorLayersCacheTag = cacheTag;
+      this._doorLayersCache = activeLayers;
+      this._doorLevelSigCache = levelSig;
+    }
     if (!activeLayers.length) {
       this._clearMountedWalls();
       if (this.macroGfx) { this.macroGfx.clear(); this.macroGfx.visible = false; }
@@ -797,7 +814,6 @@ export class VirtualWallEditor {
     const rev = this.controller.wallEditsRev || 0;
     const prevShowDoorControls = this._showDoorControls;
     this._showDoorControls = showDoorControls;
-    const levelSig = activeLayers.map(l => l.level.id).join(",");
     const key = `${levelSig}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
     if (key === this._lastKey) return;
     this._lastKey = key;

@@ -1,6 +1,6 @@
 import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, perfStats, resetPerfStats } from "./perf-patcher.mjs";
-import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches } from "./perf-gpu.mjs";
+import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches, refreshTokenBars } from "./perf-gpu.mjs";
 import { resetCpuCaches } from "./perf-cpu.mjs";
 import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
 
@@ -144,6 +144,8 @@ async function setPerfMode(enabled) {
   if (!enabled) {
     clearTokenUiBitmapCaches();
     restoreAllStandardCulling();
+  } else {
+    refreshTokenBars();
   }
   applyLightingRenderScale();
   applyDisableUiBlur();

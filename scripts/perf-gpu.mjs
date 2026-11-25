@@ -131,6 +131,33 @@ function getUiAtlas() {
   ctx.stroke();
   ctx.restore();
 
+  // (I) 3-slice Token Resource Bar Background capsule at (0, 160, 48, 24):
+  // Black 0.5 fill + 3px black outer border -> renders crisp rounded bar at any width via 3 sprites!
+  ctx.save();
+  roundedRectPath(1.5, 161.5, 45, 21, 7);
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(0,0,0,1)";
+  ctx.stroke();
+  ctx.restore();
+
+  // (J) 3-slice Token Resource Bar Fill capsule at (64, 160, 48, 24):
+  // Pure white interior (tinted via sprite.tint) + 3px black outer border (tint stays black on border? No:
+  // use separate pure-white fill capsule at (64,160) + black border overlay at (128,160) so border stays pure black!)
+  ctx.save();
+  roundedRectPath(65.5, 161.5, 45, 21, 5.5);
+  ctx.fillStyle = "rgba(255,255,255,1)";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  roundedRectPath(129.5, 161.5, 45, 21, 5.5);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(0,0,0,1)";
+  ctx.stroke();
+  ctx.restore();
+
   const base = PIXI.BaseTexture.from(canvasEl, {
     scaleMode: PIXI.SCALE_MODES.LINEAR,
     mipmap: PIXI.MIPMAP_MODES.OFF
@@ -145,7 +172,16 @@ function getUiAtlas() {
     plainBorder: new PIXI.Texture(base, new PIXI.Rectangle(0, 80, 64, 64)),
     softShadowCircle: new PIXI.Texture(base, new PIXI.Rectangle(64, 80, 64, 64)),
     solidCircle: new PIXI.Texture(base, new PIXI.Rectangle(128, 80, 64, 64)),
-    circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(192, 80, 64, 64))
+    circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(192, 80, 64, 64)),
+    barBgL: new PIXI.Texture(base, new PIXI.Rectangle(0, 160, 10, 24)),
+    barBgM: new PIXI.Texture(base, new PIXI.Rectangle(12, 160, 24, 24)),
+    barBgR: new PIXI.Texture(base, new PIXI.Rectangle(38, 160, 10, 24)),
+    barFillL: new PIXI.Texture(base, new PIXI.Rectangle(64, 160, 10, 24)),
+    barFillM: new PIXI.Texture(base, new PIXI.Rectangle(76, 160, 24, 24)),
+    barFillR: new PIXI.Texture(base, new PIXI.Rectangle(102, 160, 10, 24)),
+    barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 160, 10, 24)),
+    barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 160, 24, 24)),
+    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 160, 10, 24))
   };
   return _uiAtlas;
 }
@@ -912,9 +948,148 @@ function getBitmapCacheResolution() {
   return Math.max(1, Math.min(2, r));
 }
 
+function layoutBar3Slice(sprites, x, y, w, h, tint = 0xffffff, visible = true) {
+  const [l, m, r] = sprites;
+  if (!visible || w <= 0.5 || h <= 0.5) {
+    l.visible = m.visible = r.visible = false;
+    return;
+  }
+  const capW = Math.min(w * 0.5, h * (10 / 24));
+  const midW = Math.max(0, w - capW * 2);
+  l.visible = true;
+  l.position.set(x, y);
+  l.width = capW;
+  l.height = h;
+  l.tint = tint;
+  if (midW > 0.25) {
+    m.visible = true;
+    m.position.set(x + capW, y);
+    m.width = midW;
+    m.height = h;
+    m.tint = tint;
+  } else {
+    m.visible = false;
+  }
+  r.visible = true;
+  r.position.set(x + w - capW, y);
+  r.width = capW;
+  r.height = h;
+  r.tint = tint;
+}
+
+function hideBar3SliceSprites(bar) {
+  const g = bar?._blBarSprites;
+  if (!g) return;
+  for (let i = 0; i < g.all.length; i++) g.all[i].visible = false;
+}
+
+function ensureBar3SliceSprites(bar, atlas) {
+  if (bar._blBarSprites && !bar._blBarSprites.all[0].destroyed) return bar._blBarSprites;
+  const make = (tex) => {
+    const sp = new PIXI.Sprite(tex);
+    sp.eventMode = "none";
+    bar.addChild(sp);
+    return sp;
+  };
+  const bg = [make(atlas.barBgL), make(atlas.barBgM), make(atlas.barBgR)];
+  const fill = [make(atlas.barFillL), make(atlas.barFillM), make(atlas.barFillR)];
+  const stroke = [make(atlas.barStrokeL), make(atlas.barStrokeM), make(atlas.barStrokeR)];
+  bar._blBarSprites = { bg, fill, stroke, all: [...bg, ...fill, ...stroke] };
+  return bar._blBarSprites;
+}
+
+function drawBatched3SliceBar(tok, number, bar, pct, colorVal) {
+  const atlas = getUiAtlas();
+  if (!atlas || !bar || bar.destroyed) return false;
+  if (bar.geometry?.graphicsData?.length) bar.clear();
+  const size = tok.document?.getSize?.() ?? { width: tok.w || 100, height: tok.h || 100 };
+  const s = globalThis.canvas?.dimensions?.uiScale || 1;
+  const bw = size.width;
+  const bh = 8 * ((tok.document?.height ?? 1) >= 2 ? 1.5 : 1) * s;
+  const g = ensureBar3SliceSprites(bar, atlas);
+  layoutBar3Slice(g.bg, 0, 0, bw, bh, 0xffffff, true);
+  const fillW = pct * bw;
+  const showFill = fillW > 0.5;
+  layoutBar3Slice(g.fill, 0, 0, fillW, bh, colorVal, showFill);
+  layoutBar3Slice(g.stroke, 0, 0, fillW, bh, 0xffffff, showFill);
+  bar.position.set(0, number === 0 ? size.height - bh : 0);
+  perfStats.tokenBarsCached++;
+  return true;
+}
+
+function isBarbrawlActive() {
+  return Boolean(globalThis.game?.modules?.get?.("barbrawl")?.active);
+}
+
+function patchDnd5eHpBars() {
+  // Batch D&D 5e Token5e#_drawHPBar when there is no temp HP / tempmax modification (95%+ of tokens!)
+  const Token5eCls = globalThis.dnd5e?.canvas?.Token5e ?? globalThis.CONFIG?.Token?.objectClass;
+  if (!Token5eCls?.prototype?._drawHPBar) return false;
+  return Boolean(wrapTargetMethod(Token5eCls.prototype, "_drawHPBar", "Token5e.prototype._drawHPBar", function (wrapped, number, bar, data, ...rest) {
+    const hp = this.actor?.system?.attributes?.hp;
+    const hasTemp = Boolean(hp && ((Number(hp.temp) || 0) > 0 || (Number(hp.tempmax) || 0) !== 0));
+    if (
+      !PERF_CONFIG.perfEnabled ||
+      !PERF_CONFIG.perfTokenUiCache ||
+      isPrimePerfActive() ||
+      isBarbrawlActive() ||
+      hasTemp ||
+      !bar || bar.destroyed ||
+      (bar !== this.bars?.bar1 && bar !== this.bars?.bar2) ||
+      !hp || !(Number(hp.effectiveMax ?? hp.max) > 0)
+    ) {
+      hideBar3SliceSprites(bar);
+      return wrapped(number, bar, data, ...rest);
+    }
+    const effMax = Number(hp.effectiveMax ?? hp.max);
+    const val = Math.max(0, Math.min(effMax, Number(hp.value) || 0));
+    const pct = val / effMax;
+    const Actor5e = globalThis.dnd5e?.documents?.Actor5e;
+    const rawCol = Actor5e?.getHPColor ? Actor5e.getHPColor(val, effMax) : null;
+    const colorVal = rawCol != null ? (typeof rawCol === "number" ? rawCol : rawCol.valueOf()) : 0x00ff00;
+    if (!drawBatched3SliceBar(this, number, bar, pct, colorVal)) {
+      hideBar3SliceSprites(bar);
+      return wrapped(number, bar, data, ...rest);
+    }
+  }));
+}
+
 function patchTokenUiCaching() {
-  // Note: Do NOT cacheAsBitmap bar1/bar2 — Foundry v14 animates HP bars over 90-216 frames,
-  // and per-bar RenderTextures thrash FBOs during animations and break multi-texture batching (>16 textures).
+  // Replace PIXI.Graphics drawRoundedRect (~200 verts/bar -> breaks batching) with 3-slice sprites on _uiAtlas (1 draw call for 100+ tokens!)
+  const okDrawBar = wrapFoundryMethod("Token", "_drawBar", function (wrapped, number, bar, data, ...rest) {
+    if (
+      !PERF_CONFIG.perfEnabled ||
+      !PERF_CONFIG.perfTokenUiCache ||
+      isPrimePerfActive() ||
+      isBarbrawlActive() ||
+      !bar || bar.destroyed ||
+      (bar !== this.bars?.bar1 && bar !== this.bars?.bar2) ||
+      !data || !Number.isFinite(Number(data.max)) || Number(data.max) <= 0
+    ) {
+      hideBar3SliceSprites(bar);
+      return wrapped(number, bar, data, ...rest);
+    }
+    // Delegate D&D 5e HP bars to Token5e#_drawHPBar patch (which handles temp / tempmax cleanly)
+    if (data.attribute === "attributes.hp" && typeof this._drawHPBar === "function") {
+      return wrapped(number, bar, data, ...rest);
+    }
+    const max = Number(data.max);
+    const val = Math.max(0, Math.min(max, Number(data.value) || 0));
+    const pct = val / max;
+    const colors = typeof this._getBarColors === "function" ? this._getBarColors(number, data) : null;
+    const ColorCls = globalThis.foundry?.utils?.Color;
+    let colorVal = number === 0 ? 0x00ff00 : 0x80b3ff;
+    if (colors?.empty !== undefined && colors?.full !== undefined && ColorCls?.mix) {
+      colorVal = ColorCls.mix(colors.empty, colors.full, pct).valueOf();
+    }
+    if (!drawBatched3SliceBar(this, number, bar, pct, colorVal)) {
+      hideBar3SliceSprites(bar);
+      return wrapped(number, bar, data, ...rest);
+    }
+  }, { type: "MIXED" });
+
+  patchDnd5eHpBars();
+
   const okDrawFx = wrapFoundryMethod("Token", "_drawEffects", function (wrapped, ...args) {
     if (this.effects) this.effects.cacheAsBitmap = false;
     return wrapped(...args);
@@ -950,7 +1125,22 @@ function patchTokenUiCaching() {
     return res;
   }, { type: "WRAPPER" });
 
-  return [Boolean(okDrawFx), Boolean(okRefFx)];
+  return [Boolean(okDrawBar), Boolean(okDrawFx), Boolean(okRefFx)];
+}
+
+export function refreshTokenBars() {
+  const placeables = globalThis.canvas?.tokens?.placeables;
+  if (!placeables?.length) return;
+  for (let i = 0; i < placeables.length; i++) {
+    const tok = placeables[i];
+    if (!tok || tok.destroyed || !tok.bars || tok.bars.destroyed) continue;
+    if (typeof tok.drawBars === "function") {
+      try { tok.drawBars(); } catch {}
+    } else {
+      hideBar3SliceSprites(tok.bars.bar1);
+      hideBar3SliceSprites(tok.bars.bar2);
+    }
+  }
 }
 
 export function clearTokenUiBitmapCaches() {
@@ -960,11 +1150,18 @@ export function clearTokenUiBitmapCaches() {
   for (const tok of placeables) {
     if (tok.bars) {
       tok.bars.cacheAsBitmap = false;
-      if (tok.bars.bar1) tok.bars.bar1.cacheAsBitmap = false;
-      if (tok.bars.bar2) tok.bars.bar2.cacheAsBitmap = false;
+      if (tok.bars.bar1) {
+        tok.bars.bar1.cacheAsBitmap = false;
+        hideBar3SliceSprites(tok.bars.bar1);
+      }
+      if (tok.bars.bar2) {
+        tok.bars.bar2.cacheAsBitmap = false;
+        hideBar3SliceSprites(tok.bars.bar2);
+      }
     }
     if (tok.effects) tok.effects.cacheAsBitmap = false;
   }
+  refreshTokenBars();
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,7 +1636,10 @@ export function installGpuPerfEngine() {
   }
 
   Hooks.once("ready", () => {
-    if (!isPrimePerfActive()) patchDnd5eMapLocationIcons();
+    if (!isPrimePerfActive()) {
+      patchDnd5eMapLocationIcons();
+      patchDnd5eHpBars();
+    }
   });
 
   Hooks.on("canvasReady", () => {
@@ -1447,6 +1647,7 @@ export function installGpuPerfEngine() {
     if (!isPrimePerfActive()) {
       attachLightingLayerBatcher();
       patchDnd5eMapLocationIcons();
+      patchDnd5eHpBars();
       attachTokenUiBatcher();
       applyLightingRenderScale();
     }
@@ -1461,13 +1662,19 @@ export function installGpuPerfEngine() {
 }
 
 let _lastSpriteIconsSig = null;
+let _lastTokenBarsSig = null;
 
 export function refreshGpuPerfSettings() {
   applyDisableUiBlur();
   if (isPrimePerfActive()) return;
   applyLightingRenderScale();
+  const tokenBarsSig = `${PERF_CONFIG.perfEnabled ? 1 : 0}:${PERF_CONFIG.perfTokenUiCache ? 1 : 0}`;
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfTokenUiCache) {
     clearTokenUiBitmapCaches();
+    _lastTokenBarsSig = tokenBarsSig;
+  } else if (tokenBarsSig !== _lastTokenBarsSig) {
+    _lastTokenBarsSig = tokenBarsSig;
+    refreshTokenBars();
   }
   const spriteIconsSig = `${PERF_CONFIG.perfEnabled ? 1 : 0}:${PERF_CONFIG.perfWallSprites ? 1 : 0}:${PERF_CONFIG.perfControlIconCache ? 1 : 0}`;
   if (spriteIconsSig === _lastSpriteIconsSig) return;

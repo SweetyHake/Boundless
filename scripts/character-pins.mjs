@@ -658,7 +658,11 @@ export class CharacterPinManager {
       if (!e.worldVisible) continue;
       e.pulseRing.scale.set(ringScale);
       e.pulseRing.alpha = ringAlpha;
-      e.root.position.set(e._lastPosX ?? 0, e._lastPosY ?? 0);
+      const lx = e._lastPosX ?? 0;
+      const ly = e._lastPosY ?? 0;
+      if (e.root.position.x !== lx || e.root.position.y !== ly) {
+        e.root.position.set(lx, ly);
+      }
     }
   }
 
@@ -847,14 +851,23 @@ export class CharacterPinManager {
           tipClass = "tip-bottom";
         }
 
+        // Quantize arrow angle (~1.1 deg) and throttle distance subText DOM writes during fast pan to prevent 120Hz layout thrashing
+        const qAngle = (Math.round(angle * 50) / 50).toFixed(2);
+        const nowMs = performance.now();
+        let nextSubText = entry._lastSubText;
+        if (!nextSubText || !entry._lastSubTextMs || (nowMs - entry._lastSubTextMs) >= 140) {
+          entry._lastSubTextMs = nowMs;
+          nextSubText = formatWorldDistance(pos.x - (pivot?.x || 0), pos.y - (pivot?.y || 0));
+        }
+
         this._setEdgeDom(entry, {
           display: "",
           transform: `translate3d(${Math.round(ex)}px, ${Math.round(ey)}px, 0) translate(-50%, -50%)`,
           tipClass,
           arrowDisplay: "",
-          arrowTransform: `rotate(${angle.toFixed(3)}rad)`,
+          arrowTransform: `rotate(${qAngle}rad)`,
           badgeDisplay: "none",
-          subText: formatWorldDistance(pos.x - (pivot?.x || 0), pos.y - (pivot?.y || 0))
+          subText: nextSubText
         });
       }
     }

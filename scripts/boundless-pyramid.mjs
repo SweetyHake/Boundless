@@ -1152,9 +1152,30 @@ export const pyramidMethods = {
     // Foreground walls sit at level.elevation.top (above bottom tokens) with SCENE sortLayer (below TILES roofs/props)
     // and negative sort (< 1) so the next upper level's floor at the same elevation always draws cleanly above them.
     m.sort = isFg ? (-200 + e.z * 10) : (1 + e.z * 10);
+    // Ground (non-upper, non-foreground) pyramid tiles only need SURFACE occlusion if the scene has defineSurface Regions;
+    // otherwise keep OCCLUSION_MODES.NONE so non-depth tiles use the fast PIXI "batch" shader instead of batchOcclusion!
+    let groundOccMode = CONST.OCCLUSION_MODES.NONE;
+    if (isFg) {
+      groundOccMode = CONST.OCCLUSION_MODES.SURFACE;
+    } else if (!layer.isUpper) {
+      const regions = canvas.regions?.placeables;
+      if (regions?.length) {
+        for (let ri = 0; ri < regions.length; ri++) {
+          const behaviors = regions[ri]?.document?.behaviors;
+          if (!behaviors?.size) continue;
+          for (const b of behaviors) {
+            if (!b.disabled && b.type === "defineSurface") {
+              groundOccMode = CONST.OCCLUSION_MODES.SURFACE;
+              break;
+            }
+          }
+          if (groundOccMode !== CONST.OCCLUSION_MODES.NONE) break;
+        }
+      }
+    }
     m.occlusionMode = layer.isUpper
       ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)
-      : CONST.OCCLUSION_MODES.SURFACE;
+      : groundOccMode;
     if (isFg) m._occludedBySameElevationSurfaces = false;
     m.occludedAlpha = layer.isUpper ? 0.08 : 1.0;
     m.hoverFade = layer.isUpper;

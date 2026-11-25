@@ -179,6 +179,7 @@ export class ChunkStreamer {
     if (this.states.size === 0 || !Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
     const now = performance.now();
     for (const [, st] of this.states) {
+      st.prewarmKeys?.clear?.();
       const { cfg, populated, layer } = st;
       const cw = cfg.chunkWorldPx;
       const cols = cfg.cols || Math.ceil((layer.worldPx || cw) / cw);
@@ -296,12 +297,15 @@ export class ChunkStreamer {
       })
       .then(data => {
         const isCurrent = st.pending.get(ck) === req;
+        const wasPrewarm = Boolean(st.prewarmKeys?.has?.(ck));
         if (isCurrent) {
           st.pending.delete(ck);
           st.prewarmKeys?.delete?.(ck);
         }
         if (!isCurrent || gen !== this._gen || !this.states.has(st.layer.level.id)) return;
         st.failed?.delete?.(ck);
+        // Skip mounting a stale chunk whose fetch completed after the camera already moved elsewhere
+        if (!wasPrewarm && st.lastNeeded?.size > 0 && !st.lastNeeded.has(ck)) return;
         this._mountChunkData(st, ck, data);
       })
       .catch(err => {
@@ -323,18 +327,6 @@ export class ChunkStreamer {
     if (!data || st.loaded.has(ck)) return;
     const { layer } = st;
     const spec = layer.spec;
-
-    // If we are already at capacity and every loaded chunk is actively needed, skip mounting an unrequested stale chunk
-    if (st.loaded.size >= MAX_LOADED_CHUNKS && !st.lastNeeded?.has?.(ck)) {
-      let hasEvictable = false;
-      for (const loadedKey of st.loaded.keys()) {
-        if (!st.lastNeeded?.has?.(loadedKey)) {
-          hasEvictable = true;
-          break;
-        }
-      }
-      if (!hasEvictable) return;
-    }
 
     const overlayIds = [];
     if (data.overlays && typeof data.overlays === "object") {

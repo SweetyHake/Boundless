@@ -885,7 +885,7 @@ export class PoiManager {
     if (visibleCount > 9) return;
 
     const now = performance.now();
-    const templates = getProvinceSubPoiTemplates();
+    let templates = null;
 
     for (let r = r0; r <= r1; r++) {
       for (let c = c0; c <= c1; c++) {
@@ -895,6 +895,7 @@ export class PoiManager {
           existing.lastUsedMs = now;
           continue;
         }
+        if (!templates) templates = getProvinceSubPoiTemplates();
         const ox = c * regionPx;
         const oy = r * regionPx;
         const bucket = { lastUsedMs: now, entries: [] };
@@ -1599,14 +1600,17 @@ export class PoiManager {
     const px = pivot?.x || 0;
     const py = pivot?.y || 0;
 
+    const prevScale = this.lastScale;
+    const wasLayoutDirty = Boolean(this._layoutDirty);
     if (
-      !this._layoutDirty &&
-      Math.abs(stageScale - this.lastScale) < 0.00005 &&
+      !wasLayoutDirty &&
+      Math.abs(stageScale - prevScale) < 0.00005 &&
       Math.abs(px - this.lastPivotX) < 1 &&
       Math.abs(py - this.lastPivotY) < 1
     ) {
       return;
     }
+    const isPurePan = !wasLayoutDirty && Math.abs(stageScale - prevScale) < 0.00005;
     this.lastScale = stageScale;
     this.lastPivotX = px;
     this.lastPivotY = py;
@@ -1661,10 +1665,25 @@ export class PoiManager {
     }
 
     if (onScreen.length === 0) {
+      this._lastOnScreenH1 = 0;
+      this._lastOnScreenCount = 0;
       this.container.visible = false;
       return;
     }
     this.container.visible = true;
+
+    // On pure pan (unchanged stageScale), relative screen-space distances between pins are invariant:
+    // if the exact set of visible pins hasn't changed, skip O(N log N) sort and 2D spatial hash decluttering completely!
+    let onH1 = 2166136261 >>> 0;
+    for (let i = 0; i < onScreen.length; i++) {
+      const idx = onScreen[i].entry.orderIndex | 0;
+      onH1 = Math.imul(onH1 ^ idx, 16777619) >>> 0;
+    }
+    if (isPurePan && onScreen.length === this._lastOnScreenCount && onH1 === this._lastOnScreenH1) {
+      return;
+    }
+    this._lastOnScreenCount = onScreen.length;
+    this._lastOnScreenH1 = onH1;
 
     // 2. Priority sort: dragged/hovered -> active tier (higher alpha wins during crossfade) -> major > minor > detail -> index
     const tierWeight = (e) => (e.isMajor ? 3 : (e.isDetail ? 1 : 2));
