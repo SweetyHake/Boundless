@@ -498,11 +498,12 @@ export class TokenStreamer {
 
     if (this._activeFades.size > 0) {
       const dt = Math.min(50, Math.max(1, dtMs || 16.6));
-      for (const [docId, fade] of Array.from(this._activeFades.entries())) {
+      const visCtx = this.impostors?._collectVisionCheckers?.() ?? null;
+      for (const [docId, fade] of this._activeFades) {
         const tok = fade.tok;
         if (!tok || tok.destroyed || !tok.mesh || tok.mesh.destroyed) {
           this._activeFades.delete(docId);
-          this.impostors.setFadeOverride(docId, null);
+          this.impostors.setFadeOverride(docId, null, visCtx);
           continue;
         }
         fade.t = Math.min(1.0, fade.t + dt / fade.dur);
@@ -515,10 +516,10 @@ export class TokenStreamer {
           const impMult = fade.isTranslucent
             ? (1.0 - t)
             : (t < 0.85 ? 1.0 : Math.max(0.0, 1.0 - (t - 0.85) / 0.15));
-          this.impostors.setFadeOverride(docId, impMult);
+          this.impostors.setFadeOverride(docId, impMult, visCtx);
         } else {
           // Zero-mutation fallback: native renders immediately at native alpha while impostor dissolves beneath it
-          this.impostors.setFadeOverride(docId, 1.0 - t);
+          this.impostors.setFadeOverride(docId, 1.0 - t, visCtx);
         }
 
         if (t >= 1.0) {
@@ -678,7 +679,7 @@ export class TokenStreamer {
       }
 
       // LOD: hide tiny unreadable sub-elements at far macro zoom (< 0.22x) to cut draw calls & Canvas2D cost
-      if (lodChanged || wantRenderable) {
+      if (lodChanged || (tokToggled && wantRenderable)) {
         if (tok.nameplate) tok.nameplate.renderable = showDetail;
         if (tok.tooltip) tok.tooltip.renderable = showDetail;
         if (tok.bars) tok.bars.renderable = showDetail;

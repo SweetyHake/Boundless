@@ -4,7 +4,8 @@ import {
   getEffectiveScale,
   getLevelRoofElevation,
   buildEdgeThresholdPx,
-  resolveFoundryRoute
+  resolveFoundryRoute,
+  hasPlayerOwnerLazy
 } from "./utils.mjs";
 
 export const SOCKET_NAME = `module.${MODULE_ID}`;
@@ -434,7 +435,7 @@ export const lightingMethods = {
         if (!tok || tok.destroyed || tok.isPreview || !tok.center) continue;
         const doc = tok.document;
         const lightRadPx = Math.max(doc?.light?.dim || 0, doc?.light?.bright || 0) * pxPerFt;
-        const isCoreActor = Boolean(doc?.hasPlayerOwner)
+        const isCoreActor = hasPlayerOwnerLazy(doc)
           || Boolean(tok.vision?.active)
           || lightRadPx > 0;
         let isActiveActor = isCoreActor;
@@ -1474,6 +1475,8 @@ export const lightingMethods = {
     // Invalidate spatial caches so roofs, walls, doors, audio, editors, and sim-bubbles pick up newly loaded sectors
     layer.lastOverlayKey = "";
     layer.lastTileKey = "";
+    layer._hasVirtualSoundsRef = null;
+    layer._roofCheckSpec = null;
     this.lastSimKey = null;
     this.lastDynLightKey = null;
     this.audioStreamer.lastKey = null;
@@ -1501,6 +1504,8 @@ export const lightingMethods = {
     }
     layer.lastOverlayKey = "";
     layer.lastTileKey = "";
+    layer._hasVirtualSoundsRef = null;
+    layer._roofCheckSpec = null;
     this.lastSimKey = null;
     this.lastDynLightKey = null;
     this.audioStreamer.lastKey = null;

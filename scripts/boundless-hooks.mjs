@@ -446,13 +446,6 @@ export function registerBoundlessHooks(controller) {
     const sizeChanged = "width" in changes || "height" in changes;
     const elevChanged = "elevation" in changes;
     const lightChanged = "light" in changes || "sight" in changes;
-    if (posChanged && controller.chunkStreamer?.states?.size) {
-      const tx = Number(doc._source?.x ?? doc.x ?? 0);
-      const ty = Number(doc._source?.y ?? doc.y ?? 0);
-      if (Number.isFinite(tx) && Number.isFinite(ty)) {
-        controller.chunkStreamer.prewarmPoint?.(tx, ty);
-      }
-    }
     if (posChanged || sizeChanged || elevChanged || lightChanged) {
       if ((posChanged || elevChanged) && !controller._depthDirty && controller._hasMultiElevationDepth()) controller._depthDirty = true;
       if (posChanged || sizeChanged || elevChanged) controller._roofTokenOccDirty = true;

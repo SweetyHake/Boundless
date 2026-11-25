@@ -1675,15 +1675,23 @@ export class PoiManager {
     // On pure pan (unchanged stageScale), relative screen-space distances between pins are invariant:
     // if the exact set of visible pins hasn't changed, skip O(N log N) sort and 2D spatial hash decluttering completely!
     let onH1 = 2166136261 >>> 0;
+    let onH2 = 0;
     for (let i = 0; i < onScreen.length; i++) {
-      const idx = onScreen[i].entry.orderIndex | 0;
-      onH1 = Math.imul(onH1 ^ idx, 16777619) >>> 0;
+      const ent = onScreen[i].entry;
+      let uid = ent._uid;
+      if (!uid) {
+        uid = (this._pinUidSeq = (this._pinUidSeq || 0) + 1);
+        ent._uid = uid;
+      }
+      onH1 = Math.imul(onH1 ^ uid, 16777619) >>> 0;
+      onH2 = ((onH2 << 5) - onH2 + uid + 1) | 0;
     }
-    if (isPurePan && onScreen.length === this._lastOnScreenCount && onH1 === this._lastOnScreenH1) {
+    if (isPurePan && onScreen.length === this._lastOnScreenCount && onH1 === this._lastOnScreenH1 && onH2 === this._lastOnScreenH2) {
       return;
     }
     this._lastOnScreenCount = onScreen.length;
     this._lastOnScreenH1 = onH1;
+    this._lastOnScreenH2 = onH2;
 
     // 2. Priority sort: dragged/hovered -> active tier (higher alpha wins during crossfade) -> major > minor > detail -> index
     const tierWeight = (e) => (e.isMajor ? 3 : (e.isDetail ? 1 : 2));

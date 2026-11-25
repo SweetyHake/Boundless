@@ -948,9 +948,7 @@ export const pyramidMethods = {
     let maxTargetZ = 0;
 
     // Process currently viewed level FIRST so its pyramid tiles & virtual props always jump ahead of hidden lower levels (e.g. basement)
-    const orderedLayers = this.visibleLevelLayers.length > 1
-      ? this.visibleLevelLayers.slice().sort((a, b) => (b.level?.isView ? 1 : 0) - (a.level?.isView ? 1 : 0))
-      : this.visibleLevelLayers;
+    const orderedLayers = this._getOrderedLevelLayers();
     const sharedVtSeen = orderedLayers.length > 1 ? new Set() : null;
 
     for (const layer of orderedLayers) {
@@ -1451,8 +1449,22 @@ export const pyramidMethods = {
     return false;
   },
 
+  _getOrderedLevelLayers() {
+    const vll = this.visibleLevelLayers;
+    if (!vll || vll.length <= 1) return vll || [];
+    const viewId = globalThis.canvas?.level?.id || "";
+    if (this._orderedLayersSrc === vll && this._orderedLayersViewId === viewId && this._orderedLayersCache?.length === vll.length) {
+      return this._orderedLayersCache;
+    }
+    this._orderedLayersSrc = vll;
+    this._orderedLayersViewId = viewId;
+    this._orderedLayersCache = vll.slice().sort((a, b) => (b.level?.isView ? 1 : 0) - (a.level?.isView ? 1 : 0));
+    return this._orderedLayersCache;
+  },
+
   _setNativeLevelTextureVisible(level, kind, visible) {
     const store = kind === "foreground" ? this._hiddenNativeLevelFg : this._hiddenNativeLevelBg;
+    if (visible && !store.has(level.id)) return;
     let lt = store.get(level.id);
     if (!lt || lt.destroyed) {
       const targetName = `Level.${level.index}.${kind}`;
@@ -1844,10 +1856,12 @@ export const pyramidMethods = {
     if (this._vtIdleCleanupNeeded && !isMoving && this.pendingTileMounts.length === 0) {
       this._vtIdleCleanupNeeded = false;
       const idleVp = this.getViewportWorldRect(0.28);
-      for (const layer of this.visibleLevelLayers) {
+      const idleLayers = this._getOrderedLevelLayers();
+      const idleSharedVtSeen = idleLayers.length > 1 ? new Set() : null;
+      for (const layer of idleLayers) {
         if (!layer.spec?.tiles?.length) continue;
         layer.lastTileKey = "";
-        this.syncVirtualTiles(layer, layer.lastTargetZ >= 0 ? layer.lastTargetZ : this._computeTargetZ(layer, idleVp.scale), idleVp);
+        this.syncVirtualTiles(layer, layer.lastTargetZ >= 0 ? layer.lastTargetZ : this._computeTargetZ(layer, idleVp.scale), idleVp, idleSharedVtSeen);
       }
     }
 

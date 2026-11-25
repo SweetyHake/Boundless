@@ -143,6 +143,12 @@ export function resolveFoundryClass(className) {
 }
 
 function makeDirectWrapper(prev, wrapperFn) {
+  // Async wrappers may invoke `wrapped()` after an `await`, where shared `curThis` would already be restored
+  if (wrapperFn?.constructor?.name === "AsyncFunction") {
+    return function (...args) {
+      return wrapperFn.call(this, prev.bind(this), ...args);
+    };
+  }
   let curThis;
   const boundWrapped = function (a, b, c, d) {
     switch (arguments.length) {

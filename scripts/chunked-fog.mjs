@@ -1,4 +1,4 @@
-import { MODULE_ID, hasTokenPermissionLazy } from "./utils.mjs";
+import { MODULE_ID, hasTokenPermissionLazy, hasPlayerOwnerLazy } from "./utils.mjs";
 
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const CHUNK_WORLD_PX = 5000; // 50x50 cells per chunk (20x20 grid on 1000x1000 world)
@@ -291,6 +291,7 @@ export class ChunkedFogManager {
       sprite
     };
     this.chunks.set(key, entry);
+    this._chunksRev = (this._chunksRev || 0) + 1;
     return entry;
   }
 
@@ -525,7 +526,7 @@ export class ChunkedFogManager {
       // In Foundry v14 multi-level scenes, visionSources contains tokens from all visible levels; only burn the viewed level's fog
       const vsLevelId = vs.level?.id ?? vs.data?.level ?? vs.object?.document?.level;
       if (vsLevelId && vsLevelId !== this.levelId) continue;
-      if (skipBulkGmPrivate && !vs.object?.document?.hasPlayerOwner) continue;
+      if (skipBulkGmPrivate && !hasPlayerOwnerLazy(vs.object?.document)) continue;
       const poly = vs.los || vs.shape;
       const pts = poly?.points;
       if (!pts || pts.length < 6) continue;
@@ -542,7 +543,7 @@ export class ChunkedFogManager {
       if (this.isSharedMode) {
         // Native v14 SHARED semantics: player vision & player-owned tokens contribute to party shared fog;
         // GM-only tokens stay in GM private exploration
-        const isPlayerOwned = !game.user?.isGM || Boolean(vs.object?.document?.hasPlayerOwner);
+        const isPlayerOwned = !game.user?.isGM || hasPlayerOwnerLazy(vs.object?.document);
         if (isPlayerOwned) sharedPolys.push(rounded);
         else privatePolys.push(rounded);
       } else {
@@ -609,14 +610,16 @@ export class ChunkedFogManager {
     const cy0 = Math.floor(vp.y0 / CHUNK_WORLD_PX);
     const cx1 = Math.floor(vp.x1 / CHUNK_WORLD_PX);
     const cy1 = Math.floor(vp.y1 / CHUNK_WORLD_PX);
+    const rev = this._chunksRev || 0;
     const n = this.chunks.size;
-    if (cx0 === this._lastCullCx0 && cy0 === this._lastCullCy0 && cx1 === this._lastCullCx1 && cy1 === this._lastCullCy1 && n === this._lastCullSize) {
+    if (cx0 === this._lastCullCx0 && cy0 === this._lastCullCy0 && cx1 === this._lastCullCx1 && cy1 === this._lastCullCy1 && rev === this._lastCullRev && n === this._lastCullSize) {
       return;
     }
     this._lastCullCx0 = cx0;
     this._lastCullCy0 = cy0;
     this._lastCullCx1 = cx1;
     this._lastCullCy1 = cy1;
+    this._lastCullRev = rev;
     this._lastCullSize = n;
     for (const chunk of this.chunks.values()) {
       chunk.sprite.visible = !(chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1);
@@ -1316,6 +1319,9 @@ export class ChunkedFogManager {
       this._destroyChunkEntry(chunk);
     }
     this.chunks.clear();
+    this._chunksRev = (this._chunksRev || 0) + 1;
+    this._lastCullRev = -1;
+    this._lastCullSize = -1;
 
     if (this._storageKey) {
       try { localStorage.removeItem(this._storageKey); } catch {}
@@ -1673,6 +1679,9 @@ export class ChunkedFogManager {
       this._destroyChunkEntry(chunk);
     }
     this.chunks.clear();
+    this._chunksRev = (this._chunksRev || 0) + 1;
+    this._lastCullRev = -1;
+    this._lastCullSize = -1;
 
     if (this.container) {
       try { this.container.parent?.removeChild(this.container); } catch {}

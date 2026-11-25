@@ -1705,33 +1705,40 @@ async function stitchPyramidToWebp({
   })();
 
   const work = createWorkCanvas(outW, outH);
-  work.ctx.clearRect(0, 0, outW, outH);
-  let drawn = 0;
+  try {
+    work.ctx.clearRect(0, 0, outW, outH);
+    let drawn = 0;
 
-  for (let ty = y0; ty <= y1; ty++) {
-    for (let tx = x0; tx <= x1; tx++) {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      if (sparseSet && !sparseSet.has(`${chosenZ}/${tx}_${ty}`)) continue;
-      const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
-      let img = null;
-      try {
-        img = await loadImageSource(url, signal);
-        const dx = tx * tileWorld * scaleZ;
-        const dy = ty * tileWorld * scaleZ;
-        const dw = tileWorld * scaleZ;
-        const dh = tileWorld * scaleZ;
-        work.ctx.drawImage(img.source, dx, dy, dw, dh);
-        drawn++;
-      } catch (err) {
-        if (err?.name === "AbortError") throw err;
-        console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
-      } finally {
-        img?.close?.();
+    for (let ty = y0; ty <= y1; ty++) {
+      for (let tx = x0; tx <= x1; tx++) {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (sparseSet && !sparseSet.has(`${chosenZ}/${tx}_${ty}`)) continue;
+        const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
+        let img = null;
+        try {
+          img = await loadImageSource(url, signal);
+          const dx = tx * tileWorld * scaleZ;
+          const dy = ty * tileWorld * scaleZ;
+          const dw = tileWorld * scaleZ;
+          const dh = tileWorld * scaleZ;
+          work.ctx.drawImage(img.source, dx, dy, dw, dh);
+          drawn++;
+        } catch (err) {
+          if (err?.name === "AbortError") throw err;
+          console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
+        } finally {
+          img?.close?.();
+        }
       }
     }
+    if (!drawn) return null;
+    return await canvasToWebpBlob(work, quality);
+  } finally {
+    if (work?.canvas) {
+      work.canvas.width = 0;
+      work.canvas.height = 0;
+    }
   }
-  if (!drawn) return null;
-  return canvasToWebpBlob(work, quality);
 }
 
 /**

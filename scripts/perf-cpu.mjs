@@ -1374,7 +1374,7 @@ function patchMiscCpuGuards() {
     return res;
   }, { staticOnly: true });
 
-  // Skip per-frame uniform/shader animation CPU work for offscreen-culled light sources
+  // Skip per-frame uniform/shader animation CPU work for offscreen-culled light & darkness sources
   const okLightAnim = wrapFoundryMethod("PointLightSource", "animate", function (wrapped, dt) {
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
       const bg = this.layers?.background?.mesh;
@@ -1390,6 +1390,110 @@ function patchMiscCpuGuards() {
     }
     return wrapped(dt);
   });
+
+  const okDarkAnim = wrapFoundryMethod("PointDarknessSource", "animate", function (wrapped, dt) {
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
+      const dk = this.layers?.darkness?.mesh;
+      const bg = this.layers?.background?.mesh;
+      const il = this.layers?.illumination?.mesh;
+      const co = this.layers?.coloration?.mesh;
+      const dkOn = dk && dk.renderable !== false;
+      const bgOn = bg && bg.renderable !== false;
+      const ilOn = il && il.renderable !== false;
+      const coOn = co && co.renderable !== false;
+      if ((dk || bg || il || co) && !dkOn && !bgOn && !ilOn && !coOn) {
+        perfStats.lightAnimSkipped++;
+        return;
+      }
+    }
+    return wrapped(dt);
+  });
+
+  // Zero-alloc RenderedEffectSource#animate & animateTime (eliminates per-frame rest-spread & Object.values allocations on 60+ torches @ 120Hz)
+  const RenderedSrcCls = globalThis.foundry?.canvas?.sources?.RenderedEffectSource;
+  if (RenderedSrcCls?.prototype) {
+    if (typeof RenderedSrcCls.prototype.animate === "function") {
+      wrapTargetMethod(RenderedSrcCls.prototype, "animate", "RenderedEffectSource.prototype.animate", function (wrapped, dt) {
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt);
+        if (!this.isAnimated) return;
+        const anim = this.animation;
+        const fn = anim?.animation;
+        if (typeof fn !== "function") return;
+        // Reuse options object per source instead of allocating `{animation, ...options}` every frame
+        let opts = this._blAnimOpts;
+        if (!opts || this._blAnimSrc !== anim) {
+          opts = {};
+          for (const k in anim) {
+            if (k !== "animation") opts[k] = anim[k];
+          }
+          this._blAnimSrc = anim;
+          this._blAnimOpts = opts;
+        } else {
+          opts.speed = anim.speed;
+          opts.intensity = anim.intensity;
+          opts.reverse = anim.reverse;
+          opts.seed = anim.seed;
+          opts.time = anim.time;
+        }
+        return fn.call(this, dt, opts);
+      });
+    }
+    if (typeof RenderedSrcCls.prototype.animateTime === "function") {
+      wrapTargetMethod(RenderedSrcCls.prototype, "animateTime", "RenderedEffectSource.prototype.animateTime", function (wrapped, dt, options) {
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt, options);
+        const speed = options?.speed ?? 5;
+        const intensity = options?.intensity ?? 5;
+        const reverse = Boolean(options?.reverse);
+        let t = globalThis.canvas?.app?.ticker?.lastTime ?? 0;
+        if (reverse) t *= -1;
+        const time = ((speed * t) / 5000) + (this.animation?.seed ?? 0);
+        if (this.animation) this.animation.time = time;
+        const layers = this.layers;
+        if (!layers) return;
+        for (const k in layers) {
+          const u = layers[k]?.mesh?.uniforms;
+          if (!u) continue;
+          u.time = time;
+          u.intensity = intensity;
+        }
+      });
+    }
+  }
+
+  // Lazy Actor#applyActiveEffects: skip 2x Actor#getRollData() + Map + expandObject on actors with 0 active AE changes (80-90% of NPCs)
+  wrapFoundryMethod("Actor", "applyActiveEffects", function (wrapped, phase) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(phase);
+    const ActiveEffect = globalThis.foundry?.documents?.ActiveEffect?.implementation;
+    if (
+      typeof phase !== "string" ||
+      !ActiveEffect?.CHANGE_PHASES ||
+      !(phase in ActiveEffect.CHANGE_PHASES) ||
+      !this._completedActiveEffectPhases ||
+      this._completedActiveEffectPhases.has(phase) ||
+      typeof this.allApplicableEffects !== "function"
+    ) {
+      return wrapped(phase);
+    }
+    let hasChanges = false;
+    let hasActive = false;
+    for (const effect of this.allApplicableEffects()) {
+      if (!effect?.active) continue;
+      hasActive = true;
+      if (effect.system?.changes?.length > 0) {
+        hasChanges = true;
+        break;
+      }
+    }
+    if (hasChanges) return wrapped(phase);
+    this._completedActiveEffectPhases.add(phase);
+    if (phase === "initial" && hasActive && this.statuses) {
+      for (const effect of this.allApplicableEffects()) {
+        if (!effect?.active || !effect.statuses) continue;
+        for (const statusId of effect.statuses) this.statuses.add(statusId);
+      }
+    }
+    if (this.tokenActiveEffectChanges) this.tokenActiveEffectChanges[phase] = [];
+  }, { type: "MIXED" });
 
   // Safe partial lighting rebuild: when only vision sources moved on a light-heavy standard scene (>= 16 lights),
   // rebuild only the vision branch instead of clearing & re-adding all 50-150 static light meshes every step.
@@ -1573,7 +1677,12 @@ function patchGeometryStructures() {
   if (EdgeCls && typeof EdgeCls.identifyEdgeIntersections === "function") {
     results.push(wrapTargetMethod(EdgeCls, "identifyEdgeIntersections", "Edge.identifyEdgeIntersections", function (wrapped, edges, levelId) {
       if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(edges, levelId);
-      const arr = Array.from(edges);
+      const arr = [];
+      for (const edge of edges) {
+        // Must clear prior intersections for this level identically to Foundry core (even when n < 2!)
+        if (edge.intersections) delete edge.intersections[levelId];
+        arr.push(edge);
+      }
       const n = arr.length;
       if (n < 2) return;
       arr.sort((a, b) => a.nw.x - b.nw.x);
@@ -1597,10 +1706,21 @@ function patchGeometryStructures() {
     }));
   }
 
-  // 2. Quadtree#remove (O(k) via root entry Map instead of full-tree walk) + zero-alloc Quadtree#getObjects
+  // 2. Quadtree#remove (O(k) via root entry Map instead of full-tree walk)
   const QT = globalThis.foundry?.canvas?.geometry?.Quadtree ?? globalThis.Quadtree;
   if (QT?.prototype) {
     const okIns = wrapTargetMethod(QT.prototype, "insert", "Quadtree.prototype.insert", function (wrapped, obj) {
+      if (this.depth === 0 && obj?.t !== undefined && this._blEntries) {
+        const prev = this._blEntries.get(obj.t);
+        if (prev && prev !== obj && prev.n?.size) {
+          for (const leaf of prev.n) {
+            const arr = leaf.objects;
+            const idx = arr.indexOf(prev);
+            if (idx !== -1) arr.splice(idx, 1);
+          }
+          prev.n.clear();
+        }
+      }
       const res = wrapped(obj);
       if (this.depth === 0 && obj?.t !== undefined) {
         if (!this._blEntries) this._blEntries = new Map();

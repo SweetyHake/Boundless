@@ -484,11 +484,10 @@ class MegaWorld1000 {
       }
     }
 
-    const layers = [];
-    for (const level of visibleLevels) {
-      const entry = await this._resolveSingleLevelLayer(level, sceneManifest, defaultLevelId);
-      if (entry) layers.push(entry);
-    }
+    const resolved = await Promise.all(
+      visibleLevels.map(level => this._resolveSingleLevelLayer(level, sceneManifest, defaultLevelId))
+    );
+    const layers = resolved.filter(Boolean);
 
     layers.sort((a, b) => {
       const ea = getLevelBottomElevation(a.level);
@@ -927,6 +926,18 @@ class MegaWorld1000 {
     // Mount chunked world streamer BEFORE lightBatch & first updateAll so active token/viewport chunks stream smoothly
     this.chunkStreamer.mount(layers);
 
+    // Kick off z=0 base pyramid WebP fetch+decode in worker pool immediately so it overlaps with IDB hydration & light batching
+    const preloadTasks = [];
+    for (const layer of layers) {
+      if (layer.hasPyramid) {
+        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
+        preloadTasks.push(this.texMgr.load(`${mBase}/0/0_0.webp`, { mipmap: true, isPinned: true }));
+      }
+      if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
+        preloadTasks.push(this.texMgr.load(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`, { mipmap: true, isPinned: true }));
+      }
+    }
+
     // Build unified GPU light batch across all visible Boundless levels (monolithic or chunked macroLights)
     const worldId = game.world?.id || "world";
     const visibleLevelIds = layers.map(l => l.level.id);
@@ -966,16 +977,6 @@ class MegaWorld1000 {
     // Asynchronously bake 2048x2048 pixel-accurate roof alpha mask so macro lighting (localZ < 5) matches depthMask 1:1
     this._bakeRoofMask(layers, scene.id, mountedLevelId);
 
-    const preloadTasks = [];
-    for (const layer of layers) {
-      if (layer.hasPyramid) {
-        const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
-        preloadTasks.push(this.texMgr.load(`${mBase}/0/0_0.webp`, { mipmap: true, isPinned: true }));
-      }
-      if (layer.hasForegroundPyramid && this.hasForegroundTile(layer, 0, 0, 0)) {
-        preloadTasks.push(this.texMgr.load(`${layer.foregroundPyramidBaseUrl}/0/0_0.webp`, { mipmap: true, isPinned: true }));
-      }
-    }
     await Promise.all(preloadTasks);
     if (this._mountGen !== mountGen) return;
     if (!this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
@@ -983,7 +984,7 @@ class MegaWorld1000 {
       return;
     }
 
-    // Warm z=1 tiles silently in background for every visible pyramid layer (clipped to actual bounds for non-square maps)
+    // Warm z=1 tiles silently in background at lower priority so saved tactical views decode on-screen tiles first
     for (const layer of layers) {
       const z1TileSz = this._getPyramidTileSize(layer, 1);
       const maxX1 = Math.min(1, Math.floor((Math.max(1, layer.bounds?.w || layer.worldPx) - 0.001) / z1TileSz));
@@ -991,14 +992,14 @@ class MegaWorld1000 {
       if (layer.hasPyramid && layer.maxZoomZ >= 1 && (!layer.superGrid || (layer.superGrid.macroMaxZ ?? 2) >= 1)) {
         const mBase = layer.superGrid?.macroPyramidUrl || layer.pyramidBaseUrl;
         for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
-          this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+          this.texMgr.load(`${mBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true, priority: 2 });
         }
       }
       if (layer.hasForegroundPyramid && layer.foregroundMaxZoomZ >= 1) {
         const fgBase = layer.foregroundPyramidBaseUrl;
         for (let y = 0; y <= maxY1; y++) for (let x = 0; x <= maxX1; x++) {
           if (this.hasForegroundTile(layer, 1, x, y)) {
-            this.texMgr.load(`${fgBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true });
+            this.texMgr.load(`${fgBase}/1/${x}_${y}.webp`, { mipmap: true, isPinned: true, priority: 2 });
           }
         }
       }

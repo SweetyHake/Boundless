@@ -100,7 +100,7 @@ export const overlayMethods = {
     const lid = layer.level.id;
     const gen = this._mountGen;
     this.overlayPending.add(`${fullId}:w`);
-    this.texMgr.load(existing.srcWalls, { mipmap: true }).then((tWalls) => {
+    this.texMgr.load(existing.srcWalls, { mipmap: true, maxDim: 2048 }).then((tWalls) => {
       if (this._mountGen === gen && this.levelLayers.get(lid) === layer) {
         this.overlayPending.delete(`${fullId}:w`);
       }
@@ -231,7 +231,7 @@ export const overlayMethods = {
       if (!maskTex && roofUrls.size > 0 && roofUrls.size <= MAX_SPRITE_MASK_URLS) {
         // Small reusable template roof set (<= 24 shared textures): load into LRU cache without permanently pinning VRAM across levels
         const urlList = Array.from(roofUrls);
-        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: false })));
+        const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: false, maxDim: 2048 })));
         if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
           return;
         }

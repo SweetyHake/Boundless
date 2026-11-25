@@ -984,7 +984,16 @@ function hideBar3SliceSprites(bar) {
 }
 
 function ensureBar3SliceSprites(bar, atlas) {
-  if (bar._blBarSprites && !bar._blBarSprites.all[0].destroyed) return bar._blBarSprites;
+  if (bar._blBarSprites && !bar._blBarSprites.all[0].destroyed) {
+    const all = bar._blBarSprites.all;
+    // Re-attach if a third-party module called bar.removeChildren() without destroying sprites
+    if (all[0].parent !== bar) {
+      for (let i = 0; i < all.length; i++) {
+        if (!all[i].destroyed && all[i].parent !== bar) bar.addChild(all[i]);
+      }
+    }
+    return bar._blBarSprites;
+  }
   const make = (tex) => {
     const sp = new PIXI.Sprite(tex);
     sp.eventMode = "none";
@@ -1027,7 +1036,9 @@ function patchDnd5eHpBars() {
   if (!Token5eCls?.prototype?._drawHPBar) return false;
   return Boolean(wrapTargetMethod(Token5eCls.prototype, "_drawHPBar", "Token5e.prototype._drawHPBar", function (wrapped, number, bar, data, ...rest) {
     const hp = this.actor?.system?.attributes?.hp;
-    const hasTemp = Boolean(hp && ((Number(hp.temp) || 0) > 0 || (Number(hp.tempmax) || 0) !== 0));
+    const rawMax = Number(hp?.max) || 0;
+    const effMax = Number(hp?.effectiveMax ?? hp?.max) || 0;
+    const hasTemp = Boolean(hp && ((Number(hp.temp) || 0) > 0 || (Number(hp.tempmax) || 0) !== 0 || (rawMax > 0 && effMax !== rawMax)));
     if (
       !PERF_CONFIG.perfEnabled ||
       !PERF_CONFIG.perfTokenUiCache ||
@@ -1036,12 +1047,11 @@ function patchDnd5eHpBars() {
       hasTemp ||
       !bar || bar.destroyed ||
       (bar !== this.bars?.bar1 && bar !== this.bars?.bar2) ||
-      !hp || !(Number(hp.effectiveMax ?? hp.max) > 0)
+      !hp || !(effMax > 0)
     ) {
       hideBar3SliceSprites(bar);
       return wrapped(number, bar, data, ...rest);
     }
-    const effMax = Number(hp.effectiveMax ?? hp.max);
     const val = Math.max(0, Math.min(effMax, Number(hp.value) || 0));
     const pct = val / effMax;
     const Actor5e = globalThis.dnd5e?.documents?.Actor5e;
@@ -1415,12 +1425,147 @@ function patchV14CoreRenderPasses() {
 
     // OcclusionMask renders right before DepthMask and feeds depth shader's occlusionTexture
     results.push(wrapTargetMethod(OccMaskCls.prototype, "render", "CanvasOcclusionMask.prototype.render", function (wrapped, renderer) {
-      if (PERF_CONFIG.perfEnabled && !globalThis.Boundless?.active && (this.autoRender || this.renderDirty)) {
+      const willRender = this.autoRender || this.renderDirty;
+      if (PERF_CONFIG.perfEnabled && !globalThis.Boundless?.active && willRender) {
         const dm = globalThis.canvas?.masks?.depth;
         if (dm) dm.renderDirty = true;
       }
-      return wrapped(renderer);
+      const res = wrapped(renderer);
+      if (willRender) {
+        const isEmpty = !this.tokens?.geometry?.graphicsData?.length && !this.surfaces?.geometry?.graphicsData?.length && this.children.length <= 2;
+        this._blCleanState = isEmpty && this.renderTexture ? `${this.renderTexture.width}x${this.renderTexture.height}` : null;
+      }
+      return res;
     }));
+
+    // Smart HiddenCanvasGroup#invalidateMasks: skip re-rendering provably constant/empty fullscreen mask FBOs during pan/zoom
+    const HiddenGroupCls = globalThis.foundry?.canvas?.groups?.HiddenCanvasGroup;
+    const DarknessLevelCls = globalThis.foundry?.canvas?.layers?.DarknessLevelContainer ?? globalThis.foundry?.canvas?.containers?.DarknessLevelContainer;
+    const VisionMaskCls = globalThis.foundry?.canvas?.layers?.CanvasVisionMask ?? globalThis.foundry?.canvas?.containers?.CanvasVisionMask;
+    if (DarknessLevelCls?.prototype?.render) {
+      results.push(wrapTargetMethod(DarknessLevelCls.prototype, "render", "DarknessLevelContainer.prototype.render", function (wrapped, renderer) {
+        const willRender = this.autoRender || this.renderDirty;
+        const res = wrapped(renderer);
+        if (willRender) {
+          this._blCleanState = (this.children.length === 0 && this.renderTexture)
+            ? `${this.renderTexture.width}x${this.renderTexture.height}:${this.clearColor?.[0] ?? 0}`
+            : null;
+        }
+        return res;
+      }));
+    }
+    if (VisionMaskCls?.prototype?.render) {
+      results.push(wrapTargetMethod(VisionMaskCls.prototype, "render", "CanvasVisionMask.prototype.render", function (wrapped, renderer) {
+        const willRender = this.autoRender || this.renderDirty;
+        const res = wrapped(renderer);
+        if (willRender) {
+          const isVisOff = !globalThis.canvas?.visibility?.visible && !(globalThis.canvas?.effects?.visionSources?.size > 0);
+          this._blCleanState = (isVisOff && this.renderTexture)
+            ? `${this.renderTexture.width}x${this.renderTexture.height}`
+            : null;
+        }
+        return res;
+      }));
+    }
+    if (HiddenGroupCls?.prototype?.invalidateMasks) {
+      results.push(wrapTargetMethod(HiddenGroupCls.prototype, "invalidateMasks", "HiddenCanvasGroup.prototype.invalidateMasks", function (wrapped) {
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return wrapped();
+        const kids = this.masks?.children;
+        if (!kids?.length) return;
+        const CachedCtr = globalThis.foundry?.canvas?.containers?.CachedContainer;
+        const occMask = this.masks?.occlusion;
+        const visMask = this.masks?.vision;
+        const darkMask = this.masks?.darknessLevelMeshes;
+        const visOff = !globalThis.canvas?.visibility?.visible && !(globalThis.canvas?.effects?.visionSources?.size > 0);
+        for (let i = 0; i < kids.length; i++) {
+          const mask = kids[i];
+          if (CachedCtr && !(mask instanceof CachedCtr)) continue;
+          const rt = mask.renderTexture;
+          if (rt && mask._blCleanState) {
+            if (mask === darkMask || mask.constructor?.name === "DarknessLevelContainer") {
+              if (mask.children.length === 0 && mask._blCleanState === `${rt.width}x${rt.height}:${mask.clearColor?.[0] ?? 0}`) continue;
+            } else if (mask === occMask) {
+              if (!mask.tokens?.geometry?.graphicsData?.length && !mask.surfaces?.geometry?.graphicsData?.length && mask.children.length <= 2 && mask._blCleanState === `${rt.width}x${rt.height}`) continue;
+            } else if (mask === visMask) {
+              if (visOff && mask._blCleanState === `${rt.width}x${rt.height}`) continue;
+            }
+          }
+          mask.renderDirty = true;
+        }
+      }));
+    }
+
+    // Skip HeadsUpDisplayContainer#align() DOM style mutations during pan/zoom when no HUD is open
+    const HudCtrCls = globalThis.foundry?.applications?.hud?.HeadsUpDisplayContainer;
+    if (HudCtrCls?.prototype?.align) {
+      results.push(wrapTargetMethod(HudCtrCls.prototype, "align", "HeadsUpDisplayContainer.prototype.align", function (wrapped) {
+        if (!this.rendered) return;
+        if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) {
+          this._blAlignDirty = false;
+          this._blLastHudSig = null;
+          return wrapped();
+        }
+        const hud = this.element;
+        let hasActiveHud = Boolean(this.token?.rendered || this.tile?.rendered || this.drawing?.rendered);
+        if (!hasActiveHud && hud?.children?.length) {
+          const kids = hud.children;
+          for (let i = 0; i < kids.length; i++) {
+            if (kids[i].childElementCount > 0) { hasActiveHud = true; break; }
+          }
+        }
+        if (!hasActiveHud) {
+          this._blAlignDirty = true;
+          return;
+        }
+        this._blAlignDirty = false;
+        const prim = globalThis.canvas?.primary;
+        const dims = globalThis.canvas?.dimensions;
+        const scale = globalThis.canvas?.stage?.scale?.x;
+        if (prim && dims && hud?.style && Number.isFinite(scale)) {
+          let x = 0, y = 0;
+          if (typeof prim.getGlobalPosition === "function" && globalThis.PIXI?.Point) {
+            if (!this._blHudPt) this._blHudPt = new PIXI.Point();
+            const pt = prim.getGlobalPosition(this._blHudPt, false);
+            x = pt.x; y = pt.y;
+          } else if (prim.worldTransform) {
+            x = prim.worldTransform.tx; y = prim.worldTransform.ty;
+          }
+          const w = dims.width;
+          const h = dims.height;
+          if (this._blHudX === x && this._blHudY === y && this._blHudW === w && this._blHudH === h && this._blHudS === scale) {
+            return;
+          }
+          this._blHudX = x; this._blHudY = y; this._blHudW = w; this._blHudH = h; this._blHudS = scale;
+          hud.style.width = `${w}px`;
+          hud.style.height = `${h}px`;
+          hud.style.left = `${x}px`;
+          hud.style.top = `${y}px`;
+          hud.style.transform = `scale(${scale})`;
+          return;
+        }
+        return wrapped();
+      }));
+
+      const syncHudIfDirty = () => {
+        const hud = globalThis.canvas?.hud;
+        if (hud?._blAlignDirty) {
+          hud._blAlignDirty = false;
+          hud._blHudX = NaN;
+          try { hud.align(); } catch {}
+        }
+      };
+      for (const hk of ["renderTokenHUD", "renderTileHUD", "renderDrawingHUD", "chatBubble"]) {
+        Hooks.on(hk, syncHudIfDirty);
+      }
+      const BaseHudCls = globalThis.foundry?.applications?.hud?.BasePlaceableHUD;
+      if (BaseHudCls?.prototype?._onRender) {
+        results.push(wrapTargetMethod(BaseHudCls.prototype, "_onRender", "BasePlaceableHUD.prototype._onRender", function (wrapped, ...args) {
+          const res = wrapped(...args);
+          syncHudIfDirty();
+          return res;
+        }));
+      }
+    }
 
     if (typeof DepthMaskCls.prototype._update === "function") {
       results.push(wrapTargetMethod(DepthMaskCls.prototype, "_update", "CanvasDepthMask.prototype._update", function (wrapped) {
@@ -1477,7 +1622,8 @@ function patchV14CoreRenderPasses() {
             const occBits = os
               ? ((Math.round((os.fade || 0) * 100) & 255) | ((Math.round((os.radial || 0) * 100) & 255) << 8) | ((Math.round((os.vision || 0) * 100) & 255) << 16) | ((Math.round((os.surface || 0) * 100) & 255) << 24))
               : 0;
-            const v1 = ((p.transform?._worldID | 0) ^ ((p.texture?.baseTexture?._updateID | 0) << 5) ^ ((p._restrictionState | 0) << 12) ^ (vis << 20)) | 0;
+            const bt = p.texture?.baseTexture;
+            const v1 = ((p.transform?._worldID | 0) ^ ((bt?._updateID | 0) << 5) ^ ((bt?.uid | 0) << 9) ^ ((p._restrictionState | 0) << 12) ^ (vis << 20)) | 0;
             const v2 = (occBits ^ (Math.round((p.textureAlphaThreshold ?? 0.75) * 100) << 3)) | 0;
             h1 = Math.imul(h1 ^ v1 ^ v2, 16777619) >>> 0;
             h2 = ((h2 << 5) - h2 + v1 + v2 + 1) | 0;

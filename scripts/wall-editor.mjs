@@ -1041,8 +1041,12 @@ export class VirtualWallEditor {
         if (diff && "ds" in diff) {
           this.controller.doorStates.set(nextDKey, nextState.ds);
           if (nextState.ds === 1) {
+            const skParts = String(entry.sk || "").split("_");
             this.controller.openDoors.set(nextDKey, {
               levelId: entry.levelId,
+              sx: Number(skParts[0]) || 0,
+              sy: Number(skParts[1]) || 0,
+              eid: entry.eid ?? entry.idx,
               x: (nextState.c[0] + nextState.c[2]) * 0.5,
               y: (nextState.c[1] + nextState.c[3]) * 0.5
             });
@@ -1190,6 +1194,8 @@ export class VirtualWallEditor {
   unmount() {
     this.active = false;
     this._lastKey = "";
+    this._doorLayersCache = null;
+    this._doorLayersCacheTag = "";
     this._clearMountedWalls();
     this._removePatches();
     if (this.macroGfx) {

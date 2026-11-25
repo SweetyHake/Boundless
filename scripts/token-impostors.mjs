@@ -27,16 +27,16 @@ uniform mat3 translationMatrix;
 uniform mat3 projectionMatrix;
 uniform vec2 uScreenDimensions;
 uniform float uStageScale;
+uniform vec2 uBakedRoofOrigin;
+uniform vec2 uBakedRoofRegion;
 
 varying vec2 vLocal;
 varying vec2 vSamplerUvs;
 varying vec2 vCenterScreenUv;
-varying vec2 vWorldPos;
+varying vec2 vRoofUv;
 varying vec4 vAtlasRect;
 varying vec2 vFlip;
 varying float vAlpha;
-varying float vScreenRadius;
-varying float vRot;
 varying float vElevation;
 varying float vNeedsVision;
 
@@ -54,11 +54,9 @@ void main() {
     vLocal = vec2(2.0);
     vSamplerUvs = vec2(0.0);
     vCenterScreenUv = vec2(0.0);
-    vWorldPos = vec2(0.0);
+    vRoofUv = vec2(0.0);
     vAtlasRect = vec4(0.0);
     vFlip = vec2(1.0);
-    vScreenRadius = 0.0;
-    vRot = 0.0;
     vElevation = 0.0;
     vNeedsVision = 0.0;
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -79,12 +77,10 @@ void main() {
   vLocal = aCorner;
   vSamplerUvs = tPos.xy / safeDims;
   vCenterScreenUv = cPos.xy / safeDims;
-  vWorldPos = worldPos;
+  vRoofUv = (worldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
   vAtlasRect = aAtlasRect;
   vFlip = aFlipAndPad.xy;
   vAlpha = finalAlpha;
-  vScreenRadius = max(aSizeInfo.x, aSizeInfo.y) * sm * scale;
-  vRot = aSizeInfo.z;
   vElevation = aSizeInfo.w;
   vNeedsVision = aState.y;
 
@@ -100,20 +96,16 @@ uniform sampler2D uVisionTex;
 uniform bool uUseVisionMask;
 uniform sampler2D uBakedRoofMask;
 uniform bool uUseBakedRoofMask;
-uniform vec2 uBakedRoofOrigin;
-uniform vec2 uBakedRoofRegion;
 uniform bool uBakedRoofRepeat;
 uniform float uRoofElev;
 
 varying vec2 vLocal;
 varying vec2 vSamplerUvs;
 varying vec2 vCenterScreenUv;
-varying vec2 vWorldPos;
+varying vec2 vRoofUv;
 varying vec4 vAtlasRect;
 varying vec2 vFlip;
 varying float vAlpha;
-varying float vScreenRadius;
-varying float vRot;
 varying float vElevation;
 varying float vNeedsVision;
 
@@ -129,7 +121,7 @@ void main() {
 
   // 2. Pixel-accurate baked roof mask when native roof meshes are unloaded on macro zoom
   if (uUseBakedRoofMask && vElevation < uRoofElev) {
-    vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
+    vec2 rawRoofUv = vRoofUv;
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
       vec2 roofUv = uBakedRoofRepeat ? fract(rawRoofUv) : rawRoofUv;
@@ -431,14 +423,25 @@ export class TokenImpostorLayer {
       this._destroyGeometry(this.geometry);
       this.geometry = null;
     }
-    this.shader = null;
+    if (this.shader) {
+      try { this.shader.destroy?.(); } catch {}
+      this.shader = null;
+    }
 
     if (this.atlasTexture && this.atlasTexture !== PIXI.Texture.WHITE) {
       try { this.atlasTexture.destroy(true); } catch {}
     }
     this.atlasTexture = null;
+    if (this.atlasCanvas) {
+      this.atlasCanvas.width = 0;
+      this.atlasCanvas.height = 0;
+    }
     this.atlasCanvas = null;
     this.atlasCtx = null;
+    if (this._tmpCanvas) {
+      this._tmpCanvas.width = 0;
+      this._tmpCanvas.height = 0;
+    }
     this._tmpCanvas = null;
     this._tmpCtx = null;
     this.atlasDirty = false;
@@ -1243,7 +1246,7 @@ export class TokenImpostorLayer {
     }
   }
 
-  setFadeOverride(docId, multiplier) {
+  setFadeOverride(docId, multiplier, visCtx = null) {
     if (!this.mounted || !docId) return;
     if (multiplier === null || multiplier === undefined) {
       this.fadeOverrides.delete(docId);
@@ -1251,7 +1254,7 @@ export class TokenImpostorLayer {
       this.fadeOverrides.set(docId, Math.max(0, Math.min(1, multiplier)));
     }
     const doc = canvas?.scene?.tokens?.get?.(docId);
-    if (doc) this._updateSingleTokenState(doc);
+    if (doc) this._updateSingleTokenState(doc, visCtx);
   }
 
   markVisibilityDirty() {

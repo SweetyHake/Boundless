@@ -2929,3 +2929,91 @@ test("refreshTokenBars and clearTokenUiBitmapCaches reset cached bars and redraw
   refreshTokenBars();
   assert.equal(drawCalls, 2);
 });
+
+test("wrapTargetMethod safely binds `this` for async wrappers calling wrapped() after await", async () => {
+  const { wrapTargetMethod } = await import("../scripts/perf-patcher.mjs");
+  const obj = {
+    val: 42,
+    async load(mult) {
+      await Promise.resolve();
+      return this.val * mult;
+    }
+  };
+  wrapTargetMethod(obj, "load", "test.async.load", async function (wrapped, mult) {
+    await Promise.resolve();
+    return (await wrapped(mult)) + 1;
+  });
+  const res = await obj.load(2);
+  assert.equal(res, 85);
+});
+
+test("MegaLightBatch.updateViewport resets hysteresis cull box when viewport shrinks on Zoom-In", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+  const lb = new MegaLightBatch();
+  let bufUpdates = 0;
+  lb.indexBuffer = { update() { bufUpdates++; } };
+  lb.illumMesh = { visible: false, size: 0 };
+  lb.colorMesh = { visible: false, size: 0 };
+  lb.activeLightsCount = 2;
+  lb.allIndices = new Uint32Array([0, 1, 2, 3, 4, 5]);
+  lb.visibleIndices = new Uint32Array(6);
+  lb.sectorBounds = [
+    { minX: 0, minY: 0, maxX: 500, maxY: 500, idxStart: 0, idxCount: 3 },
+    { minX: 40000, minY: 40000, maxX: 40500, maxY: 40500, idxStart: 3, idxCount: 3 }
+  ];
+
+  // Macro view covers the whole map -> both sectors visible (6 indices)
+  lb.updateViewport({ x0: 0, y0: 0, x1: 50000, y1: 50000, scale: 0.05 });
+  assert.equal(lb.visibleIndexCount, 6);
+  assert.equal(bufUpdates, 1);
+
+  // Zoom-In to room near (0,0): strictly inside previous cull box, but viewport shrank -> MUST re-cull to 3 indices!
+  lb.updateViewport({ x0: 0, y0: 0, x1: 1200, y1: 900, scale: 1.0 });
+  assert.equal(lb.visibleIndexCount, 3, "Zoom-In must tighten hysteresis cull box and cull distant sectors");
+  assert.equal(bufUpdates, 2);
+});
+
+test("lightingMethods.onChunkLoaded invalidates _hasVirtualSoundsRef and _roofCheckSpec on chunked layers", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+  const layer = {
+    level: { id: "lvl1" },
+    spec: { sectors: {}, overlays: {} },
+    _hasVirtualSoundsRef: {},
+    _roofCheckSpec: {}
+  };
+  const ctrl = {
+    ...lightingMethods,
+    active: true,
+    lightBatch: { queueChunkBake() {}, detachChunk() {} },
+    audioStreamer: { lastKey: "k" },
+    openDoors: new Map(),
+    _reconcileChunkDoorStates() {},
+    _scheduleChunkBatchRefresh() {}
+  };
+  ctrl.onChunkLoaded(layer, "0_0", { sectors: { "0_0": {} } });
+  assert.equal(layer._hasVirtualSoundsRef, null);
+  assert.equal(layer._roofCheckSpec, null);
+
+  layer._hasVirtualSoundsRef = layer.spec.sectors;
+  layer._roofCheckSpec = layer.spec;
+  ctrl.onChunkUnloaded(layer, "0_0", { deferRefresh: true });
+  assert.equal(layer._hasVirtualSoundsRef, null);
+  assert.equal(layer._roofCheckSpec, null);
+});
+
+test("hasPlayerOwnerLazy avoids touching doc.actor on lazy synthetic ActorDelta", async () => {
+  installBaseGlobals();
+  const { hasPlayerOwnerLazy } = await import("../scripts/utils.mjs");
+  let actorTouched = false;
+  globalThis.game = { actors: new Map([["a1", { hasPlayerOwner: true }], ["a2", { hasPlayerOwner: false }]]) };
+  const makeLazy = (actorId) => ({
+    isLazyDelta: true,
+    _source: { actorId },
+    get hasPlayerOwner() { actorTouched = true; return true; }
+  });
+  assert.equal(hasPlayerOwnerLazy(makeLazy("a1")), true);
+  assert.equal(hasPlayerOwnerLazy(makeLazy("a2")), false);
+  assert.equal(actorTouched, false, "must never read doc.hasPlayerOwner on lazy ActorDelta");
+});

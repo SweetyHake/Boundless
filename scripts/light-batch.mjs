@@ -477,16 +477,17 @@ uniform vec2 uScreenDimensions;
 uniform float uTime;
 uniform float uStageScale;
 uniform float uMinScreenRadius;
+uniform vec2 uBakedRoofOrigin;
+uniform vec2 uBakedRoofRegion;
 
 varying vec2 vOffset;
 varying vec2 vSamplerUvs;
-varying vec2 vWorldPos;
+varying vec2 vRoofUv;
 varying vec3 vColor;
 varying float vRatio;
 varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
-varying float vDimPx;
 varying float vIsMacro;
 varying float vAttenuation;
 varying float vLuminosity;
@@ -505,11 +506,10 @@ void main() {
     vColorAlpha = 0.0;
     vOffset = vec2(2.0);
     vSamplerUvs = vec2(0.0);
-    vWorldPos = vec2(0.0);
+    vRoofUv = vec2(0.0);
     vColor = vec3(0.0);
     vRatio = 0.5;
     vDepthElev = 1.0;
-    vDimPx = 0.0;
     vIsMacro = 0.0;
     vAttenuation = 0.5;
     vLuminosity = 0.5;
@@ -575,13 +575,12 @@ void main() {
 
   vOffset = effOffset;
   vSamplerUvs = tPos.xy / uScreenDimensions;
-  vWorldPos = worldPos;
+  vRoofUv = (worldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
   vColor = effColor;
   vRatio = effRatio;
   vColorAlpha = aParams.z * 2.0 * pulse * aWeight;
   vWeight = aWeight;
   vDepthElev = aDepthElev;
-  vDimPx = aParams.x;
   vIsMacro = aParams.w < -1.5 ? 1.0 : 0.0;
   vAttenuation = aStyle.x;
   vLuminosity = aStyle.y;
@@ -601,8 +600,6 @@ uniform sampler2D uDepthTexture;
 uniform bool uUseDepthTexture;
 uniform sampler2D uBakedRoofMask;
 uniform bool uUseBakedRoofMask;
-uniform vec2 uBakedRoofOrigin;
-uniform vec2 uBakedRoofRegion;
 uniform bool uBakedRoofRepeat;
 uniform vec3 uStaticBg;
 uniform vec3 uStaticBright;
@@ -611,17 +608,15 @@ uniform vec3 uAmbientDaylight;
 uniform vec3 uAmbientDarkness;
 uniform vec3 uAmbientBrightest;
 uniform vec4 uWeights;
-uniform float uAttenuation;
 
 varying vec2 vOffset;
 varying vec2 vSamplerUvs;
-varying vec2 vWorldPos;
+varying vec2 vRoofUv;
 varying vec3 vColor;
 varying float vRatio;
 varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
-varying float vDimPx;
 varying float vIsMacro;
 varying float vAttenuation;
 varying float vLuminosity;
@@ -637,8 +632,9 @@ vec3 switchColor(vec3 innerColor, vec3 outerColor, float dist, float ratio, floa
 
 void main() {
   if (vWeight <= 0.001) discard;
-  float dist = length(vOffset);
-  if (dist >= 1.0) discard;
+  float distSq = dot(vOffset, vOffset);
+  if (distSq >= 1.0) discard;
+  float dist = sqrt(distSq);
 
   float depthMask = 1.0;
   bool aboveBakedRoof = vDepthElev > 2.0;
@@ -650,7 +646,7 @@ void main() {
     if (depthMask <= 0.001) discard;
   }
   if (uUseBakedRoofMask && vIsMacro < 0.5 && !aboveBakedRoof) {
-    vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
+    vec2 rawRoofUv = vRoofUv;
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
       vec2 roofUv = uBakedRoofRepeat ? fract(rawRoofUv) : rawRoofUv;
@@ -710,21 +706,17 @@ uniform sampler2D uDepthTexture;
 uniform bool uUseDepthTexture;
 uniform sampler2D uBakedRoofMask;
 uniform bool uUseBakedRoofMask;
-uniform vec2 uBakedRoofOrigin;
-uniform vec2 uBakedRoofRegion;
 uniform bool uBakedRoofRepeat;
-uniform float uAttenuation;
 uniform float uMacroLift;
 
 varying vec2 vOffset;
 varying vec2 vSamplerUvs;
-varying vec2 vWorldPos;
+varying vec2 vRoofUv;
 varying vec3 vColor;
 varying float vRatio;
 varying float vColorAlpha;
 varying float vWeight;
 varying float vDepthElev;
-varying float vDimPx;
 varying float vIsMacro;
 varying float vAttenuation;
 varying float vLuminosity;
@@ -736,8 +728,9 @@ float perceivedBrightness(vec3 c) { return sqrt(dot(BT709, c * c)); }
 
 void main() {
   if (vColorAlpha <= 0.001 || dot(vColor, vColor) <= 0.0001) discard;
-  float dist = length(vOffset);
-  if (dist >= 1.0) discard;
+  float distSq = dot(vOffset, vOffset);
+  if (distSq >= 1.0) discard;
+  float dist = sqrt(distSq);
 
   float depthMask = 1.0;
   bool aboveBakedRoof = vDepthElev > 2.0;
@@ -749,7 +742,7 @@ void main() {
     if (depthMask <= 0.001) discard;
   }
   if (uUseBakedRoofMask && vIsMacro < 0.5 && !aboveBakedRoof) {
-    vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
+    vec2 rawRoofUv = vRoofUv;
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
       vec2 roofUv = uBakedRoofRepeat ? fract(rawRoofUv) : rawRoofUv;
@@ -2001,6 +1994,26 @@ export class MegaLightBatch {
       batch.colorMesh.visible = false;
       return;
     }
+    const cb = batch._lastCullBox;
+    const vw = x1 - x0;
+    const vh = y1 - y0;
+    if (
+      cb && batch._hasVisKey &&
+      x0 >= cb.x0 && y0 >= cb.y0 && x1 <= cb.x1 && y1 <= cb.y1 &&
+      (cb.x1 - cb.x0) <= vw * 1.5 + 1800 && (cb.y1 - cb.y0) <= vh * 1.5 + 1800
+    ) {
+      const hasVisible = batch.visibleIndexCount > 0 && batch.activeCount > 0;
+      batch.illumMesh.visible = hasVisible;
+      batch.colorMesh.visible = hasVisible;
+      return;
+    }
+    const HYST_PX = 450;
+    const cx0 = x0 - HYST_PX;
+    const cy0 = y0 - HYST_PX;
+    const cx1 = x1 + HYST_PX;
+    const cy1 = y1 + HYST_PX;
+    batch._lastCullBox = { x0: cx0, y0: cy0, x1: cx1, y1: cy1 };
+
     const sectors = batch.sectorBounds;
     const totalSec = sectors.length;
     let visCount = 0;
@@ -2008,15 +2021,17 @@ export class MegaLightBatch {
     let h2 = 0;
     for (let i = 0; i < totalSec; i++) {
       const s = sectors[i];
-      if (s.maxX >= x0 && s.minX <= x1 && s.maxY >= y0 && s.minY <= y1) {
+      if (s.maxX >= cx0 && s.minX <= cx1 && s.maxY >= cy0 && s.minY <= cy1) {
         visCount++;
         h1 = Math.imul(h1 ^ i, 16777619) >>> 0;
         h2 = ((h2 << 5) - h2 + i + 1) | 0;
       }
     }
-    const key = `${visCount}:${h1}:${h2}`;
-    if (key !== batch.lastVisKey) {
-      batch.lastVisKey = key;
+    if (!batch._hasVisKey || visCount !== batch._lastVisCount || h1 !== batch._lastVisH1 || h2 !== batch._lastVisH2) {
+      batch._hasVisKey = true;
+      batch._lastVisCount = visCount;
+      batch._lastVisH1 = h1;
+      batch._lastVisH2 = h2;
       let cursor = 0;
       if (visCount === totalSec && totalSec > 0) {
         batch.visibleIndices.set(batch.allIndices, 0);
@@ -2024,7 +2039,7 @@ export class MegaLightBatch {
       } else if (visCount > 0) {
         for (let i = 0; i < totalSec; i++) {
           const s = sectors[i];
-          if (s.maxX >= x0 && s.minX <= x1 && s.maxY >= y0 && s.minY <= y1) {
+          if (s.maxX >= cx0 && s.minX <= cx1 && s.maxY >= cy0 && s.minY <= cy1) {
             batch.visibleIndices.set(
               batch.allIndices.subarray(s.idxStart, s.idxStart + s.idxCount),
               cursor
@@ -2625,8 +2640,15 @@ export class MegaLightBatch {
     // 3. Monolithic single-buffer batch (classic 1000x1000 scenes)
     if (!this.indexBuffer || !this.illumMesh || !this.colorMesh) return;
     // O(1) hysteresis box check: skip sector scan & GPU indexBuffer re-pack while camera stays inside buffered cull box
+    // Also rebuild when viewport shrinks significantly on Zoom-In so frustum culling stays tight!
     const cb = this._lastCullBox;
-    if (cb && this.lastVisKey && x0 >= cb.x0 && y0 >= cb.y0 && x1 <= cb.x1 && y1 <= cb.y1) {
+    const vw = x1 - x0;
+    const vh = y1 - y0;
+    if (
+      cb && this.lastVisKey &&
+      x0 >= cb.x0 && y0 >= cb.y0 && x1 <= cb.x1 && y1 <= cb.y1 &&
+      (cb.x1 - cb.x0) <= vw * 1.5 + 1800 && (cb.y1 - cb.y0) <= vh * 1.5 + 1800
+    ) {
       return;
     }
     const HYST_PX = 450;
@@ -2694,11 +2716,33 @@ export class MegaLightBatch {
   _updateIllumUniforms() {
     const u = this.illumShader?.uniforms;
     if (!u || !canvas?.ready) return;
+    const tickTime = canvas.app?.ticker?.lastTime ?? -1;
+    const scale = canvas.stage?.scale?.x || 1;
+    const sw = canvas.screenDimensions?.[0] || 1;
+    const sh = canvas.screenDimensions?.[1] || 1;
+    const dark = canvas.environment?.darknessLevel ?? 0;
+    // Deduplicate across up to 9 chunk meshes sharing the same illumShader in a single render frame
+    if (
+      tickTime > 0 &&
+      tickTime === this._lastIllumTick &&
+      scale === this._lastIllumScale &&
+      sw === this._lastIllumSw &&
+      sh === this._lastIllumSh &&
+      dark === this._lastIllumDark
+    ) {
+      return;
+    }
+    this._lastIllumTick = tickTime;
+    this._lastIllumScale = scale;
+    this._lastIllumSw = sw;
+    this._lastIllumSh = sh;
+    this._lastIllumDark = dark;
+
     this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
-    u.uStageScale = canvas.stage?.scale?.x || 1;
-    u.uScreenDimensions[0] = canvas.screenDimensions?.[0] || 1;
-    u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
+    u.uStageScale = scale;
+    u.uScreenDimensions[0] = sw;
+    u.uScreenDimensions[1] = sh;
 
     const illum = canvas.effects?.illumination;
     const isDynamic = Boolean(illum?.hasDynamicDarknessLevel && isTextureUsable(illum?.renderTexture));
@@ -2753,12 +2797,29 @@ export class MegaLightBatch {
   _updateColorUniforms() {
     const u = this.colorShader?.uniforms;
     if (!u || !canvas?.ready) return;
-    this._checkDepthElevationsDirty();
+    const tickTime = canvas.app?.ticker?.lastTime ?? -1;
     const scale = canvas.stage?.scale?.x || 1;
+    const sw = canvas.screenDimensions?.[0] || 1;
+    const sh = canvas.screenDimensions?.[1] || 1;
+    if (
+      tickTime > 0 &&
+      tickTime === this._lastColorTick &&
+      scale === this._lastColorScale &&
+      sw === this._lastColorSw &&
+      sh === this._lastColorSh
+    ) {
+      return;
+    }
+    this._lastColorTick = tickTime;
+    this._lastColorScale = scale;
+    this._lastColorSw = sw;
+    this._lastColorSh = sh;
+
+    this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
     u.uStageScale = scale;
-    u.uScreenDimensions[0] = canvas.screenDimensions?.[0] || 1;
-    u.uScreenDimensions[1] = canvas.screenDimensions?.[1] || 1;
+    u.uScreenDimensions[0] = sw;
+    u.uScreenDimensions[1] = sh;
 
     const primTex = canvas.primary?.renderTexture;
     const hasPrim = isTextureUsable(primTex);

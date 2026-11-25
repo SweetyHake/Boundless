@@ -341,3 +341,16 @@ export function computePredictiveViewportRect(
 
   return { scale: s, x0, y0, x1, y1 };
 }
+
+/**
+ * Check whether a TokenDocument has any non-GM player owner without materializing
+ * a lazy synthetic ActorDelta (which would instantiate a full Actor on 500+ NPCs).
+ */
+export function hasPlayerOwnerLazy(doc) {
+  if (!doc) return false;
+  if (!doc.isLazyDelta) return Boolean(doc.hasPlayerOwner);
+  const baseActorId = doc._source?.actorId ?? doc.actorId;
+  const baseActor = baseActorId ? globalThis.game?.actors?.get?.(baseActorId) : null;
+  if (!baseActor) return false;
+  return Boolean(baseActor.hasPlayerOwner);
+}
