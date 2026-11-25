@@ -1634,42 +1634,7 @@ function patchGeometryStructures() {
       return wrapped();
     });
 
-    const okGet = wrapTargetMethod(QT.prototype, "getObjects", "Quadtree.prototype.getObjects", function (wrapped, rect, opts = {}) {
-      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || !rect || !this.bounds || opts._s) {
-        return wrapped(rect, opts);
-      }
-      const out = new Set();
-      const test = opts.collisionTest || null;
-      const rx = rect.x;
-      const ry = rect.y;
-      const rr = rx + rect.width;
-      const rb = ry + rect.height;
-      // Attach rect briefly only if collisionTest expects (o, rect); fallback-safe via closure-free helper
-      const visit = (node) => {
-        const objs = node.objects;
-        for (let i = 0, len = objs.length; i < len; i++) {
-          const o = objs[i];
-          if (out.has(o.t)) continue;
-          if (!test || test(o, rect)) out.add(o.t);
-        }
-        const subs = node.nodes;
-        if (!subs || subs.length === 0) return;
-        const midX = node.bounds.x + node.bounds.width * 0.5;
-        const midY = node.bounds.y + node.bounds.height * 0.5;
-        const top = ry < midY;
-        const bottom = rb >= midY;
-        const left = rx < midX;
-        const right = rr >= midX;
-        if (right && top && subs[0]) visit(subs[0]);
-        if (left && top && subs[1]) visit(subs[1]);
-        if (left && bottom && subs[2]) visit(subs[2]);
-        if (right && bottom && subs[3]) visit(subs[3]);
-      };
-      visit(this);
-      return out;
-    });
-
-    results.push(okIns, okRem, okClr, okGet);
+    results.push(okIns, okRem, okClr);
   }
 
   return results;
