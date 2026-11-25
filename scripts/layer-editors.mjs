@@ -390,6 +390,7 @@ export class VirtualLayerEditors {
         obj._preview = null;
       }
       layer?.quadtree?.remove(obj);
+      if (layer === canvas?.tiles) this._cleanupLeakedTileMesh(obj);
       obj.parent?.removeChild(obj);
       if (!obj.destroyed) obj.destroy({ children: true });
     } catch {}
@@ -1355,6 +1356,15 @@ export class VirtualLayerEditors {
     const sy1 = Math.min(simGrid - 1, Math.floor((curVp.y1 + pad) / simSectorPx));
 
     const tids = new Set();
+    // Prioritize edited/moved tiles first so they are never truncated by MAX_TILES_IN_VIEW on dense maps
+    const lvlTileEdits = this.controller.tileEdits?.get(lid);
+    if (lvlTileEdits?.size) {
+      for (const [tKey, ov] of lvlTileEdits) {
+        if (!ov || !tKey.startsWith("t:")) continue;
+        const tid = Number(tKey.slice(2));
+        if (Number.isInteger(tid) && specTiles[tid]) tids.add(tid);
+      }
+    }
     if (spec.sectors) {
       for (let sy = sy0; sy <= sy1; sy++) {
         for (let sx = sx0; sx <= sx1; sx++) {
@@ -1364,16 +1374,6 @@ export class VirtualLayerEditors {
       }
     } else {
       for (let tid = 0; tid < specTiles.length; tid++) tids.add(tid);
-    }
-
-    // Also include tiles edited & dragged outside their original home sector
-    const lvlTileEdits = this.controller.tileEdits?.get(lid);
-    if (lvlTileEdits?.size) {
-      for (const [tKey, ov] of lvlTileEdits) {
-        if (!ov || !tKey.startsWith("t:")) continue;
-        const tid = Number(tKey.slice(2));
-        if (Number.isInteger(tid) && specTiles[tid]) tids.add(tid);
-      }
     }
 
     const items = [];
@@ -1392,15 +1392,26 @@ export class VirtualLayerEditors {
       const effH = Math.abs(h) * Math.abs(syVal);
       const pivX = item.anchorX === undefined ? (item.x + w * 0.5) : item.x;
       const pivY = item.anchorY === undefined ? (item.y + h * 0.5) : item.y;
-      const rad = ((item.rot || 0) * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
       const dx = (0.5 - effAx) * effW;
       const dy = (0.5 - effAy) * effH;
-      const cx = pivX + (cos * dx - sin * dy);
-      const cy = pivY + (sin * dx + cos * dy);
-      const halfDiag = Math.hypot(effW, effH) * 0.5;
-      if (cx + halfDiag < curVp.x0 - pad || cx - halfDiag > curVp.x1 + pad || cy + halfDiag < curVp.y0 - pad || cy - halfDiag > curVp.y1 + pad) continue;
+      const rot = item.rot || 0;
+      let cx, cy, halfX, halfY;
+      if (rot === 0) {
+        cx = pivX + dx;
+        cy = pivY + dy;
+        halfX = effW * 0.5;
+        halfY = effH * 0.5;
+      } else {
+        const rad = (rot * Math.PI) / 180;
+        const cos = Math.cos(rad);
+        const sin = Math.sin(rad);
+        cx = pivX + (cos * dx - sin * dy);
+        cy = pivY + (sin * dx + cos * dy);
+        const halfDiag = Math.hypot(effW, effH) * 0.5;
+        halfX = halfDiag;
+        halfY = halfDiag;
+      }
+      if (cx + halfX < curVp.x0 - pad || cx - halfX > curVp.x1 + pad || cy + halfY < curVp.y0 - pad || cy - halfY > curVp.y1 + pad) continue;
       items.push(item);
       if (items.length >= MAX_TILES_IN_VIEW) break;
     }

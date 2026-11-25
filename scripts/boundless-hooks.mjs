@@ -657,6 +657,7 @@ export function registerBoundlessHooks(controller) {
       if (!isRuntimeReady()) return;
       const sc = doc?.parent?.documentName === "Scene" ? doc.parent : doc?.parent?.parent;
       if (sc && sc.id !== canvas.scene?.id) return;
+      controller._regionsRev = (controller._regionsRev || 0) + 1;
       controller._depthDirty = true;
       controller._occlusionDirty = true;
     });

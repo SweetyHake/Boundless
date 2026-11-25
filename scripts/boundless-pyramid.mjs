@@ -1097,6 +1097,33 @@ export const pyramidMethods = {
     });
   },
 
+  _hasDefineSurfaceRegions() {
+    const regions = canvas.regions?.placeables;
+    const len = regions?.length || 0;
+    if (len === 0) return false;
+    const rev = this._regionsRev || 0;
+    if (this._defineSurfaceCacheRev === rev && this._defineSurfaceCacheLen === len && this._defineSurfaceCacheRef === regions) {
+      return this._defineSurfaceCacheVal;
+    }
+    let found = false;
+    for (let ri = 0; ri < len; ri++) {
+      const behaviors = regions[ri]?.document?.behaviors;
+      if (!behaviors?.size) continue;
+      for (const b of behaviors) {
+        if (!b.disabled && b.type === "defineSurface") {
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+    }
+    this._defineSurfaceCacheRev = rev;
+    this._defineSurfaceCacheLen = len;
+    this._defineSurfaceCacheRef = regions;
+    this._defineSurfaceCacheVal = found;
+    return found;
+  },
+
   _mountTileMesh(e, tex, instant) {
     if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0)) return false;
     const isFg = e.channel === "fg";
@@ -1155,21 +1182,8 @@ export const pyramidMethods = {
     let groundOccMode = CONST.OCCLUSION_MODES.NONE;
     if (isFg) {
       groundOccMode = CONST.OCCLUSION_MODES.SURFACE;
-    } else if (!layer.isUpper) {
-      const regions = canvas.regions?.placeables;
-      if (regions?.length) {
-        for (let ri = 0; ri < regions.length; ri++) {
-          const behaviors = regions[ri]?.document?.behaviors;
-          if (!behaviors?.size) continue;
-          for (const b of behaviors) {
-            if (!b.disabled && b.type === "defineSurface") {
-              groundOccMode = CONST.OCCLUSION_MODES.SURFACE;
-              break;
-            }
-          }
-          if (groundOccMode !== CONST.OCCLUSION_MODES.NONE) break;
-        }
-      }
+    } else if (!layer.isUpper && this._hasDefineSurfaceRegions()) {
+      groundOccMode = CONST.OCCLUSION_MODES.SURFACE;
     }
     m.occlusionMode = layer.isUpper
       ? (CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE)

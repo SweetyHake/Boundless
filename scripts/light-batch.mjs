@@ -776,6 +776,18 @@ void main() {
 }
 `;
 
+const _colorRgbCache = new Map();
+function resolveColorRgb(colorHex) {
+  if (!colorHex) return null;
+  const hit = _colorRgbCache.get(colorHex);
+  if (hit !== undefined) return hit;
+  const c = foundry.utils.Color.from(colorHex);
+  const rgb = c?.rgb ? [c.rgb[0], c.rgb[1], c.rgb[2]] : [0, 0, 0];
+  if (_colorRgbCache.size >= 256) _colorRgbCache.delete(_colorRgbCache.keys().next().value);
+  _colorRgbCache.set(colorHex, rgb);
+  return rgb;
+}
+
 export class MegaLightBatch {
   totalLights = 0;
   totalVertices = 0;
@@ -1001,8 +1013,8 @@ export class MegaLightBatch {
       const alpha = Math.min(0.45, (m[4] ?? 0.45) * 0.55);
       let r = 1, g = 0.72, b = 0.35;
       if (colorHex) {
-        const c = foundry.utils.Color.from(colorHex);
-        [r, g, b] = c.rgb;
+        const rgb = resolveColorRgb(colorHex);
+        r = rgb[0]; g = rgb[1]; b = rgb[2];
       }
       const v0 = vc++;
       const v1 = vc++;
@@ -1289,8 +1301,8 @@ export class MegaLightBatch {
             const ratio = Math.min(1, ((brightFt || 0) * pxPerFt) / dimPx);
             let r = 0, g = 0, b = 0;
             if (colorHex) {
-              const c = foundry.utils.Color.from(colorHex);
-              [r, g, b] = c.rgb;
+              const rgb = resolveColorRgb(colorHex);
+              r = rgb[0]; g = rgb[1]; b = rgb[2];
             }
             const basePhase = Math.abs(Math.sin(lx * 0.0137 + ly * 0.0193 + elevation * 0.31) * 100.0);
 
@@ -1458,6 +1470,9 @@ export class MegaLightBatch {
         fakeLevel = built.fakeLevel;
       };
 
+      const topElev = getLevelRoofElevation(level);
+      const layerHasOverlays = hasSpecOverlays(spec.overlays);
+
       for (const [sk, sec] of Object.entries(sectors)) {
         if (!sec?.l?.length) continue;
         const [sx, sy] = sk.split("_").map(Number);
@@ -1530,8 +1545,8 @@ export class MegaLightBatch {
           const aVal = alpha ?? 0.5;
           let r = 0, g = 0, b = 0;
           if (colorHex) {
-            const c = foundry.utils.Color.from(colorHex);
-            [r, g, b] = c.rgb;
+            const rgb = resolveColorRgb(colorHex);
+            r = rgb[0]; g = rgb[1]; b = rgb[2];
           }
           const basePhase = Math.abs(Math.sin(lx * 0.0137 + ly * 0.0193 + elevation * 0.31) * 100.0);
           const vStart = vertCursor;
@@ -1608,9 +1623,8 @@ export class MegaLightBatch {
           }
 
           const vCount = vertCursor - vStart;
-          const topElev = getLevelRoofElevation(level);
           let isIndoor = false;
-          if (elevation < topElev && hasSpecOverlays(spec.overlays)) {
+          if (elevation < topElev && layerHasOverlays) {
             const lsx = simSectorPx > 0 ? Math.floor(lx / simSectorPx) : sx;
             const lsy = simSectorPx > 0 ? Math.floor(ly / simSectorPx) : sy;
             for (let dy = -1; dy <= 1 && !isIndoor; dy++) {
@@ -2275,8 +2289,8 @@ export class MegaLightBatch {
           const aVal = resolved.alpha ?? 0.5;
           let r = 0, g = 0, b = 0;
           if (resolved.color) {
-            const c = foundry.utils.Color.from(resolved.color);
-            [r, g, b] = c.rgb;
+            const rgb = resolveColorRgb(resolved.color);
+            r = rgb[0]; g = rgb[1]; b = rgb[2];
           }
           const basePhase = Math.abs(Math.sin(lx * 0.0137 + ly * 0.0193 + elevation * 0.31) * 100.0);
           let hasNearbyWall = false;

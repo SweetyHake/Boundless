@@ -6,6 +6,7 @@ import {
   getLevelBaseElevation as getFiniteLevelBaseElevation,
   getLevelRoofElevation as getFiniteLevelRoofElevation
 } from "./utils.mjs";
+import { isWorkerDecodableUrl } from "./tile-worker-pool.mjs";
 
 const CELL_PX = 128;
 const PAD_PX = 4;
@@ -863,8 +864,15 @@ export class TokenImpostorLayer {
       return { drawable: null, shouldClose: false };
     }
 
-    // 3. Off-main-thread raster decode with high-quality resize
+    // 3. Off-main-thread raster decode with worker-side downscale to <=256px for 120x120 atlas cells
     const isSvg = lower.endsWith(".svg");
+    const workerPool = this.controller?.texMgr?.workerPool;
+    if (!isSvg && workerPool && isWorkerDecodableUrl(src)) {
+      try {
+        const bmp = await workerPool.decode(src, { priority: 1, maxDim: 256 });
+        if (bmp) return { drawable: bmp, shouldClose: true };
+      } catch {}
+    }
     if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
       try {
         const res = await fetch(resolvedSrc);
@@ -1322,16 +1330,26 @@ export class TokenImpostorLayer {
     return { tokenVision, isGM, hasActiveVision, visionBoxes, visionSourceDocIds };
   }
 
-  _computeTokenAlpha(doc, visCtx) {
-    if (!doc || !doc.viewed) return { alpha: 0, needsVision: 0, isParty: 0 };
+  _computeTokenAlpha(doc, visCtx, out = null) {
+    const res = out || (this._tmpAlphaOut ??= { alpha: 0, needsVision: 0, isParty: 0 });
+    if (!doc || !doc.viewed) {
+      res.alpha = 0; res.needsVision = 0; res.isParty = 0;
+      return res;
+    }
 
     const isParty = isPartyTokenDoc(doc) ? 1.0 : 0.0;
     const isHidden = Boolean(doc._source?.hidden ?? doc.hidden);
-    if (isHidden && !visCtx.isGM) return { alpha: 0, needsVision: 1, isParty };
+    if (isHidden && !visCtx.isGM) {
+      res.alpha = 0; res.needsVision = 1; res.isParty = isParty;
+      return res;
+    }
 
     const owned = isOwnedByCurrentUserSafe(doc);
     const isVisionSource = Boolean(visCtx.visionSourceDocIds?.has?.(doc.id));
     const needsVision = (visCtx.tokenVision && !visCtx.isGM && !owned && !isVisionSource) ? 1.0 : 0.0;
+    res.alpha = 0;
+    res.needsVision = needsVision;
+    res.isParty = isParty;
 
     // Never render a GPU impostor beneath an already-mounted active native Token!
     // If Foundry or Showstopper intentionally hid the native token/mesh (e.g. camera occlusion above lens,
@@ -1346,20 +1364,14 @@ export class TokenImpostorLayer {
       obj._ssOcclusionAlpha <= 0.05
     );
     if (isMountedOnLayer && !this.streamer?.isTokenDrawing?.(obj)) {
-      if (obj.visible === false || hiddenByShowstopper) {
-        return { alpha: 0, needsVision, isParty };
-      }
+      if (obj.visible === false || hiddenByShowstopper) return res;
       // At tactical zoom (_nativeTokensActive), mounted native tokens with renderable=false are simply frustum-culled
       // offscreen by TokenStreamer — never turn on the GPU Impostor shader & atlas bind for them!
-      if (this.streamer?._nativeTokensActive && !hasFadeOverride) {
-        return { alpha: 0, needsVision, isParty };
-      }
+      if (this.streamer?._nativeTokensActive && !hasFadeOverride) return res;
       const nativeActive = Boolean(obj.renderable && (!obj.mesh || (!obj.mesh.destroyed && obj.mesh.renderable)));
-      if (nativeActive && !hasFadeOverride) {
-        return { alpha: 0, needsVision, isParty };
-      }
+      if (nativeActive && !hasFadeOverride) return res;
     } else if (hiddenByShowstopper) {
-      return { alpha: 0, needsVision, isParty };
+      return res;
     }
 
     const grid = canvas.grid?.size || 100;
@@ -1368,36 +1380,30 @@ export class TokenImpostorLayer {
 
     // Roof & multi-level floor check: suppress impostor if under a baked roof or occluded by an opaque upper level
     const lid = doc._source?.level || doc.level || canvas.level?.id;
-    if (this.controller?.isPointUnderBakedRoof?.(lid, cx, cy, elev)) {
-      return { alpha: 0, needsVision, isParty };
-    }
+    if (this.controller?.isPointUnderBakedRoof?.(lid, cx, cy, elev)) return res;
     if (lid && lid !== canvas.level?.id) {
       const tokLayer = this.controller?.levelLayers?.get?.(lid);
       if (tokLayer && this.controller?._isRectOccludedByUpperLevels?.(tokLayer, cx - w * 0.4, cy - h * 0.4, w * 0.8, h * 0.8)) {
-        return { alpha: 0, needsVision, isParty };
+        return res;
       }
     }
 
     // Strict Foundry v14 tokenVision CPU gate (prevents any leak into explored-only FoW or Invisible enemies!)
     if (visCtx.tokenVision && !isVisionSource) {
       if (!visCtx.isGM && !owned) {
-        if (!visCtx.hasActiveVision) return { alpha: 0, needsVision, isParty };
-        if (isTokenInvisibleSafe(doc)) return { alpha: 0, needsVision, isParty };
-        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) {
-          return { alpha: 0, needsVision, isParty };
-        }
+        if (!visCtx.hasActiveVision) return res;
+        if (isTokenInvisibleSafe(doc)) return res;
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) return res;
       } else if (visCtx.isGM && visCtx.hasActiveVision && !obj?.controlled) {
-        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) {
-          return { alpha: 0, needsVision, isParty };
-        }
+        if (!this._passesVisionCheck(cx, cy, elev, w, h, visCtx.visionBoxes, obj)) return res;
       }
     }
 
     const baseAlpha = Number.isFinite(doc.alpha) ? doc.alpha : Number(doc._source?.alpha ?? 1);
     const rawAlpha = isHidden ? Math.min(baseAlpha, 0.5) : baseAlpha;
     const overrideMult = hasFadeOverride ? this.fadeOverrides.get(doc.id) : 1.0;
-    const alpha = Math.max(0, Math.min(1, rawAlpha * overrideMult));
-    return { alpha, needsVision, isParty };
+    res.alpha = Math.max(0, Math.min(1, rawAlpha * overrideMult));
+    return res;
   }
 
   _passesVisionCheck(cx, cy, elev, w, h, visionBoxes, obj = null) {
@@ -1439,9 +1445,9 @@ export class TokenImpostorLayer {
     }
   }
 
-  _updateSingleTokenState(doc, visCtx = null) {
+  _updateSingleTokenState(doc, visCtx = null, knownIdx = -1) {
     if (!this.mounted || !doc?.id || !this.stateArr) return;
-    const idx = this.docIndexById.get(doc.id);
+    const idx = knownIdx >= 0 ? knownIdx : this.docIndexById.get(doc.id);
     if (idx === undefined) return;
     const ctx = visCtx || this._collectVisionCheckers();
     const st = this._computeTokenAlpha(doc, ctx);
@@ -1492,7 +1498,7 @@ export class TokenImpostorLayer {
     for (let i = 0; i < this.count; i++) {
       const doc = tokens.get(this.docIds[i]);
       if (doc) {
-        this._updateSingleTokenState(doc, visCtx);
+        this._updateSingleTokenState(doc, visCtx, i);
         if (this.stateArr[i * 16] > 0.002) visCount++;
       } else if (this.stateArr[i * 16] > 0.001) {
         // Zero out any orphaned GPU slot whose TokenDocument no longer exists

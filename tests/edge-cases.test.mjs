@@ -3061,3 +3061,27 @@ test("MegaAudioStreamer expands search padding for large-radius virtual sounds (
   assert.equal(attached.length, 1, "150ft sound at 3200px distance must be discovered via dynamic padPx");
   as.unmount();
 });
+
+test("pyramidMethods._hasDefineSurfaceRegions caches lookup and invalidates on _regionsRev change", async () => {
+  installBaseGlobals();
+  const { pyramidMethods } = await import("../scripts/boundless-pyramid.mjs");
+  let behaviorReads = 0;
+  const region = {
+    document: {
+      get behaviors() {
+        behaviorReads++;
+        return new Set([{ disabled: false, type: "defineSurface" }]);
+      }
+    }
+  };
+  globalThis.canvas = { regions: { placeables: [region] } };
+  const ctrl = { ...pyramidMethods, _regionsRev: 0 };
+
+  assert.equal(ctrl._hasDefineSurfaceRegions(), true);
+  assert.equal(ctrl._hasDefineSurfaceRegions(), true);
+  assert.equal(behaviorReads, 1, "repeated calls with unchanged _regionsRev must hit cache");
+
+  ctrl._regionsRev++;
+  assert.equal(ctrl._hasDefineSurfaceRegions(), true);
+  assert.equal(behaviorReads, 2, "incrementing _regionsRev must invalidate cache");
+});
