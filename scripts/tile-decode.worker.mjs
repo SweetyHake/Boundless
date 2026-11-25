@@ -77,9 +77,8 @@ self.onmessage = async (event) => {
     }
 
     const decodeMs = performance.now() - t0;
-    const transferBmp = bitmap;
+    self.postMessage({ id, bitmap, decodeMs }, [bitmap]);
     bitmap = null;
-    self.postMessage({ id, bitmap: transferBmp, decodeMs }, [transferBmp]);
   } catch (err) {
     if (ctrl.signal.aborted || err?.name === "AbortError") {
       self.postMessage({ id, aborted: true });

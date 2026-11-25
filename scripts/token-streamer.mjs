@@ -29,6 +29,18 @@ function getSectorKey(x, y) {
   return `${sx}_${sy}`;
 }
 
+function getTokenDocBounds(doc, grid) {
+  const x = Number(doc?._source?.x ?? doc?.x ?? 0);
+  const y = Number(doc?._source?.y ?? doc?.y ?? 0);
+  const sz = typeof doc?.getSize === "function" ? doc.getSize() : null;
+  const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc?._source?.width ?? doc?.width ?? 1) || 1) * grid);
+  const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc?._source?.height ?? doc?.height ?? 1) || 1) * grid);
+  const cp = typeof doc?.getCenterPoint === "function" ? doc.getCenterPoint() : null;
+  const cx = (cp && Number.isFinite(cp.x)) ? cp.x : (x + w * 0.5);
+  const cy = (cp && Number.isFinite(cp.y)) ? cp.y : (y + h * 0.5);
+  return { x, y, w, h, cx, cy };
+}
+
 /**
  * Determine whether a TokenDocument must stay permanently mounted as a live Token placeable
  * (PCs, linked story actors, combatants, light emitters, GM-pinned, controlled/targeted).
@@ -71,6 +83,7 @@ function isLazyTokenLayerActiveForScene(scene) {
 
 let lazyPatchInstalled = false;
 let lazyFilteredViewKey = null;
+let lazyDrawDepth = 0;
 const coreDrawingCounts = new WeakMap();
 const coreDrawPromises = new WeakMap();
 
@@ -85,10 +98,22 @@ export function installLazyTokenLayerPatch() {
   const TokenLayerCls = foundry.canvas?.layers?.TokenLayer ?? CONFIG.Token?.layerClass;
   if (!TokenLayerCls?.prototype?.viewedDocuments) return;
 
+  if (typeof TokenLayerCls.prototype._draw === "function") {
+    const origLayerDraw = TokenLayerCls.prototype._draw;
+    TokenLayerCls.prototype._draw = async function (...args) {
+      lazyDrawDepth++;
+      try {
+        return await origLayerDraw.apply(this, args);
+      } finally {
+        lazyDrawDepth = Math.max(0, lazyDrawDepth - 1);
+      }
+    };
+  }
+
   const origViewed = TokenLayerCls.prototype.viewedDocuments;
   TokenLayerCls.prototype.viewedDocuments = function* () {
     const scene = this.scene ?? canvas?.scene;
-    if (!isLazyTokenLayerActiveForScene(scene)) {
+    if (lazyDrawDepth <= 0 || !isLazyTokenLayerActiveForScene(scene)) {
       yield* origViewed.call(this);
       return;
     }
@@ -590,8 +615,9 @@ export class TokenStreamer {
       if (!tok || tok.destroyed || tok.isPreview || this.isTokenDrawing(tok)) continue;
       const doc = tok.document;
       if (!doc) continue;
-      const w = (doc?.width || 1) * grid;
-      const h = (doc?.height || 1) * grid;
+      const b = getTokenDocBounds(doc, grid);
+      const w = b.w;
+      const h = b.h;
       const tx = doc?._source?.x ?? doc?.x ?? tok.x ?? 0;
       const ty = doc?._source?.y ?? doc?.y ?? tok.y ?? 0;
       const docOnScreen = tx + w >= cullX0 && tx <= cullX1 && ty + h >= cullY0 && ty <= cullY1;
@@ -909,14 +935,13 @@ export class TokenStreamer {
           let offscreenAfterDraw = false;
           if (latestVp) {
             const gSz = canvas.grid?.size || 100;
-            const tw = (doc.width || 1) * gSz;
-            const th = (doc.height || 1) * gSz;
+            const b = getTokenDocBounds(doc, gSz);
             const curX = doc._source?.x ?? doc.x ?? obj.x ?? 0;
             const curY = doc._source?.y ?? doc.y ?? obj.y ?? 0;
             offscreenAfterDraw = (
-              curX + tw < latestVp.x0 - CULL_VP_PAD_PX ||
+              curX + b.w < latestVp.x0 - CULL_VP_PAD_PX ||
               curX > latestVp.x1 + CULL_VP_PAD_PX ||
-              curY + th < latestVp.y0 - CULL_VP_PAD_PX ||
+              curY + b.h < latestVp.y0 - CULL_VP_PAD_PX ||
               curY > latestVp.y1 + CULL_VP_PAD_PX
             );
           }
@@ -1230,7 +1255,19 @@ export class TokenStreamer {
     if (!isGM) {
       if (doc._source?.hidden ?? doc.hidden) return false;
       const base = doc.baseActor;
-      const isOwner = Boolean(doc.isOwner || base?.testUserPermission?.(game.user, "OWNER"));
+      let isOwner;
+      if (!doc.isLazyDelta) {
+        isOwner = Boolean(doc.isOwner || base?.testUserPermission?.(game.user, "OWNER"));
+      } else {
+        const ownerLevel = globalThis.CONST?.DOCUMENT_OWNERSHIP_LEVELS?.OWNER ?? 3;
+        const deltaOwn = doc._source?.delta?.ownership;
+        const uid = game.user?.id;
+        const deltaHasOwner = Boolean(
+          deltaOwn &&
+          ((uid && Number(deltaOwn[uid]) >= ownerLevel) || Number(deltaOwn.default) >= ownerLevel)
+        );
+        isOwner = Boolean(base?.testUserPermission?.(game.user, "OWNER") || deltaHasOwner);
+      }
       if (!isOwner) return false;
     }
     const existing = doc._object;
@@ -1239,11 +1276,10 @@ export class TokenStreamer {
       if (existing._ssHitboxRect?.occluded) return false;
     } else if (!isGM && this.controller?.isPointUnderBakedRoof) {
       const grid = canvas.grid?.size || 100;
-      const cx = (Number(doc._source?.x ?? doc.x ?? 0)) + (Number(doc._source?.width ?? doc.width ?? 1) * grid) * 0.5;
-      const cy = (Number(doc._source?.y ?? doc.y ?? 0)) + (Number(doc._source?.height ?? doc.height ?? 1) * grid) * 0.5;
+      const b = getTokenDocBounds(doc, grid);
       const lid = doc._source?.level ?? doc.level ?? canvas.level?.id;
       const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
-      if (this.controller.isPointUnderBakedRoof(lid, cx, cy, elev)) return false;
+      if (this.controller.isPointUnderBakedRoof(lid, b.cx, b.cy, elev)) return false;
     }
     return true;
   }
@@ -1280,11 +1316,8 @@ export class TokenStreamer {
         for (const docId of ids) {
           const doc = scene.tokens.get(docId);
           if (!this._canUserControlDoc(doc)) continue;
-          const x = Number(doc._source?.x ?? doc.x ?? 0);
-          const y = Number(doc._source?.y ?? doc.y ?? 0);
-          const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
-          const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
-          if (x + w < minX || x > maxX || y + h < minY || y > maxY) continue;
+          const b = getTokenDocBounds(doc, grid);
+          if (b.x + b.w < minX || b.x > maxX || b.y + b.h < minY || b.y > maxY) continue;
           out.push(doc);
         }
       }
@@ -1336,16 +1369,11 @@ export class TokenStreamer {
         for (const docId of ids) {
           const doc = scene.tokens.get(docId);
           if (!this._canUserControlDoc(doc)) continue;
-          const x = Number(doc._source?.x ?? doc.x ?? 0);
-          const y = Number(doc._source?.y ?? doc.y ?? 0);
-          const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
-          const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
-          const cx = x + w * 0.5;
-          const cy = y + h * 0.5;
-          const halfW = Math.max(w * 0.5, minHitRadiusWorld);
-          const halfH = Math.max(h * 0.5, minHitRadiusWorld);
-          const dx = Math.abs(wx - cx);
-          const dy = Math.abs(wy - cy);
+          const b = getTokenDocBounds(doc, grid);
+          const halfW = Math.max(b.w * 0.5, minHitRadiusWorld);
+          const halfH = Math.max(b.h * 0.5, minHitRadiusWorld);
+          const dx = Math.abs(wx - b.cx);
+          const dy = Math.abs(wy - b.cy);
           if (dx > halfW || dy > halfH) continue;
           const distSq = dx * dx + dy * dy;
           if (distSq < bestDistSq) {
@@ -1421,16 +1449,12 @@ export class TokenStreamer {
     const runBulk = typeof bulkRunner === "function" ? bulkRunner : ((fn) => fn());
 
     const missing = this.prepareMountedTokensForSelection(targetDocs);
-    const curVp = this._lastVp || this.controller?.getViewportWorldRect?.(0.1);
     const grid = canvas.grid?.size || 100;
     const isDocOnScreen = (doc) => {
-      if (!curVp || !doc) return true;
-      const x = Number(doc._source?.x ?? doc.x ?? 0);
-      const y = Number(doc._source?.y ?? doc.y ?? 0);
-      const sz = typeof doc.getSize === "function" ? doc.getSize() : null;
-      const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid);
-      const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid);
-      return !(x + w < curVp.x0 - CULL_VP_PAD_PX || x > curVp.x1 + CULL_VP_PAD_PX || y + h < curVp.y0 - CULL_VP_PAD_PX || y > curVp.y1 + CULL_VP_PAD_PX);
+      const vp = this._lastVp || this.controller?.getViewportWorldRect?.(0.1);
+      if (!vp || !doc) return true;
+      const b = getTokenDocBounds(doc, grid);
+      return !(b.x + b.w < vp.x0 - CULL_VP_PAD_PX || b.x > vp.x1 + CULL_VP_PAD_PX || b.y + b.h < vp.y0 - CULL_VP_PAD_PX || b.y > vp.y1 + CULL_VP_PAD_PX);
     };
 
     let immediate = 0;
@@ -1532,7 +1556,15 @@ export class TokenStreamer {
           await obj.draw();
           frameWorkMs += (performance.now() - tDraw);
           if (gen === this._gen) this._drawingIds.delete(doc.id);
-          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || !layer.active) break;
+          if (selectGen !== this._selectGen || gen !== this._gen || !this.enabled || !canvas?.ready || !layer.active) {
+            if (obj && !obj.destroyed && !this._nativeTokensActive && !obj.controlled) {
+              obj.renderable = false;
+              if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
+              if (obj._ssJumpShadow && !obj._ssJumpShadow.destroyed) obj._ssJumpShadow.renderable = false;
+              this.impostors.markVisibilityDirty();
+            }
+            break;
+          }
           if (obj.destroyed || !canvas.scene?.tokens?.has?.(doc.id)) {
             if (!obj.destroyed) {
               try {
@@ -1542,12 +1574,20 @@ export class TokenStreamer {
             }
             continue;
           }
-          // Keep offscreen tokens non-renderable so selecting 150+ continent tokens adds zero offscreen GPU cost!
-          const wantVis = onScr;
+          // Keep offscreen / roof-occluded tokens non-renderable so selecting 150+ continent tokens adds zero offscreen GPU cost!
+          const blockedByRoof = Boolean(
+            this.controller?._roofHiddenTokens?.has?.(obj) ||
+            this.controller?.isTokenUnderBakedRoof?.(obj)
+          );
+          if (blockedByRoof) this.controller?._roofHiddenTokens?.add?.(obj);
+          const wantVis = onScr && !blockedByRoof;
           obj.renderable = wantVis;
           if (obj.mesh && !obj.mesh.destroyed) {
             obj.mesh.renderable = wantVis;
-            if (wantVis) obj.mesh.visible = true;
+            const hiddenByShowstopper = typeof obj._ssOcclusionAlpha === "number" && Number.isFinite(obj._ssOcclusionAlpha) && obj._ssOcclusionAlpha <= 0.01;
+            if (wantVis && obj.visible !== false && !hiddenByShowstopper && obj.mesh.visible === false) {
+              obj.mesh.visible = true;
+            }
           }
           if (wantVis) this.lastSeenMs.set(doc.id, performance.now());
           const showDetail = getEffectiveScale(this._lastVp?.scale ?? (canvas.stage?.scale?.x || 1)) >= LOD_DETAIL_MIN_SCALE;

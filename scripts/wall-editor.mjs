@@ -84,6 +84,9 @@ export class VirtualWallEditor {
     const origUpdateEmbedded = scene.updateEmbeddedDocuments;
     const origDeleteEmbedded = scene.deleteEmbeddedDocuments;
     const origWallsGet = wallsLayer.get;
+    const hadOwnUpdate = Object.prototype.hasOwnProperty.call(scene, "updateEmbeddedDocuments");
+    const hadOwnDelete = Object.prototype.hasOwnProperty.call(scene, "deleteEmbeddedDocuments");
+    const hadOwnWallsGet = Object.prototype.hasOwnProperty.call(wallsLayer, "get");
     const state = { active: true };
 
     const wrappedWallsGet = (objectId) => {
@@ -154,6 +157,9 @@ export class VirtualWallEditor {
       origUpdateEmbedded,
       origDeleteEmbedded,
       origWallsGet,
+      hadOwnUpdate,
+      hadOwnDelete,
+      hadOwnWallsGet,
       wrappedUpdateEmbedded,
       wrappedDeleteEmbedded,
       wrappedWallsGet
@@ -165,13 +171,23 @@ export class VirtualWallEditor {
     const {
       state, scene, wallsLayer,
       origUpdateEmbedded, origDeleteEmbedded, origWallsGet,
+      hadOwnUpdate, hadOwnDelete, hadOwnWallsGet,
       wrappedUpdateEmbedded, wrappedDeleteEmbedded, wrappedWallsGet
     } = this._patches;
     state.active = false;
     try {
-      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) scene.updateEmbeddedDocuments = origUpdateEmbedded;
-      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
-      if (wallsLayer.get === wrappedWallsGet) wallsLayer.get = origWallsGet;
+      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) {
+        if (hadOwnUpdate) scene.updateEmbeddedDocuments = origUpdateEmbedded;
+        else delete scene.updateEmbeddedDocuments;
+      }
+      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) {
+        if (hadOwnDelete) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
+        else delete scene.deleteEmbeddedDocuments;
+      }
+      if (wallsLayer.get === wrappedWallsGet) {
+        if (hadOwnWallsGet) wallsLayer.get = origWallsGet;
+        else delete wallsLayer.get;
+      }
     } catch {}
     this._patches = null;
   }
@@ -384,6 +400,13 @@ export class VirtualWallEditor {
       if (wallsLayer?.clipboard?.cut && wallsLayer.clipboard.objects?.length) {
         wallsLayer.clipboard.objects = wallsLayer.clipboard.objects.filter(o => o !== w);
       }
+      if (w._preview && !w._preview.destroyed) {
+        try {
+          w._preview.parent?.removeChild(w._preview);
+          w._preview.destroy({ children: true });
+        } catch {}
+        w._preview = null;
+      }
       wallsLayer?.quadtree?.remove(w);
       w.parent?.removeChild(w);
       if (!w.destroyed) w.destroy({ children: true });
@@ -477,7 +500,13 @@ export class VirtualWallEditor {
     if (seg.threshold) initData.threshold = foundry.utils.deepClone(seg.threshold);
     if (seg.animation?.type && seg.animation?.texture) initData.animation = foundry.utils.deepClone(seg.animation);
 
-    const doc = new WallDocCls(initData, { parent: canvas.scene });
+    let doc;
+    try {
+      doc = new WallDocCls(initData, { parent: canvas.scene });
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to construct virtual WallDocument ${seg.wKey}:`, err);
+      return;
+    }
     doc._mmVirtualMeta = { id, wKey: seg.wKey, dKey, levelId: seg.levelId, kind: seg.kind, sk: seg.sk, idx: seg.idx };
     // Virtual WallDocuments are not added to scene.walls so WallDocument#initializeEdge never runs;
     // expose a live `edge` getter so Foundry v14 DoorMesh.animateSlide() and WallsLayer helpers never see `null`.
@@ -805,6 +834,13 @@ export class VirtualWallEditor {
             } else if (!this._pendingMountKeys.has(seg.wKey)) {
               this._pendingMountKeys.add(seg.wKey);
               this._pendingMounts.push(seg);
+            } else {
+              for (let pi = 0; pi < this._pendingMounts.length; pi++) {
+                if (this._pendingMounts[pi].wKey === seg.wKey) {
+                  this._pendingMounts[pi] = seg;
+                  break;
+                }
+              }
             }
           }
         }
@@ -824,6 +860,7 @@ export class VirtualWallEditor {
 
     const flagUpdate = {};
     const updatedDocs = [];
+    const doorOnlyUpdates = [];
     let hasGeometryOrConfigEdit = false;
 
     for (const u of virtUpdates) {
@@ -838,11 +875,11 @@ export class VirtualWallEditor {
       const patchKeys = Object.keys(patch);
       const isDoorStateOnly = entry.isDoor && entry.dKey && patchKeys.length === 1 && patchKeys[0] === "ds";
 
-      // Fast-path: DoorControl click (left-click open/close or right-click lock/unlock)
+      // Fast-path: DoorControl click (left-click open/close, right-click lock/unlock, or GM "Close All Doors" bulk toggle)
       if (isDoorStateOnly) {
         const targetDs = Number(patch.ds);
         const playSound = operation?.sound !== false;
-        this.controller.requestDoorState(entry.dKey, targetDs, { playSound });
+        doorOnlyUpdates.push({ entry, targetDs, playSound });
         updatedDocs.push(entry.doc);
         continue;
       }
@@ -934,6 +971,49 @@ export class VirtualWallEditor {
         this._syncOpenWallSheet(entry, diff, { syncDoorControl: ("door" in diff) || ("ds" in diff) });
       }
       updatedDocs.push(entry.doc);
+    }
+
+    if (doorOnlyUpdates.length === 1 || (doorOnlyUpdates.length > 1 && !game.user?.isGM)) {
+      for (const d of doorOnlyUpdates) {
+        this.controller.requestDoorState(d.entry.dKey, d.targetDs, { playSound: d.playSound });
+      }
+    } else if (doorOnlyUpdates.length > 1 && game.user?.isGM) {
+      const doorFlagUpdate = {};
+      const pendingKeys = [];
+      for (const d of doorOnlyUpdates) {
+        const dKey = d.entry.dKey;
+        this.controller._applyDoorStateLocal(dKey, d.targetDs, {
+          playSound: d.playSound,
+          deferRefresh: true,
+          skipDeferRebake: true
+        });
+        doorFlagUpdate[`flags.${MODULE_ID}.doorStates.${dKey}`] = d.targetDs;
+        this.controller._pendingDoorCommits?.set?.(dKey, d.targetDs);
+        pendingKeys.push({ dKey, ds: d.targetDs });
+      }
+      this.controller.updateSimAndLightBubbles(false);
+      canvas.perception?.update({
+        initializeLighting: true,
+        refreshLightSources: true,
+        refreshLighting: true,
+        refreshVision: true
+      });
+      scene.update(doorFlagUpdate)
+        .catch((err) => {
+          console.warn(`${MODULE_ID} | Failed to persist batched door state:`, err);
+          for (const { dKey } of pendingKeys) {
+            const persisted = scene.flags?.[MODULE_ID]?.doorStates?.[dKey];
+            const fallback = Number.isFinite(persisted) ? persisted : 0;
+            this.controller._applyDoorStateLocal(dKey, fallback, { playSound: false, skipDeferRebake: true });
+          }
+        })
+        .finally(() => {
+          for (const { dKey, ds } of pendingKeys) {
+            if (this.controller._pendingDoorCommits?.get?.(dKey) === ds) {
+              this.controller._pendingDoorCommits.delete(dKey);
+            }
+          }
+        });
     }
 
     if (hasGeometryOrConfigEdit && Object.keys(flagUpdate).length) {

@@ -175,14 +175,39 @@ function littleEndianToCss(le) {
   return `rgb(${r},${g},${b})`;
 }
 
-function getFoundryRingAssetInfo(sizeUnits) {
+function getTokenDocBounds(doc, grid) {
+  const x = Number(doc?._source?.x ?? doc?.x ?? 0);
+  const y = Number(doc?._source?.y ?? doc?.y ?? 0);
+  const sz = typeof doc?.getSize === "function" ? doc.getSize() : null;
+  const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc?._source?.width ?? doc?.width ?? 1) || 1) * grid);
+  const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc?._source?.height ?? doc?.height ?? 1) || 1) * grid);
+  const cp = typeof doc?.getCenterPoint === "function" ? doc.getCenterPoint() : null;
+  const cx = (cp && Number.isFinite(cp.x)) ? cp.x : (x + w * 0.5);
+  const cy = (cp && Number.isFinite(cp.y)) ? cp.y : (y + h * 0.5);
+  return { x, y, w, h, cx, cy };
+}
+
+function getFoundryRingAssetInfo(sizeUnits, ringPack = "", liveRing = null) {
   try {
     const RingCls = globalThis.CONFIG?.Token?.ring?.ringClass;
     if (!RingCls?.getRingDataBySize) return null;
     const data = RingCls.getRingDataBySize(Math.max(1, sizeUnits || 1));
     if (!data?.ringName && !data?.bkgName) return null;
-    const ringTex = data.ringName ? globalThis.PIXI?.Assets?.cache?.get?.(data.ringName) : null;
-    const bkgTex = data.bkgName ? globalThis.PIXI?.Assets?.cache?.get?.(data.bkgName) : null;
+    const cache = globalThis.PIXI?.Assets?.cache;
+    const lookupPacked = (baseName, liveName) => {
+      if (liveName) {
+        const liveTex = cache?.get?.(liveName);
+        if (liveTex) return liveTex;
+      }
+      if (ringPack && baseName) {
+        const bare = baseName.includes(":") ? baseName.slice(baseName.indexOf(":") + 1) : baseName;
+        const packTex = cache?.get?.(`${ringPack}:${bare}`) || cache?.get?.(`${ringPack}:${baseName}`);
+        if (packTex) return packTex;
+      }
+      return baseName ? cache?.get?.(baseName) : null;
+    };
+    const ringTex = lookupPacked(data.ringName, liveRing?.ringName);
+    const bkgTex = lookupPacked(data.bkgName, liveRing?.bkgName);
     return {
       ringTex,
       bkgTex,
@@ -206,7 +231,10 @@ function getTokenRenderSpec(doc) {
   const wUnits = Number(srcObj.width ?? doc.width ?? 1) || 1;
   const hUnits = Number(srcObj.height ?? doc.height ?? 1) || 1;
   const sizeUnits = Math.min(wUnits, hUnits);
-  const ringInfo = ringEnabled ? getFoundryRingAssetInfo(sizeUnits) : null;
+  const ringPack = ringEnabled
+    ? String(srcObj.flags?.["multiple-rings"]?.ringAppearance ?? doc.flags?.["multiple-rings"]?.ringAppearance ?? "").trim()
+    : "";
+  const ringInfo = ringEnabled ? getFoundryRingAssetInfo(sizeUnits, ringPack, doc._object?.ring) : null;
   const subjectScaleAdj = ringInfo?.subjectScaleAdjustment || 1.5;
 
   const sx = Number(srcObj.texture?.scaleX ?? doc.texture?.scaleX ?? 1) || 1;
@@ -226,13 +254,14 @@ function getTokenRenderSpec(doc) {
   const bgColor = ringEnabled ? parseCssColor(srcObj.ring?.colors?.background, ringInfo?.defaultBkgCss || "") : "";
 
   const slotKey = ringEnabled
-    ? `R${hasDistinctSubject ? "P" : "C"}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
+    ? `R${hasDistinctSubject ? "P" : "C"}|${ringPack}|${sizeUnits}|${artSrc}|${ringColor}|${bgColor}|${subScale.toFixed(2)}`
     : `T|${artSrc}`;
 
   return {
     slotKey,
     artSrc,
     ringEnabled,
+    ringPack,
     hasDistinctSubject,
     sizeUnits,
     subjectScaleAdj,
@@ -712,8 +741,70 @@ export class TokenImpostorLayer {
       }
     } catch {}
 
-    // 2. Off-main-thread raster decode with high-quality resize
+    // 2. Animated video tokens (.webm / .mp4): capture first decoded frame without keeping a live <video> element around
     const lower = String(src).split("?")[0].toLowerCase();
+    const isVideo = Boolean(
+      globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(src) ||
+      /\.(webm|mp4|m4v|ogv|ogg|mov)$/.test(lower)
+    );
+    if (isVideo) {
+      try {
+        const loadTex = globalThis.foundry?.canvas?.loadTexture;
+        if (typeof loadTex === "function") {
+          const tex = await loadTex(src);
+          const vSrc = tex?.baseTexture?.resource?.source;
+          if (vSrc && (vSrc.videoWidth > 0 || vSrc.width > 0)) {
+            return { drawable: vSrc, shouldClose: false };
+          }
+        }
+      } catch {}
+      if (typeof document !== "undefined" && typeof document.createElement === "function") {
+        const video = document.createElement("video");
+        video.muted = true;
+        video.playsInline = true;
+        video.crossOrigin = "anonymous";
+        video.preload = "auto";
+        try {
+          await new Promise((resolve, reject) => {
+            let done = false;
+            const finish = (ok, err) => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              video.onloadeddata = null;
+              video.onerror = null;
+              if (ok) resolve();
+              else reject(err || new Error("video decode failed"));
+            };
+            const timer = setTimeout(() => finish(false, new Error("video timeout")), 4000);
+            video.onloadeddata = () => finish(true);
+            video.onerror = (e) => finish(false, e);
+            video.src = src;
+            try { video.load(); } catch {}
+          });
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            if (typeof createImageBitmap === "function") {
+              const bmp = await createImageBitmap(video);
+              return { drawable: bmp, shouldClose: true };
+            }
+            const c = document.createElement("canvas");
+            c.width = video.videoWidth;
+            c.height = video.videoHeight;
+            c.getContext("2d")?.drawImage(video, 0, 0);
+            return { drawable: c, shouldClose: false };
+          }
+        } finally {
+          try {
+            video.pause();
+            video.removeAttribute("src");
+            video.load();
+          } catch {}
+        }
+      }
+      return { drawable: null, shouldClose: false };
+    }
+
+    // 3. Off-main-thread raster decode with high-quality resize
     const isSvg = lower.endsWith(".svg");
     if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
       try {
@@ -726,7 +817,7 @@ export class TokenImpostorLayer {
       } catch {}
     }
 
-    // 3. Fallback via HTMLImageElement (handles SVG, special URLs, etc.)
+    // 4. Fallback via HTMLImageElement (handles SVG, special URLs, etc.)
     if (typeof Image !== "undefined") {
       const img = await new Promise((resolve, reject) => {
         const el = new Image();
@@ -815,7 +906,7 @@ export class TokenImpostorLayer {
       ctx.clearRect(cellX, cellY, CELL_PX, CELL_PX);
 
       if (slot.spec.ringEnabled) {
-        const ringInfo = getFoundryRingAssetInfo(slot.spec.sizeUnits);
+        const ringInfo = getFoundryRingAssetInfo(slot.spec.sizeUnits, slot.spec.ringPack || "");
         const cx = dstX + CONTENT_PX * 0.5;
         const cy = dstY + CONTENT_PX * 0.5;
         const subScale = slot.spec.subjectScale || 1;
@@ -986,13 +1077,7 @@ export class TokenImpostorLayer {
     }
 
     const grid = canvas.grid?.size || 100;
-    const x = Number(doc._source?.x ?? doc.x ?? 0);
-    const y = Number(doc._source?.y ?? doc.y ?? 0);
-    const sz = typeof doc.getSize === "function" ? doc.getSize() : null;
-    const w = (sz && Number.isFinite(sz.width)) ? sz.width : ((Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid);
-    const h = (sz && Number.isFinite(sz.height)) ? sz.height : ((Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid);
-    const cx = x + w * 0.5;
-    const cy = y + h * 0.5;
+    const { w, h, cx, cy } = getTokenDocBounds(doc, grid);
     const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0);
     const lockRot = Boolean(doc._source?.lockRotation ?? doc.lockRotation);
     const rotRad = lockRot ? 0 : ((Number(doc._source?.rotation ?? doc.rotation ?? 0) || 0) * Math.PI / 180);
@@ -1209,12 +1294,7 @@ export class TokenImpostorLayer {
     }
 
     const grid = canvas.grid?.size || 100;
-    const x = Number(doc._source?.x ?? doc.x ?? 0);
-    const y = Number(doc._source?.y ?? doc.y ?? 0);
-    const w = (Number(doc._source?.width ?? doc.width ?? 1) || 1) * grid;
-    const h = (Number(doc._source?.height ?? doc.height ?? 1) || 1) * grid;
-    const cx = x + w * 0.5;
-    const cy = y + h * 0.5;
+    const { w, h, cx, cy } = getTokenDocBounds(doc, grid);
     const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0);
 
     // Roof check: suppress impostor if sitting under a baked pyramid roof when native roofMesh isn't mounted

@@ -569,13 +569,15 @@ void main() {
   if (dist >= 1.0) discard;
 
   float depthMask = 1.0;
+  bool aboveBakedRoof = vDepthElev > 2.0;
+  float depthElev = aboveBakedRoof ? (vDepthElev - 10.0) : vDepthElev;
   if (uUseDepthTexture && vIsMacro < 0.5) {
     vec4 depthColor = texture2D(uDepthTexture, vSamplerUvs);
-    depthMask = step(depthColor.g - (0.5 / 255.0), vDepthElev)
-              * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
+    depthMask = step(depthColor.g - (0.5 / 255.0), depthElev)
+              * step(depthElev, (254.5 / 255.0) - depthColor.r);
     if (depthMask <= 0.001) discard;
   }
-  if (uUseBakedRoofMask && vIsMacro < 0.5) {
+  if (uUseBakedRoofMask && vIsMacro < 0.5 && !aboveBakedRoof) {
     vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
@@ -661,13 +663,15 @@ void main() {
   if (dist >= 1.0) discard;
 
   float depthMask = 1.0;
+  bool aboveBakedRoof = vDepthElev > 2.0;
+  float depthElev = aboveBakedRoof ? (vDepthElev - 10.0) : vDepthElev;
   if (uUseDepthTexture && vIsMacro < 0.5) {
     vec4 depthColor = texture2D(uDepthTexture, vSamplerUvs);
-    depthMask = step(depthColor.g - (0.5 / 255.0), vDepthElev)
-              * step(vDepthElev, (254.5 / 255.0) - depthColor.r);
+    depthMask = step(depthColor.g - (0.5 / 255.0), depthElev)
+              * step(depthElev, (254.5 / 255.0) - depthColor.r);
     if (depthMask <= 0.001) discard;
   }
-  if (uUseBakedRoofMask && vIsMacro < 0.5) {
+  if (uUseBakedRoofMask && vIsMacro < 0.5 && !aboveBakedRoof) {
     vec2 rawRoofUv = (vWorldPos - uBakedRoofOrigin) / max(uBakedRoofRegion, vec2(1.0));
     bool inRoofBounds = uBakedRoofRepeat || (rawRoofUv.x >= 0.0 && rawRoofUv.x <= 1.0 && rawRoofUv.y >= 0.0 && rawRoofUv.y <= 1.0);
     if (inRoofBounds) {
@@ -724,6 +728,7 @@ export class MegaLightBatch {
   bakedRoofOrigin = new Float32Array([0, 0]);
   bakedRoofRegion = new Float32Array([100000, 100000]);
   bakedRoofRepeat = false;
+  bakedRoofElevation = Infinity;
   useBakedRoofMask = false;
 
   depthElevArray = null;
@@ -1083,13 +1088,18 @@ export class MegaLightBatch {
       const levelId = level.id;
       const defaultLightElev = getLevelBaseElevation(level) + 6;
       const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
-      const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
-      const extraLevelSig = this._getLevelCacheSigFn ? String(this._getLevelCacheSigFn(levelId) ?? "") : "";
+      const rawExtraSig = this._getLevelCacheSigFn ? String(this._getLevelCacheSigFn(levelId) ?? "") : "";
+      // Strip transient openDoors (`|od:...`) from static polygon cache signature: open doors are handled via dynamicLights, never baked static walls!
+      const extraLevelSig = rawExtraSig.replace(/\|od:[^|]*/g, "");
+      const hasSigWallEdits = Boolean(extraLevelSig && /(?:^|\|)we:(?!0(?:\||$))/.test(extraLevelSig));
+      const hasEditsOnLevel = Boolean(this._hasLevelEditsFn?.(levelId)) || hasSigWallEdits || nativeEdges.length > 0;
       const wallGeomHash = spec._superGridBase ? "sg" : hashLevelWallGeometry(sectors);
       const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}|wg:${wallGeomHash}`;
 
-      // Fast instanced light baking for unmodified superGrid worlds (e.g. 6000x6000 = 6x6 provinces -> 22,860 shadowed lights in ~120ms)
-      if (spec._superGridBase && spec.superGrid && !hasEditsOnLevel) {
+      // Fast instanced light baking for unmodified superGrid worlds (only when regionPx divides evenly by baseSimSectorPx)
+      const sgBaseSectorPx = spec._superGridBase ? (spec._superGridBase.simSectorPx || Math.ceil((spec.superGrid?.regionPx || 100000) / (spec._superGridBase.simGrid || 40))) : 1;
+      const sgExactDiv = Boolean(spec._superGridBase && spec.superGrid && ((spec.superGrid.regionPx || 100000) % sgBaseSectorPx) === 0);
+      if (sgExactDiv && !hasEditsOnLevel) {
         const sg = spec.superGrid;
         const baseSpec = spec._superGridBase;
         const baseSectors = baseSpec.sectors || {};
@@ -1346,13 +1356,11 @@ export class MegaLightBatch {
 
       // Pre-build static light-blocking Edge arrays per sector for this level
       const bp = spec.bakedPolys;
-      const hasOpenDoors = Boolean(extraLevelSig && extraLevelSig.includes("|od:") && !extraLevelSig.endsWith("|od:"));
       const canUseSpecBakedPolys = Boolean(
         bp && typeof bp === "object" && bp.polys && typeof bp.polys === "object" &&
         bp.wg === wallGeomHash &&
         (!bp.pxPerFt || Math.abs(bp.pxPerFt - pxPerFt) < 0.01) &&
-        !hasEditsOnLevel &&
-        !hasOpenDoors
+        !hasEditsOnLevel
       );
 
       let sectorEdges = null;
@@ -1444,7 +1452,19 @@ export class MegaLightBatch {
             const pre = bp.polys[`${sk}_${li}`];
             if (Array.isArray(pre) && pre.length >= 6) {
               offsets = Float32Array.from(pre);
-              hasNearbyWall = useWalls;
+              if (useWalls && angle < 360 && ROTATE_ANIM_TYPES.has(anim)) {
+                const edges = ensureLocalEdges();
+                for (let ei = 0; ei < edges.length; ei++) {
+                  const e = edges[ei];
+                  if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
+                      Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
+                    hasNearbyWall = true;
+                    break;
+                  }
+                }
+              } else {
+                hasNearbyWall = useWalls;
+              }
             }
             this._polyCache.set(lightId, { sig: polySig, offsets, hasNearbyWall });
             this.lastPolyCacheHits++;
@@ -1675,19 +1695,19 @@ export class MegaLightBatch {
     const sectors = spec.sectors;
     const defaultLightElev = getLevelBaseElevation(level) + 6;
     const nativeEdges = this._collectNativeWallEdges(levelId, EdgeCls);
-    const hasEditsOnLevel = Boolean(hasLevelEditsFn?.(levelId)) || nativeEdges.length > 0;
-    const extraLevelSig = getLevelCacheSigFn ? String(getLevelCacheSigFn(levelId) ?? "") : "";
+    const rawExtraSig = getLevelCacheSigFn ? String(getLevelCacheSigFn(levelId) ?? "") : "";
+    const extraLevelSig = rawExtraSig.replace(/\|od:[^|]*/g, "");
+    const hasSigWallEdits = Boolean(extraLevelSig && /(?:^|\|)we:(?!0(?:\||$))/.test(extraLevelSig));
+    const hasEditsOnLevel = Boolean(hasLevelEditsFn?.(levelId)) || hasSigWallEdits || nativeEdges.length > 0;
     const wallGeomHash = hashLevelWallGeometry(sectors);
     const levelCacheSig = `${levelId}|e:${hasEditsOnLevel ? 1 : 0}|${extraLevelSig}|nw:${this._buildNativeEdgesSig(nativeEdges)}|wg:${wallGeomHash}`;
 
     const bp = spec.bakedPolys;
-    const hasOpenDoors = Boolean(extraLevelSig && extraLevelSig.includes("|od:") && !extraLevelSig.endsWith("|od:"));
     const canUseSpecBakedPolys = Boolean(
       bp && typeof bp === "object" && bp.polys && typeof bp.polys === "object" &&
       bp.wg === wallGeomHash &&
       (!bp.pxPerFt || Math.abs(bp.pxPerFt - pxPerFt) < 0.01) &&
-      !hasEditsOnLevel &&
-      !hasOpenDoors
+      !hasEditsOnLevel
     );
 
     let sectorEdges = null;
@@ -1784,42 +1804,45 @@ export class MegaLightBatch {
     return { computed, skipped, aborted: false };
   }
 
+  _encodeDepthElev(meta, baseDepth = 1.0) {
+    const aboveRoof = Number.isFinite(this.bakedRoofElevation) && (meta.elevation >= this.bakedRoofElevation);
+    return aboveRoof ? (baseDepth + 10.0) : baseDepth;
+  }
+
   /**
-   * Re-map per-light elevations into Foundry v14's depthTexture [0..1] space.
-   * Only enables depthTexture sampling when multiple elevations/restrictsLight floors actually exist!
+   * Re-map per-light elevations into Foundry v14's depthTexture [0..1] space
+   * (encoding `aboveBakedRoof` as +10.0 so rooftop & upper-level lights are never cut by a lower level's bakedRoofMask).
    */
   syncDepthElevations(useDepth) {
     this.useDepthTexture = Boolean(useDepth);
     const hasMonolithic = Boolean(this.depthElevArray && this.depthElevBuffer);
     const hasChunks = this.chunkBatches.size > 0;
     if (!hasMonolithic && !hasChunks) return;
-    if (!this.useDepthTexture) {
-      this._depthElevCheckMap.clear();
-      return;
-    }
 
-    const depthMask = canvas.masks?.depth;
-    if (!depthMask) return;
-    // Ensure Foundry's primary children are sorted and depth mask elevation table is up to date before mapping
-    if (canvas.primary?.sortDirty) canvas.primary.sortChildren();
-    depthMask._elevationDirty = true;
-    depthMask._update?.();
+    const depthMask = this.useDepthTexture ? canvas.masks?.depth : null;
+    if (depthMask) {
+      // Ensure Foundry's primary children are sorted and depth mask elevation table is up to date before mapping
+      if (canvas.primary?.sortDirty) canvas.primary.sortChildren();
+      depthMask._elevationDirty = true;
+      depthMask._update?.();
+    }
 
     this._depthElevCheckMap.clear();
     let monoChanged = false;
     const dirtyChunkBatches = new Set();
     for (const meta of this.lightMetaById.values()) {
-      const mapped = depthMask.mapElevation(meta.elevation);
-      this._depthElevCheckMap.set(meta.elevation, mapped);
+      const baseMapped = depthMask ? depthMask.mapElevation(meta.elevation) : 1.0;
+      if (depthMask) this._depthElevCheckMap.set(meta.elevation, baseMapped);
+      const encoded = this._encodeDepthElev(meta, baseMapped);
       if (meta.batch) {
         const arr = meta.batch.depthElevArray;
-        if (arr && Math.abs(arr[meta.vStart] - mapped) > 0.0001) {
-          arr.fill(mapped, meta.vStart, meta.vStart + meta.vCount);
+        if (arr && Math.abs(arr[meta.vStart] - encoded) > 0.0001) {
+          arr.fill(encoded, meta.vStart, meta.vStart + meta.vCount);
           dirtyChunkBatches.add(meta.batch);
         }
       } else if (hasMonolithic) {
-        if (Math.abs(this.depthElevArray[meta.vStart] - mapped) > 0.0001) {
-          this.depthElevArray.fill(mapped, meta.vStart, meta.vStart + meta.vCount);
+        if (Math.abs(this.depthElevArray[meta.vStart] - encoded) > 0.0001) {
+          this.depthElevArray.fill(encoded, meta.vStart, meta.vStart + meta.vCount);
           monoChanged = true;
         }
       }
@@ -2261,10 +2284,12 @@ export class MegaLightBatch {
           otherBatchesStale = true;
         }
         this._depthElevCheckMap.set(meta.elevation, mapped);
-        depthElevs.fill(mapped, meta.vStart, meta.vStart + meta.vCount);
+        depthElevs.fill(this._encodeDepthElev(meta, mapped), meta.vStart, meta.vStart + meta.vCount);
       }
     } else {
-      depthElevs.fill(1.0);
+      for (const meta of job.metas) {
+        depthElevs.fill(this._encodeDepthElev(meta, 1.0), meta.vStart, meta.vStart + meta.vCount);
+      }
     }
     const IdxArr = job.vertCursor > 65535 ? Uint32Array : Uint16Array;
     const allIndices = new IdxArr(job.indicesArr);
@@ -2640,7 +2665,7 @@ export class MegaLightBatch {
     this._applyMetaEffectiveWeight(meta);
   }
 
-  setBakedRoofMask(rt, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false } = {}) {
+  setBakedRoofMask(rt, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity } = {}) {
     if (this.bakedRoofMask && this.bakedRoofMask !== rt && !this.bakedRoofMask.destroyed) {
       this.bakedRoofMask.destroy(true);
     }
@@ -2650,6 +2675,8 @@ export class MegaLightBatch {
     this.bakedRoofRegion[0] = Math.max(1, regionW);
     this.bakedRoofRegion[1] = Math.max(1, regionH);
     this.bakedRoofRepeat = Boolean(repeat);
+    this.bakedRoofElevation = Number.isFinite(roofElevation) ? roofElevation : Infinity;
+    this.syncDepthElevations(this.useDepthTexture);
   }
 
   setUseBakedRoofMask(enabled) {
@@ -2658,6 +2685,7 @@ export class MegaLightBatch {
 
   disposeBakedRoofMask() {
     this.useBakedRoofMask = false;
+    this.bakedRoofElevation = Infinity;
     if (this.bakedRoofMask && !this.bakedRoofMask.destroyed) {
       this.bakedRoofMask.destroy(true);
     }
@@ -2825,8 +2853,14 @@ export class MegaLightBatch {
       this._destroyGeometry(this.geometry);
       this.geometry = null;
     }
-    this.illumShader = null;
-    this.colorShader = null;
+    if (this.illumShader) {
+      try { this.illumShader.destroy?.(); } catch {}
+      this.illumShader = null;
+    }
+    if (this.colorShader) {
+      try { this.colorShader.destroy?.(); } catch {}
+      this.colorShader = null;
+    }
     this.weightArray = null;
     this.weightBuffer = null;
     this.weightsDirty = false;

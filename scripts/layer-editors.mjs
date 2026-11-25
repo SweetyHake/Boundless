@@ -225,6 +225,11 @@ export class VirtualLayerEditors {
     const origLightGet = lighting?.get;
     const origSoundGet = sounds?.get;
     const origTileGet = tiles?.get;
+    const hadOwnUpdate = Object.prototype.hasOwnProperty.call(scene, "updateEmbeddedDocuments");
+    const hadOwnDelete = Object.prototype.hasOwnProperty.call(scene, "deleteEmbeddedDocuments");
+    const hadOwnLightGet = Boolean(lighting && Object.prototype.hasOwnProperty.call(lighting, "get"));
+    const hadOwnSoundGet = Boolean(sounds && Object.prototype.hasOwnProperty.call(sounds, "get"));
+    const hadOwnTileGet = Boolean(tiles && Object.prototype.hasOwnProperty.call(tiles, "get"));
     const state = { active: true };
 
     const wrappedLightGet = (lighting && origLightGet)
@@ -314,6 +319,7 @@ export class VirtualLayerEditors {
       scene, lighting, sounds, tiles,
       origUpdateEmbedded, origDeleteEmbedded,
       origLightGet, origSoundGet, origTileGet,
+      hadOwnUpdate, hadOwnDelete, hadOwnLightGet, hadOwnSoundGet, hadOwnTileGet,
       wrappedUpdateEmbedded, wrappedDeleteEmbedded,
       wrappedLightGet, wrappedSoundGet, wrappedTileGet
     };
@@ -325,16 +331,32 @@ export class VirtualLayerEditors {
       state, scene, lighting, sounds, tiles,
       origUpdateEmbedded, origDeleteEmbedded,
       origLightGet, origSoundGet, origTileGet,
+      hadOwnUpdate, hadOwnDelete, hadOwnLightGet, hadOwnSoundGet, hadOwnTileGet,
       wrappedUpdateEmbedded, wrappedDeleteEmbedded,
       wrappedLightGet, wrappedSoundGet, wrappedTileGet
     } = this._patches;
     state.active = false;
     try {
-      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) scene.updateEmbeddedDocuments = origUpdateEmbedded;
-      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
-      if (lighting && wrappedLightGet && lighting.get === wrappedLightGet) lighting.get = origLightGet;
-      if (sounds && wrappedSoundGet && sounds.get === wrappedSoundGet) sounds.get = origSoundGet;
-      if (tiles && wrappedTileGet && tiles.get === wrappedTileGet) tiles.get = origTileGet;
+      if (scene.updateEmbeddedDocuments === wrappedUpdateEmbedded) {
+        if (hadOwnUpdate) scene.updateEmbeddedDocuments = origUpdateEmbedded;
+        else delete scene.updateEmbeddedDocuments;
+      }
+      if (scene.deleteEmbeddedDocuments === wrappedDeleteEmbedded) {
+        if (hadOwnDelete) scene.deleteEmbeddedDocuments = origDeleteEmbedded;
+        else delete scene.deleteEmbeddedDocuments;
+      }
+      if (lighting && wrappedLightGet && lighting.get === wrappedLightGet) {
+        if (hadOwnLightGet) lighting.get = origLightGet;
+        else delete lighting.get;
+      }
+      if (sounds && wrappedSoundGet && sounds.get === wrappedSoundGet) {
+        if (hadOwnSoundGet) sounds.get = origSoundGet;
+        else delete sounds.get;
+      }
+      if (tiles && wrappedTileGet && tiles.get === wrappedTileGet) {
+        if (hadOwnTileGet) tiles.get = origTileGet;
+        else delete tiles.get;
+      }
     } catch {}
     this._patches = null;
   }
@@ -356,6 +378,17 @@ export class VirtualLayerEditors {
     if (!obj) return;
     try {
       if (obj.controlled) obj.release({ broadcast: false });
+      if (layer?.clipboard?.cut && layer.clipboard.objects?.length) {
+        layer.clipboard.objects = layer.clipboard.objects.filter(o => o !== obj);
+      }
+      if (obj._preview && !obj._preview.destroyed) {
+        try {
+          if (layer === canvas?.tiles) this._cleanupLeakedTileMesh(obj._preview);
+          obj._preview.parent?.removeChild(obj._preview);
+          obj._preview.destroy({ children: true });
+        } catch {}
+        obj._preview = null;
+      }
       layer?.quadtree?.remove(obj);
       obj.parent?.removeChild(obj);
       if (!obj.destroyed) obj.destroy({ children: true });
@@ -398,28 +431,34 @@ export class VirtualLayerEditors {
 
     const id = makeVirtualId("ml", item.levelId, item.lKey);
     const DocCls = CONFIG.AmbientLight.documentClass;
-    const doc = new DocCls({
-      _id: id,
-      x: item.x,
-      y: item.y,
-      elevation: item.elevation,
-      rotation: item.rotation || 0,
-      hidden: Boolean(item.hidden),
-      walls: item.walls !== false,
-      levels: [item.levelId],
-      config: {
-        dim: item.dim,
-        bright: item.bright,
-        angle: item.angle ?? 360,
-        color: item.color || null,
-        alpha: item.alpha ?? 0.5,
-        attenuation: item.attenuation ?? 0.5,
-        luminosity: item.luminosity ?? 0.5,
-        ...(Number.isFinite(item.coloration) ? { coloration: item.coloration } : {}),
-        darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
-        animation: { type: item.anim || null, speed: item.speed ?? 3, intensity: item.intensity ?? 3 }
-      }
-    }, { parent: canvas.scene });
+    let doc;
+    try {
+      doc = new DocCls({
+        _id: id,
+        x: item.x,
+        y: item.y,
+        elevation: item.elevation,
+        rotation: item.rotation || 0,
+        hidden: Boolean(item.hidden),
+        walls: item.walls !== false,
+        levels: [item.levelId],
+        config: {
+          dim: item.dim,
+          bright: item.bright,
+          angle: item.angle ?? 360,
+          color: item.color || null,
+          alpha: item.alpha ?? 0.5,
+          attenuation: item.attenuation ?? 0.5,
+          luminosity: item.luminosity ?? 0.5,
+          ...(Number.isFinite(item.coloration) ? { coloration: item.coloration } : {}),
+          darkness: { min: item.darkMin ?? 0, max: item.darkMax ?? 1 },
+          animation: { type: item.anim || null, speed: item.speed ?? 3, intensity: item.intensity ?? 3 }
+        }
+      }, { parent: canvas.scene });
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to construct virtual AmbientLightDocument ${item.lKey}:`, err);
+      return;
+    }
 
     doc._mmVirtualLight = item;
     attachVirtualCollectionProxy(doc, id, canvas.scene.lights);
@@ -752,20 +791,26 @@ export class VirtualLayerEditors {
 
     const id = makeVirtualId("ms", item.levelId, item.sKey);
     const DocCls = CONFIG.AmbientSound.documentClass;
-    const doc = new DocCls({
-      _id: id,
-      x: item.x,
-      y: item.y,
-      elevation: item.elevation,
-      radius: item.radius,
-      path: item.path,
-      volume: item.volume,
-      walls: item.walls,
-      easing: item.easing,
-      hidden: Boolean(item.hidden),
-      darkness: { min: item.darkMin, max: item.darkMax },
-      levels: [item.levelId]
-    }, { parent: canvas.scene });
+    let doc;
+    try {
+      doc = new DocCls({
+        _id: id,
+        x: item.x,
+        y: item.y,
+        elevation: item.elevation,
+        radius: item.radius,
+        path: item.path,
+        volume: item.volume,
+        walls: item.walls,
+        easing: item.easing,
+        hidden: Boolean(item.hidden),
+        darkness: { min: item.darkMin, max: item.darkMax },
+        levels: [item.levelId]
+      }, { parent: canvas.scene });
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to construct virtual AmbientSoundDocument ${item.sKey}:`, err);
+      return;
+    }
 
     doc._mmVirtualSound = item;
     attachVirtualCollectionProxy(doc, id, canvas.scene.sounds);
@@ -1110,37 +1155,43 @@ export class VirtualLayerEditors {
     const ay = item.anchorY ?? 0.5;
     const docX = item.anchorX === undefined ? (item.x + item.w * 0.5) : item.x;
     const docY = item.anchorY === undefined ? (item.y + item.h * 0.5) : item.y;
-    const doc = new DocCls({
-      _id: id,
-      x: docX,
-      y: docY,
-      width: item.w,
-      height: item.h,
-      rotation: item.rot || 0,
-      elevation: item.elevation,
-      sort: item.sort || 0,
-      alpha: item.alpha ?? 1,
-      hidden: Boolean(item.hidden),
-      levels: [item.levelId],
-      texture: {
-        src: item.src,
-        tint: item.tint || "#ffffff",
-        alphaThreshold: item.alphaThreshold ?? 0.75,
-        anchorX: ax,
-        anchorY: ay,
-        scaleX: item.scaleX ?? 1,
-        scaleY: item.scaleY ?? 1,
-        fit: item.fit ?? "fill"
-      },
-      occlusion: {
-        modes: occModes,
-        alpha: item.occludedAlpha ?? 0.2
-      },
-      restrictions: {
-        light: Boolean(item.restrictsLight),
-        weather: Boolean(item.restrictsWeather)
-      }
-    }, { parent: canvas.scene });
+    let doc;
+    try {
+      doc = new DocCls({
+        _id: id,
+        x: docX,
+        y: docY,
+        width: item.w,
+        height: item.h,
+        rotation: item.rot || 0,
+        elevation: item.elevation,
+        sort: item.sort || 0,
+        alpha: item.alpha ?? 1,
+        hidden: Boolean(item.hidden),
+        levels: [item.levelId],
+        texture: {
+          src: item.src,
+          tint: item.tint || "#ffffff",
+          alphaThreshold: item.alphaThreshold ?? 0.75,
+          anchorX: ax,
+          anchorY: ay,
+          scaleX: item.scaleX ?? 1,
+          scaleY: item.scaleY ?? 1,
+          fit: item.fit ?? "fill"
+        },
+        occlusion: {
+          modes: occModes,
+          alpha: item.occludedAlpha ?? 0.2
+        },
+        restrictions: {
+          light: Boolean(item.restrictsLight),
+          weather: Boolean(item.restrictsWeather)
+        }
+      }, { parent: canvas.scene });
+    } catch (err) {
+      console.warn(`${MODULE_ID} | Failed to construct virtual TileDocument ${item.tKey}:`, err);
+      return;
+    }
 
     doc._mmVirtualTile = item;
     attachVirtualCollectionProxy(doc, id, canvas.scene.tiles);

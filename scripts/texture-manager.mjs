@@ -115,9 +115,7 @@ export class LRUTextureManager {
     this.workerPool.stats.fallbackDecoded++;
     return foundry.canvas.loadTexture(src).then(tex => {
       if (gen !== this._gen) {
-        if (tex && !this.lru.has(src) && !this.pinned.has(src)) {
-          PIXI?.Assets?.unload?.(src)?.catch?.(() => {});
-        }
+        // Never unload Foundry-managed PIXI.Assets textures that native Tiles/Tokens/Lights may still share
         return null;
       }
       if (tex?.baseTexture) {
@@ -239,9 +237,8 @@ export class LRUTextureManager {
       this.workerOwned.delete(src);
       try { owned.tex?.destroy?.(true); } catch {}
       try { owned.bitmap?.close?.(); } catch {}
-    } else {
-      PIXI.Assets.unload(src).catch(() => {});
     }
+    // Non-workerOwned fallback textures belong to Foundry's global PIXI.Assets cache and may be shared with native placeables
   }
 
   needsPrune() {

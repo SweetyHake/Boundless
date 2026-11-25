@@ -120,9 +120,16 @@ test("computeLevelBakedPolys eliminates CSP raycasts on cold build and invalidat
   assert.equal(lb.lastPolyCacheBakedHits, 1);
   assert.equal(lb.lastPolyCacheMisses, 0);
 
-  // Open door invalidates bakedPolys and recomputes live CSP!
+  // Open doors are handled via dynamicLights and must NOT invalidate static bakedPolys
   lb.clearPolyCache();
   lb.build([layer], 20, null, null, { getLevelCacheSigFn: () => "we:0|od:0_0_0" });
+  assert.equal(MockCSP.computeCount, 1);
+  assert.equal(lb.lastPolyCacheBakedHits, 1);
+  assert.equal(lb.lastPolyCacheMisses, 0);
+
+  // Wall edits DO invalidate bakedPolys and recompute live CSP
+  lb.clearPolyCache();
+  lb.build([layer], 20, null, null, { getLevelCacheSigFn: () => "we:1|od:" });
   assert.equal(MockCSP.computeCount, 2);
   assert.equal(lb.lastPolyCacheBakedHits, 0);
   assert.equal(lb.lastPolyCacheMisses, 1);

@@ -1,4 +1,4 @@
-import { MODULE_ID, getEffectiveScale } from "./utils.mjs";
+import { MODULE_ID, getEffectiveScale, resolveFoundryRoute } from "./utils.mjs";
 
 const CHUNK_STREAM_MIN_SCALE = 0.022; // Below ~0.022x (true continental orbit), macro pyramid + soft Gaussian macroLights handle rendering with 0 chunk fetches
 const CHUNK_VP_PAD_PX = 14000;        // Prefetch neighboring chunks 140 cells outside screen edge
@@ -245,8 +245,10 @@ export class ChunkStreamer {
 
   _fetchChunk(st, ck) {
     const gen = this._gen;
-    const url = `${st.cfg.baseUrl}/${ck}.json`;
+    const url = resolveFoundryRoute(`${st.cfg.baseUrl}/${ck}.json`);
     const abort = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const req = { promise: null, abort };
+    st.pending.set(ck, req);
     const p = fetch(url, abort ? { signal: abort.signal } : undefined)
       .then(r => {
         if (!r.ok) {
@@ -257,21 +259,27 @@ export class ChunkStreamer {
         return r.json();
       })
       .then(data => {
-        st.pending.delete(ck);
-        st.prewarmKeys?.delete?.(ck);
+        const isCurrent = st.pending.get(ck) === req;
+        if (isCurrent) {
+          st.pending.delete(ck);
+          st.prewarmKeys?.delete?.(ck);
+        }
         st.failed?.delete?.(ck);
-        if (gen !== this._gen || !this.states.has(st.layer.level.id)) return;
+        if (!isCurrent || gen !== this._gen || !this.states.has(st.layer.level.id)) return;
         this._mountChunkData(st, ck, data);
       })
       .catch(err => {
-        st.pending.delete(ck);
-        st.prewarmKeys?.delete?.(ck);
-        if (err?.name === "AbortError" || gen !== this._gen) return;
+        const isCurrent = st.pending.get(ck) === req;
+        if (isCurrent) {
+          st.pending.delete(ck);
+          st.prewarmKeys?.delete?.(ck);
+        }
+        if (err?.name === "AbortError" || gen !== this._gen || !isCurrent) return;
         const perm = err?.status === 404 || err?.status === 410;
         st.failed?.set?.(ck, perm ? Infinity : (performance.now() + 15000));
         console.warn(`${MODULE_ID} | Failed to load chunk ${url}:`, err);
       });
-    st.pending.set(ck, { promise: p, abort });
+    req.promise = p;
     return p;
   }
 

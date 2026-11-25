@@ -18,6 +18,18 @@ export function isTextureUsable(tex) {
   return Boolean(tex && !tex.destroyed && tex.baseTexture && !tex.baseTexture.destroyed);
 }
 
+export function resolveFoundryRoute(src) {
+  if (!src || typeof src !== "string") return src;
+  if (/^(?:https?:|data:|blob:|file:|\/\/)/i.test(src)) return src;
+  const getRoute = globalThis.foundry?.utils?.getRoute;
+  if (typeof getRoute === "function") {
+    try {
+      return getRoute(src);
+    } catch {}
+  }
+  return src;
+}
+
 /**
  * In Foundry v14, unset `level.elevation.bottom` resolves to `-Infinity` and `top` to `Infinity` (ExtendedNumberField).
  * Always fall back to finite `base` -> finite `bottom` -> `0` when a finite default elevation is required.
@@ -148,11 +160,17 @@ export function attachVirtualCollectionProxy(doc, id, realColl) {
 }
 
 export function getVirtualTileBounds(tSpec) {
-  const ax = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
-  const ay = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
-  const pivX = tSpec.anchorX === undefined ? (tSpec.x + tSpec.w * 0.5) : tSpec.x;
-  const pivY = tSpec.anchorY === undefined ? (tSpec.y + tSpec.h * 0.5) : tSpec.y;
-  const halfDiag = Math.hypot(tSpec.w || 0, tSpec.h || 0) * Math.max(ax, 1 - ax, ay, 1 - ay);
+  const sx = Number.isFinite(tSpec.scaleX) && tSpec.scaleX !== 0 ? tSpec.scaleX : 1;
+  const sy = Number.isFinite(tSpec.scaleY) && tSpec.scaleY !== 0 ? tSpec.scaleY : 1;
+  const rawAx = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+  const rawAy = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+  const ax = sx < 0 ? (1 - rawAx) : rawAx;
+  const ay = sy < 0 ? (1 - rawAy) : rawAy;
+  const effW = Math.abs(tSpec.w || 0) * Math.abs(sx);
+  const effH = Math.abs(tSpec.h || 0) * Math.abs(sy);
+  const pivX = tSpec.anchorX === undefined ? (tSpec.x + (tSpec.w || 0) * 0.5) : tSpec.x;
+  const pivY = tSpec.anchorY === undefined ? (tSpec.y + (tSpec.h || 0) * 0.5) : tSpec.y;
+  const halfDiag = Math.hypot(effW, effH) * Math.max(ax, 1 - ax, ay, 1 - ay);
   return { pivX, pivY, halfDiag };
 }
 

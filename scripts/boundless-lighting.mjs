@@ -8,6 +8,19 @@ import {
 export const SOCKET_NAME = `module.${MODULE_ID}`;
 export const MAX_LOS_RADIUS_PX = 4500; // 45 cells (225 ft) horizon prevents 100kpx full-world raycasts
 
+/**
+ * In Foundry v14, BaseEffectSource/PointLightSource has no `.destroyed` property:
+ * destruction sets `#attached = false` and destroys layer meshes. Support both live v14 and mock `.destroyed`.
+ */
+function isLightSourceDead(ls) {
+  if (!ls || ls.destroyed) return true;
+  if (ls.attached === false) return true;
+  const il = ls.layers?.illumination?.mesh;
+  const co = ls.layers?.coloration?.mesh;
+  if (il?.destroyed || co?.destroyed) return true;
+  return false;
+}
+
 export const lightingMethods = {
   _getLightBatchBuildOpts() {
     return {
@@ -466,7 +479,7 @@ export const lightingMethods = {
             const canSmoothRetire = Boolean(
               !force &&
               !this._mounting &&
-              ls && !ls.destroyed &&
+              !isLightSourceDead(ls) &&
               ls._boundlessVpAnimOnly &&
               this.lightBatch.lightMetaById.has(lid) &&
               ls.layers?.coloration?.mesh?.shader?.uniforms
@@ -494,7 +507,7 @@ export const lightingMethods = {
 
         for (const lid of neededDynLights) {
           const existingLs = this.dynamicLights.get(lid);
-          if (existingLs && !existingLs.destroyed) {
+          if (existingLs && !isLightSourceDead(existingLs)) {
             const ls = existingLs;
             const isVpOnly = vpAnimOnlyIds.has(lid);
             ls._boundlessVpAnimOnly = isVpOnly;
@@ -620,7 +633,7 @@ export const lightingMethods = {
 
     for (const [lid, f] of Array.from(this._lightFades.entries())) {
       const ls = f.ls;
-      if (!ls || ls.destroyed || this.dynamicLights.get(lid) !== ls) {
+      if (isLightSourceDead(ls) || this.dynamicLights.get(lid) !== ls) {
         this._lightFades.delete(lid);
         if (this.dynamicLights.get(lid) === ls) {
           this.dynamicLights.delete(lid);
@@ -718,7 +731,10 @@ export const lightingMethods = {
       this.chunkStreamer.requeueAllLoadedChunks();
       this._syncIndoorLightVisibility();
       this.lightBatch.syncDarknessLevel(canvas.environment?.darknessLevel ?? 0);
-      this.updateSimAndLightBubbles(true);
+      // On chunked worlds wait for async chunk bakes (`onChunkBaked`) instead of wiping dynamicLights against empty lightMetaById
+      if (!(this.chunkStreamer.states.size > 0 && this.lightBatch.totalLights === 0)) {
+        this.updateSimAndLightBubbles(true);
+      }
       this.lightBatch.attachTo(canvas.effects);
       this.lightBatch.updateViewport(this.getViewportWorldRect(0.28));
       this._depthElevSyncNeeded = true;
@@ -832,7 +848,7 @@ export const lightingMethods = {
     }
   },
 
-  _applyDoorStateLocal(info, targetDs, { playSound = true, deferRefresh = false } = {}) {
+  _applyDoorStateLocal(info, targetDs, { playSound = true, deferRefresh = false, skipDeferRebake = false } = {}) {
     const { dKey, eid, levelId, sx, sy, ptA, ptB, defaultDs } = info;
     const ds = this._normalizeDoorState(targetDs, defaultDs);
     const curDs = this.getCurrentDoorState(dKey, defaultDs);
@@ -872,7 +888,7 @@ export const lightingMethods = {
     }
 
     const mountedWall = this.wallEditor?.mountedByDoorKey?.get(dKey)?.wall;
-    const deferRebakeMs = (!differsFromBaked && isOpen !== wasOpen
+    const deferRebakeMs = (!skipDeferRebake && !differsFromBaked && isOpen !== wasOpen
       && mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
       && globalThis.showstopper?.doorLighting?.isEnabled?.())
       ? (Number(mountedWall.document?.animation?.duration) || 750)
@@ -911,12 +927,39 @@ export const lightingMethods = {
         }
         this.openDoors.delete(dKey);
         this.updateSimAndLightBubbles(false);
+        let needDarknessRebuild = false;
+        const reinitSeen = new Set();
         for (const [, ls] of this.dynamicLights) {
-          if (ls.data?.level !== levelId) continue;
+          if (isLightSourceDead(ls) || ls.data?.level !== levelId) continue;
+          const r = (ls.radius || ls.data?.dim || 600) + 150;
+          if (Math.hypot(ls.x - dx, ls.y - dy) <= r) {
+            ls.initialize();
+            reinitSeen.add(ls);
+          }
+        }
+        for (const ls of canvas.effects?.lightSources ?? []) {
+          if (!ls?.active || reinitSeen.has(ls) || ls.data?.walls === false) continue;
+          const lsLvl = ls.level?.id ?? ls.data?.level;
+          if (lsLvl && lsLvl !== levelId) continue;
           const r = (ls.radius || ls.data?.dim || 600) + 150;
           if (Math.hypot(ls.x - dx, ls.y - dy) <= r) ls.initialize();
         }
-        canvas.perception?.update({ refreshLightSources: true, refreshLighting: true, refreshVision: true });
+        for (const dsSrc of canvas.effects?.darknessSources ?? []) {
+          if (!dsSrc?.active || dsSrc.data?.walls === false) continue;
+          const dsLvl = dsSrc.level?.id ?? dsSrc.data?.level;
+          if (dsLvl && dsLvl !== levelId) continue;
+          const r = (dsSrc.radius || 600) + 150;
+          if (Math.hypot(dsSrc.x - dx, dsSrc.y - dy) <= r) {
+            needDarknessRebuild = true;
+            break;
+          }
+        }
+        canvas.perception?.update({
+          initializeLighting: needDarknessRebuild,
+          refreshLightSources: true,
+          refreshLighting: true,
+          refreshVision: true
+        });
       };
       this.closingDoorTimers.set(dKey, setTimeout(runCloseRebake, deferRebakeMs + 60));
     }
@@ -1005,10 +1048,24 @@ export const lightingMethods = {
     }
 
     if (game.user.isGM) {
+      this._pendingDoorCommits ??= new Map();
+      const seq = (this._pendingDoorCommits.get(dKey) || 0) + 1;
+      this._pendingDoorCommits.set(dKey, seq);
       this._applyDoorStateLocal(info, ds, { playSound });
-      canvas.scene?.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: ds }).catch(err => {
-        console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
-      });
+      canvas.scene?.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: ds })
+        .catch(err => {
+          console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
+          if (this._pendingDoorCommits?.get(dKey) === seq && this.active) {
+            const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
+            const revertDs = persisted !== undefined ? persisted : info.defaultDs;
+            this._applyDoorStateLocal(info, revertDs, { playSound: false, skipDeferRebake: true });
+          }
+        })
+        .finally(() => {
+          if (this._pendingDoorCommits?.get(dKey) === seq) {
+            this._pendingDoorCommits.delete(dKey);
+          }
+        });
     } else {
       game.socket?.emit(SOCKET_NAME, {
         type: "doorRequest",
@@ -1100,7 +1157,7 @@ export const lightingMethods = {
     layer.lastTileKey = "";
     this.lastSimKey = null;
     this.lastDynLightKey = null;
-    this.audioStreamer.lastKey = "";
+    this.audioStreamer.lastKey = null;
     this._roofTokenOccDirty = true;
 
     const needsRoofBake = Boolean(chunkData?.overlays && !layer.spec?.roofMaskUrl);
@@ -1127,7 +1184,7 @@ export const lightingMethods = {
     layer.lastTileKey = "";
     this.lastSimKey = null;
     this.lastDynLightKey = null;
-    this.audioStreamer.lastKey = "";
+    this.audioStreamer.lastKey = null;
     this._roofTokenOccDirty = true;
     if (this.active) {
       this._scheduleChunkBatchRefresh({ needPyramid: !deferRefresh && !this._inUpdatePyramid });

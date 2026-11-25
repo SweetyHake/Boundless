@@ -438,10 +438,10 @@ test("MegaAudioStreamer retries after transient shape failure, deduplicates over
     return { x: raw[0], y: raw[1], radius: raw[2], path: raw[3], volume: raw[4], walls: true, easing: true, darkMin: 0, darkMax: 1, elevation: 25, hidden: false };
   };
 
-  // Pass 1: shape is null -> fails transiently, lastKey MUST stay "" so Pass 2 retries
+  // Pass 1: shape is null -> fails transiently, lastKey MUST stay null so Pass 2 retries
   audio.update([layer], { x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 0.05 }, resolver);
   assert.equal(audio.activeSources.size, 0);
-  assert.equal(audio.lastKey, "", "lastKey must not cache an incomplete mount");
+  assert.equal(audio.lastKey, null, "lastKey must not cache an incomplete mount");
   assert.equal(resolveCount, 1, "overlapping anchors must visit each sector once and ignore other players' distant tokens");
 
   // Pass 2: shape succeeds -> sound mounts cleanly
@@ -484,7 +484,7 @@ test("TileWorkerPool kills broken worker on postMessage throw and routes remaini
   assert.equal(res[1].status, "fulfilled", "second job must succeed on healthy worker #1");
 });
 
-test("LRUTextureManager unloads stale fallback textures and tolerates null inUseSet in prune()", async () => {
+test("LRUTextureManager preserves Foundry PIXI.Assets on stale fallback textures and tolerates null inUseSet in prune()", async () => {
   installBaseGlobals();
   const unloaded = [];
   globalThis.PIXI.Assets = { unload: async (src) => { unloaded.push(src); } };
@@ -498,7 +498,7 @@ test("LRUTextureManager unloads stale fallback textures and tolerates null inUse
   resolveTex({ baseTexture: { realWidth: 64, realHeight: 64, update() {} } });
   const out = await p;
   assert.equal(out, null);
-  assert.deepEqual(unloaded, ["test.svg"], "stale fallback texture must be unloaded from PIXI.Assets");
+  assert.deepEqual(unloaded, [], "stale Foundry-managed fallback texture must NOT be unloaded from global PIXI.Assets");
   assert.equal(tm.prune(null), 0, "prune(null) must not throw");
 });
 
@@ -966,4 +966,293 @@ test("lang/ru.json and lang/en.json have identical keys and contain no forbidden
   for (const [k, v] of [...ruMap.entries(), ...enMap.entries()]) {
     assert.ok(!/[—–:]/.test(v), `UI string ${k} contains forbidden dash or colon: ${v}`);
   }
+});
+
+test("getVirtualTileBounds honors scaleX/scaleY and mirrored negative flips", async () => {
+  const { getVirtualTileBounds } = await import("../scripts/utils.mjs");
+  const normal = getVirtualTileBounds({ x: 100, y: 100, w: 100, h: 100, anchorX: 0.5, anchorY: 0.5, scaleX: 2, scaleY: 0.5 });
+  assert.equal(normal.pivX, 100);
+  assert.equal(normal.pivY, 100);
+  assert.ok(Math.abs(normal.halfDiag - Math.hypot(200, 50) * 0.5) < 1e-6);
+
+  // Mirrored X flip with asymmetric anchor (0.2 -> effective anchor 0.8 from left)
+  const flipped = getVirtualTileBounds({ x: 200, y: 100, w: 100, h: 100, anchorX: 0.2, anchorY: 0.5, scaleX: -1, scaleY: 1 });
+  assert.equal(flipped.pivX, 200);
+  assert.ok(Math.abs(flipped.halfDiag - Math.hypot(100, 100) * 0.8) < 1e-6);
+});
+
+test("editsMethods preserves unloaded chunk doorStates and rejects malformed edit coordinates", async () => {
+  installBaseGlobals();
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+
+  const ctx = {
+    wallEdits: new Map(),
+    lightEdits: new Map(),
+    soundEdits: new Map(),
+    tileEdits: new Map(),
+    wallEditsRev: 0,
+    lightEditsRev: 0,
+    soundEditsRev: 0,
+    tileEditsRev: 0,
+    simSectors: new Map(),
+    lastSimKey: "k",
+    openDoors: new Map([["lvl1::0_0_0", { levelId: "lvl1" }], ["lvl1::9_9_0", { levelId: "lvl1" }]]),
+    doorStates: new Map([["lvl1::0_0_0", 1], ["lvl1::9_9_0", 1], ["lvl2::0_0_0", 2]]),
+    levelLayers: new Map([["lvl1", { spec: { sectors: { "0_0": { d: [] } } } }]]),
+    _resolveDoorByKey: () => null,
+    _clearClosingDoorTimer: () => {},
+    updateSimAndLightBubbles: () => {},
+    wallEditor: { syncViewport: () => {} },
+    scheduleLightBatchRebuild: () => {},
+    ...editsMethods
+  };
+
+  ctx.applyVirtualWallChangesLocal();
+  assert.equal(ctx.doorStates.has("lvl1::0_0_0"), false, "loaded sector deleted door must be purged");
+  assert.equal(ctx.doorStates.has("lvl1::9_9_0"), true, "unloaded chunk doorState must be preserved");
+  assert.equal(ctx.doorStates.has("lvl2::0_0_0"), true, "non-visible level doorState must be preserved");
+
+  const dirtyScene = {
+    flags: {
+      boundless: {
+        wallEdits: { lvl1: { "0_0:w:0": { c: [0, 0, NaN, 10] }, "0_0:w:1": { c: [0, 0, 100, 100] }, "0_0:w:2": null } },
+        tileEdits: { lvl1: { "t:0": { x: 10, y: 10, w: 0, h: 100 }, "t:1": { x: 10, y: 10, w: 100, h: 100 } } }
+      }
+    }
+  };
+  ctx._loadWallEdits(dirtyScene);
+  ctx._loadTileEdits(dirtyScene);
+  assert.equal(ctx.wallEdits.get("lvl1").has("0_0:w:0"), false, "NaN wall coords must be rejected");
+  assert.equal(ctx.wallEdits.get("lvl1").has("0_0:w:1"), true);
+  assert.equal(ctx.wallEdits.get("lvl1").get("0_0:w:2"), null);
+  assert.equal(ctx.tileEdits.get("lvl1").has("t:0"), false, "zero-width tile edit must be rejected");
+  assert.equal(ctx.tileEdits.get("lvl1").has("t:1"), true);
+});
+
+test("TokenStreamer._canUserControlDoc never materializes lazy ActorDelta on non-GM clients", async () => {
+  installBaseGlobals();
+  globalThis.game = { user: { id: "u1", isGM: false } };
+  globalThis.CONST = { DOCUMENT_OWNERSHIP_LEVELS: { OWNER: 3 } };
+  const { TokenStreamer } = await import("../scripts/token-streamer.mjs");
+  const ts = new TokenStreamer({});
+
+  let touchedIsOwner = false;
+  const lazyUnownedDoc = {
+    id: "tok1",
+    viewed: true,
+    isLazyDelta: true,
+    _source: { hidden: false, delta: { ownership: {} } },
+    baseActor: { testUserPermission: () => false },
+    get isOwner() { touchedIsOwner = true; return false; }
+  };
+  const lazyDeltaOwnedDoc = {
+    id: "tok2",
+    viewed: true,
+    isLazyDelta: true,
+    _source: { hidden: false, delta: { ownership: { u1: 3 } } },
+    baseActor: { testUserPermission: () => false },
+    get isOwner() { touchedIsOwner = true; return true; }
+  };
+
+  assert.equal(ts._canUserControlDoc(lazyUnownedDoc), false);
+  assert.equal(ts._canUserControlDoc(lazyDeltaOwnedDoc), true);
+  assert.equal(touchedIsOwner, false, "_canUserControlDoc must never access doc.isOwner on isLazyDelta tokens");
+});
+
+test("MegaAudioStreamer tears down active sources when empty, skips radius 0, and includes moved soundEdits", async () => {
+  installBaseGlobals();
+  globalThis.game = { user: { id: "gm", isGM: true } };
+  const created = [];
+  class MockSoundSource {
+    constructor(opts) { this.sourceId = opts.sourceId; this.attached = false; this.destroyed = false; }
+    initialize(cfg) { this.cfg = cfg; this.shape = { radius: cfg.radius }; }
+    add() { this.attached = true; created.push(this); }
+    destroy() { this.destroyed = true; this.attached = false; }
+  }
+  globalThis.foundry = { canvas: { sources: { PointSoundSource: MockSoundSource } } };
+  globalThis.canvas = {
+    ready: true,
+    sounds: {},
+    dimensions: { size: 100, distance: 5 },
+    environment: { darknessLevel: 0 },
+    stage: { scale: { x: 1 } },
+    level: { id: "lvl1" },
+    tokens: { placeables: [] },
+    perception: { update() {} }
+  };
+
+  const { MegaAudioStreamer } = await import("../scripts/audio-streamer.mjs");
+  const streamer = new MegaAudioStreamer();
+  const layer = {
+    level: { id: "lvl1", elevation: { base: 0 } },
+    simGrid: 10,
+    simSectorPx: 2000,
+    spec: {
+      sectors: {
+        "0_0": { s: [[100, 100, 0, "zero.ogg", 0.5, true, true, 0, 1, 5]] },
+        "5_5": { s: [[10500, 10500, 20, "moved.ogg", 0.6, true, true, 0, 1, 5]] }
+      }
+    }
+  };
+  const soundEdits = new Map([
+    ["lvl1", new Map([["5_5:s:0", { x: 200, y: 200, radius: 20, path: "moved.ogg", volume: 0.6, walls: true, easing: true, darkMin: 0, darkMax: 1, elevation: 5, hidden: false }]])]
+  ]);
+
+  streamer.update([layer], { x0: 0, y0: 0, x1: 800, y1: 800, scale: 1 }, null, soundEdits);
+  assert.equal(streamer.activeSources.size, 1, "radius 0 must be skipped and moved soundEdit must play");
+  assert.equal(created[0].cfg.path, "moved.ogg");
+
+  // Moving viewport far away (0 anchors at macro zoom) must tear down active sources even if lastKey was ""
+  streamer.lastKey = "";
+  streamer.update([layer], { x0: 0, y0: 0, x1: 800, y1: 800, scale: 0.05 }, null, soundEdits);
+  assert.equal(streamer.activeSources.size, 0, "active sources must be torn down when no anchors remain");
+  assert.equal(created[0].destroyed, true);
+});
+
+test("ChunkStreamer._fetchChunk protects newer request from stale abort race", async () => {
+  installBaseGlobals();
+  globalThis.canvas = { tokens: { placeables: [] }, level: { id: "lvl1" } };
+  const resolvers = [];
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = () => new Promise((resolve, reject) => resolvers.push({ resolve, reject }));
+  try {
+    const { ChunkStreamer } = await import("../scripts/chunk-streamer.mjs");
+    const mounted = [];
+    const cs = new ChunkStreamer({ onChunkLoaded: (_l, ck, data) => mounted.push({ ck, data }) });
+    const layer = { level: { id: "lvl1" }, worldPx: 20000, spec: { chunks: { baseUrl: "chunks", chunkWorldPx: 5000, cols: 4, rows: 4, populated: ["0_0"] } } };
+    cs.mount([layer]);
+    const st = cs.states.get("lvl1");
+    st.lastNeeded = new Set(["0_0"]);
+
+    cs._fetchChunk(st, "0_0"); // req #1
+    cs._fetchChunk(st, "0_0"); // req #2 supersedes req #1
+    const req2 = st.pending.get("0_0");
+
+    // Stale req #1 rejects late — must NOT wipe req #2 from st.pending!
+    resolvers[0].reject(new Error("late_stale_error"));
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(st.pending.get("0_0"), req2, "stale rejection must not delete newer pending request");
+
+    resolvers[1].resolve({ ok: true, json: async () => ({ sectors: { "0_0": { w: [] } } }) });
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(mounted.length, 1);
+    assert.equal(st.loaded.has("0_0"), true);
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test("scene-baker decodes URL-encoded filenames, preserves radius 0, and deduplicates shared multi-level manifestUrl", async () => {
+  installBaseGlobals();
+  const prevFetch = globalThis.fetch;
+  const prevFP = globalThis.FilePicker;
+  const prevUser = globalThis.game.user;
+  const { getDirAndFilename, virtualSoundToDocData, bakeSceneEditsToManifest } = await import("../scripts/scene-baker.mjs");
+
+  const parsed = getDirAndFilename("worlds/my%20world/maps/%D0%9A%D0%B0%D1%80%D1%82%D0%B0%201.json?v=2", "fallback");
+  assert.equal(parsed.dir, "worlds/my world/maps");
+  assert.equal(parsed.filename, "Карта 1.json");
+  assert.equal(parsed.redirected, false);
+
+  const zeroSound = virtualSoundToDocData({ x: 10, y: 20, elevation: 5, radius: 0, path: "a.ogg" }, "lvl1");
+  assert.equal(zeroSound.radius, 0, "radius 0 must not be coerced to 20");
+
+  let uploadCount = 0;
+  let uploadedManifest = null;
+  try {
+    globalThis.game.user = { isGM: true };
+    globalThis.game.i18n = { localize: (k) => k, format: (k) => k };
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        format: "boundless-pyramid-v1",
+        levels: {
+          lvlA: { worldPx: 4000, simGrid: 2, simSectorPx: 2000, tiles: [], sectors: { "0_0": { w: [], d: [], l: [[100, 100, 20, 10, "#fff", 0.5, ""]], s: [], t: [], o: [] } } },
+          lvlB: { worldPx: 4000, simGrid: 2, simSectorPx: 2000, tiles: [], sectors: { "0_0": { w: [], d: [], l: [[200, 200, 20, 10, "#fff", 0.5, ""]], s: [], t: [], o: [] } } }
+        }
+      })
+    });
+    globalThis.FilePicker = {
+      createDirectory: async () => {},
+      browse: async () => {},
+      upload: async (_src, dir, file) => {
+        uploadCount++;
+        uploadedManifest = JSON.parse(await file.text());
+        return { path: `${dir}/${file.name}` };
+      }
+    };
+    globalThis.foundry = { applications: { apps: { FilePicker: globalThis.FilePicker } }, utils: { getRoute: (p) => p } };
+    globalThis.canvas = { scene: { id: "other" }, dimensions: { size: 100, distance: 5 } };
+
+    const levels = [
+      { id: "lvlA", name: "Floor A", elevation: { base: 0 }, flags: { boundless: { enabled: true, manifestUrl: "worlds/w/shared.json" } }, async update() {} },
+      { id: "lvlB", name: "Floor B", elevation: { base: 10 }, flags: { boundless: { enabled: true, manifestUrl: "worlds/w/shared.json" } }, async update() {} }
+    ];
+    const scene = {
+      id: "scShared",
+      name: "Shared",
+      levels,
+      flags: {
+        boundless: {
+          lightEdits: {
+            lvlA: { "0_0:l:0": { x: 111, y: 111, dim: 30, bright: 15, color: "#f00", alpha: 0.5, anim: "", elevation: 6 } },
+            lvlB: { "0_0:l:0": { x: 222, y: 222, dim: 30, bright: 15, color: "#0f0", alpha: 0.5, anim: "", elevation: 16 } }
+          }
+        }
+      },
+      async update() {},
+      async deleteEmbeddedDocuments() {}
+    };
+    const controller = {
+      manifestCache: new Map(),
+      lightBatch: { clearPolyCacheDB: async () => {} },
+      collectLevelSpatialData: () => ({ sectors: {}, tiles: [], tileIdsToDelete: [], wallIdsToDelete: [], lightIdsToDelete: [], soundIdsToDelete: [] }),
+      mount: async () => {}
+    };
+
+    await bakeSceneEditsToManifest(controller, scene, { absorbNative: false });
+    assert.equal(uploadCount, 1, "shared manifestUrl across 2 levels must upload once without clobbering");
+    assert.equal(uploadedManifest.levels.lvlA.sectors["0_0"].l[0][0], 111);
+    assert.equal(uploadedManifest.levels.lvlB.sectors["0_0"].l[0][0], 222);
+  } finally {
+    globalThis.fetch = prevFetch;
+    globalThis.FilePicker = prevFP;
+    globalThis.game.user = prevUser;
+  }
+});
+
+test("TileWorkerPool resets _supported on destroy() and respawns crashed worker slots on subsequent decode()", async () => {
+  const { TileWorkerPool } = await import("../scripts/tile-worker-pool.mjs");
+  let spawnCount = 0;
+  const pool = new TileWorkerPool({
+    poolSize: 1,
+    workerFactory() {
+      const id = ++spawnCount;
+      return {
+        onmessage: null,
+        onerror: null,
+        onmessageerror: null,
+        postMessage(msg) {
+          if (id === 1 && msg.type === "decode") {
+            throw new Error("transient_crash");
+          }
+          if (msg.type === "decode") {
+            queueMicrotask(() => this.onmessage?.({ data: { id: msg.id, bitmap: { width: 8, height: 8, close() {} }, decodeMs: 1 } }));
+          }
+        },
+        terminate() {}
+      };
+    }
+  });
+
+  await assert.rejects(pool.decode("a.webp"));
+  assert.equal(pool._workers[0], null);
+
+  // Next decode must respawn slot 0 and succeed
+  const bmp = await pool.decode("b.webp");
+  assert.equal(bmp.width, 8);
+  assert.equal(spawnCount, 2);
+
+  pool.destroy();
+  assert.equal(pool._supported, null, "destroy() must reset _supported to null");
 });

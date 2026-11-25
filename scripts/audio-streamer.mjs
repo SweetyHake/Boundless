@@ -5,9 +5,9 @@ const SOUND_VP_MIN_SCALE = 0.25;
 
 export class MegaAudioStreamer {
   activeSources = new Map(); // "${levelId}::${sk}_${si}" -> PointSoundSource
-  lastKey = "";
+  lastKey = null;
 
-  update(visibleLevelLayers, vp, resolveSoundFn = null) {
+  update(visibleLevelLayers, vp, resolveSoundFn = null, soundEditsMap = globalThis.Boundless?.soundEdits) {
     if (!canvas?.ready || !canvas.sounds) return;
     if (!visibleLevelLayers?.length) {
       if (this.activeSources.size > 0) this.unmount();
@@ -63,7 +63,10 @@ export class MegaAudioStreamer {
       });
     }
 
-    if (anchors.length === 0 && this.activeSources.size === 0) return;
+    if (anchors.length === 0 && this.activeSources.size === 0) {
+      this.lastKey = "";
+      return;
+    }
 
     const needed = new Map(); // soundKey -> { layer, item }
 
@@ -76,7 +79,6 @@ export class MegaAudioStreamer {
       const visitedSectors = new Set();
 
       for (const a of anchors) {
-        if (a.levelId && a.levelId !== lid) continue;
         const sx0 = Math.max(0, Math.floor(a.x0 / simSectorPx));
         const sy0 = Math.max(0, Math.floor(a.y0 / simSectorPx));
         const sx1 = Math.min(simGrid - 1, Math.floor(a.x1 / simSectorPx));
@@ -93,17 +95,57 @@ export class MegaAudioStreamer {
               const item = resolveSoundFn
                 ? resolveSoundFn(lid, sk, si, raw, level)
                 : {
-                    x: raw[0], y: raw[1], radius: raw[2] || 20, path: raw[3],
+                    x: raw[0], y: raw[1], radius: Number.isFinite(raw[2]) ? raw[2] : 20, path: raw[3],
                     volume: raw[4] ?? 0.6, walls: raw[5] !== false, easing: raw[6] !== false,
                     darkMin: raw[7] ?? 0, darkMax: raw[8] ?? 1,
                     elevation: Number.isFinite(raw[9]) ? raw[9] : (getLevelBaseElevation(level) + 5),
                     hidden: Boolean(raw[10]?.hidden)
                   };
               if (!item || !item.path || item.hidden) continue;
+              const radiusFt = Number.isFinite(item.radius) ? item.radius : 20;
+              if (radiusFt <= 0) continue;
               if (darkness < item.darkMin || darkness > item.darkMax) continue;
               needed.set(`${lid}::${sk}_${si}`, { layer, item });
             }
           }
+        }
+      }
+
+      // Include sounds edited and dragged outside their original home sector into an active listener anchor
+      const lvlSoundEdits = soundEditsMap?.get?.(lid);
+      if (lvlSoundEdits?.size && anchors.length > 0) {
+        for (const [sKey, ov] of lvlSoundEdits) {
+          if (!ov) continue;
+          const parts = sKey.split(":");
+          if (parts.length !== 3) continue;
+          const [sk, , idxStr] = parts;
+          if (visitedSectors.has(sk)) continue;
+          const si = Number(idxStr);
+          const raw = sectors[sk]?.s?.[si];
+          if (!raw) continue;
+          const item = resolveSoundFn
+            ? resolveSoundFn(lid, sk, si, raw, level)
+            : {
+                x: ov.x, y: ov.y, radius: Number.isFinite(ov.radius) ? ov.radius : 20, path: ov.path || "",
+                volume: ov.volume ?? 0.6, walls: ov.walls !== false, easing: ov.easing !== false,
+                darkMin: ov.darkMin ?? 0, darkMax: ov.darkMax ?? 1,
+                elevation: Number.isFinite(ov.elevation) ? ov.elevation : (getLevelBaseElevation(level) + 5),
+                hidden: Boolean(ov.hidden)
+              };
+          if (!item || !item.path || item.hidden) continue;
+          const radiusFt = Number.isFinite(item.radius) ? item.radius : 20;
+          if (radiusFt <= 0) continue;
+          if (darkness < item.darkMin || darkness > item.darkMax) continue;
+          const rPx = radiusFt * pxPerFt;
+          let inAnchor = false;
+          for (let ai = 0; ai < anchors.length; ai++) {
+            const a = anchors[ai];
+            if (item.x + rPx >= a.x0 && item.x - rPx <= a.x1 && item.y + rPx >= a.y0 && item.y - rPx <= a.y1) {
+              inAnchor = true;
+              break;
+            }
+          }
+          if (inAnchor) needed.set(`${lid}::${sk}_${si}`, { layer, item });
         }
       }
     }
@@ -116,7 +158,7 @@ export class MegaAudioStreamer {
       keyParts.push(`${k}:${s}`);
     }
     const key = keyParts.sort().join("|");
-    if (key === this.lastKey) return;
+    if (this.lastKey !== null && key === this.lastKey && (key !== "" || this.activeSources.size === 0)) return;
 
     let changed = false;
     let complete = true;
@@ -134,7 +176,7 @@ export class MegaAudioStreamer {
     for (const [k, { layer, item }] of needed) {
       const existing = this.activeSources.get(k);
       const itemSig = entrySigs.get(k);
-      const radiusPx = (item.radius || 20) * pxPerFt;
+      const radiusPx = (Number.isFinite(item.radius) ? item.radius : 20) * pxPerFt;
       if (existing) {
         if (this._sourceSigs.get(k) === itemSig && existing.attached) {
           continue;
@@ -205,7 +247,7 @@ export class MegaAudioStreamer {
       }
     }
 
-    this.lastKey = complete ? key : "";
+    this.lastKey = complete ? key : null;
 
     if (changed) {
       canvas.perception?.update({ refreshSounds: true });
@@ -219,7 +261,7 @@ export class MegaAudioStreamer {
     }
     this.activeSources.clear();
     this._sourceSigs?.clear?.();
-    this.lastKey = "";
+    this.lastKey = null;
     if (hadAny && canvas?.ready) {
       canvas.perception?.update({ refreshSounds: true });
     }

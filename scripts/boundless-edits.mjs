@@ -16,7 +16,10 @@ export const editsMethods = {
         for (const [wKey, val] of Object.entries(mapObj)) {
           if (val === null) {
             levelMap.set(wKey, null);
-          } else if (val && typeof val === "object" && Array.isArray(val.c)) {
+          } else if (
+            val && typeof val === "object" &&
+            Array.isArray(val.c) && val.c.length === 4 && val.c.every(Number.isFinite)
+          ) {
             levelMap.set(wKey, val);
           }
         }
@@ -112,13 +115,26 @@ export const editsMethods = {
     this.simSectors.clear();
     this.lastSimKey = "";
 
-    // Revalidate tracked doors in openDoors & doorStates after wall/door edits (removals, wall conversions, coordinate moves)
+    // Revalidate tracked doors in openDoors & doorStates after wall/door edits (removals, wall conversions, coordinate moves).
+    // Preserve doorStates for doors on non-visible levels or currently unloaded chunks so LRU eviction never wipes persisted state!
     for (const dKey of Array.from(new Set([...this.openDoors.keys(), ...this.doorStates.keys()]))) {
       const info = this._resolveDoorByKey(dKey);
       if (!info) {
+        let sectorLoaded = false;
+        if (typeof dKey === "string") {
+          const sep = dKey.indexOf("::");
+          if (sep > 0) {
+            const lid = dKey.slice(0, sep);
+            const parts = dKey.slice(sep + 2).split("_");
+            const layer = this.levelLayers.get(lid);
+            if (layer && parts.length === 3 && layer.spec?.sectors?.[`${parts[0]}_${parts[1]}`]) {
+              sectorLoaded = true;
+            }
+          }
+        }
         this._clearClosingDoorTimer?.(dKey);
         this.openDoors.delete(dKey);
-        this.doorStates.delete(dKey);
+        if (sectorLoaded) this.doorStates.delete(dKey);
         continue;
       }
       const curDs = this.getCurrentDoorState(dKey, info.defaultDs);
@@ -139,13 +155,19 @@ export const editsMethods = {
   _loadGenericEdits(scene, flagName, targetMap) {
     targetMap.clear();
     const raw = scene?.flags?.[MODULE_ID]?.[flagName];
+    const isTile = flagName === "tileEdits";
     if (raw && typeof raw === "object") {
       for (const [lid, mapObj] of Object.entries(raw)) {
         if (!mapObj || typeof mapObj !== "object") continue;
         const levelMap = new Map();
         for (const [k, val] of Object.entries(mapObj)) {
-          if (val === null) levelMap.set(k, null);
-          else if (val && typeof val === "object") levelMap.set(k, val);
+          if (val === null) {
+            levelMap.set(k, null);
+          } else if (val && typeof val === "object") {
+            if (!Number.isFinite(val.x) || !Number.isFinite(val.y)) continue;
+            if (isTile && (!Number.isFinite(val.w) || val.w <= 0 || !Number.isFinite(val.h) || val.h <= 0)) continue;
+            levelMap.set(k, val);
+          }
         }
         if (levelMap.size) targetMap.set(lid, levelMap);
       }
@@ -246,7 +268,7 @@ export const editsMethods = {
     const ex = extra && typeof extra === "object" ? extra : null;
     return {
       levelId, sk, idx, sKey,
-      x, y, radius: radius || 20, path: path || "",
+      x, y, radius: Number.isFinite(radius) ? radius : 20, path: path || "",
       volume: volume ?? 0.6, walls: walls !== false, easing: easing !== false,
       darkMin: darkMin ?? 0, darkMax: darkMax ?? 1,
       elevation: Number.isFinite(customElev) ? customElev : defaultElev,
@@ -262,7 +284,7 @@ export const editsMethods = {
   },
 
   applyVirtualSoundChangesLocal() {
-    this.audioStreamer.lastKey = "";
+    this.audioStreamer.lastKey = null;
     this.audioStreamer.update(
       this.visibleLevelLayers,
       this.getViewportWorldRect(0.28),
@@ -370,7 +392,7 @@ export const editsMethods = {
       for (const dKey of prevKeys) {
         this._clearClosingDoorTimer?.(dKey);
         const info = this._resolveDoorByKey(dKey);
-        if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: true })) {
+        if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: true, skipDeferRebake: true })) {
           anyDoorChanged = true;
         }
         this._clearClosingDoorTimer?.(dKey);
@@ -398,13 +420,16 @@ export const editsMethods = {
           const dKey = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
           this._clearClosingDoorTimer?.(dKey);
           const info = this._resolveDoorByKey(dKey);
-          if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: batchMode })) {
+          if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: batchMode, skipDeferRebake: true })) {
             anyDoorChanged = true;
           }
           this._clearClosingDoorTimer?.(dKey);
           this.doorStates.delete(dKey);
           this.openDoors.delete(dKey);
+          if (!batchMode && anyDoorChanged) this.updateSimAndLightBubbles(false);
         } else {
+          // Ignore stale server echoes from an earlier rapid toggle while a newer local GM commit is still in flight
+          if (this._pendingDoorCommits?.has?.(rawKey)) continue;
           const info = this._resolveDoorByKey(rawKey);
           if (info) {
             if (this._applyDoorStateLocal(info, rawVal, { playSound: !batchMode, deferRefresh: batchMode })) {
@@ -485,12 +510,15 @@ export const editsMethods = {
     if (!scene) return null;
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const kind = poiSpec.kind === "detail" ? "detail" : (poiSpec.kind === "minor" ? "minor" : "major");
+    const dims = scene.getDimensions?.();
+    const defaultCx = (dims?.sceneX ?? 0) + (dims?.sceneWidth ?? scene.width ?? 100000) * 0.5;
+    const defaultCy = (dims?.sceneY ?? 0) + (dims?.sceneHeight ?? scene.height ?? 100000) * 0.5;
     const entry = {
       id: poiSpec.id || foundry.utils.randomID(),
       name: poiSpec.name || game.i18n.localize("BOUNDLESS.Config.PoiDefaultName"),
       subtitle: poiSpec.subtitle || "",
-      x: Math.round(poiSpec.x ?? (scene.width || 100000) * 0.5),
-      y: Math.round(poiSpec.y ?? (scene.height || 100000) * 0.5),
+      x: Math.round(poiSpec.x ?? defaultCx),
+      y: Math.round(poiSpec.y ?? defaultCy),
       levelId: poiSpec.levelId || null,
       targetScale: Number(poiSpec.targetScale ?? poiSpec.scale) || (kind === "major" ? 0.085 : (kind === "detail" ? 0.68 : 0.26)),
       color: poiSpec.color || "#f5c96b",
@@ -623,16 +651,22 @@ export const editsMethods = {
       tiles.push(tileSpec);
       tileIdsToDelete.push(t.id);
 
-      // Compute rotated AABB around Foundry v14 Tile pivot (t.x, t.y) with anchor (ax, ay)
+      // Compute rotated AABB around Foundry v14 Tile pivot (t.x, t.y) with anchor (ax, ay) & scaleX/scaleY (including negative mirror flips)
+      const sxVal = Number.isFinite(t.texture.scaleX) && t.texture.scaleX !== 0 ? t.texture.scaleX : 1;
+      const syVal = Number.isFinite(t.texture.scaleY) && t.texture.scaleY !== 0 ? t.texture.scaleY : 1;
+      const effW = Math.abs(t.width) * Math.abs(sxVal);
+      const effH = Math.abs(t.height) * Math.abs(syVal);
+      const effAx = sxVal < 0 ? (1 - ax) : ax;
+      const effAy = syVal < 0 ? (1 - ay) : ay;
       const rad = (rot * Math.PI) / 180;
       const cos = Math.cos(rad);
       const sin = Math.sin(rad);
-      const dx = (0.5 - ax) * t.width;
-      const dy = (0.5 - ay) * t.height;
+      const dx = (0.5 - effAx) * effW;
+      const dy = (0.5 - effAy) * effH;
       const cx = t.x + (cos * dx - sin * dy);
       const cy = t.y + (sin * dx + cos * dy);
-      const rx = (t.width * Math.abs(cos) + t.height * Math.abs(sin)) * 0.5;
-      const ry = (t.width * Math.abs(sin) + t.height * Math.abs(cos)) * 0.5;
+      const rx = (effW * Math.abs(cos) + effH * Math.abs(sin)) * 0.5;
+      const ry = (effW * Math.abs(sin) + effH * Math.abs(cos)) * 0.5;
       const minX = cx - rx, maxX = cx + rx, minY = cy - ry, maxY = cy + ry;
       const sx0 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(minX / simSectorPx)));
       const sy0 = Math.max(0, Math.min(resolvedSimGrid - 1, Math.floor(minY / simSectorPx)));
@@ -649,9 +683,9 @@ export const editsMethods = {
     for (const w of scene.walls) {
       if (w.levels?.size && !w.levels.has(levelId)) continue;
       const [x1, y1, x2, y2] = w.c;
-      const cx = (x1 + x2) * 0.5, cy = (y1 + y2) * 0.5;
-      const sec = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
       if (w.door) {
+        const cx = (x1 + x2) * 0.5, cy = (y1 + y2) * 0.5;
+        const sec = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
         const extra = {};
         if (w.move !== undefined && w.move !== 20) extra.move = w.move;
         if (w.sight !== undefined && w.sight !== 20) extra.sight = w.sight;
@@ -682,18 +716,31 @@ export const editsMethods = {
           ? [x1, y1, x2, y2, w.door, w.ds || 0, extra]
           : [x1, y1, x2, y2, w.door, w.ds || 0]);
       } else {
-        const row = [x1, y1, x2, y2, w.move, w.sight, w.light, w.sound, w.dir || 0];
-        if (w.threshold && (w.threshold.light || w.threshold.sight || w.threshold.sound)) {
-          row.push({
-            threshold: {
-              light: w.threshold.light ?? null,
-              sight: w.threshold.sight ?? null,
-              sound: w.threshold.sound ?? null,
-              attenuation: Boolean(w.threshold.attenuation)
+        // Subdivide long non-door walls (> simSectorPx) so endpoints never fall outside 3x3 neighbor sector queries
+        const segLen = Math.hypot(x2 - x1, y2 - y1);
+        const parts = segLen > simSectorPx ? Math.ceil(segLen / simSectorPx) : 1;
+        const thresholdObj = (w.threshold && (w.threshold.light || w.threshold.sight || w.threshold.sound))
+          ? {
+              threshold: {
+                light: w.threshold.light ?? null,
+                sight: w.threshold.sight ?? null,
+                sound: w.threshold.sound ?? null,
+                attenuation: Boolean(w.threshold.attenuation)
+              }
             }
-          });
+          : null;
+        for (let pi = 0; pi < parts; pi++) {
+          const t0 = pi / parts;
+          const t1 = (pi + 1) / parts;
+          const ax = pi === 0 ? x1 : Math.round(x1 + (x2 - x1) * t0);
+          const ay = pi === 0 ? y1 : Math.round(y1 + (y2 - y1) * t0);
+          const bx = pi === parts - 1 ? x2 : Math.round(x1 + (x2 - x1) * t1);
+          const by = pi === parts - 1 ? y2 : Math.round(y1 + (y2 - y1) * t1);
+          const sec = ensureSec(Math.floor(((ax + bx) * 0.5) / simSectorPx), Math.floor(((ay + by) * 0.5) / simSectorPx));
+          const row = [ax, ay, bx, by, w.move, w.sight, w.light, w.sound, w.dir || 0];
+          if (thresholdObj) row.push(thresholdObj);
+          sec.w.push(row);
         }
-        sec.w.push(row);
       }
       wallIdsToDelete.push(w.id);
     }
@@ -701,8 +748,8 @@ export const editsMethods = {
     const lightIdsToDelete = [];
     for (const l of scene.lights) {
       if (l.levels?.size && !l.levels.has(levelId)) continue;
-      // Keep negative (darkness) and vision-providing sources as native AmbientLightDocuments
-      if (l.config?.negative || l.vision) continue;
+      // Keep negative (darkness), vision-providing, and priority (> 0, e.g. Daylight) sources as native AmbientLightDocuments
+      if (l.config?.negative || l.vision || (l.config?.priority ?? 0) > 0) continue;
       const sec = ensureSec(Math.floor(l.x / simSectorPx), Math.floor(l.y / simSectorPx));
       const colorCss = l.config?.color ? foundry.utils.Color.from(l.config.color).css : null;
       const extra = {};

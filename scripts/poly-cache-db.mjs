@@ -188,10 +188,10 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
   if (!db) return false;
 
   const now = Date.now();
-  let quotaHit = false;
-  const saved = await new Promise((resolve) => {
+  const writeOnce = (targetDb) => new Promise((resolve) => {
+    let quotaHit = false;
     try {
-      const tx = db.transaction(STORE_NAME, "readwrite");
+      const tx = targetDb.transaction(STORE_NAME, "readwrite");
       const store = tx.objectStore(STORE_NAME);
       for (const [levelId, entries] of entriesByLevel) {
         if (!levelId || !Array.isArray(entries) || !entries.length) continue;
@@ -204,35 +204,80 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
           entries
         });
       }
-      tx.oncomplete = () => resolve(true);
+      tx.oncomplete = () => resolve({ saved: true, quotaHit: false });
       tx.onerror = (ev) => {
         try { ev?.preventDefault?.(); } catch {}
         const err = tx.error;
         if (err?.name === "QuotaExceededError") quotaHit = true;
         else handleDbTxError(err);
-        resolve(false);
+        resolve({ saved: false, quotaHit });
       };
       tx.onabort = () => {
         const err = tx.error;
         if (err?.name === "QuotaExceededError") quotaHit = true;
         else handleDbTxError(err);
-        resolve(false);
+        resolve({ saved: false, quotaHit });
       };
     } catch (err) {
       if (err?.name === "QuotaExceededError") quotaHit = true;
       else handleDbTxError(err);
-      resolve(false);
+      resolve({ saved: false, quotaHit });
     }
   });
 
-  if (quotaHit && maxRecords > 0) {
+  let { saved, quotaHit } = await writeOnce(db);
+
+  if (quotaHit) {
     const freshDb = await openPolyCacheDB();
-    if (freshDb) await _pruneOldRecords(freshDb, Math.max(4, Math.floor(maxRecords / 2)));
+    if (freshDb) {
+      const evicted = await _pruneHalfRecords(freshDb);
+      if (evicted > 0) {
+        const retry = await writeOnce(freshDb);
+        saved = retry.saved;
+      }
+    }
   } else if (saved && maxRecords > 0) {
     const freshDb = await openPolyCacheDB();
     if (freshDb) await _pruneOldRecords(freshDb, maxRecords);
   }
   return saved;
+}
+
+function _pruneHalfRecords(db) {
+  return new Promise((resolve) => {
+    let deleted = 0;
+    try {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        try {
+          const total = countReq.result || 0;
+          const toDelete = total > 0 ? Math.max(1, Math.ceil(total / 2)) : 0;
+          if (toDelete <= 0) return;
+          const idx = store.index("updatedAt");
+          const cursorReq = idx.openCursor();
+          cursorReq.onsuccess = () => {
+            try {
+              const cursor = cursorReq.result;
+              if (!cursor || deleted >= toDelete) return;
+              cursor.delete();
+              deleted++;
+              cursor.continue();
+            } catch {}
+          };
+          cursorReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
+        } catch {}
+      };
+      countReq.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} };
+      tx.oncomplete = () => resolve(deleted);
+      tx.onerror = (ev) => { try { ev?.preventDefault?.(); } catch {} resolve(deleted); };
+      tx.onabort = () => resolve(deleted);
+    } catch (err) {
+      handleDbTxError(err);
+      resolve(deleted);
+    }
+  });
 }
 
 function _pruneOldRecords(db, maxRecords) {

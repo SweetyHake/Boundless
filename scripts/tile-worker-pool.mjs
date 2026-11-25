@@ -6,8 +6,11 @@
  * - Automatic fallback detection for non-raster URLs (SVG/video) or unsupported environments
  */
 
+import { resolveFoundryRoute } from "./utils.mjs";
+
 const RASTER_EXT_RE = /\.(webp|png|jpe?g|avif|bmp|gif)(\?.*)?$/i;
 const MAX_INFLIGHT_PER_WORKER = 2;
+const MAX_RESPAWNS_PER_SLOT = 3;
 
 export function isWorkerDecodableUrl(src) {
   if (!src || typeof src !== "string") return false;
@@ -16,13 +19,14 @@ export function isWorkerDecodableUrl(src) {
 }
 
 function resolveAbsoluteUrl(src) {
+  const routed = resolveFoundryRoute(src);
   try {
     const base = typeof document !== "undefined" && document.baseURI
       ? document.baseURI
       : (typeof location !== "undefined" ? location.href : undefined);
-    return base ? new URL(src, base).href : src;
+    return base ? new URL(routed, base).href : routed;
   } catch {
-    return src;
+    return routed;
   }
 }
 
@@ -33,6 +37,8 @@ export class TileWorkerPool {
     this._workerFactory = workerFactory || null;
     this._workers = [];
     this._workerLoad = [];
+    this._respawnCounts = [];
+    this._workerUrl = null;
     this._initialized = false;
     this._supported = null;
 
@@ -68,33 +74,53 @@ export class TileWorkerPool {
     return this._supported;
   }
 
+  _spawnWorkerSlot(idx) {
+    try {
+      const w = this._workerFactory
+        ? this._workerFactory(idx)
+        : new Worker(this._workerUrl, { type: "module" });
+      w.onmessage = (ev) => this._onWorkerMessage(idx, ev);
+      w.onerror = (err) => this._onWorkerError(idx, err);
+      w.onmessageerror = (err) => this._onWorkerError(idx, err);
+      this._workers[idx] = w;
+      this._workerLoad[idx] = 0;
+      return true;
+    } catch (err) {
+      console.warn("boundless | Failed to spawn tile decoder worker:", err);
+      return false;
+    }
+  }
+
   _ensureWorkers() {
-    if (this._initialized) return this._workers.length > 0;
+    if (this._initialized) {
+      if (this._workers.some(Boolean)) return true;
+      // Attempt bounded respawn of crashed worker slots before giving up
+      let respawned = false;
+      for (let i = 0; i < this._workers.length; i++) {
+        if (!this._workers[i] && (this._respawnCounts[i] || 0) < MAX_RESPAWNS_PER_SLOT) {
+          this._respawnCounts[i] = (this._respawnCounts[i] || 0) + 1;
+          if (this._spawnWorkerSlot(i)) respawned = true;
+        }
+      }
+      if (respawned) {
+        this._supported = true;
+        return true;
+      }
+      return false;
+    }
     this._initialized = true;
     if (!this.isSupported()) return false;
 
-    const workerUrl = this._workerFactory
+    this._workerUrl = this._workerFactory
       ? null
       : new URL("./tile-decode.worker.mjs", import.meta.url);
 
     for (let i = 0; i < this.poolSize; i++) {
-      try {
-        const w = this._workerFactory
-          ? this._workerFactory(i)
-          : new Worker(workerUrl, { type: "module" });
-        const idx = this._workers.length;
-        w.onmessage = (ev) => this._onWorkerMessage(idx, ev);
-        w.onerror = (err) => this._onWorkerError(idx, err);
-        w.onmessageerror = (err) => this._onWorkerError(idx, err);
-        this._workers.push(w);
-        this._workerLoad.push(0);
-      } catch (err) {
-        console.warn("boundless | Failed to spawn tile decoder worker:", err);
-        break;
-      }
+      this._respawnCounts[i] = 0;
+      if (!this._spawnWorkerSlot(i)) break;
     }
 
-    if (this._workers.length === 0) {
+    if (this._workers.filter(Boolean).length === 0) {
       this._supported = false;
       return false;
     }
@@ -402,6 +428,8 @@ export class TileWorkerPool {
     }
     this._workers = [];
     this._workerLoad = [];
+    this._respawnCounts = [];
     this._initialized = false;
+    this._supported = null;
   }
 }

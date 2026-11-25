@@ -1212,6 +1212,7 @@ class MegaWorld1000 {
     }
     for (const timerId of this.closingDoorTimers.values()) clearTimeout(timerId);
     this.closingDoorTimers.clear();
+    this._pendingDoorCommits?.clear?.();
     this.simSectors.clear();
     this.doorStates.clear();
     this.openDoors.clear();
@@ -1245,7 +1246,10 @@ class MegaWorld1000 {
     for (const tok of this._roofHiddenTokens) {
       if (tok && !tok.destroyed) {
         tok.renderable = true;
-        if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = true;
+        if (tok.mesh && !tok.mesh.destroyed) {
+          tok.mesh.renderable = true;
+          if (tok.visible !== false && !tok._ssHideMesh && tok.mesh.visible === false) tok.mesh.visible = true;
+        }
         if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
       }
     }

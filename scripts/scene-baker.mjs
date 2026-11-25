@@ -1,4 +1,4 @@
-import { MODULE_ID, getLevelBaseElevation } from "./utils.mjs";
+import { MODULE_ID, getLevelBaseElevation, resolveFoundryRoute } from "./utils.mjs";
 import { extractLightStyle, computeLevelBakedPolys } from "./light-batch.mjs";
 
 function attachBakedPolysIfPossible(spec, scene, level) {
@@ -114,11 +114,12 @@ async function canvasToWebpBlob(work, quality) {
 
 async function loadImageSource(src, signal = null) {
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-  const lower = String(src || "").split("?")[0].toLowerCase();
+  const resolvedSrc = resolveFoundryRoute(src);
+  const lower = String(resolvedSrc || "").split("?")[0].toLowerCase();
   const isSvg = lower.endsWith(".svg");
   if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
     try {
-      const res = await fetch(src, signal ? { signal } : undefined);
+      const res = await fetch(resolvedSrc, signal ? { signal } : undefined);
       if (res.ok) {
         const blob = await res.blob();
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -161,9 +162,9 @@ async function loadImageSource(src, signal = null) {
     };
     img.onerror = () => {
       cleanup();
-      reject(new Error(`Failed to load background image: ${src}`));
+      reject(new Error(`Failed to load background image: ${resolvedSrc}`));
     };
-    img.src = src;
+    img.src = resolvedSrc;
   });
 }
 
@@ -467,9 +468,9 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       const fgSrc = level.foreground?.src || "";
       const hasRasterBg = Boolean(bgSrc && !VIDEO_EXT_RE.test(bgSrc));
       const hasRasterFg = Boolean(fgSrc && !VIDEO_EXT_RE.test(fgSrc));
-      const levelSlug = chosenLevels.length === 1
+      const levelSlug = targetLevels.length <= 1
         ? "pyramid"
-        : `lvl_${idx}_${slugifyPathPart(level.name, level.id.slice(0, 6))}`;
+        : `lvl_${idx}_${slugifyPathPart(level.name, "lvl")}_${level.id.slice(0, 6)}`;
       const levelPyramidDir = `${outDir}/${levelSlug}`;
       const levelFgPyramidDir = `${outDir}/${levelSlug}_fg`;
 
@@ -498,6 +499,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
 
       levelJobs.push({
         level,
+        levelSlug,
         bgSrc,
         fgSrc,
         hasRasterBg,
@@ -630,13 +632,16 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           levels: mergedLevelSpecs
         };
 
+    const manifestName = (isPartialMultiLevel && singleLevelId)
+      ? `${levelJobs[0]?.levelSlug || singleLevelId.slice(0, 6)}_manifest.json`
+      : "pyramid_manifest.json";
     const manifestFile = new File(
       [JSON.stringify(manifestObj)],
-      "pyramid_manifest.json",
+      manifestName,
       { type: "application/json" }
     );
-    await uploadFileSilent(outDir, manifestFile);
-    const manifestUrl = `${outDir}/pyramid_manifest.json`;
+    const manifestUpRes = await uploadFileSilent(outDir, manifestFile);
+    const manifestUrl = manifestUpRes?.path || `${outDir}/${manifestName}`;
     controller.manifestCache?.delete?.(manifestUrl);
 
     // 6. Clean up original embedded documents & background on targetScene if requested
@@ -844,13 +849,20 @@ function resolveOccModesArray(modeSpec) {
   return [];
 }
 
+function normalizePersistedDoorState(raw) {
+  if (typeof raw === "boolean") return raw ? 1 : 0;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  return undefined;
+}
+
 function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelId) {
   const wKey = `${sk}:${kind}:${idx}`;
   const dKey = `${levelId}::${sk}_${kind === "w" ? "w" : ""}${idx}`;
   const legacyDKey = `${levelId}:${sk}:${kind === "w" ? "w:" : ""}${idx}`;
-  const liveDs = (doorStatesObj && dKey in doorStatesObj)
+  const rawLiveDs = (doorStatesObj && dKey in doorStatesObj)
     ? doorStatesObj[dKey]
     : ((doorStatesObj && legacyDKey in doorStatesObj) ? doorStatesObj[legacyDKey] : undefined);
+  const liveDs = normalizePersistedDoorState(rawLiveDs);
 
   if (wallEditsObj && Object.prototype.hasOwnProperty.call(wallEditsObj, wKey)) {
     const ov = wallEditsObj[wKey];
@@ -1026,7 +1038,7 @@ function resolveSoundItem(sk, idx, raw, soundEditsObj, defaultElev) {
   return {
     x,
     y,
-    radius: radius || 20,
+    radius: Number.isFinite(radius) ? radius : 20,
     path: path || "",
     volume: volume ?? 0.6,
     walls: walls !== false,
@@ -1042,7 +1054,7 @@ function encodeSoundTuple(item) {
   const row = [
     item.x,
     item.y,
-    item.radius || 20,
+    Number.isFinite(item.radius) ? item.radius : 20,
     item.path || "",
     item.volume ?? 0.6,
     item.walls !== false,
@@ -1155,7 +1167,7 @@ export function virtualSoundToDocData(item, levelId) {
     x: item.x,
     y: item.y,
     elevation: item.elevation,
-    radius: item.radius || 20,
+    radius: Number.isFinite(item.radius) ? item.radius : 20,
     path: item.path || "",
     volume: item.volume ?? 0.6,
     walls: item.walls !== false,
@@ -1432,23 +1444,28 @@ function isWritableDataPath(url) {
   return true;
 }
 
-function getDirAndFilename(url, fallbackDir) {
+export function getDirAndFilename(url, fallbackDir) {
   const clean = String(url || "").split("?")[0].replace(/^\/+/, "");
   const slash = clean.lastIndexOf("/");
   if (slash <= 0 || !isWritableDataPath(clean)) {
     return { dir: fallbackDir, filename: "pyramid_manifest.json", redirected: true };
   }
+  let dir = clean.slice(0, slash);
+  let filename = clean.slice(slash + 1) || "pyramid_manifest.json";
+  try { dir = decodeURIComponent(dir); } catch {}
+  try { filename = decodeURIComponent(filename); } catch {}
   return {
-    dir: clean.slice(0, slash),
-    filename: clean.slice(slash + 1) || "pyramid_manifest.json",
+    dir,
+    filename,
     redirected: false
   };
 }
 
 async function fetchManifestJson(url, signal = null) {
-  const sep = url.includes("?") ? "&" : "?";
-  const res = await fetch(`${url}${sep}t=${Date.now()}`, signal ? { signal } : undefined);
-  if (!res.ok) throw new Error(`Failed to fetch manifest (${res.status}): ${url}`);
+  const routed = resolveFoundryRoute(url);
+  const sep = routed.includes("?") ? "&" : "?";
+  const res = await fetch(`${routed}${sep}t=${Date.now()}`, signal ? { signal } : undefined);
+  if (!res.ok) throw new Error(`Failed to fetch manifest (${res.status}): ${routed}`);
   return res.json();
 }
 
@@ -1547,17 +1564,34 @@ async function stitchPyramidToWebp({
   });
 
   const sparseSet = (() => {
-    if (!sparseTiles) return null;
+    if (sparseTiles === null || sparseTiles === undefined) return null;
     const set = new Set();
+    const normEntry = (raw) => {
+      const s = String(raw || "").trim().replace(/^\/+/, "").replace(/\.webp$/i, "");
+      if (!s) return "";
+      if (s.includes("/")) return s;
+      const parts = s.split("_");
+      if (parts.length === 3) return `${parts[0]}/${parts[1]}_${parts[2]}`;
+      return s;
+    };
     if (Array.isArray(sparseTiles)) {
-      for (const entry of sparseTiles) set.add(String(entry));
-    } else if (typeof sparseTiles === "object") {
-      const list = sparseTiles[String(chosenZ)] || sparseTiles[chosenZ];
-      if (Array.isArray(list)) {
-        for (const xy of list) set.add(`${chosenZ}/${xy}`);
+      for (const entry of sparseTiles) {
+        const key = normEntry(entry);
+        if (key) set.add(key);
       }
+      return set;
     }
-    return set.size ? set : null;
+    if (typeof sparseTiles === "object") {
+      const list = sparseTiles[String(chosenZ)] ?? sparseTiles[chosenZ];
+      if (Array.isArray(list)) {
+        for (const xy of list) {
+          const clean = String(xy || "").trim().replace(/\.webp$/i, "");
+          if (clean) set.add(clean.includes("/") ? clean : `${chosenZ}/${clean}`);
+        }
+      }
+      return set;
+    }
+    return null;
   })();
 
   const work = createWorkCanvas(outW, outH);
@@ -1647,8 +1681,36 @@ export async function bakeSceneEditsToManifest(controller, scene, {
 
   // 1. Handle per-level manifests and inline manifests first (including Kartograf exports where
   //    `level.flags.boundless.manifestUrl` inherits `scene.flags.boundless.enabled` without per-level `enabled: true`)
-  // Stage 1: Fetch, validate, and merge all level manifests in memory first so partial failures never corrupt persisted manifests
+  // Stage 1: Fetch, validate, and merge all level manifests in memory first so partial failures never corrupt persisted manifests.
+  // Deduplicate target manifest files by canonical `${dir}/${filename}` so multi-level scenes sharing one manifest file merge cleanly.
   const pendingWrites = [];
+  const pendingFileMap = new Map();
+
+  const getOrCreateFileEntry = async (manifestUrl, fallbackPath) => {
+    const { dir, filename, redirected } = getDirAndFilename(manifestUrl, fallbackPath);
+    const fileKey = `${dir}/${filename}`;
+    let entry = pendingFileMap.get(fileKey);
+    if (!entry) {
+      const rawManifest = await fetchManifestJson(manifestUrl, signal);
+      if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
+        throw new Error("Chunked and superGrid manifests cannot be edited in place.");
+      }
+      entry = {
+        kind: "file",
+        dir,
+        filename,
+        manifest: rawManifest,
+        origUrls: new Set([manifestUrl]),
+        levelTargets: [],
+        sceneTarget: null
+      };
+      pendingFileMap.set(fileKey, entry);
+      pendingWrites.push(entry);
+    } else {
+      entry.origUrls.add(manifestUrl);
+    }
+    return { entry, redirected };
+  };
 
   for (let i = 0; i < allLevels.length; i++) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -1685,10 +1747,9 @@ export async function bakeSceneEditsToManifest(controller, scene, {
       processedByLevelManifest.add(lid);
     } else if (lcfg.manifestUrl) {
       report(20 + Math.round((i / Math.max(1, allLevels.length)) * 30), game.i18n.format("BOUNDLESS.BakeEdits.StepLevel", { level: lvl.name || lid }));
-      const rawManifest = await fetchManifestJson(lcfg.manifestUrl, signal);
-      if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
-        throw new Error("Chunked and superGrid manifests cannot be edited in place.");
-      }
+      const levelFallback = `${fallbackDir}/lvl_${i}_${slugifyPathPart(lvl.name, "lvl")}_${lid.slice(0, 6)}`;
+      const { entry, redirected } = await getOrCreateFileEntry(lcfg.manifestUrl, levelFallback);
+      const rawManifest = entry.manifest;
       const targetSpec = rawManifest.levels?.[lid] || rawManifest;
       if (targetSpec.chunks?.baseUrl || targetSpec.superGrid) {
         throw new Error("Chunked and superGrid manifests cannot be edited in place.");
@@ -1705,11 +1766,10 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         nativeSpatial
       });
       attachBakedPolysIfPossible(merged.spec, scene, lvl);
-      const updatedManifest = rawManifest.levels?.[lid]
+      entry.manifest = rawManifest.levels?.[lid]
         ? { ...rawManifest, levels: { ...rawManifest.levels, [lid]: merged.spec } }
         : merged.spec;
-      const { dir, filename, redirected } = getDirAndFilename(lcfg.manifestUrl, `${fallbackDir}/lvl_${slugifyPathPart(lvl.name, lid.slice(0, 6))}`);
-      pendingWrites.push({ kind: "levelFile", lvl, origUrl: lcfg.manifestUrl, dir, filename, redirected, manifest: updatedManifest });
+      entry.levelTargets.push({ lvl, origUrl: lcfg.manifestUrl, redirected });
       totalWalls += merged.counts.walls;
       totalLights += merged.counts.lights;
       totalSounds += merged.counts.sounds;
@@ -1725,7 +1785,10 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   );
   if (cfg.enabled && sceneManifestUrl && hasRemainingSceneLevels) {
     report(55, game.i18n.localize("BOUNDLESS.Baker.StepManifest"));
-    const rawManifest = await fetchManifestJson(sceneManifestUrl, signal);
+    const { dir: sceneDir, filename: sceneFilename, redirected: sceneRedirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
+    const sceneFileKey = `${sceneDir}/${sceneFilename}`;
+    const existingEntry = pendingFileMap.get(sceneFileKey);
+    const rawManifest = existingEntry ? existingEntry.manifest : await fetchManifestJson(sceneManifestUrl, signal);
     if (rawManifest.chunks?.baseUrl || rawManifest.superGrid) {
       throw new Error("Chunked and superGrid manifests cannot be edited in place.");
     }
@@ -1762,7 +1825,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
       updatedManifest = { ...rawManifest, levels: nextLevels };
     } else {
       const targetLvl = (sceneLevelId && scene.levels.get(sceneLevelId))
-        || scene.initialLevel
+        || (typeof scene.initialLevel === "string" ? scene.levels.get(scene.initialLevel) : scene.initialLevel)
         || scene.firstLevel
         || allLevels[0];
       if (targetLvl && !processedByLevelManifest.has(targetLvl.id) && targetLvl.flags?.[MODULE_ID]?.enabled !== false) {
@@ -1790,8 +1853,23 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     }
 
     if (sceneManifestTouched) {
-      const { dir, filename, redirected } = getDirAndFilename(sceneManifestUrl, fallbackDir);
-      pendingWrites.push({ kind: "sceneFile", origUrl: sceneManifestUrl, dir, filename, redirected, manifest: updatedManifest });
+      if (existingEntry) {
+        existingEntry.manifest = updatedManifest;
+        existingEntry.origUrls.add(sceneManifestUrl);
+        existingEntry.sceneTarget = { origUrl: sceneManifestUrl, redirected: sceneRedirected };
+      } else {
+        const entry = {
+          kind: "file",
+          dir: sceneDir,
+          filename: sceneFilename,
+          manifest: updatedManifest,
+          origUrls: new Set([sceneManifestUrl]),
+          levelTargets: [],
+          sceneTarget: { origUrl: sceneManifestUrl, redirected: sceneRedirected }
+        };
+        pendingFileMap.set(sceneFileKey, entry);
+        pendingWrites.push(entry);
+      }
     }
   }
 
@@ -1805,24 +1883,21 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     if (w.kind === "inline") {
       // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
       await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
-    } else if (w.kind === "levelFile") {
+    } else if (w.kind === "file") {
       await ensureDirectoryRecursive(w.dir);
       const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
-      await uploadFileSilent(w.dir, file);
-      const finalUrl = `${w.dir}/${w.filename}`;
-      controller.manifestCache?.delete?.(w.origUrl);
+      const upRes = await uploadFileSilent(w.dir, file);
+      const finalUrl = upRes?.path || `${w.dir}/${w.filename}`;
+      for (const origUrl of w.origUrls) controller.manifestCache?.delete?.(origUrl);
       controller.manifestCache?.delete?.(finalUrl);
-      if (w.redirected) {
-        await w.lvl.update({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+      const cleanFinal = String(finalUrl || "").split("?")[0].replace(/^\/+/, "");
+      const sameUrl = (orig) => String(orig || "").split("?")[0].replace(/^\/+/, "") === cleanFinal;
+      for (const lt of w.levelTargets) {
+        if (lt.redirected || !sameUrl(lt.origUrl)) {
+          await lt.lvl.update?.({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+        }
       }
-    } else if (w.kind === "sceneFile") {
-      await ensureDirectoryRecursive(w.dir);
-      const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
-      await uploadFileSilent(w.dir, file);
-      const finalUrl = `${w.dir}/${w.filename}`;
-      controller.manifestCache?.delete?.(w.origUrl);
-      controller.manifestCache?.delete?.(finalUrl);
-      if (w.redirected) {
+      if (w.sceneTarget && (w.sceneTarget.redirected || !sameUrl(w.sceneTarget.origUrl))) {
         scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
       }
     }
@@ -1921,6 +1996,11 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     }
   }
 
+  const defaultFlatLevelId = sceneLevelId
+    || (typeof scene.initialLevel === "string" ? scene.initialLevel : scene.initialLevel?.id)
+    || scene.firstLevel?.id
+    || srcLevels[0]?.id;
+
   const levelSpecEntries = [];
   for (let i = 0; i < srcLevels.length; i++) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -1937,7 +2017,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     } else if (cfg.enabled && sceneManifest) {
       if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
         spec = sceneManifest.levels[lvl.id] || null;
-      } else if ((!sceneLevelId && i === 0) || sceneLevelId === lvl.id) {
+      } else if (lvl.id === defaultFlatLevelId) {
         spec = sceneManifest;
       }
     }
@@ -2043,8 +2123,10 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         }
         if (Object.keys(lvlPatch).length) {
           // Baked pyramids already incorporate `level.textures` transforms (offset/scale/rotation/anchor/fit);
-          // reset them when restoring stitched images so Foundry doesn't double-apply transforms.
-          if (dstLevel.textures) {
+          // reset them when restoring stitched images, unless an untouched video layer still depends on them.
+          const hasUntouchedVideoBg = Boolean(dstLevel.background?.src && VIDEO_EXT_RE.test(dstLevel.background.src));
+          const hasUntouchedVideoFg = Boolean(dstLevel.foreground?.src && VIDEO_EXT_RE.test(dstLevel.foreground.src));
+          if (dstLevel.textures && !hasUntouchedVideoBg && !hasUntouchedVideoFg) {
             lvlPatch["textures.offsetX"] = 0;
             lvlPatch["textures.offsetY"] = 0;
             lvlPatch["textures.scaleX"] = 1;

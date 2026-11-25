@@ -141,11 +141,14 @@ export const overlayMethods = {
     const renderer = canvas?.app?.renderer;
     if (!renderer || !layers?.length) return;
 
-    // Pick the primary layer carrying visible baked building roofs (skip lower-level roofs hidden when viewing an upper level)
+    // Pick the primary layer carrying visible baked building roofs (prefer currently viewed level; skip lower roofs hidden under upper view)
     const viewedBottom = getLevelBottomElevation(canvas.level);
+    const ordered = layers.length > 1
+      ? layers.slice().sort((a, b) => (b.level?.isView ? 1 : 0) - (a.level?.isView ? 1 : 0))
+      : layers;
     let targetLayer = null;
     let ovList = null;
-    for (const l of layers) {
+    for (const l of ordered) {
       const topElev = getLevelRoofElevation(l.level);
       if (!l.level?.isView && viewedBottom >= topElev) continue;
       if (l.spec?.roofMaskUrl) {
@@ -170,6 +173,7 @@ export const overlayMethods = {
     const originY = isSuperGrid ? 0 : (targetLayer.bounds?.y || 0);
     const regionW = isSuperGrid ? (targetLayer.spec.superGrid.regionPx || 100000) : (targetLayer.bounds?.w || 100000);
     const regionH = isSuperGrid ? (targetLayer.spec.superGrid.regionPx || 100000) : (targetLayer.bounds?.h || 100000);
+    const roofElevation = getLevelRoofElevation(targetLayer.level);
 
     return this._bakeRoofMaskFromList(ovList, {
       originX,
@@ -177,13 +181,14 @@ export const overlayMethods = {
       regionW,
       regionH,
       repeat: isSuperGrid,
+      roofElevation,
       roofMaskUrl: targetLayer.spec?.roofMaskUrl || null,
       sceneId,
       mountedLevelId
     });
   },
 
-  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofMaskUrl = null, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
+  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity, roofMaskUrl = null, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
     const renderer = canvas?.app?.renderer;
     if (!renderer || (!ovList?.length && !roofMaskUrl)) return;
 
@@ -328,7 +333,8 @@ export const overlayMethods = {
         originY,
         regionW,
         regionH,
-        repeat
+        repeat,
+        roofElevation
       });
       rt = null;
       this._syncIndoorLightVisibility();
@@ -485,7 +491,8 @@ export const overlayMethods = {
           // Avoid 1-frame double light-cut (CanvasDepthMask + bakedRoofMask) while retiring roof waits for z<=4
           if (this.lightBatch?.bakedRoofMask && !this.lightBatch.bakedRoofMask.destroyed && ov.roofMesh.restrictsLight) {
             ov.roofMesh.restrictsLight = false;
-            this._markDepthDirty();
+            ov.roofMesh.updateCanvasTransform?.();
+            this._markDepthDirty({ syncElev: true });
           }
           ov.roofMesh.hoverFade = false;
           ov.roofMesh.unoccludedAlpha = 1.0;
@@ -515,7 +522,8 @@ export const overlayMethods = {
         } else if (ov.roofMesh) {
           if (!ov.roofMesh.restrictsLight) {
             ov.roofMesh.restrictsLight = true;
-            this._markDepthDirty();
+            ov.roofMesh.updateCanvasTransform?.();
+            this._markDepthDirty({ syncElev: true });
           }
           if (ov.roofMesh.occlusionMode !== wantOccMode) {
             ov.roofMesh.occlusionMode = wantOccMode;
@@ -897,8 +905,13 @@ export const overlayMethods = {
     m.restrictsLight = Boolean(tSpec.restrictsLight);
     m.restrictsWeather = Boolean(tSpec.restrictsWeather);
     m.textureAlphaThreshold = tSpec.alphaThreshold ?? 0.75;
-    if (tSpec.tint !== undefined && tSpec.tint !== null) {
-      m.tint = typeof tSpec.tint === "string" ? foundry.utils.Color.from(tSpec.tint).valueOf() : tSpec.tint;
+    if (tSpec.tint !== undefined && tSpec.tint !== null && tSpec.tint !== "") {
+      if (typeof tSpec.tint === "number" && Number.isFinite(tSpec.tint)) {
+        m.tint = tSpec.tint;
+      } else {
+        const c = foundry.utils.Color.from(tSpec.tint);
+        if (c.valid) m.tint = c.valueOf();
+      }
     }
     // Hide raw mesh if TilesLayer editor currently renders the native editable Tile for this exact level & slot
     const edTile = this.layerEditors?.tileActive ? this.layerEditors.tilesByKey.get(`t:${tid}`) : null;
@@ -922,14 +935,20 @@ export const overlayMethods = {
   },
 
   _isPointInsideVirtualTile(px, py, tSpec, pad = 0) {
-    const w = tSpec?.w || 0;
-    const h = tSpec?.h || 0;
-    if (w <= 0 || h <= 0) return false;
+    const rawW = tSpec?.w || 0;
+    const rawH = tSpec?.h || 0;
+    if (rawW <= 0 || rawH <= 0) return false;
+    const sx = Number.isFinite(tSpec.scaleX) && tSpec.scaleX !== 0 ? tSpec.scaleX : 1;
+    const sy = Number.isFinite(tSpec.scaleY) && tSpec.scaleY !== 0 ? tSpec.scaleY : 1;
+    const w = rawW * Math.abs(sx);
+    const h = rawH * Math.abs(sy);
     // Anchor pivot matches syncVirtualTiles(): if anchorX is omitted, x/y is top-left and pivot is (x + w/2, y + h/2)
-    const ax = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
-    const ay = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
-    const pivX = tSpec.anchorX === undefined ? (tSpec.x + w * 0.5) : tSpec.x;
-    const pivY = tSpec.anchorY === undefined ? (tSpec.y + h * 0.5) : tSpec.y;
+    const rawAx = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
+    const rawAy = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+    const ax = sx < 0 ? (1 - rawAx) : rawAx;
+    const ay = sy < 0 ? (1 - rawAy) : rawAy;
+    const pivX = tSpec.anchorX === undefined ? (tSpec.x + rawW * 0.5) : tSpec.x;
+    const pivY = tSpec.anchorY === undefined ? (tSpec.y + rawH * 0.5) : tSpec.y;
     const dx = px - pivX;
     const dy = py - pivY;
     const rot = tSpec.rot || 0;
@@ -1011,7 +1030,8 @@ export const overlayMethods = {
           if (tSpec.minZ !== undefined) {
             if (tSpec.src && missingSrcs?.has?.(tSpec.src)) continue;
             const mountedVt = this.activeVirtualTiles.get(`${layerId}::${tid}`)?.mesh;
-            const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
+            const targetAlpha = tSpec.alpha ?? 1;
+            const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= targetAlpha * 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
             if (!vtReadyOpaque && this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
               return true;
             }
@@ -1167,7 +1187,10 @@ export const overlayMethods = {
       if (nextHidden.has(tok)) continue;
       if (tok && !tok.destroyed) {
         tok.renderable = true;
-        if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = true;
+        if (tok.mesh && !tok.mesh.destroyed) {
+          tok.mesh.renderable = true;
+          if (tok.visible !== false && !tok._ssHideMesh && tok.mesh.visible === false) tok.mesh.visible = true;
+        }
         if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
         restoredAny = true;
       }
@@ -1201,8 +1224,13 @@ export const overlayMethods = {
     for (const vt of this.activeVirtualTiles.values()) {
       const m = vt.mesh;
       if (!m?.visible || !m.occlusionMode) continue;
-      const rx = Math.max(m.width || 0, m.height || 0) * 0.65 + 250;
-      if (Math.abs(tx - m.x) <= rx && Math.abs(ty - m.y) <= rx) return true;
+      const b = m.canvasBounds;
+      if (b && Number.isFinite(b.x) && Number.isFinite(b.width)) {
+        if (tx >= b.x - 250 && tx <= b.x + b.width + 250 && ty >= b.y - 250 && ty <= b.y + b.height + 250) return true;
+      } else {
+        const rx = Math.max(m.width || 0, m.height || 0) + 250;
+        if (Math.abs(tx - m.x) <= rx && Math.abs(ty - m.y) <= rx) return true;
+      }
     }
     return false;
   }
