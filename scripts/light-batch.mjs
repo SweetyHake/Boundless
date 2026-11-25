@@ -2036,8 +2036,23 @@ export class MegaLightBatch {
 
     const pxPerFt = this._buildPxPerFt || 20;
     const simSectorPx = layer.simSectorPx || layer.spec?.simSectorPx || ((layer.worldPx && layer.simGrid) ? (layer.worldPx / layer.simGrid) : 0);
-    // Index all resident chunk sectors via buildSectorEdgeMap so moved walls, wide lights, and door extra fields stay 100% exact
-    const wallSourceSectors = allLevelSectors === sectors ? sectors : { ...allLevelSectors, ...sectors };
+    // Avoid rebuilding walls across all 8 chunks when there are no wallEdits on this level:
+    // index this chunk's sectors + its 1-sector neighbor ring (or all resident sectors when wallEdits exist)
+    let wallSourceSectors;
+    if (hasEditsOnLevel || allLevelSectors === sectors) {
+      wallSourceSectors = allLevelSectors === sectors ? sectors : { ...allLevelSectors, ...sectors };
+    } else {
+      wallSourceSectors = { ...sectors };
+      for (const [sk] of sectorEntries) {
+        const [sx, sy] = sk.split("_").map(Number);
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nsk = `${sx + dx}_${sy + dy}`;
+            if (!wallSourceSectors[nsk] && allLevelSectors[nsk]) wallSourceSectors[nsk] = allLevelSectors[nsk];
+          }
+        }
+      }
+    }
     const sectorEdges = buildSectorEdgeMap(wallSourceSectors, levelId, pxPerFt, EdgeCls, this._resolveWallFn, simSectorPx);
 
     const worldSpan = layer.worldPx || 100000;
@@ -2120,12 +2135,14 @@ export class MegaLightBatch {
   }
 
   _pumpChunkBakeQueue() {
-    const budgetMs = 6.0; // Never stall main thread > 6ms while streaming chunk light shadows
+    const isMoving = Boolean(globalThis.Boundless?.isActivelyMoving?.());
+    const budgetMs = isMoving ? 1.5 : 2.5; // Keep chunk shadow baking well inside a 120 FPS (8.33ms) frame
     const startMs = performance.now();
     const CSP = foundry.canvas.geometry.ClockwiseSweepPolygon;
     const pxPerFt = this._buildPxPerFt || 20;
+    let didWork = false;
 
-    while (this._chunkBakeQueue.length > 0 && (performance.now() - startMs) < budgetMs) {
+    while (this._chunkBakeQueue.length > 0 && (!didWork || (performance.now() - startMs) < budgetMs)) {
       const job = this._chunkBakeQueue[0];
       if (job.gen !== this._chunkBakeGen) {
         this._chunkBakeQueue.shift();
@@ -2135,15 +2152,31 @@ export class MegaLightBatch {
       const defaultLightElev = getLevelBaseElevation(job.level) + 6;
       const topElev = getLevelRoofElevation(job.level);
 
-      while (job.secIdx < job.sectorEntries.length && (performance.now() - startMs) < budgetMs) {
-        const [sk, sec] = job.sectorEntries[job.secIdx++];
-        const [sx, sy] = sk.split("_").map(Number);
-        const localEdges = collectEdgesInRadius(job.sectorEdges, job.nativeEdges, 0, 0, 0, 0, sx, sy);
+      while ((job.curSec || job.secIdx < job.sectorEntries.length) && (!didWork || (performance.now() - startMs) < budgetMs)) {
+        if (!job.curSec) {
+          const [sk, sec] = job.sectorEntries[job.secIdx++];
+          const [sx, sy] = sk.split("_").map(Number);
+          job.curSec = {
+            sk,
+            sec,
+            sx,
+            sy,
+            localEdges: collectEdgesInRadius(job.sectorEdges, job.nativeEdges, 0, 0, 0, 0, sx, sy),
+            idxStart: job.indicesArr.length,
+            minX: Infinity,
+            minY: Infinity,
+            maxX: -Infinity,
+            maxY: -Infinity,
+            lightIdx: 0
+          };
+        }
+        const cs = job.curSec;
+        const { sk, sec, sx, sy, localEdges } = cs;
 
-        const idxStart = job.indicesArr.length;
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
-        for (let li = 0; li < sec.l.length; li++) {
+        for (; cs.lightIdx < sec.l.length; cs.lightIdx++) {
+          if (didWork && (performance.now() - startMs) >= budgetMs) break;
+          didWork = true;
+          const li = cs.lightIdx;
           const raw = sec.l[li];
           const extra = raw[8] && typeof raw[8] === "object" ? raw[8] : null;
           const resolved = this._resolveLightFn
@@ -2297,21 +2330,33 @@ export class MegaLightBatch {
             attenuation: style.attenuation, luminosity: style.luminosity,
             raw: rawEntry
           });
-          if (lx - dimPx < minX) minX = lx - dimPx;
-          if (ly - dimPx < minY) minY = ly - dimPx;
-          if (lx + dimPx > maxX) maxX = lx + dimPx;
-          if (ly + dimPx > maxY) maxY = ly + dimPx;
+          if (lx - dimPx < cs.minX) cs.minX = lx - dimPx;
+          if (ly - dimPx < cs.minY) cs.minY = ly - dimPx;
+          if (lx + dimPx > cs.maxX) cs.maxX = lx + dimPx;
+          if (ly + dimPx > cs.maxY) cs.maxY = ly + dimPx;
         }
 
-        const idxCount = job.indicesArr.length - idxStart;
-        if (idxCount > 0) {
-          job.sectorBounds.push({ levelId: job.levelId, sk, minX, minY, maxX, maxY, idxStart, idxCount });
+        if (cs.lightIdx >= sec.l.length) {
+          const idxCount = job.indicesArr.length - cs.idxStart;
+          if (idxCount > 0) {
+            job.sectorBounds.push({
+              levelId: job.levelId, sk,
+              minX: cs.minX, minY: cs.minY, maxX: cs.maxX, maxY: cs.maxY,
+              idxStart: cs.idxStart, idxCount
+            });
+          }
+          job.curSec = null;
         }
       }
 
-      if (job.secIdx >= job.sectorEntries.length) {
+      if (!job.curSec && job.secIdx >= job.sectorEntries.length) {
+        if (didWork && (performance.now() - startMs) >= budgetMs) {
+          // Defer GPU geometry finalization & perception hook to the next animation frame
+          break;
+        }
         this._chunkBakeQueue.shift();
         this._finalizeChunkBatch(job);
+        didWork = true;
       }
     }
 

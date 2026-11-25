@@ -613,7 +613,7 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
     rejectClose: false
   });
 
-  if (!res) return null;
+  if (!res || (globalThis.game?.scenes && !globalThis.game.scenes.has(scene.id))) return null;
 
   if (isEdit) {
     await controller.updatePOI(initial.id, res, scene);
@@ -651,6 +651,9 @@ export class PoiManager {
   _pendingLevelSwitch = null;
   _superGridInfo = null;        // { cols, rows, regionPx } when using superGrid manifest defaults
   _superGridSubProvinces = new Map(); // "col_row" -> { lastUsedMs, entries: [] }
+  _pendingSubPins = [];
+  _subPinRaf = null;
+  _subPinGen = 0;
 
   constructor(controller = null) {
     this.controller = controller;
@@ -716,6 +719,16 @@ export class PoiManager {
   }
 
   _clearSuperGridSubPins() {
+    this._subPinGen++;
+    this._pendingSubPins = [];
+    if (this._subPinRaf !== null) {
+      if (typeof cancelAnimationFrame === "function") {
+        try { cancelAnimationFrame(this._subPinRaf); } catch {}
+      } else {
+        clearTimeout(this._subPinRaf);
+      }
+      this._subPinRaf = null;
+    }
     for (const bucket of this._superGridSubProvinces.values()) {
       for (const p of bucket.entries) {
         p.root.parent?.removeChild(p.root);
@@ -723,6 +736,34 @@ export class PoiManager {
       }
     }
     this._superGridSubProvinces.clear();
+  }
+
+  _scheduleSubPinPump() {
+    if (this._subPinRaf !== null || this._pendingSubPins.length === 0) return;
+    const gen = this._subPinGen;
+    const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+    this._subPinRaf = sched(() => {
+      this._subPinRaf = null;
+      if (gen !== this._subPinGen || !this.container || !this.enabled) return;
+      const t0 = performance.now();
+      let created = 0;
+      const maxPerFrame = this.controller?.isActivelyMoving?.() ? 1 : 3;
+      while (this._pendingSubPins.length > 0 && created < maxPerFrame) {
+        const job = this._pendingSubPins.shift();
+        const bucket = this._superGridSubProvinces.get(job.key);
+        if (!bucket) continue;
+        bucket.entries.push(this._createPin(job.subPoi, job.orderIndex));
+        created++;
+        if ((performance.now() - t0) >= 1.5) break;
+      }
+      if (created > 0) {
+        this._layoutDirty = true;
+        this.updateViewport();
+      }
+      if (this._pendingSubPins.length > 0) {
+        this._scheduleSubPinPump();
+      }
+    });
   }
 
   rebuild(scene = canvas.scene, manifest = null) {
@@ -810,7 +851,8 @@ export class PoiManager {
         }
         const ox = c * regionPx;
         const oy = r * regionPx;
-        const entries = [];
+        const bucket = { lastUsedMs: now, entries: [] };
+        this._superGridSubProvinces.set(key, bucket);
         for (let i = 0; i < templates.length; i++) {
           const tpl = templates[i];
           const subPoi = {
@@ -824,15 +866,17 @@ export class PoiManager {
             icon: tpl.icon,
             _virtualSub: true
           };
-          entries.push(this._createPin(subPoi, 1000 + i));
+          this._pendingSubPins.push({ key, subPoi, orderIndex: 1000 + i });
         }
-        this._superGridSubProvinces.set(key, { lastUsedMs: now, entries });
       }
     }
+    if (this._pendingSubPins.length > 0) {
+      this._scheduleSubPinPump();
+    }
 
-    // LRU evict distant province sub-pins (never evict provinces currently visible on screen)
+    // LRU evict distant province sub-pins when not actively mid-pan (avoids WebGL texture destroy stalls)
     const maxKeep = Math.max(6, visibleCount);
-    if (this._superGridSubProvinces.size > maxKeep) {
+    if (this._superGridSubProvinces.size > maxKeep && !this.controller?.isActivelyMoving?.()) {
       const sorted = Array.from(this._superGridSubProvinces.entries()).sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
       while (sorted.length > maxKeep) {
         const [evictKey, bucket] = sorted.shift();
@@ -841,6 +885,9 @@ export class PoiManager {
           p.root.destroy({ children: true });
         }
         this._superGridSubProvinces.delete(evictKey);
+      }
+      if (this._pendingSubPins.length > 0) {
+        this._pendingSubPins = this._pendingSubPins.filter(j => this._superGridSubProvinces.has(j.key));
       }
     }
   }

@@ -396,7 +396,6 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
     try { onProgress?.({ pct: Math.max(0, Math.min(100, pct)), text }); } catch {}
   };
 
-  const outDir = String(targetDir || buildDefaultBakeDir(sourceScene)).replace(/^\/+|\/+$/g, "");
   const origLevels = Array.from(sourceScene.levels?.sorted || sourceScene.levels || []);
   const selectedOrigIndices = [];
   for (let i = 0; i < origLevels.length; i++) {
@@ -404,9 +403,24 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
   }
   if (!selectedOrigIndices.length) throw new Error("No levels selected for baking.");
 
+  // Guard against direct API re-baking of an already-baked scene (which would overwrite the manifest with empty geometry)
+  const sceneHasBoundless = Boolean(sourceScene.flags?.[MODULE_ID]?.enabled || sourceScene.flags?.[MODULE_ID]?.manifestUrl);
+  const allSelectedAlreadyBaked = selectedOrigIndices.every((idx) => {
+    const lvl = origLevels[idx];
+    const lFlags = lvl?.flags?.[MODULE_ID];
+    const hasManifest = Boolean(lFlags?.manifestUrl || lFlags?.inlineManifest || (sceneHasBoundless && lFlags?.enabled !== false));
+    const fgSrc = typeof lvl?.foreground === "string" ? lvl.foreground : lvl?.foreground?.src;
+    const hasBg = Boolean(lvl?.background?.src && !VIDEO_EXT_RE.test(lvl.background.src));
+    const hasFg = Boolean(fgSrc && !VIDEO_EXT_RE.test(fgSrc));
+    return hasManifest && !hasBg && !hasFg;
+  });
+  if (allSelectedAlreadyBaked) {
+    throw new Error("Scene is already baked for Boundless. Use bakeSceneEditsToManifest() to update edits or unbakeSceneFromBoundless() to restore.");
+  }
+
   report(2, game.i18n.localize("BOUNDLESS.Baker.StepPreparing"));
 
-  // 1. Clone scene upfront if requested so manifest level IDs match the cloned scene's exact level IDs
+  // 1. Clone scene upfront if requested so manifest level IDs and output directory match the cloned scene
   let targetScene = sourceScene;
   let createdClone = false;
   if (createCopy) {
@@ -416,6 +430,8 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
     if (!targetScene) throw new Error("Failed to clone scene.");
     createdClone = true;
   }
+
+  const outDir = String(targetDir || buildDefaultBakeDir(targetScene)).replace(/^\/+|\/+$/g, "");
 
   const levelJobs = [];
   const allPendingUploads = [];
@@ -778,9 +794,10 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
 
     report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));
 
+    const hasCanvas = Boolean(globalThis.canvas?.ready && !game.settings?.get?.("core", "noCanvas"));
     if (createCopy && activateCopy) {
       await targetScene.view();
-    } else if (canvas.scene?.id === targetScene.id) {
+    } else if (hasCanvas && canvas.scene?.id === targetScene.id) {
       await controller.mount(targetScene);
     }
 
@@ -1956,7 +1973,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   }
 
   await controller.lightBatch?.clearPolyCacheDB?.(scene.id, game.world?.id);
-  if (canvas.scene?.id === scene.id) {
+  if (globalThis.canvas?.ready && !game.settings?.get?.("core", "noCanvas") && canvas.scene?.id === scene.id) {
     await controller.mount(scene);
   }
 
@@ -2194,9 +2211,10 @@ export async function unbakeSceneFromBoundless(controller, scene, {
 
     report(100, game.i18n.localize("BOUNDLESS.Baker.StepDone"));
 
+    const hasCanvas = Boolean(globalThis.canvas?.ready && !game.settings?.get?.("core", "noCanvas"));
     if (createCopy && activateCopy) {
       await targetScene.view();
-    } else if (canvas.scene?.id === targetScene.id) {
+    } else if (hasCanvas && canvas.scene?.id === targetScene.id) {
       controller.unmount({ clearTextures: true });
       await canvas.draw();
     }

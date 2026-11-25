@@ -503,7 +503,11 @@ export const editsMethods = {
 
   getEffectivePOIs(scene = canvas.scene) {
     if (!scene) return [];
-    const resolved = this.poiManager.resolvePois(scene, scene.id === canvas.scene?.id ? this.manifest : null);
+    const mUrl = scene.flags?.[MODULE_ID]?.manifestUrl;
+    const manifest = scene.id === canvas.scene?.id
+      ? this.manifest
+      : (mUrl ? (this.manifestCache?.get?.(mUrl) ?? null) : null);
+    const resolved = this.poiManager.resolvePois(scene, manifest);
     return foundry.utils.deepClone(resolved || []);
   },
 
@@ -633,6 +637,8 @@ export const editsMethods = {
     for (const t of scene.tiles) {
       if (t.levels?.size && !t.levels.has(levelId)) continue;
       if (!t.texture?.src) continue;
+      // Leave video tiles native so Foundry preserves game.video playback, looping, and audio
+      if (/\.(webm|mp4|m4v|ogv)(\?|$)/i.test(t.texture.src) || globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(t.texture.src)) continue;
       const tid = tiles.length;
       const occModes = Array.from(t.occlusion?.modes || []);
       const rot = t.rotation || 0;

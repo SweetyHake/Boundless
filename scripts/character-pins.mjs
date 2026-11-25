@@ -634,7 +634,8 @@ export class CharacterPinManager {
 
     if (!this.container?.visible || !anyVisible) return;
 
-    this._pulsePhase = (this._pulsePhase + (delta || 1) * 0.032) % (Math.PI * 2);
+    const clampedDelta = Math.min(Math.max(0, Number(delta) || 1), 5);
+    this._pulsePhase = (this._pulsePhase + clampedDelta * 0.032) % (Math.PI * 2);
     const wave = (Math.sin(this._pulsePhase) + 1) * 0.5; // 0..1
     const ringScale = 1.0 + wave * 0.24;
     const ringAlpha = 0.55 * (1 - wave * 0.82);
@@ -648,9 +649,9 @@ export class CharacterPinManager {
   }
 
   _getSafeScreenBounds() {
-    const now = performance.now();
-    if (now - this._lastSidebarCheckMs > 250) {
-      this._lastSidebarCheckMs = now;
+    // Only read DOM layout when invalidated (mount, collapseSidebar, canvasResize/resize) — never force reflows on 120 FPS pan
+    if (this._lastSidebarCheckMs === 0) {
+      this._lastSidebarCheckMs = performance.now() || 1;
       const leftCol = document.getElementById("ui-left-column-1") || document.getElementById("scene-controls");
       const lcRect = leftCol?.getBoundingClientRect?.();
       this._cachedLeftInset = (lcRect && lcRect.right > 20) ? Math.round(lcRect.right + 34) : 116;

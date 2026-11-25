@@ -1920,3 +1920,136 @@ test("lightingMethods rejects non-canonical dKey syntax and toggles mmv_* edges 
   ctrl._applyDoorStateLocal(info, 0, { playSound: false, deferRefresh: true });
   assert.equal(edges.has(mEid), true, "closing a moved door must restore its mmv_* edge in active destination sector");
 });
+
+test("TokenImpostorLayer.refreshTokenStates updates O(K) slots and flush() coalesces atlas uploads during active decodes", async () => {
+  installBaseGlobals();
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  const imp = new TokenImpostorLayer({}, {});
+  imp.mounted = true;
+  imp.count = 100;
+  let visScanCalls = 0;
+  const updatedIds = [];
+  imp._collectVisionCheckers = () => { visScanCalls++; return {}; };
+  imp._updateSingleTokenState = (doc) => { updatedIds.push(doc.id); };
+
+  imp.refreshTokenStates([{ id: "t1" }, { id: "t2" }]);
+  assert.equal(visScanCalls, 1, "must compute vision checkers only once for the toggled batch");
+  assert.deepEqual(updatedIds, ["t1", "t2"]);
+
+  // Atlas upload coalescing while decodes are in flight
+  let atlasUploads = 0;
+  imp.atlasTexture = { baseTexture: { update() { atlasUploads++; } } };
+  imp.atlasDirty = true;
+  imp._activeDecodes = 2;
+  imp._lastAtlasUploadMs = performance.now();
+  imp.flush();
+  assert.equal(atlasUploads, 0, "must defer 2048x2048 atlas upload inside 180ms window while decodes are streaming");
+
+  imp._activeDecodes = 0;
+  imp._decodeQueue = [];
+  imp.flush();
+  assert.equal(atlasUploads, 1, "must flush atlas immediately once decode queue drains");
+});
+
+test("TokenStreamer.materializeAndSelect calls applyRenderFlags before hex _overlapsSelection", async () => {
+  installBaseGlobals();
+  const { TokenStreamer } = await import("../scripts/token-streamer.mjs");
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  let appliedBeforeOverlap = false;
+  let controlled = false;
+  const tokObj = {
+    destroyed: false,
+    parent: null,
+    controlled: false,
+    shape: null,
+    async draw() {},
+    applyRenderFlags() { this.shape = { type: "hex" }; },
+    _overlapsSelection() {
+      appliedBeforeOverlap = Boolean(this.shape);
+      return appliedBeforeOverlap;
+    },
+    control() { this.controlled = true; controlled = true; return true; }
+  };
+  const doc = { id: "hexTok1", viewed: true, _source: { x: 100, y: 100, width: 1, height: 1 }, _object: null };
+  const tokenLayer = {
+    active: true,
+    objects: { addChild(c) { c.parent = this; } },
+    createObject: () => tokObj
+  };
+  globalThis.ui = { controls: { rendered: false }, notifications: { info() {}, warn() {} } };
+  globalThis.canvas = {
+    ready: true,
+    grid: { size: 100, isHexagonal: true },
+    stage: { scale: { x: 1 } },
+    scene: { id: "sc1", tokens: new Map([["hexTok1", doc]]) },
+    tokens: tokenLayer
+  };
+
+  const streamer = new TokenStreamer({ active: true });
+  streamer.enabled = true;
+  streamer.impostors = new TokenImpostorLayer({}, streamer);
+  streamer.materializeAndSelect([doc], {
+    releaseOthers: false,
+    maxCount: 1,
+    selectionRect: { x: 0, y: 0, width: 500, height: 500 }
+  });
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(appliedBeforeOverlap, true, "applyRenderFlags() must populate shape before _overlapsSelection on hex grids");
+  assert.equal(controlled, true, "freshly materialized hex token overlapping selectionRect must be controlled");
+});
+
+test("editsMethods skips video tiles during baking and preserves cached manifest POIs for inactive scenes", async () => {
+  installBaseGlobals();
+  globalThis.CONST.OCCLUSION_MODES = { NONE: 0, FADE: 1, RADIAL: 2, VISION: 3 };
+  globalThis.foundry = { utils: { deepClone: (o) => structuredClone(o) } };
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+
+  const scene = {
+    id: "scVideo",
+    width: 4000,
+    height: 4000,
+    flags: { boundless: { manifestUrl: "worlds/w/m.json" } },
+    tiles: [
+      { id: "tImg", x: 100, y: 100, width: 200, height: 200, texture: { src: "img/table.webp" }, elevation: 0 },
+      { id: "tVid", x: 300, y: 300, width: 200, height: 200, texture: { src: "vfx/fire.webm" }, elevation: 0 }
+    ],
+    walls: [],
+    lights: [],
+    sounds: []
+  };
+  const level = { id: "lvl1", elevation: { base: 0 } };
+  const spatial = editsMethods.collectLevelSpatialData(scene, level);
+  assert.equal(spatial.tiles.length, 1, "video tile must NOT be absorbed into static manifest");
+  assert.deepEqual(spatial.tileIdsToDelete, ["tImg"]);
+
+  // getEffectivePOIs when viewing a different scene must still consult manifestCache
+  globalThis.canvas = { scene: { id: "otherScene" } };
+  const cachedManifest = { pois: [{ id: "p1", name: "Capital", x: 100, y: 100 }] };
+  const ctrl = {
+    ...editsMethods,
+    manifest: null,
+    manifestCache: new Map([["worlds/w/m.json", cachedManifest]]),
+    poiManager: { resolvePois: (_sc, man) => man?.pois ?? [] }
+  };
+  const pois = ctrl.getEffectivePOIs(scene);
+  assert.equal(pois.length, 1);
+  assert.equal(pois[0].name, "Capital");
+});
+
+test("bakeSceneToBoundless rejects direct API re-baking of an already-baked scene", async () => {
+  installBaseGlobals();
+  const { bakeSceneToBoundless } = await import("../scripts/scene-baker.mjs");
+
+  const bakedScene = {
+    id: "scBaked",
+    name: "Baked Map",
+    flags: { boundless: { enabled: true, manifestUrl: "worlds/w/boundless/m.json" } },
+    levels: [{ id: "lvl1", background: { src: null }, foreground: null, flags: { boundless: { enabled: true, manifestUrl: "worlds/w/boundless/m.json" } } }]
+  };
+  await assert.rejects(
+    bakeSceneToBoundless({}, bakedScene, { createCopy: false }),
+    /already baked/i
+  );
+});

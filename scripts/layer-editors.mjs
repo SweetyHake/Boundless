@@ -670,7 +670,7 @@ export class VirtualLayerEditors {
         } catch {}
       } else {
         this._destroyPlaceable(canvas.lighting, existing, this.lightsByKey, this.lightsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-        this._mountNativeLight(it, gen, curRev);
+        if (this._lastLightNeededKeys.has(it.lKey)) this._mountNativeLight(it, gen, curRev);
       }
     }
   }
@@ -1038,7 +1038,7 @@ export class VirtualLayerEditors {
         } catch {}
       } else {
         this._destroyPlaceable(canvas.sounds, existing, this.soundsByKey, this.soundsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-        this._mountNativeSound(it, gen, curRev);
+        if (this._lastSoundNeededKeys.has(it.sKey)) this._mountNativeSound(it, gen, curRev);
       }
     }
   }
@@ -1455,7 +1455,7 @@ export class VirtualLayerEditors {
       } else {
         this._setRawVirtualTileVisible(existing.fullId, true);
         this._destroyPlaceable(canvas.tiles, existing, this.tilesByKey, this.tilesById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-        this._mountNativeTile(it, gen, curRev);
+        if (this._lastTileNeededKeys.has(it.tKey)) this._mountNativeTile(it, gen, curRev);
       }
     }
   }

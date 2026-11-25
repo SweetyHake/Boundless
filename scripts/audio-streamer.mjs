@@ -70,8 +70,20 @@ export class MegaAudioStreamer {
 
     if (anchors.length === 0 && this.activeSources.size === 0) {
       this.lastKey = "";
+      this._lastFastKey = "";
       return;
     }
+
+    // Fast quantized early-exit on 120 FPS panning: skip full sector/Map/sort rebuild when listener grid cells are unchanged
+    let fastKey = `${Math.round(darkness * 100)}|${globalThis.Boundless?.soundEditsRev || 0}|${this.activeSources.size}|${visibleLevelLayers.length}`;
+    for (let i = 0; i < visibleLevelLayers.length; i++) {
+      fastKey += `,${visibleLevelLayers[i]?.level?.id || ""}`;
+    }
+    for (let i = 0; i < anchors.length; i++) {
+      const a = anchors[i];
+      fastKey += `;${a.levelId || ""}:${Math.floor(a.x0 / 250)}:${Math.floor(a.y0 / 250)}:${Math.floor(a.x1 / 250)}:${Math.floor(a.y1 / 250)}`;
+    }
+    if (this.lastKey !== null && this._lastFastKey === fastKey) return;
 
     const needed = new Map(); // soundKey -> { layer, item }
 
@@ -165,7 +177,10 @@ export class MegaAudioStreamer {
       keyParts.push(`${k}:${s}`);
     }
     const key = keyParts.sort().join("|");
-    if (this.lastKey !== null && key === this.lastKey && (key !== "" || this.activeSources.size === 0)) return;
+    if (this.lastKey !== null && key === this.lastKey && (key !== "" || this.activeSources.size === 0)) {
+      this._lastFastKey = fastKey;
+      return;
+    }
 
     let changed = false;
     let complete = true;
@@ -255,6 +270,7 @@ export class MegaAudioStreamer {
     }
 
     this.lastKey = complete ? key : null;
+    this._lastFastKey = complete ? fastKey : null;
 
     if (changed) {
       canvas.perception?.update({ refreshSounds: true });
@@ -268,6 +284,7 @@ export class MegaAudioStreamer {
     }
     this.activeSources.clear();
     this._sourceSigs?.clear?.();
+    this._lastFastKey = null;
     this.lastKey = null;
     if (hadAny && canvas?.ready) {
       canvas.perception?.update({ refreshSounds: true });

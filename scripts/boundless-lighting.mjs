@@ -1392,7 +1392,7 @@ export const lightingMethods = {
       if (doPyramid && !this._inUpdatePyramid) {
         this.updatePyramid();
       }
-      this.updateSimAndLightBubbles(true);
+      this.updateSimAndLightBubbles(false);
       this.wallEditor.syncViewport(true);
       this.layerEditors.syncViewport(true);
     });

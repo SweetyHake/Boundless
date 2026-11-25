@@ -231,10 +231,12 @@ export function registerBoundlessHooks(controller) {
     }
     syncPerfConfigFromSettings();
     controller.applyVramProfile();
-    installLazyTokenLayerPatch();
-    installBulkSelectionPatch(controller);
-    installHoverFadeHitTestPatch(controller);
-    installCharacterSwitchPatch(controller);
+    if (!game.settings?.get?.("core", "noCanvas")) {
+      installLazyTokenLayerPatch();
+      installBulkSelectionPatch(controller);
+      installHoverFadeHitTestPatch(controller);
+      installCharacterSwitchPatch(controller);
+    }
   });
 
   Hooks.once("setup", () => {
@@ -472,13 +474,81 @@ export function registerBoundlessHooks(controller) {
     }, 120);
   });
 
-  window.addEventListener("resize", () => {
+  const onResizeSync = (syncPyramid = false) => {
     if (!isRuntimeReady()) return;
     controller._recomputeWorldMinScale?.();
     controller.poiManager._layoutDirty = true;
     controller.poiManager.updateViewport();
     controller.charPins._lastSidebarCheckMs = 0;
     controller.charPins.updateViewport();
+    if (syncPyramid) {
+      controller.updatePyramid();
+      controller.selectionOverlay?.refresh?.(true);
+    }
+  };
+  window.addEventListener("resize", () => onResizeSync(false));
+  Hooks.on("canvasResize", () => onResizeSync(true));
+
+  for (const hookName of ["createCombatant", "deleteCombatant", "updateCombat", "deleteCombat"]) {
+    Hooks.on(hookName, () => {
+      if (!isRuntimeReady()) return;
+      controller.tokenStreamer.onCombatChanged();
+    });
+  }
+
+  Hooks.on("deleteScene", (scene) => {
+    if (!scene?.id) return;
+    const sid = scene.id;
+    const worldId = game.world?.id || "world";
+    if (controller._cachedSceneId === sid || controller._mountedSceneId === sid) {
+      controller.clearSceneCache();
+    }
+    // Evict manifestCache URLs only referenced by the deleted scene
+    const deletedUrls = new Set();
+    const sUrl = scene.flags?.[MODULE_ID]?.manifestUrl;
+    if (sUrl) deletedUrls.add(sUrl);
+    for (const lvl of scene.levels || []) {
+      const lUrl = lvl.flags?.[MODULE_ID]?.manifestUrl;
+      if (lUrl) deletedUrls.add(lUrl);
+    }
+    if (deletedUrls.size && controller.manifestCache?.size) {
+      const stillUsed = new Set();
+      for (const sc of game.scenes || []) {
+        if (!sc || sc.id === sid) continue;
+        const u = sc.flags?.[MODULE_ID]?.manifestUrl;
+        if (u) stillUsed.add(u);
+        for (const lvl of sc.levels || []) {
+          const lu = lvl.flags?.[MODULE_ID]?.manifestUrl;
+          if (lu) stillUsed.add(lu);
+        }
+      }
+      for (const u of deletedUrls) {
+        if (!stillUsed.has(u)) controller.manifestCache.delete(u);
+      }
+    }
+    controller.lightBatch?.clearPolyCacheDB?.(sid, worldId)?.catch?.(() => {});
+    try {
+      localStorage.removeItem(`boundless.camera.${worldId}.${sid}`);
+      const fogPrefix = `boundless.fog.v2.${worldId}.${sid}.`;
+      const keysToDel = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(fogPrefix)) keysToDel.push(k);
+      }
+      for (const k of keysToDel) localStorage.removeItem(k);
+    } catch {}
+  });
+
+  Hooks.on("deleteLevel", (level) => {
+    const parentScene = level?.parent;
+    if (!parentScene?.id || !level?.id) return;
+    const worldId = game.world?.id || "world";
+    try {
+      localStorage.removeItem(`boundless.fog.v2.${worldId}.${parentScene.id}.${level.id}`);
+    } catch {}
+    if (globalThis.canvas?.ready && parentScene.id === globalThis.canvas.scene?.id && controller.levelLayers?.has?.(level.id)) {
+      controller.mount(parentScene);
+    }
   });
 
   // React seamlessly to native TileDocuments added/edited/removed on any level (floors blocking lower-level lights, roofs, etc.)

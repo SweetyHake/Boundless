@@ -200,6 +200,23 @@ export class ChunkStreamer {
 
   update(vp) {
     if (this._updating || this.states.size === 0) return;
+    // Fast quantized early-exit on 120 Hz panning inside the same chunk grid cell
+    if (vp) {
+      let qKey = `${this._gen}|${Math.floor(vp.x0 / 2500)}_${Math.floor(vp.y0 / 2500)}_${Math.floor(vp.x1 / 2500)}_${Math.floor(vp.y1 / 2500)}_${(vp.scale ?? 1) >= 0.022 ? 1 : 0}`;
+      const toks = globalThis.canvas?.tokens?.placeables;
+      if (toks?.length) {
+        let th = toks.length | 0;
+        for (let i = 0; i < toks.length; i++) {
+          const t = toks[i];
+          if (!t || t.destroyed || !t.center) continue;
+          if (!t.controlled && !t.document?.baseActor?.hasPlayerOwner) continue;
+          th = (Math.imul(th, 31) ^ (Math.floor(t.center.x / 2500) + Math.imul(Math.floor(t.center.y / 2500), 131))) | 0;
+        }
+        qKey += `|${th}`;
+      }
+      if (this._lastUpdateQKey === qKey) return;
+      this._lastUpdateQKey = qKey;
+    }
     this._updating = true;
     try {
       const now = performance.now();

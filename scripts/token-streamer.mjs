@@ -617,8 +617,12 @@ export class TokenStreamer {
 
     // 1. Fast frustum `renderable` culling & zoom LOD on currently mounted native tokens (runs even during camera flight!)
     const roofHidden = this.controller?._roofHiddenTokens;
+    const activeCombat = game.combat?.started ? game.combat : null;
+    const activeTurnTokenId = (activeCombat && activeCombat.combatant?.sceneId === canvas.scene?.id)
+      ? activeCombat.combatant?.tokenId
+      : null;
     const placeables = canvas.tokens.placeables;
-    let anyRenderableToggled = false;
+    let toggledDocs = null;
     for (let i = 0; i < placeables.length; i++) {
       const tok = placeables[i];
       if (!tok || tok.destroyed || tok.isPreview || this.isTokenDrawing(tok)) continue;
@@ -632,7 +636,8 @@ export class TokenStreamer {
       const isAnimating = Boolean(tok.movementAnimationPromise || (tok.animationContexts?.size > 0));
       const animOnScreen = isAnimating && (tok.x + w >= cullX0 && tok.x <= cullX1 && tok.y + h >= cullY0 && tok.y <= cullY1);
       const onScreen = showTokens && (docOnScreen || animOnScreen);
-      const keepVisible = onScreen || tok.controlled;
+      const isActiveTurn = Boolean(tok.turnMarker?.visible || (activeTurnTokenId && doc.id === activeTurnTokenId));
+      const keepVisible = onScreen || tok.controlled || isActiveTurn;
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
       let blockedByRoof = Boolean(roofHidden?.has?.(tok));
@@ -642,17 +647,18 @@ export class TokenStreamer {
         blockedByRoof = true;
       }
       const wantRenderable = keepVisible && !blockedByRoof;
+      let tokToggled = false;
       if (tok.renderable !== wantRenderable) {
         if (!wantRenderable && this._activeFades.has(doc.id)) {
           this._finishFadeImmediate(doc.id);
         }
         tok.renderable = wantRenderable;
-        anyRenderableToggled = true;
+        tokToggled = true;
       }
       if (tok.mesh && !tok.mesh.destroyed) {
         if (tok.mesh.renderable !== wantRenderable) {
           tok.mesh.renderable = wantRenderable;
-          anyRenderableToggled = true;
+          tokToggled = true;
         }
         // Foundry v14 Token#_refreshVisibility sets mesh.visible = visible && renderable; restore it when returning to view,
         // unless Showstopper intentionally hid the token (e.g. flying above camera lens occlusion).
@@ -664,6 +670,10 @@ export class TokenStreamer {
       if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed && tok._ssJumpShadow.renderable !== wantRenderable) {
         tok._ssJumpShadow.renderable = wantRenderable;
       }
+      if (tokToggled) {
+        if (!toggledDocs) toggledDocs = [];
+        toggledDocs.push(doc);
+      }
 
       // LOD: hide tiny unreadable sub-elements at far macro zoom (< 0.22x) to cut draw calls & Canvas2D cost
       if (lodChanged || wantRenderable) {
@@ -674,12 +684,17 @@ export class TokenStreamer {
       }
     }
 
+    const anyRenderableToggled = Boolean(toggledDocs && toggledDocs.length > 0);
     if (anyRenderableToggled || lodChanged) {
       invalidateTokenLayerCache();
     }
     if (anyRenderableToggled) {
-      // Flush impostor state synchronously in the same frame so Native <-> Impostor handoff has zero 1-frame blink
-      this.impostors.refreshVisibility(true);
+      // Update ONLY the toggled tokens in O(K) instead of O(N) full-scene scan so pan frames stay 120 FPS smooth
+      if (typeof this.impostors.refreshTokenStates === "function") {
+        this.impostors.refreshTokenStates(toggledDocs);
+      } else {
+        this.impostors.refreshVisibility(true);
+      }
       this.impostors.flush();
     } else if (force) {
       this.impostors.markVisibilityDirty();
@@ -1238,6 +1253,30 @@ export class TokenStreamer {
     else queueMicrotask(finish);
   }
 
+  onCombatChanged() {
+    if (!this.enabled || !canvas?.ready || !canvas.scene?.tokens) return;
+    const sceneId = canvas.scene.id;
+    const combatants = game.combat?.combatants;
+    if (combatants) {
+      for (const c of combatants) {
+        if (c?.sceneId !== sceneId || !c.tokenId) continue;
+        const doc = canvas.scene.tokens.get(c.tokenId);
+        if (!doc || !doc.viewed) continue;
+        const mounted = doc._object && !doc._object.destroyed && doc._object.parent === canvas.tokens?.objects;
+        if (!mounted && !this._drawQueuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
+          this._drawQueuedIds.add(doc.id);
+          this._drawQueue.push(doc);
+        }
+      }
+      if (this._drawQueue.length > 0 && !this._pumping && this._rafId === null) {
+        this._primeQueueTextures();
+        this._scheduleDrawPump();
+      }
+    }
+    this._lastStreamKey = "";
+    this._queueSyncMicrotask(true);
+  }
+
   onVisibilityChanged() {
     if (!this.enabled) return;
     this.impostors.markVisibilityDirty();
@@ -1585,6 +1624,8 @@ export class TokenStreamer {
             }
             continue;
           }
+          // Apply renderFlags immediately so Foundry v14 populates `obj.shape` & `obj.position` before `_overlapsSelection` (hex grids!)
+          try { obj.applyRenderFlags?.(); } catch {}
           // Keep offscreen / roof-occluded tokens non-renderable so selecting 150+ continent tokens adds zero offscreen GPU cost!
           const blockedByRoof = Boolean(
             this.controller?._roofHiddenTokens?.has?.(obj) ||

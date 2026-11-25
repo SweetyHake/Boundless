@@ -1397,6 +1397,15 @@ export class TokenImpostorLayer {
     }
   }
 
+  refreshTokenStates(docs) {
+    if (!this.mounted || !docs?.length || this.count === 0) return;
+    const visCtx = this._collectVisionCheckers();
+    for (let i = 0; i < docs.length; i++) {
+      const doc = docs[i];
+      if (doc) this._updateSingleTokenState(doc, visCtx);
+    }
+  }
+
   refreshVisibility(force = false) {
     if (!this.mounted || !canvas?.scene?.tokens || this.count === 0) {
       this.activeVisibleCount = 0;
@@ -1433,8 +1442,14 @@ export class TokenImpostorLayer {
   flush() {
     if (!this.mounted) return;
     if (this.atlasDirty && this.atlasTexture?.baseTexture) {
-      this.atlasDirty = false;
-      this.atlasTexture.baseTexture.update();
+      const now = performance.now();
+      const stillStreaming = this._activeDecodes > 0 || this._decodeQueue.length > 0;
+      // Coalesce expensive 2048x2048 mipmapped atlas uploads while portraits are actively streaming in
+      if (!stillStreaming || (now - (this._lastAtlasUploadMs || 0)) >= 180) {
+        this.atlasDirty = false;
+        this._lastAtlasUploadMs = now;
+        this.atlasTexture.baseTexture.update();
+      }
     }
     if (this._bufDirty.center && this.centerBuf) { this.centerBuf.update(); this._bufDirty.center = false; }
     if (this._bufDirty.sizeInfo && this.sizeInfoBuf) { this.sizeInfoBuf.update(); this._bufDirty.sizeInfo = false; }

@@ -1479,7 +1479,14 @@ function attachIdleFpsLimiter() {
     window.addEventListener("pointerdown", bump, { passive: true });
     window.addEventListener("wheel", bump, { passive: true });
     window.addEventListener("keydown", bump);
+    window.addEventListener("focus", bump);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) bump();
+      });
+    }
     Hooks.on("sightRefresh", bump);
+    Hooks.on("canvasPan", bump);
   }
   if (_idle.ticker === ticker) return;
   if (_idle.ticker && _idle.tickerFn) {

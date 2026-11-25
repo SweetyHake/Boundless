@@ -730,6 +730,11 @@ export function installAutoPerfEngine(controller) {
     scheduleStandardCulling(true);
   });
 
+  Hooks.on("canvasResize", () => {
+    if (!isStandardSceneActive()) return;
+    scheduleStandardCulling(true);
+  });
+
   Hooks.on("drawTile", (tile) => {
     if (!isStandardSceneActive()) return;
     if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {

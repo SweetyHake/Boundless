@@ -115,7 +115,7 @@ export async function openOptimizeSceneDialog(controller, scene) {
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Optimize.ProgressTitle", ({ signal, onProgress }) =>
     bakeSceneToBoundless(controller, liveScene, {
-      targetDir: buildDefaultBakeDir(liveScene),
+      targetDir: null,
       levelIds: null,
       createCopy: opts.createCopy,
       removeOriginals: true,

@@ -739,15 +739,18 @@ export class VirtualWallEditor {
       return;
     }
 
-    const collectLimit = isWallsEditMode ? (inNativeZoom ? 6000 : 3000) : (MAX_NATIVE_DOORS_IN_VIEW + 1);
+    const doorCap = this._doorsCapped ? 200 : 260;
+    const collectLimit = isWallsEditMode ? (inNativeZoom ? 6000 : 3000) : (doorCap + 1);
     const segments = this._collectViewportSegments(curVp, { doorsOnly: !isWallsEditMode, limit: collectLimit });
 
-    // On massive continental maps with > 220 doors in viewport at far zoom, avoid mounting hundreds of native Wall objects
-    if (!isWallsEditMode && segments.length > MAX_NATIVE_DOORS_IN_VIEW) {
+    // On massive continental maps with > 260 doors in viewport at far zoom, avoid mounting hundreds of native Wall objects (hysteresis exit at <= 200)
+    if (!isWallsEditMode && segments.length > doorCap) {
+      this._doorsCapped = true;
       this._clearMountedWalls();
       if (this.macroGfx) { this.macroGfx.clear(); this.macroGfx.visible = false; }
       return;
     }
+    if (!isWallsEditMode) this._doorsCapped = false;
 
     // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview
     if (isWallsEditMode && (!inNativeZoom || segments.length > MAX_NATIVE_WALLS_IN_VIEW)) {
@@ -822,7 +825,10 @@ export class VirtualWallEditor {
       } else {
         const dKey = this._buildDoorKey(seg);
         const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, seg.ds) : (seg.ds || 0);
+        if (existing.editsRev === rev && existing.liveDs === liveDs) continue;
         const nextSig = this._wallSig(seg, liveDs);
+        existing.editsRev = rev;
+        existing.liveDs = liveDs;
         if (existing.sig !== nextSig) {
           const sheet = getExistingSheet(existing.doc);
           if (sheet?.rendered) {

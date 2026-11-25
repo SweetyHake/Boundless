@@ -720,6 +720,9 @@ class MegaWorld1000 {
   }
 
   mount(scene) {
+    if (globalThis.game?.settings?.get?.("core", "noCanvas")) {
+      return Promise.resolve();
+    }
     const switchingScene = Boolean(this._cachedSceneId && scene?.id !== this._cachedSceneId);
     this.unmount({ clearTextures: switchingScene });
     const mountGen = ++this._mountGen;
@@ -759,6 +762,7 @@ class MegaWorld1000 {
       }
       return;
     }
+    if (!globalThis.canvas?.ready || !globalThis.canvas?.app?.ticker) return;
 
     installLosHorizonPatch();
     installBulkSelectionPatch(this);

@@ -541,6 +541,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
           const minHitRadius = Math.max(40, 14 / rawScale);
           const hitDoc = streamer.findHitDocAtPoint(origin.x, origin.y, minHitRadius);
           if (hitDoc) {
+            this.hud?.close?.();
             if (event.shiftKey && hitDoc._object?.controlled) {
               hitDoc._object.release();
               controller?.selectionOverlay?.refresh?.();
@@ -637,13 +638,14 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
           if (hitDoc) {
             const alreadyControlled = Boolean(hitDoc._object?.controlled);
             streamer.materializeAndSelect([hitDoc], {
-              releaseOthers: !alreadyControlled,
+              releaseOthers: !alreadyControlled && !event.shiftKey,
               maxCount: 1,
               bulkRunner: (fn) => runBulkOnTokenLayer(this, fn),
               onComplete: (tokens) => {
                 const tok = tokens?.[0] || hitDoc._object;
                 if (tok && !tok.destroyed && this.active && (typeof tok._canHUD !== "function" || tok._canHUD(game.user, event))) {
-                  this.hud?.bind?.(tok);
+                  if (tok.hasActiveHUD) this.hud?.close?.();
+                  else this.hud?.bind?.(tok);
                 }
               }
             });
