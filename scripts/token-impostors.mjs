@@ -362,6 +362,8 @@ export class TokenImpostorLayer {
     this.fadeOverrides = new Map();
     this._visibilityDirty = true;
     this._lastVisSyncMs = 0;
+    this._pendingUpserts = new Map();
+    this._upsertQueued = false;
   }
 
   mount(scene) {
@@ -385,6 +387,8 @@ export class TokenImpostorLayer {
     this._decodeQueuedSet.clear();
     this._activeDecodes = 0;
     this.fadeOverrides.clear();
+    this._pendingUpserts.clear();
+    this._upsertQueued = false;
 
     if (this.mesh) {
       this.mesh.parent?.removeChild(this.mesh);
@@ -1008,12 +1012,40 @@ export class TokenImpostorLayer {
 
   upsertToken(doc) {
     if (!this.mounted || !doc?.id) return;
+    this._pendingUpserts.delete(doc.id);
     this._upsertDocInternal(doc);
     this._updateSingleTokenState(doc);
   }
 
+  /**
+   * Coalesce burst token upserts (batch create/update/draw) into a single microtask
+   * so `_collectVisionCheckers()` and GPU buffer `flush()` run once instead of N times.
+   */
+  queueUpsertToken(doc) {
+    if (!this.mounted || !doc?.id) return;
+    this._pendingUpserts.set(doc.id, doc);
+    if (this._upsertQueued) return;
+    this._upsertQueued = true;
+    const gen = this._gen;
+    queueMicrotask(() => {
+      this._upsertQueued = false;
+      if (!this.mounted || gen !== this._gen || this._pendingUpserts.size === 0) return;
+      const batch = Array.from(this._pendingUpserts.values());
+      this._pendingUpserts.clear();
+      const visCtx = this._collectVisionCheckers();
+      for (let i = 0; i < batch.length; i++) {
+        const d = batch[i];
+        if (!d?.id) continue;
+        this._upsertDocInternal(d);
+        this._updateSingleTokenState(d, visCtx);
+      }
+      this.flush();
+    });
+  }
+
   removeToken(docId) {
     if (!this.mounted || !docId) return;
+    this._pendingUpserts.delete(docId);
     const idx = this.docIndexById.get(docId);
     if (idx === undefined) return;
 
@@ -1273,7 +1305,9 @@ export class TokenImpostorLayer {
       return;
     }
     const now = performance.now();
-    if (!force && !this._visibilityDirty && (now - this._lastVisSyncMs) < 120) return;
+    // Respect 120ms throttle even when _visibilityDirty is true (tick() will flush once cooldown elapses);
+    // force=true still runs immediately for zero-blink Native <-> Impostor handoffs.
+    if (!force && (now - this._lastVisSyncMs) < 120) return;
     this._visibilityDirty = false;
     this._lastVisSyncMs = now;
 

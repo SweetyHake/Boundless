@@ -286,7 +286,7 @@ export class VirtualWallEditor {
       : `${seg.levelId}::${seg.sk}_${seg.idx}`;
   }
 
-  _collectViewportSegments(vp, { doorsOnly = false } = {}) {
+  _collectViewportSegments(vp, { doorsOnly = false, limit = Infinity } = {}) {
     const layer = this._getViewedLayer();
     if (!layer?.spec?.sectors) return [];
 
@@ -318,6 +318,7 @@ export class VirtualWallEditor {
             if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
                 (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
             segments.push(resolved);
+            if (segments.length >= limit) return segments;
           }
         }
 
@@ -336,6 +337,7 @@ export class VirtualWallEditor {
             if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
                 (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
             segments.push(resolved);
+            if (segments.length >= limit) return segments;
           }
         }
       }
@@ -358,6 +360,7 @@ export class VirtualWallEditor {
         if ((x1 < vx0 && x2 < vx0) || (x1 > vx1 && x2 > vx1) ||
             (y1 < vy0 && y2 < vy0) || (y1 > vy1 && y2 > vy1)) continue;
         segments.push(resolved);
+        if (segments.length >= limit) return segments;
       }
     }
     return segments;
@@ -632,8 +635,11 @@ export class VirtualWallEditor {
     if (!segments.length) return;
 
     const lw = Math.max(2, Math.min(28, 2.6 / Math.max(0.01, scale)));
+    const maxDraw = 2500;
+    const step = segments.length > maxDraw ? Math.ceil(segments.length / maxDraw) : 1;
     const byColor = new Map();
-    for (const seg of segments) {
+    for (let i = 0; i < segments.length; i += step) {
+      const seg = segments[i];
       const col = getMacroWallColor(seg);
       let list = byColor.get(col);
       if (!list) {
@@ -645,8 +651,8 @@ export class VirtualWallEditor {
 
     for (const [col, list] of byColor) {
       g.lineStyle(lw, col, 0.72);
-      for (const seg of list) {
-        const [x1, y1, x2, y2] = seg.c;
+      for (let i = 0; i < list.length; i++) {
+        const [x1, y1, x2, y2] = list[i].c;
         g.moveTo(x1, y1);
         g.lineTo(x2, y2);
       }
@@ -672,7 +678,7 @@ export class VirtualWallEditor {
     const inNativeZoom = isWallsEditMode ? (effScale >= NATIVE_WALLS_MIN_SCALE) : this._doorsZoomActive;
     const showDoorControls = isWallsEditMode || effScale >= DOOR_CONTROL_MIN_SCALE;
 
-    const qStep = 200;
+    const qStep = Math.max(200, Math.round(60 / Math.max(0.01, curVp.scale)));
     const qx0 = Math.floor(curVp.x0 / qStep);
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
@@ -681,7 +687,7 @@ export class VirtualWallEditor {
     const rev = this.controller.wallEditsRev || 0;
     const prevShowDoorControls = this._showDoorControls;
     this._showDoorControls = showDoorControls;
-    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
+    const key = `${layer.level.id}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:m${isWallsEditMode ? 1 : 0}:n${inNativeZoom ? 1 : 0}:c${showDoorControls ? 1 : 0}:r${rev}`;
     if (key === this._lastKey) return;
     this._lastKey = key;
     if (prevShowDoorControls !== showDoorControls) this.refreshDoorVisibility();
@@ -693,7 +699,8 @@ export class VirtualWallEditor {
       return;
     }
 
-    const segments = this._collectViewportSegments(curVp, { doorsOnly: !isWallsEditMode });
+    const collectLimit = isWallsEditMode ? (inNativeZoom ? 6000 : 3000) : (MAX_NATIVE_DOORS_IN_VIEW + 1);
+    const segments = this._collectViewportSegments(curVp, { doorsOnly: !isWallsEditMode, limit: collectLimit });
 
     // On massive continental maps with > 220 doors in viewport at far zoom, avoid mounting hundreds of native Wall objects
     if (!isWallsEditMode && segments.length > MAX_NATIVE_DOORS_IN_VIEW) {

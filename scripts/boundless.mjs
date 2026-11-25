@@ -1028,6 +1028,13 @@ class MegaWorld1000 {
     this.soundEdits.clear();
     this.tileEdits.clear();
     this._lightRebuildScheduled = false;
+    this._chunkRefreshQueued = false;
+    this._chunkRefreshNeedPyramid = false;
+    this._chunkRoofBakeLayer = null;
+    this._chunkRoofBakeChunkData = null;
+    this._lastRoofOccH1 = 0;
+    this._lastRoofOccH2 = 0;
+    this._lastRoofOccCount = -1;
     this._vpAnimLightsActive = false;
     if (this._vpLightSyncTimer) { clearTimeout(this._vpLightSyncTimer); this._vpLightSyncTimer = null; }
     if (this._lightRefreshAudioTimer) { clearTimeout(this._lightRefreshAudioTimer); this._lightRefreshAudioTimer = null; }

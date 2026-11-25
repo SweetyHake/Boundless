@@ -179,6 +179,8 @@ export class TokenStreamer {
     this._lastStreamKey = "";
     this._nativeTokensActive = false;
     this._flightPrewarmTarget = null;
+    this._syncMicrotaskQueued = false;
+    this._syncMicrotaskForce = false;
   }
 
   isTokenDrawing(tok) {
@@ -400,6 +402,8 @@ export class TokenStreamer {
     this._lastStreamKey = "";
     this._nativeTokensActive = false;
     this._flightPrewarmTarget = null;
+    this._syncMicrotaskQueued = false;
+    this._syncMicrotaskForce = false;
 
     const curScene = canvas?.scene;
     const curViewKey = curScene?.id ? `${curScene.id}::${curScene._view ?? canvas?.level?.id ?? ""}` : null;
@@ -1101,11 +1105,28 @@ export class TokenStreamer {
 
   /* ------------------------- Live Document Hooks ------------------------- */
 
+  _queueSyncMicrotask(force = false) {
+    if (force) {
+      this._syncMicrotaskForce = true;
+      this._lastStreamKey = "";
+    }
+    if (this._syncMicrotaskQueued) return;
+    this._syncMicrotaskQueued = true;
+    const gen = this._gen;
+    queueMicrotask(() => {
+      const doForce = this._syncMicrotaskForce;
+      this._syncMicrotaskQueued = false;
+      this._syncMicrotaskForce = false;
+      if (!this.enabled || gen !== this._gen || !this._lastVp) return;
+      this.scheduleSync(this._lastVp, doForce);
+    });
+  }
+
   onTokenCreated(doc) {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
     this._indexDoc(doc);
     this.lastSeenMs.set(doc.id, performance.now());
-    this.impostors.upsertToken(doc);
+    this.impostors.queueUpsertToken(doc);
   }
 
   onTokenUpdated(doc, changes) {
@@ -1128,7 +1149,7 @@ export class TokenStreamer {
       this._indexDoc(doc);
     }
     if (visualChanged) {
-      this.impostors.upsertToken(doc);
+      this.impostors.queueUpsertToken(doc);
     }
     if (moved || alwaysMountChanged) {
       const needsMount = !doc._object || doc._object.destroyed || doc._object.parent !== canvas?.tokens?.objects;
@@ -1140,14 +1161,8 @@ export class TokenStreamer {
           this._scheduleDrawPump();
         }
       } else if (moved && this._lastVp) {
-        if (needsMount) {
-          // If a previously unmounted NPC moved into the current viewport, queue its native draw
-          this._lastStreamKey = "";
-          this.scheduleSync(this._lastVp, true);
-        } else {
-          // Refresh frustum culling so a mounted offscreen token walking into view becomes renderable immediately
-          this.scheduleSync(this._lastVp, false);
-        }
+        // Coalesce batch token moves into one viewport sync microtask instead of O(K*N) synchronous scans
+        this._queueSyncMicrotask(needsMount);
       }
     }
   }
@@ -1178,10 +1193,9 @@ export class TokenStreamer {
         if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
         if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = false;
       } else if (this._lastVp) {
-        this.scheduleSync(this._lastVp, false);
+        this._queueSyncMicrotask(false);
       }
-      this.impostors.upsertToken(doc);
-      this.impostors.flush();
+      this.impostors.queueUpsertToken(doc);
     };
     const pending = coreDrawPromises.get(tok);
     if (pending) pending.then(finish, finish);

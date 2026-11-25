@@ -363,32 +363,62 @@ export const editsMethods = {
 
     if ("-=doorStates" in flagChanges || flagChanges.doorStates === null) {
       const prevKeys = Array.from(this.doorStates.keys());
+      let anyDoorChanged = false;
       // Keep this.doorStates intact while reverting so _applyDoorStateLocal sees curDs !== defaultDs
       for (const dKey of prevKeys) {
         const info = this._resolveDoorByKey(dKey);
-        if (info) this._applyDoorStateLocal(info, info.defaultDs, { playSound: false });
+        if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: true })) {
+          anyDoorChanged = true;
+        }
       }
       this.doorStates.clear();
       this.openDoors.clear();
       this._restoreDoorStates(scene);
+      if (anyDoorChanged) {
+        this.updateSimAndLightBubbles(false);
+        canvas.perception?.update({
+          initializeVision: true,
+          initializeLighting: true,
+          initializeSounds: true,
+          refreshLightSources: true,
+          refreshLighting: true,
+          refreshVision: true
+        });
+      }
     } else if (flagChanges.doorStates && typeof flagChanges.doorStates === "object") {
-      for (const [rawKey, rawVal] of Object.entries(flagChanges.doorStates)) {
+      const entries = Object.entries(flagChanges.doorStates);
+      const batchMode = entries.length > 1;
+      let anyDoorChanged = false;
+      for (const [rawKey, rawVal] of entries) {
         if (rawKey.startsWith("-=") || rawVal === null) {
           const dKey = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
           const info = this._resolveDoorByKey(dKey);
-          if (info) {
-            this._applyDoorStateLocal(info, info.defaultDs, { playSound: false });
+          if (info && this._applyDoorStateLocal(info, info.defaultDs, { playSound: false, deferRefresh: batchMode })) {
+            anyDoorChanged = true;
           }
           this.doorStates.delete(dKey);
           this.openDoors.delete(dKey);
         } else {
           const info = this._resolveDoorByKey(rawKey);
           if (info) {
-            this._applyDoorStateLocal(info, rawVal, { playSound: false });
+            if (this._applyDoorStateLocal(info, rawVal, { playSound: false, deferRefresh: batchMode })) {
+              anyDoorChanged = true;
+            }
           } else {
             this.doorStates.set(rawKey, this._normalizeDoorState(rawVal, 0));
           }
         }
+      }
+      if (batchMode && anyDoorChanged) {
+        this.updateSimAndLightBubbles(false);
+        canvas.perception?.update({
+          initializeVision: true,
+          initializeLighting: true,
+          initializeSounds: true,
+          refreshLightSources: true,
+          refreshLighting: true,
+          refreshVision: true
+        });
       }
     }
 

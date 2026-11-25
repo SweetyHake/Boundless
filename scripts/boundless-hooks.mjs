@@ -268,7 +268,7 @@ export function registerBoundlessHooks(controller) {
     controller.scheduleCameraSave();
     controller.updatePyramid();
     controller.scheduleViewportLightSync();
-    controller.selectionOverlay?.refresh?.();
+    controller.selectionOverlay?.refresh?.(false);
   });
 
   let _controlTokenQueued = false;
@@ -328,6 +328,43 @@ export function registerBoundlessHooks(controller) {
     });
   });
 
+  // Coalesce burst Token hooks (batch create / drag / delete / draw) into a single microtask flush so K tokens stay O(N) instead of O(K*N)
+  let _tokBatchQueued = false;
+  let _tokBatchBubbles = false;
+  let _tokBatchSelection = false;
+  let _tokBatchVoidFilter = false;
+  let _tokBatchVoidFilterForce = false;
+  let _tokBatchOcclusion = false;
+  const queueTokenBatchFlush = ({ bubbles = false, selection = false, voidFilter = false, voidFilterForce = false, occlusion = false } = {}) => {
+    if (bubbles) _tokBatchBubbles = true;
+    if (selection) _tokBatchSelection = true;
+    if (voidFilter) _tokBatchVoidFilter = true;
+    if (voidFilterForce) _tokBatchVoidFilterForce = true;
+    if (occlusion) _tokBatchOcclusion = true;
+    if (_tokBatchQueued) return;
+    _tokBatchQueued = true;
+    queueMicrotask(() => {
+      const doBubbles = _tokBatchBubbles;
+      const doSelection = _tokBatchSelection;
+      const doVoidFilter = _tokBatchVoidFilter;
+      const doVoidForce = _tokBatchVoidFilterForce;
+      const doOcclusion = _tokBatchOcclusion;
+      _tokBatchQueued = false;
+      _tokBatchBubbles = false;
+      _tokBatchSelection = false;
+      _tokBatchVoidFilter = false;
+      _tokBatchVoidFilterForce = false;
+      _tokBatchOcclusion = false;
+      if (!controller.active) return;
+      if (doVoidFilter) controller._syncInterfaceVoidFilter(doVoidForce);
+      if (doBubbles) controller.updateSimAndLightBubbles(false);
+      if (doSelection) controller.selectionOverlay?.refresh?.(true);
+      if (doOcclusion) {
+        canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
+      }
+    });
+  };
+
   Hooks.on("updateToken", (doc, changes) => {
     if (!controller.active || doc?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenUpdated(doc, changes);
@@ -336,22 +373,21 @@ export function registerBoundlessHooks(controller) {
     const elevChanged = "elevation" in changes;
     const lightChanged = "light" in changes || "sight" in changes;
     if (posChanged || elevChanged || lightChanged) {
-      if ((posChanged || elevChanged) && controller._hasMultiElevationDepth()) controller._depthDirty = true;
-      if (posChanged || lightChanged) controller.updateSimAndLightBubbles(false);
-      if (posChanged || elevChanged) {
-        controller._roofTokenOccDirty = true;
-        controller.selectionOverlay?.refresh?.();
-      }
-      if (posChanged && controller.needsOcclusionRefreshNear(doc)) {
-        canvas.perception.update({ refreshOcclusion: true, refreshOcclusionStates: true, refreshOcclusionMask: true });
-      }
+      if ((posChanged || elevChanged) && !controller._depthDirty && controller._hasMultiElevationDepth()) controller._depthDirty = true;
+      if (posChanged || elevChanged) controller._roofTokenOccDirty = true;
+      const needOcc = posChanged && !_tokBatchOcclusion && controller.needsOcclusionRefreshNear(doc);
+      queueTokenBatchFlush({
+        bubbles: posChanged || lightChanged,
+        selection: posChanged || elevChanged,
+        occlusion: needOcc
+      });
     }
   });
 
   Hooks.on("drawToken", (tok) => {
     if (!controller.active || tok?.document?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenDrawn(tok);
-    if (!tok.isPreview) controller._syncInterfaceVoidFilter(true);
+    if (!tok.isPreview) queueTokenBatchFlush({ voidFilter: true, voidFilterForce: true });
   });
 
   Hooks.on("refreshToken", (tok, flags) => {
@@ -366,9 +402,8 @@ export function registerBoundlessHooks(controller) {
     controller.tokenStreamer.onTokenCreated(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
-    controller._syncInterfaceVoidFilter(true);
-    controller.updateSimAndLightBubbles(false);
-    controller.syncRoofTokenOcclusion();
+    controller._roofTokenOccDirty = true;
+    queueTokenBatchFlush({ bubbles: true, voidFilter: true, voidFilterForce: true });
   });
 
   Hooks.on("deleteToken", (doc) => {
@@ -376,13 +411,7 @@ export function registerBoundlessHooks(controller) {
     controller.tokenStreamer.onTokenDeleted(doc);
     controller.charPins.onTokenCreatedOrDeleted();
     controller._depthDirty = true;
-    queueMicrotask(() => {
-      if (controller.active) {
-        controller._syncInterfaceVoidFilter();
-        controller.selectionOverlay?.refresh?.();
-      }
-    });
-    controller.updateSimAndLightBubbles(false);
+    queueTokenBatchFlush({ bubbles: true, selection: true, voidFilter: true });
   });
 
   Hooks.on("updateUser", (_user, changes) => {

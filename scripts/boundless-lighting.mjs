@@ -656,21 +656,33 @@ export const lightingMethods = {
   scheduleLightBatchRebuild() {
     if (this._lightRebuildScheduled) return;
     this._lightRebuildScheduled = true;
+    const mountGen = this._mountGen;
     queueMicrotask(() => {
       this._lightRebuildScheduled = false;
-      if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready) return;
+      if (!this.active || this._mountGen !== mountGen || !this.visibleLevelLayers.length || !canvas?.ready) return;
       const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+      const sceneId = canvas.scene?.id;
+      const worldId = game.world?.id || "world";
+      const visibleLevelIds = this.visibleLevelLayers.map(l => l.level.id);
       this.lightBatch.build(
         this.visibleLevelLayers,
         pxPerFt,
         (lid, kind, sk, idx, raw) => this.resolveVirtualWall(lid, kind, sk, idx, raw),
         (lid, sk, idx, raw, lvl) => this.resolveVirtualLight(lid, sk, idx, raw, lvl),
-        this._getLightBatchBuildOpts()
+        {
+          ...this._getLightBatchBuildOpts(),
+          timeSliceThreshold: 80,
+          syncBudgetMs: 12,
+          deferredBudgetMs: 6,
+          onDeferredPolysReady: () => {
+            if (!this.active || this._mountGen !== mountGen || canvas.scene?.id !== sceneId) return;
+            this.scheduleLightBatchRebuild();
+            if (sceneId) this.lightBatch.persistPolyCacheToDB(worldId, sceneId, visibleLevelIds).catch(() => {});
+          }
+        }
       );
-      if (this.lightBatch.lastPolyCacheMisses > 0 && canvas.scene?.id) {
-        const worldId = game.world?.id || "world";
-        const visibleLevelIds = this.visibleLevelLayers.map(l => l.level.id);
-        this.lightBatch.persistPolyCacheToDB(worldId, canvas.scene.id, visibleLevelIds).catch(() => {});
+      if (this.lightBatch.lastPolyCacheMisses > 0 && this.lightBatch._deferredBakeRaf === null && sceneId) {
+        this.lightBatch.persistPolyCacheToDB(worldId, sceneId, visibleLevelIds).catch(() => {});
       }
       // Re-queue GPU light baking for all resident chunks on chunked worlds so edits never wipe chunk lights
       this.chunkStreamer.requeueAllLoadedChunks();
@@ -779,7 +791,7 @@ export const lightingMethods = {
     }
   },
 
-  _applyDoorStateLocal(info, targetDs, { playSound = true } = {}) {
+  _applyDoorStateLocal(info, targetDs, { playSound = true, deferRefresh = false } = {}) {
     const { dKey, eid, levelId, sx, sy, ptA, ptB, defaultDs } = info;
     const ds = this._normalizeDoorState(targetDs, defaultDs);
     const curDs = this.getCurrentDoorState(dKey, defaultDs);
@@ -868,7 +880,7 @@ export const lightingMethods = {
       this.closingDoorTimers.set(dKey, setTimeout(runCloseRebake, deferRebakeMs + 60));
     }
 
-    if (isOpen !== wasOpen) {
+    if (isOpen !== wasOpen && !deferRefresh) {
       const hasAnimatedDoorLighting = Boolean(
         mountedUpdated && mountedWall && !mountedWall.destroyed && mountedWall.hasDoorMesh && mountedWall.doorMeshes?.size
         && globalThis.showstopper?.doorLighting?.isEnabled?.()
@@ -1003,6 +1015,73 @@ export const lightingMethods = {
     }
   },
 
+  _scheduleChunkBatchRefresh({ needPyramid = true, roofBakeLayer = null, roofBakeChunkData = null } = {}) {
+    if (needPyramid) this._chunkRefreshNeedPyramid = true;
+    if (roofBakeLayer) {
+      this._chunkRoofBakeLayer = roofBakeLayer;
+      this._chunkRoofBakeChunkData = roofBakeChunkData;
+    }
+    if (this._chunkRefreshQueued) return;
+    this._chunkRefreshQueued = true;
+    const mountGen = this._mountGen;
+    queueMicrotask(() => {
+      const doPyramid = Boolean(this._chunkRefreshNeedPyramid);
+      const bakeLayer = this._chunkRoofBakeLayer;
+      const bakeChunkData = this._chunkRoofBakeChunkData;
+      this._chunkRefreshQueued = false;
+      this._chunkRefreshNeedPyramid = false;
+      this._chunkRoofBakeLayer = null;
+      this._chunkRoofBakeChunkData = null;
+      if (!this.active || this._mountGen !== mountGen) return;
+
+      if (bakeLayer && !bakeLayer.spec?.roofMaskUrl) {
+        const isSuperGrid = Boolean(bakeLayer.spec?.superGrid);
+        const regionPx = bakeLayer.spec?.superGrid?.regionPx || 100000;
+        const b = bakeChunkData?.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
+        const isFullSuperGridProvince = isSuperGrid && (b.w === regionPx && b.h === regionPx);
+        if (isFullSuperGridProvince) {
+          if (!this.lightBatch.bakedRoofMask && !this._roofMaskBaking && bakeChunkData?.overlays) {
+            const ovList = Array.isArray(bakeChunkData.overlays) ? bakeChunkData.overlays : Object.values(bakeChunkData.overlays);
+            this._bakeRoofMaskFromList(ovList, {
+              originX: b.x || 0,
+              originY: b.y || 0,
+              regionW: b.w || regionPx,
+              regionH: b.h || regionPx,
+              repeat: true
+            });
+          }
+        } else {
+          const allOvs = Object.values(bakeLayer.spec.overlays || {});
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const ov of allOvs) {
+            if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
+            const r = Math.hypot(ov.w || 0, ov.h || 0) * 0.5;
+            if (ov.cx - r < minX) minX = ov.cx - r;
+            if (ov.cy - r < minY) minY = ov.cy - r;
+            if (ov.cx + r > maxX) maxX = ov.cx + r;
+            if (ov.cy + r > maxY) maxY = ov.cy + r;
+          }
+          if (minX < maxX && minY < maxY) {
+            this._bakeRoofMaskFromList(allOvs, {
+              originX: minX,
+              originY: minY,
+              regionW: maxX - minX,
+              regionH: maxY - minY,
+              repeat: false
+            });
+          }
+        }
+      }
+
+      if (doPyramid && !this._inUpdatePyramid) {
+        this.updatePyramid();
+      }
+      this.updateSimAndLightBubbles(true);
+      this.wallEditor.syncViewport(true);
+      this.layerEditors.syncViewport(true);
+    });
+  },
+
   onChunkLoaded(layer, chunkKey, chunkData) {
     if (!this.active || !layer) return;
     // Queue non-blocking time-sliced GPU light baking for this chunk (<= 6ms/frame)
@@ -1011,57 +1090,20 @@ export const lightingMethods = {
     // Reconcile persisted door states that belong to sectors in this newly loaded chunk
     this._reconcileChunkDoorStates(layer, chunkData);
 
-    // Bake pixel-accurate roof mask for chunked worlds (repeat=true only when chunk spans full superGrid region)
-    if (chunkData?.overlays && !layer.spec?.roofMaskUrl) {
-      const isSuperGrid = Boolean(layer.spec?.superGrid);
-      const regionPx = layer.spec?.superGrid?.regionPx || 100000;
-      const b = chunkData.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
-      const isFullSuperGridProvince = isSuperGrid && (b.w === regionPx && b.h === regionPx);
-      if (isFullSuperGridProvince) {
-        if (!this.lightBatch.bakedRoofMask && !this._roofMaskBaking) {
-          const ovList = Array.isArray(chunkData.overlays) ? chunkData.overlays : Object.values(chunkData.overlays);
-          this._bakeRoofMaskFromList(ovList, {
-            originX: b.x || 0,
-            originY: b.y || 0,
-            regionW: b.w || regionPx,
-            regionH: b.h || regionPx,
-            repeat: true
-          });
-        }
-      } else {
-        const allOvs = Object.values(layer.spec.overlays || {});
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const ov of allOvs) {
-          if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
-          const r = Math.hypot(ov.w || 0, ov.h || 0) * 0.5;
-          if (ov.cx - r < minX) minX = ov.cx - r;
-          if (ov.cy - r < minY) minY = ov.cy - r;
-          if (ov.cx + r > maxX) maxX = ov.cx + r;
-          if (ov.cy + r > maxY) maxY = ov.cy + r;
-        }
-        if (minX < maxX && minY < maxY) {
-          this._bakeRoofMaskFromList(allOvs, {
-            originX: minX,
-            originY: minY,
-            regionW: maxX - minX,
-            regionH: maxY - minY,
-            repeat: false
-          });
-        }
-      }
-    }
-
-    // Invalidate spatial caches so roofs, walls, doors, audio, editors, and sim-bubbles pick up newly loaded sectors immediately
+    // Invalidate spatial caches so roofs, walls, doors, audio, editors, and sim-bubbles pick up newly loaded sectors
     layer.lastOverlayKey = "";
     layer.lastTileKey = "";
     this.lastSimKey = null;
     this.lastDynLightKey = null;
     this.audioStreamer.lastKey = "";
     this._roofTokenOccDirty = true;
-    this.updatePyramid();
-    this.updateSimAndLightBubbles(true);
-    this.wallEditor.syncViewport(true);
-    this.layerEditors.syncViewport(true);
+
+    const needsRoofBake = Boolean(chunkData?.overlays && !layer.spec?.roofMaskUrl);
+    this._scheduleChunkBatchRefresh({
+      needPyramid: true,
+      roofBakeLayer: needsRoofBake ? layer : null,
+      roofBakeChunkData: needsRoofBake ? chunkData : null
+    });
   },
 
   onChunkUnloaded(layer, chunkKey, { deferRefresh = false } = {}) {
@@ -1082,12 +1124,7 @@ export const lightingMethods = {
     this.audioStreamer.lastKey = "";
     this._roofTokenOccDirty = true;
     if (this.active) {
-      this.updateSimAndLightBubbles(true);
-      this.wallEditor.syncViewport(true);
-      this.layerEditors.syncViewport(true);
-      if (!deferRefresh && !this._inUpdatePyramid) {
-        this.updatePyramid();
-      }
+      this._scheduleChunkBatchRefresh({ needPyramid: !deferRefresh && !this._inUpdatePyramid });
     }
   }
 };

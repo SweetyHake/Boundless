@@ -297,10 +297,18 @@ function pruneOutOfSight() {
 }
 
 function sourceLosSig(vs) {
+  const uid = vs.updateId ?? 0;
+  if (vs._blLosSigVer === _perceptionVer && vs._blLosSigUid === uid && vs._blLosSigStr) {
+    return vs._blLosSigStr;
+  }
   const d = vs.data ?? {};
-  return `${(vs.x ?? d.x ?? 0).toFixed(1)},${(vs.y ?? d.y ?? 0).toFixed(1)},${d.elevation ?? 0}`
-    + `,${vs.level?.id ?? ""},${d.walls !== false ? 1 : 0},${vs.updateId ?? 0}`
+  const sig = `${Math.round((vs.x ?? d.x ?? 0) * 10)},${Math.round((vs.y ?? d.y ?? 0) * 10)},${d.elevation ?? 0}`
+    + `,${vs.level?.id ?? ""},${d.walls !== false ? 1 : 0},${uid}`
     + `,${vs.radius ?? d.radius ?? 0},${d.angle ?? 360},${d.rotation ?? 0},${d.externalRadius ?? ""}`;
+  vs._blLosSigVer = _perceptionVer;
+  vs._blLosSigUid = uid;
+  vs._blLosSigStr = sig;
+  return sig;
 }
 
 function patchVisibilityAndLos() {
@@ -320,7 +328,7 @@ function patchVisibilityAndLos() {
     }
     const p = test?.point;
     if (!p) return wrapped(visionSource, mode, target, test);
-    const key = `${p.x.toFixed(1)},${p.y.toFixed(1)},${(p.elevation ?? 0).toFixed(1)}`
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round((p.elevation ?? 0) * 10)}`
       + `|${test.level?.id ?? ""}|${this.constructor.name}|${this.walls ? 1 : 0}${this.angle ? 1 : 0}`
       + `|${visionSource.sourceId}|${sourceLosSig(visionSource)}`;
     const hit = _losCache.get(key);
@@ -347,7 +355,7 @@ function patchVisibilityAndLos() {
     const p = arr[0];
     if (!Number.isFinite(p?.x) || !Number.isFinite(p?.y)) return wrapped(points, options);
     const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
-    const key = `${p.x.toFixed(1)},${p.y.toFixed(1)},${elev.toFixed(1)}|${globalThis.canvas?.level?.id ?? ""}|t${options.tolerance ?? 2}|v${_perceptionVer}`;
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|t${options.tolerance ?? 2}|v${_perceptionVer}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;

@@ -1193,7 +1193,16 @@ export const pyramidMethods = {
     return !(ax + asz <= bx + 1 || ax + 1 >= bx + bsz || ay + asz <= by + 1 || ay + 1 >= by + bsz);
   },
 
-  hasReadyOtherZCovering(e) {
+  hasReadyOtherZCovering(e, bucket = null) {
+    if (bucket) {
+      for (let i = 0; i < bucket.length; i++) {
+        const other = bucket[i];
+        if (other.z < e.z && this.rectsOverlap(e.x0, e.y0, e.sizePx, other.x0, other.y0, other.sizePx)) {
+          return true;
+        }
+      }
+      return false;
+    }
     const ch = e.channel || "bg";
     for (const [, other] of this.tilesByKey) {
       if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.ready && !other.awaitingSwap && other.z > 0 && other.z < e.z && other.mesh?.visible && other.alpha >= 0.9 &&
@@ -1215,7 +1224,7 @@ export const pyramidMethods = {
     return false;
   },
 
-  isTileFullyReplacedByDesired(e, vp = null) {
+  isTileFullyReplacedByDesired(e, vp = null, bucket = null) {
     const ch = e.channel || "bg";
     const s = e.sizePx;
     let rx0 = e.x0;
@@ -1238,25 +1247,32 @@ export const pyramidMethods = {
     if (rx1 <= rx0 || ry1 <= ry0) return true;
     const rw = rx1 - rx0;
     const rh = ry1 - ry0;
-    const pts = [
-      [rx0 + rw * 0.25, ry0 + rh * 0.25],
-      [rx0 + rw * 0.75, ry0 + rh * 0.25],
-      [rx0 + rw * 0.25, ry0 + rh * 0.75],
-      [rx0 + rw * 0.75, ry0 + rh * 0.75],
-    ];
-    for (const [px, py] of pts) {
-      let covered = false;
-      for (const [, other] of this.tilesByKey) {
-        if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.desired && other.ready && !other.awaitingSwap && other.mesh?.visible && other.z > 0 && other.alpha >= 0.98 &&
-            px >= other.x0 && px <= other.x0 + other.sizePx &&
-            py >= other.y0 && py <= other.y0 + other.sizePx) {
-          covered = true;
-          break;
-        }
+    const p0x = rx0 + rw * 0.25, p1x = rx0 + rw * 0.75;
+    const p0y = ry0 + rh * 0.25, p1y = ry0 + rh * 0.75;
+    let c0 = false, c1 = false, c2 = false, c3 = false;
+    if (bucket) {
+      for (let i = 0; i < bucket.length; i++) {
+        const other = bucket[i];
+        const ox0 = other.x0, oy0 = other.y0, ox1 = ox0 + other.sizePx, oy1 = oy0 + other.sizePx;
+        if (!c0 && p0x >= ox0 && p0x <= ox1 && p0y >= oy0 && p0y <= oy1) c0 = true;
+        if (!c1 && p1x >= ox0 && p1x <= ox1 && p0y >= oy0 && p0y <= oy1) c1 = true;
+        if (!c2 && p0x >= ox0 && p0x <= ox1 && p1y >= oy0 && p1y <= oy1) c2 = true;
+        if (!c3 && p1x >= ox0 && p1x <= ox1 && p1y >= oy0 && p1y <= oy1) c3 = true;
+        if (c0 && c1 && c2 && c3) return true;
       }
-      if (!covered) return false;
+      return false;
     }
-    return true;
+    for (const [, other] of this.tilesByKey) {
+      if (other.levelId === e.levelId && (other.channel || "bg") === ch && other.desired && other.ready && !other.awaitingSwap && other.mesh?.visible && other.z > 0 && other.alpha >= 0.98) {
+        const ox0 = other.x0, oy0 = other.y0, ox1 = ox0 + other.sizePx, oy1 = oy0 + other.sizePx;
+        if (!c0 && p0x >= ox0 && p0x <= ox1 && p0y >= oy0 && p0y <= oy1) c0 = true;
+        if (!c1 && p1x >= ox0 && p1x <= ox1 && p0y >= oy0 && p0y <= oy1) c1 = true;
+        if (!c2 && p0x >= ox0 && p0x <= ox1 && p1y >= oy0 && p1y <= oy1) c2 = true;
+        if (!c3 && p1x >= ox0 && p1x <= ox1 && p1y >= oy0 && p1y <= oy1) c3 = true;
+        if (c0 && c1 && c2 && c3) return true;
+      }
+    }
+    return false;
   },
 
   _hasPendingVisibleRoofs(layer, visVp) {
@@ -1325,15 +1341,22 @@ export const pyramidMethods = {
     // Also dynamically reveal interior z=6 tiles + wallsMesh on z=5 when a roof is occluded so ALT / tokens / Regions expose real interiors instead of baked pyramid roofs
     const occSurfaces = canvas.masks?.occlusion?.occludedSurfaces;
     const nextRevealSpecs = new Map();
+    let occH1 = 2166136261 >>> 0;
+    let occH2 = (occSurfaces?.size ?? 0) | 0;
+    let occCount = 0;
     if (this.activeOverlays.size > 0) {
-      let sig = `s:${occSurfaces?.size ?? 0}|`;
+      let ovIdx = 0;
       for (const [k, ov] of this.activeOverlays) {
+        ovIdx++;
         const rm = ov.roofMesh;
         if (!rm?.visible) continue;
         const fadeAmt = Math.round((rm._occlusionState?.fade ?? 0) * 10);
         const hoverAmt = Math.round((rm._hoverFadeState?.occlusion ?? 0) * 10);
         const revealed = this._isRoofRevealed(rm, occSurfaces);
-        sig += `${k}:${rm.occluded ? 1 : 0}:${fadeAmt}:${hoverAmt}:${revealed ? 1 : 0},`;
+        const v = ((ovIdx << 12) ^ ((rm.occluded ? 1 : 0) << 10) ^ (fadeAmt << 5) ^ (hoverAmt << 1) ^ (revealed ? 1 : 0)) | 0;
+        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+        occCount++;
 
         const layer = this.levelLayers.get(ov.levelId);
         const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
@@ -1379,39 +1402,35 @@ export const pyramidMethods = {
           }
         }
       }
-      // Also track light-restricting virtual & native tiles with occlusion so CanvasDepthMask refreshes on fade
-      for (const [vtKey, vt] of this.activeVirtualTiles) {
-        const m = vt?.mesh;
+    }
+    // Track light-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
+    let vtIdx = 0;
+    for (const vt of this.activeVirtualTiles.values()) {
+      vtIdx++;
+      const m = vt?.mesh;
+      if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
+      const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
+      occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+      occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+      occCount++;
+    }
+    const nativeTiles = canvas.tiles?.placeables;
+    if (nativeTiles?.length) {
+      for (let i = 0; i < nativeTiles.length; i++) {
+        const m = nativeTiles[i]?.mesh;
         if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        sig += `vt:${vtKey}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
+        const v = (0x200000 ^ (i << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
+        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+        occCount++;
       }
-      for (const nt of canvas.tiles?.placeables ?? []) {
-        const m = nt?.mesh;
-        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        sig += `nt:${nt.id}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
-      }
-      if (sig !== this._lastRoofOccSig) {
-        this._lastRoofOccSig = sig;
-        this._depthDirty = true;
-        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
-      }
-    } else {
-      let tileSig = "";
-      for (const [vtKey, vt] of this.activeVirtualTiles) {
-        const m = vt?.mesh;
-        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        tileSig += `vt:${vtKey}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
-      }
-      for (const nt of canvas.tiles?.placeables ?? []) {
-        const m = nt?.mesh;
-        if (!m || m.destroyed || !m.restrictsLight || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        tileSig += `nt:${nt.id}:${Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)},`;
-      }
-      if (tileSig !== this._lastRoofOccSig) {
-        this._lastRoofOccSig = tileSig;
-        this._depthDirty = true;
-        if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
-      }
+    }
+    if (occH1 !== this._lastRoofOccH1 || occH2 !== this._lastRoofOccH2 || occCount !== this._lastRoofOccCount) {
+      this._lastRoofOccH1 = occH1;
+      this._lastRoofOccH2 = occH2;
+      this._lastRoofOccCount = occCount;
+      this._depthDirty = true;
+      if (canvas.masks?.depth) canvas.masks.depth.renderDirty = true;
     }
 
     // Reconcile localized z=6 interior reveal tiles on z=5
@@ -1723,16 +1742,35 @@ export const pyramidMethods = {
       }
     }
 
+    // Pre-bucket ready tiles by (levelId, channel) in O(M) to avoid O(M^2) inner scans in Pass 2
+    const readyVisBuckets = new Map();
+    const readyDesBuckets = new Map();
+    for (const e of this.tilesByKey.values()) {
+      if (!e.ready || e.awaitingSwap || e.z <= 0 || !e.mesh?.visible) continue;
+      const bk = `${e.levelId}::${e.channel || "bg"}`;
+      if (e.alpha >= 0.9) {
+        let arr = readyVisBuckets.get(bk);
+        if (!arr) { arr = []; readyVisBuckets.set(bk, arr); }
+        arr.push(e);
+      }
+      if (e.desired && e.alpha >= 0.98) {
+        let arr = readyDesBuckets.get(bk);
+        if (!arr) { arr = []; readyDesBuckets.set(bk, arr); }
+        arr.push(e);
+      }
+    }
+
     // Pass 2: atomic 1-frame LOD swap once all visible desired tiles are ready (zero double-alpha blending & zero depth flicker!)
     for (const [k, e] of this.tilesByKey) {
       const isFg = e.channel === "fg";
       const st = isFg ? fgReadyState.get(e.levelId) : levelReadyState.get(e.levelId);
       if (e.z === 0) continue;
+      const bk = `${e.levelId}::${e.channel || "bg"}`;
 
       if (e.desired) {
         if (e.ready && e.awaitingSwap) {
           const canSwapNow = Boolean(st?.visDesiredReady)
-            || !this.hasReadyOtherZCovering(e);
+            || !this.hasReadyOtherZCovering(e, readyVisBuckets.get(bk) || EMPTY_ARRAY);
           if (canSwapNow) {
             e.awaitingSwap = false;
             e.alpha = 1.0;
@@ -1740,6 +1778,12 @@ export const pyramidMethods = {
               e.mesh.unoccludedAlpha = 1.0;
               e.mesh.visible = true;
             }
+            let visArr = readyVisBuckets.get(bk);
+            if (!visArr) { visArr = []; readyVisBuckets.set(bk, visArr); }
+            visArr.push(e);
+            let desArr = readyDesBuckets.get(bk);
+            if (!desArr) { desArr = []; readyDesBuckets.set(bk, desArr); }
+            desArr.push(e);
             anyPyramidSwapped = true;
             if (!isFg) anyBgPyramidSwapped = true;
           } else {
@@ -1772,7 +1816,7 @@ export const pyramidMethods = {
           anyPyramidSwapped = true;
           if (!isFg) anyBgPyramidSwapped = true;
         } else if (e.z < curTargetZ) {
-          if (this.isTileFullyReplacedByDesired(e, vp)) {
+          if (this.isTileFullyReplacedByDesired(e, vp, readyDesBuckets.get(bk) || EMPTY_ARRAY)) {
             toDelete.push(k);
             anyPyramidSwapped = true;
             if (!isFg) anyBgPyramidSwapped = true;

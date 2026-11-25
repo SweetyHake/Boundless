@@ -97,6 +97,7 @@ export class MacroSelectionOverlay {
     this.controller = controller;
     this.gfx = null;
     this._mounted = false;
+    this._lastScale = NaN;
   }
 
   mount() {
@@ -112,11 +113,12 @@ export class MacroSelectionOverlay {
     parent.addChild(gfx);
     this.gfx = gfx;
     this._mounted = true;
-    this.refresh();
+    this.refresh(true);
   }
 
   unmount() {
     this._mounted = false;
+    this._lastScale = NaN;
     if (this.gfx) {
       try {
         this.gfx.parent?.removeChild?.(this.gfx);
@@ -126,11 +128,13 @@ export class MacroSelectionOverlay {
     }
   }
 
-  refresh() {
+  refresh(force = true) {
     if (!this._mounted || !this.gfx || this.gfx.destroyed) return;
     const gfx = this.gfx;
-    const controlled = canvas?.tokens?.controlled;
     const rawScale = canvas?.stage?.scale?.x || 1;
+    if (!force && this._lastScale === rawScale) return;
+    this._lastScale = rawScale;
+    const controlled = canvas?.tokens?.controlled;
     const effScale = getEffectiveScale(rawScale);
 
     if (!this.controller?.active || !controlled?.length || effScale >= MACRO_BORDER_MAX_SCALE) {

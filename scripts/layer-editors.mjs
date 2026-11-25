@@ -13,6 +13,9 @@ const TILE_STREAM_MIN_SCALE = 0.18;
 const MAX_LIGHTS_IN_VIEW = 260;
 const MAX_SOUNDS_IN_VIEW = 200;
 const MAX_TILES_IN_VIEW = 160;
+const MAX_MACRO_MARKERS = 1500;
+const LAYER_MOUNT_BUDGET_MS = 2.5;
+const LAYER_SYNC_MOUNTS_PER_PASS = 4;
 
 let _validOcclusionModesCache = null;
 function getValidOcclusionModes() {
@@ -92,9 +95,75 @@ export class VirtualLayerEditors {
   _soundGen = 0;
   _tileGen = 0;
   _patches = null;
+  _mountQueue = [];
+  _mountQueuedKeys = new Set();
+  _mountRafId = null;
 
   constructor(controller) {
     this.controller = controller;
+  }
+
+  _enqueueMount(kind, key, item, gen, editsRev) {
+    const qk = `${kind}:${key}`;
+    if (this._mountQueuedKeys.has(qk)) return;
+    this._mountQueuedKeys.add(qk);
+    this._mountQueue.push({ kind, key, qk, item, gen, editsRev });
+    if (this._mountRafId === null) {
+      const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn => setTimeout(fn, 16));
+      this._mountRafId = sched(() => this._pumpMountQueue());
+    }
+  }
+
+  _purgeMountQueue(kind = null) {
+    if (!kind) {
+      this._mountQueue = [];
+      this._mountQueuedKeys.clear();
+      if (this._mountRafId !== null) {
+        if (typeof cancelAnimationFrame === "function") {
+          try { cancelAnimationFrame(this._mountRafId); } catch {}
+        } else {
+          clearTimeout(this._mountRafId);
+        }
+        this._mountRafId = null;
+      }
+      return;
+    }
+    if (!this._mountQueue.length) return;
+    const kept = [];
+    for (let i = 0; i < this._mountQueue.length; i++) {
+      const job = this._mountQueue[i];
+      if (job.kind === kind) this._mountQueuedKeys.delete(job.qk);
+      else kept.push(job);
+    }
+    this._mountQueue = kept;
+  }
+
+  _pumpMountQueue() {
+    this._mountRafId = null;
+    if (!this.controller?.active || !this._mountQueue.length) return;
+    const t0 = performance.now();
+    let mounted = 0;
+    while (this._mountQueue.length > 0 && mounted < 6 && (mounted === 0 || (performance.now() - t0) < LAYER_MOUNT_BUDGET_MS)) {
+      const job = this._mountQueue.shift();
+      this._mountQueuedKeys.delete(job.qk);
+      if (job.kind === "light") {
+        if (!this.lightActive || job.gen !== this._lightGen || this.lightsByKey.has(job.key)) continue;
+        this._mountNativeLight(job.item, job.gen, job.editsRev);
+        mounted++;
+      } else if (job.kind === "sound") {
+        if (!this.soundActive || job.gen !== this._soundGen || this.soundsByKey.has(job.key)) continue;
+        this._mountNativeSound(job.item, job.gen, job.editsRev);
+        mounted++;
+      } else if (job.kind === "tile") {
+        if (!this.tileActive || job.gen !== this._tileGen || this.tilesByKey.has(job.key)) continue;
+        this._mountNativeTile(job.item, job.gen, job.editsRev);
+        mounted++;
+      }
+    }
+    if (this._mountQueue.length > 0 && this._mountRafId === null) {
+      const sched = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (fn => setTimeout(fn, 16));
+      this._mountRafId = sched(() => this._pumpMountQueue());
+    }
   }
 
   mount() {
@@ -298,6 +367,7 @@ export class VirtualLayerEditors {
 
   _clearLights() {
     this._lightGen++;
+    this._purgeMountQueue("light");
     for (const entry of Array.from(this.lightsByKey.values())) {
       this._destroyPlaceable(canvas?.lighting, entry, this.lightsByKey, this.lightsById, { closeSheet: true });
     }
@@ -305,7 +375,7 @@ export class VirtualLayerEditors {
     this.lightsById.clear();
   }
 
-  async _mountNativeLight(item, gen) {
+  async _mountNativeLight(item, gen, editsRev = this.controller?.lightEditsRev || 0) {
     if (!this.lightActive || gen !== this._lightGen || !canvas?.lighting?.objects || !canvas.scene) return;
     if (this.lightsByKey.has(item.lKey)) return;
 
@@ -358,7 +428,7 @@ export class VirtualLayerEditors {
     };
     patchVirtualLight(placeable);
 
-    const entry = { id, key: item.lKey, levelId: item.levelId, sk: item.sk, idx: item.idx, sig: JSON.stringify(item), placeable, doc };
+    const entry = { id, key: item.lKey, levelId: item.levelId, sk: item.sk, idx: item.idx, editsRev, sig: JSON.stringify(item), placeable, doc };
     this.lightsByKey.set(item.lKey, entry);
     this.lightsById.set(id, entry);
 
@@ -392,14 +462,15 @@ export class VirtualLayerEditors {
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
     const pad = 350;
-    const qStep = 250;
+    const qStep = Math.max(250, Math.round(70 / Math.max(0.01, curVp.scale)));
     const qx0 = Math.floor(curVp.x0 / qStep);
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
     const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= LIGHT_STREAM_MIN_SCALE;
-    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.lightEditsRev || 0}`;
+    const curRev = this.controller.lightEditsRev || 0;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:${inZoom ? 1 : 0}:r${curRev}`;
     if (key === this._lastLightKey) return;
     this._lastLightKey = key;
 
@@ -449,9 +520,10 @@ export class VirtualLayerEditors {
         g.clear();
         g.visible = true;
         const r = Math.max(12, Math.min(180, 6 / Math.max(0.01, curVp.scale)));
+        const step = items.length > MAX_MACRO_MARKERS ? Math.ceil(items.length / MAX_MACRO_MARKERS) : 1;
         g.lineStyle(Math.max(2, r * 0.2), 0x000000, 0.8);
         g.beginFill(0xffcc44, 0.85);
-        for (const it of items) g.drawCircle(it.x, it.y, r);
+        for (let i = 0; i < items.length; i += step) g.drawCircle(items[i].x, items[i].y, r);
         g.endFill();
       }
       return;
@@ -475,52 +547,65 @@ export class VirtualLayerEditors {
     }
 
     const gen = this._lightGen;
+    const tMountStart = performance.now();
+    let syncMounted = 0;
     for (const it of needed.values()) {
       const existing = this.lightsByKey.get(it.lKey);
-      const nextSig = JSON.stringify(it);
       if (!existing) {
-        this._mountNativeLight(it, gen);
-      } else if (existing.sig !== nextSig) {
-        const sheet = getExistingSheet(existing.doc);
-        if (sheet?.rendered) {
-          const prevAngle = existing.doc.config?.angle ?? 360;
-          const patch = {
-            x: it.x, y: it.y, elevation: it.elevation, rotation: it.rotation || 0,
-            hidden: Boolean(it.hidden), walls: it.walls !== false,
-            config: {
-              dim: it.dim, bright: it.bright, angle: it.angle ?? 360,
-              color: it.color || null, alpha: it.alpha ?? 0.5,
-              attenuation: it.attenuation ?? 0.5,
-              luminosity: it.luminosity ?? 0.5,
-              ...(Number.isFinite(it.coloration) ? { coloration: it.coloration } : {}),
-              darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 },
-              animation: { type: it.anim || null, speed: it.speed ?? 3, intensity: it.intensity ?? 3 }
-            }
-          };
-          existing.doc.updateSource(patch);
-          existing.sig = nextSig;
-          const shapeChanged = (prevAngle >= 360) !== ((it.angle ?? 360) >= 360);
-          if (existing.placeable && !existing.placeable.destroyed) {
-            Promise.resolve(shapeChanged ? existing.placeable.draw() : null).then(() => {
-              if (!existing.placeable.destroyed) {
-                existing.placeable.renderFlags.set({ refresh: true });
-                existing.placeable.applyRenderFlags();
-                existing.placeable._updateQuadtree?.();
-              }
-            }).catch(() => {});
-          }
-          try {
-            if (sheet._preview && typeof sheet._previewChanges === "function") {
-              sheet._previewChanges(patch);
-            } else {
-              sheet._preview?.updateSource?.(patch);
-            }
-            sheet.render(false);
-          } catch {}
+        if (syncMounted < LAYER_SYNC_MOUNTS_PER_PASS && (syncMounted === 0 || (performance.now() - tMountStart) < LAYER_MOUNT_BUDGET_MS)) {
+          this._mountNativeLight(it, gen, curRev);
+          syncMounted++;
         } else {
-          this._destroyPlaceable(canvas.lighting, existing, this.lightsByKey, this.lightsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-          this._mountNativeLight(it, gen);
+          this._enqueueMount("light", it.lKey, it, gen, curRev);
         }
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      if (existing.sig === nextSig) {
+        existing.editsRev = curRev;
+        continue;
+      }
+      const sheet = getExistingSheet(existing.doc);
+      if (sheet?.rendered) {
+        const prevAngle = existing.doc.config?.angle ?? 360;
+        const patch = {
+          x: it.x, y: it.y, elevation: it.elevation, rotation: it.rotation || 0,
+          hidden: Boolean(it.hidden), walls: it.walls !== false,
+          config: {
+            dim: it.dim, bright: it.bright, angle: it.angle ?? 360,
+            color: it.color || null, alpha: it.alpha ?? 0.5,
+            attenuation: it.attenuation ?? 0.5,
+            luminosity: it.luminosity ?? 0.5,
+            ...(Number.isFinite(it.coloration) ? { coloration: it.coloration } : {}),
+            darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 },
+            animation: { type: it.anim || null, speed: it.speed ?? 3, intensity: it.intensity ?? 3 }
+          }
+        };
+        existing.doc.updateSource(patch);
+        existing.sig = nextSig;
+        existing.editsRev = curRev;
+        const shapeChanged = (prevAngle >= 360) !== ((it.angle ?? 360) >= 360);
+        if (existing.placeable && !existing.placeable.destroyed) {
+          Promise.resolve(shapeChanged ? existing.placeable.draw() : null).then(() => {
+            if (!existing.placeable.destroyed) {
+              existing.placeable.renderFlags.set({ refresh: true });
+              existing.placeable.applyRenderFlags();
+              existing.placeable._updateQuadtree?.();
+            }
+          }).catch(() => {});
+        }
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") {
+            sheet._previewChanges(patch);
+          } else {
+            sheet._preview?.updateSource?.(patch);
+          }
+          sheet.render(false);
+        } catch {}
+      } else {
+        this._destroyPlaceable(canvas.lighting, existing, this.lightsByKey, this.lightsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+        this._mountNativeLight(it, gen, curRev);
       }
     }
   }
@@ -633,6 +718,7 @@ export class VirtualLayerEditors {
 
   _clearSounds() {
     this._soundGen++;
+    this._purgeMountQueue("sound");
     for (const entry of Array.from(this.soundsByKey.values())) {
       this._destroyPlaceable(canvas?.sounds, entry, this.soundsByKey, this.soundsById, { closeSheet: true });
     }
@@ -640,7 +726,7 @@ export class VirtualLayerEditors {
     this.soundsById.clear();
   }
 
-  async _mountNativeSound(item, gen) {
+  async _mountNativeSound(item, gen, editsRev = this.controller?.soundEditsRev || 0) {
     if (!this.soundActive || gen !== this._soundGen || !canvas?.sounds?.objects || !canvas.scene) return;
     if (this.soundsByKey.has(item.sKey)) return;
 
@@ -691,7 +777,7 @@ export class VirtualLayerEditors {
     };
     patchVirtualSound(placeable);
 
-    const entry = { id, key: item.sKey, levelId: item.levelId, sk: item.sk, idx: item.idx, sig: JSON.stringify(item), placeable, doc };
+    const entry = { id, key: item.sKey, levelId: item.levelId, sk: item.sk, idx: item.idx, editsRev, sig: JSON.stringify(item), placeable, doc };
     this.soundsByKey.set(item.sKey, entry);
     this.soundsById.set(id, entry);
 
@@ -725,14 +811,15 @@ export class VirtualLayerEditors {
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
     const pad = 400;
-    const qStep = 300;
+    const qStep = Math.max(300, Math.round(80 / Math.max(0.01, curVp.scale)));
     const qx0 = Math.floor(curVp.x0 / qStep);
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
     const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= SOUND_STREAM_MIN_SCALE;
-    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.soundEditsRev || 0}`;
+    const curRev = this.controller.soundEditsRev || 0;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:${inZoom ? 1 : 0}:r${curRev}`;
     if (key === this._lastSoundKey) return;
     this._lastSoundKey = key;
 
@@ -782,9 +869,10 @@ export class VirtualLayerEditors {
         g.clear();
         g.visible = true;
         const r = Math.max(14, Math.min(180, 7 / Math.max(0.01, curVp.scale)));
+        const step = items.length > MAX_MACRO_MARKERS ? Math.ceil(items.length / MAX_MACRO_MARKERS) : 1;
         g.lineStyle(Math.max(2, r * 0.2), 0x000000, 0.8);
         g.beginFill(0x66ccff, 0.85);
-        for (const it of items) g.drawCircle(it.x, it.y, r);
+        for (let i = 0; i < items.length; i += step) g.drawCircle(items[i].x, items[i].y, r);
         g.endFill();
       }
       return;
@@ -808,38 +896,51 @@ export class VirtualLayerEditors {
     }
 
     const gen = this._soundGen;
+    const tMountStart = performance.now();
+    let syncMounted = 0;
     for (const it of needed.values()) {
       const existing = this.soundsByKey.get(it.sKey);
-      const nextSig = JSON.stringify(it);
       if (!existing) {
-        this._mountNativeSound(it, gen);
-      } else if (existing.sig !== nextSig) {
-        const sheet = getExistingSheet(existing.doc);
-        if (sheet?.rendered) {
-          const patch = {
-            x: it.x, y: it.y, elevation: it.elevation, radius: it.radius,
-            path: it.path, volume: it.volume, walls: it.walls, easing: it.easing,
-            hidden: Boolean(it.hidden), darkness: { min: it.darkMin, max: it.darkMax }
-          };
-          existing.doc.updateSource(patch);
-          existing.sig = nextSig;
-          if (existing.placeable && !existing.placeable.destroyed) {
-            existing.placeable.renderFlags.set({ refresh: true });
-            existing.placeable.applyRenderFlags();
-            existing.placeable._updateQuadtree?.();
-          }
-          try {
-            if (sheet._preview && typeof sheet._previewChanges === "function") {
-              sheet._previewChanges(patch);
-            } else {
-              sheet._preview?.updateSource?.(patch);
-            }
-            sheet.render(false);
-          } catch {}
+        if (syncMounted < LAYER_SYNC_MOUNTS_PER_PASS && (syncMounted === 0 || (performance.now() - tMountStart) < LAYER_MOUNT_BUDGET_MS)) {
+          this._mountNativeSound(it, gen, curRev);
+          syncMounted++;
         } else {
-          this._destroyPlaceable(canvas.sounds, existing, this.soundsByKey, this.soundsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-          this._mountNativeSound(it, gen);
+          this._enqueueMount("sound", it.sKey, it, gen, curRev);
         }
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      if (existing.sig === nextSig) {
+        existing.editsRev = curRev;
+        continue;
+      }
+      const sheet = getExistingSheet(existing.doc);
+      if (sheet?.rendered) {
+        const patch = {
+          x: it.x, y: it.y, elevation: it.elevation, radius: it.radius,
+          path: it.path, volume: it.volume, walls: it.walls, easing: it.easing,
+          hidden: Boolean(it.hidden), darkness: { min: it.darkMin, max: it.darkMax }
+        };
+        existing.doc.updateSource(patch);
+        existing.sig = nextSig;
+        existing.editsRev = curRev;
+        if (existing.placeable && !existing.placeable.destroyed) {
+          existing.placeable.renderFlags.set({ refresh: true });
+          existing.placeable.applyRenderFlags();
+          existing.placeable._updateQuadtree?.();
+        }
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") {
+            sheet._previewChanges(patch);
+          } else {
+            sheet._preview?.updateSource?.(patch);
+          }
+          sheet.render(false);
+        } catch {}
+      } else {
+        this._destroyPlaceable(canvas.sounds, existing, this.soundsByKey, this.soundsById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+        this._mountNativeSound(it, gen, curRev);
       }
     }
   }
@@ -939,6 +1040,7 @@ export class VirtualLayerEditors {
 
   _clearTiles() {
     this._tileGen++;
+    this._purgeMountQueue("tile");
     this._lastTileNeededKeys = null;
     for (const entry of Array.from(this.tilesByKey.values())) {
       this._setRawVirtualTileVisible(entry.fullId, true);
@@ -964,7 +1066,7 @@ export class VirtualLayerEditors {
     }
   }
 
-  async _mountNativeTile(item, gen) {
+  async _mountNativeTile(item, gen, editsRev = this.controller?.tileEditsRev || 0) {
     if (!this.tileActive || gen !== this._tileGen || !canvas?.tiles?.objects || !canvas.scene) return;
     if (this.tilesByKey.has(item.tKey)) return;
 
@@ -1028,7 +1130,7 @@ export class VirtualLayerEditors {
     Object.defineProperty(placeable, "isFilteredOut", { value: false, configurable: true });
 
     const fullId = `${item.levelId}::${item.tid}`;
-    const entry = { id, key: item.tKey, fullId, levelId: item.levelId, tid: item.tid, sig: JSON.stringify(item), placeable, doc };
+    const entry = { id, key: item.tKey, fullId, levelId: item.levelId, tid: item.tid, editsRev, sig: JSON.stringify(item), placeable, doc };
     this.tilesByKey.set(item.tKey, entry);
     this.tilesById.set(id, entry);
 
@@ -1068,14 +1170,15 @@ export class VirtualLayerEditors {
     const { simGrid, simSectorPx, spec, level } = layer;
     const lid = level.id;
     const pad = 300;
-    const qStep = 200;
+    const qStep = Math.max(200, Math.round(60 / Math.max(0.01, curVp.scale)));
     const qx0 = Math.floor(curVp.x0 / qStep);
     const qy0 = Math.floor(curVp.y0 / qStep);
     const qx1 = Math.floor(curVp.x1 / qStep);
     const qy1 = Math.floor(curVp.y1 / qStep);
     const effScale = getEffectiveScale(curVp.scale);
     const inZoom = effScale >= TILE_STREAM_MIN_SCALE;
-    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:${inZoom ? 1 : 0}:r${this.controller.tileEditsRev || 0}`;
+    const curRev = this.controller.tileEditsRev || 0;
+    const key = `${lid}:${qx0}_${qy0}_${qx1}_${qy1}:q${qStep}:${inZoom ? 1 : 0}:r${curRev}`;
     if (key === this._lastTileKey) return;
     this._lastTileKey = key;
 
@@ -1153,61 +1256,74 @@ export class VirtualLayerEditors {
     }
 
     const gen = this._tileGen;
+    const tMountStart = performance.now();
+    let syncMounted = 0;
     for (const it of needed.values()) {
       const existing = this.tilesByKey.get(it.tKey);
-      const nextSig = JSON.stringify(it);
       if (!existing) {
-        this._mountNativeTile(it, gen);
-      } else if (existing.sig !== nextSig) {
-        const sheet = getExistingSheet(existing.doc);
-        if (sheet?.rendered) {
-          const prevSrc = existing.doc.texture?.src || "";
-          const ax = it.anchorX ?? 0.5;
-          const ay = it.anchorY ?? 0.5;
-          const patch = {
-            x: it.anchorX === undefined ? (it.x + it.w * 0.5) : it.x,
-            y: it.anchorY === undefined ? (it.y + it.h * 0.5) : it.y,
-            width: it.w, height: it.h, rotation: it.rot || 0, elevation: it.elevation,
-            sort: it.sort || 0, alpha: it.alpha ?? 1, hidden: Boolean(it.hidden),
-            texture: {
-              src: it.src, tint: it.tint || "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
-              anchorX: ax, anchorY: ay, scaleX: it.scaleX ?? 1, scaleY: it.scaleY ?? 1, fit: it.fit ?? "fill"
-            },
-            occlusion: { modes: resolveOcclusionModeArray(it.occlusionMode), alpha: it.occludedAlpha ?? 0.2 },
-            restrictions: { light: Boolean(it.restrictsLight), weather: Boolean(it.restrictsWeather) }
-          };
-          existing.doc.updateSource(patch);
-          existing.sig = nextSig;
-          const srcChanged = (it.src || "") !== prevSrc;
-          if (existing.placeable && !existing.placeable.destroyed) {
-            Promise.resolve(srcChanged ? existing.placeable.draw() : null).then(() => {
-              if (existing.placeable.destroyed) {
-                this._cleanupLeakedTileMesh(existing.placeable);
-              } else {
-                existing.placeable.renderFlags.set({ refresh: true });
-                existing.placeable.applyRenderFlags();
-                existing.placeable._updateQuadtree?.();
-                if (srcChanged && sheet?.rendered && sheet._preview?.rendered && sheet._preview.texture?.src === existing.doc.texture?.src) {
-                  sheet._preview.object?.renderFlags?.set?.({ redraw: true });
-                }
-              }
-            }).catch(() => {
-              if (existing.placeable?.destroyed) this._cleanupLeakedTileMesh(existing.placeable);
-            });
-          }
-          try {
-            if (sheet._preview && typeof sheet._previewChanges === "function") {
-              sheet._previewChanges(patch);
-            } else {
-              sheet._preview?.updateSource?.(patch);
-            }
-            sheet.render(false);
-          } catch {}
+        if (syncMounted < LAYER_SYNC_MOUNTS_PER_PASS && (syncMounted === 0 || (performance.now() - tMountStart) < LAYER_MOUNT_BUDGET_MS)) {
+          this._mountNativeTile(it, gen, curRev);
+          syncMounted++;
         } else {
-          this._setRawVirtualTileVisible(existing.fullId, true);
-          this._destroyPlaceable(canvas.tiles, existing, this.tilesByKey, this.tilesById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
-          this._mountNativeTile(it, gen);
+          this._enqueueMount("tile", it.tKey, it, gen, curRev);
         }
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      if (existing.sig === nextSig) {
+        existing.editsRev = curRev;
+        continue;
+      }
+      const sheet = getExistingSheet(existing.doc);
+      if (sheet?.rendered) {
+        const prevSrc = existing.doc.texture?.src || "";
+        const ax = it.anchorX ?? 0.5;
+        const ay = it.anchorY ?? 0.5;
+        const patch = {
+          x: it.anchorX === undefined ? (it.x + it.w * 0.5) : it.x,
+          y: it.anchorY === undefined ? (it.y + it.h * 0.5) : it.y,
+          width: it.w, height: it.h, rotation: it.rot || 0, elevation: it.elevation,
+          sort: it.sort || 0, alpha: it.alpha ?? 1, hidden: Boolean(it.hidden),
+          texture: {
+            src: it.src, tint: it.tint || "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
+            anchorX: ax, anchorY: ay, scaleX: it.scaleX ?? 1, scaleY: it.scaleY ?? 1, fit: it.fit ?? "fill"
+          },
+          occlusion: { modes: resolveOcclusionModeArray(it.occlusionMode), alpha: it.occludedAlpha ?? 0.2 },
+          restrictions: { light: Boolean(it.restrictsLight), weather: Boolean(it.restrictsWeather) }
+        };
+        existing.doc.updateSource(patch);
+        existing.sig = nextSig;
+        existing.editsRev = curRev;
+        const srcChanged = (it.src || "") !== prevSrc;
+        if (existing.placeable && !existing.placeable.destroyed) {
+          Promise.resolve(srcChanged ? existing.placeable.draw() : null).then(() => {
+            if (existing.placeable.destroyed) {
+              this._cleanupLeakedTileMesh(existing.placeable);
+            } else {
+              existing.placeable.renderFlags.set({ refresh: true });
+              existing.placeable.applyRenderFlags();
+              existing.placeable._updateQuadtree?.();
+              if (srcChanged && sheet?.rendered && sheet._preview?.rendered && sheet._preview.texture?.src === existing.doc.texture?.src) {
+                sheet._preview.object?.renderFlags?.set?.({ redraw: true });
+              }
+            }
+          }).catch(() => {
+            if (existing.placeable?.destroyed) this._cleanupLeakedTileMesh(existing.placeable);
+          });
+        }
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") {
+            sheet._previewChanges(patch);
+          } else {
+            sheet._preview?.updateSource?.(patch);
+          }
+          sheet.render(false);
+        } catch {}
+      } else {
+        this._setRawVirtualTileVisible(existing.fullId, true);
+        this._destroyPlaceable(canvas.tiles, existing, this.tilesByKey, this.tilesById, { closeSheet: isSheetActiveOrRendering(sheet, existing.placeable) });
+        this._mountNativeTile(it, gen, curRev);
       }
     }
   }
@@ -1314,6 +1430,7 @@ export class VirtualLayerEditors {
   }
 
   unmount() {
+    this._purgeMountQueue();
     this.deactivateLighting();
     this.deactivateSounds();
     this.deactivateTiles();

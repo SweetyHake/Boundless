@@ -16,6 +16,8 @@ let _cullTimer = null;
 let _vramTimer = null;
 let _prewarmTimer = null;
 let _prewarmGen = 0;
+let _hasStandardCulling = false;
+let _tileShadersSynced = false;
 const _hintedScenes = new Set();
 
 function isStandardSceneActive() {
@@ -63,7 +65,9 @@ export function rectsIntersect(ax0, ay0, ax1, ay1, vp) {
 export function restoreAllStandardCulling() {
   const c = globalThis.canvas;
   if (!c) return;
-  syncDecorativeTileShaders(false);
+  if (_hasFastBatchTiles || _tileShadersSynced) syncDecorativeTileShaders(false);
+  if (!_hasStandardCulling) return;
+  _hasStandardCulling = false;
   for (const tile of c.tiles?.placeables ?? []) {
     if (tile.mesh && !tile.mesh.destroyed) tile.mesh.renderable = true;
   }
@@ -105,7 +109,8 @@ export function updateStandardSceneCulling() {
     return;
   }
   if (!isStandardSceneActive()) return;
-  syncDecorativeTileShaders(true);
+  if (!_tileShadersSynced) syncDecorativeTileShaders(true);
+  _hasStandardCulling = true;
 
   const c = globalThis.canvas;
   const vp = computeExpandedViewport(c.stage, c.app?.renderer?.screen, 0.45, 420);
@@ -366,9 +371,17 @@ function syncSingleDecorativeTile(t, allow) {
 
 export function syncDecorativeTileShaders(enable) {
   const tiles = globalThis.canvas?.tiles?.placeables;
-  if (!tiles?.length) return;
   const allow = Boolean(enable && PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling && isStandardSceneActive());
-  if (!allow && !_hasFastBatchTiles) return;
+  if (!allow) {
+    _tileShadersSynced = false;
+    if (!_hasFastBatchTiles || !tiles?.length) {
+      _hasFastBatchTiles = false;
+      return;
+    }
+  } else {
+    _tileShadersSynced = true;
+    if (!tiles?.length) return;
+  }
   for (let i = 0; i < tiles.length; i++) {
     syncSingleDecorativeTile(tiles[i], allow);
   }
@@ -376,6 +389,7 @@ export function syncDecorativeTileShaders(enable) {
 }
 
 function scheduleStandardCulling() {
+  if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling) return;
   if (_cullTimer) return;
   _cullTimer = setTimeout(() => {
     _cullTimer = null;
@@ -648,6 +662,8 @@ export function installAutoPerfEngine(controller) {
   Hooks.on("canvasTearDown", () => {
     _prewarmGen++;
     _hasFastBatchTiles = false;
+    _hasStandardCulling = false;
+    _tileShadersSynced = false;
     if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
     if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
     if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }

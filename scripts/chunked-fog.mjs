@@ -57,6 +57,7 @@ export class ChunkedFogManager {
   chunks = new Map();
 
   _saveTimer = null;
+  _localCacheTimer = null;
   _storageKey = null;
   _dirtyShared = new Set();
   _dirtyPrivate = new Set();
@@ -272,6 +273,7 @@ export class ChunkedFogManager {
       sharedCanvas: null, // Copy-on-write buffer for GM in SHARED mode when private exploration diverges
       sharedCtx: null,
       hasPrivate: false,
+      encodedUrl: null,
       texture,
       sprite
     };
@@ -380,7 +382,10 @@ export class ChunkedFogManager {
     }
 
     if (touched.size > 0) {
-      for (const chunk of touched) chunk.texture.baseTexture.update();
+      for (const chunk of touched) {
+        chunk.encodedUrl = null;
+        chunk.texture.baseTexture.update();
+      }
       this.updateViewportCulling();
       if (markDirty) this._scheduleSave();
       return true;
@@ -423,7 +428,10 @@ export class ChunkedFogManager {
     }
 
     if (touched.size > 0) {
-      for (const chunk of touched) chunk.texture.baseTexture.update();
+      for (const chunk of touched) {
+        chunk.encodedUrl = null;
+        chunk.texture.baseTexture.update();
+      }
       this.updateViewportCulling();
       if (markDirty) this._scheduleSave();
       return true;
@@ -565,8 +573,8 @@ export class ChunkedFogManager {
       const isAuthoritativeGM = game.users?.activeGM?.id === game.user?.id;
       this._applyPolygons(payload.polygons, { target: "shared", markDirty: isAuthoritativeGM, maxChunks: 64 });
       if (!isAuthoritativeGM) {
-        // Keep local cache fresh on non-GM clients without triggering server writes
-        this._saveLocalCacheOnly();
+        // Keep local cache fresh on non-GM clients without blocking the frame on every incoming step
+        this._scheduleLocalCacheSave();
       }
       return true;
     }
@@ -785,7 +793,7 @@ export class ChunkedFogManager {
     if (!Array.isArray(strokes) || !strokes.length) return;
     const shouldPersist = !this.isSharedMode;
     this._applyBrushStrokes(strokes, { markDirty: shouldPersist });
-    if (!shouldPersist) this._saveLocalCacheOnly();
+    if (!shouldPersist) this._scheduleLocalCacheSave();
   }
 
   _clearAllSharedChunksLocal() {
@@ -795,6 +803,7 @@ export class ChunkedFogManager {
     for (const [key, chunk] of Array.from(this.chunks.entries())) {
       if (chunk.hasPrivate && chunk.sharedCtx) {
         chunk.sharedCtx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
+        chunk.encodedUrl = null;
       } else {
         this._destroyChunkEntry(chunk);
         this.chunks.delete(key);
@@ -823,12 +832,21 @@ export class ChunkedFogManager {
     }, FOG_SAVE_DEBOUNCE_MS);
   }
 
+  _scheduleLocalCacheSave(delayMs = 1500) {
+    if (this._localCacheTimer !== null) return;
+    this._localCacheTimer = setTimeout(() => {
+      this._localCacheTimer = null;
+      if (this.enabled) this._saveLocalCacheOnly();
+    }, delayMs);
+  }
+
   _saveLocalCacheOnly() {
     if (!this._storageKey || this._pendingChunkLoads.size > 0) return;
     try {
       const chunks = {};
       for (const [key, chunk] of this.chunks) {
-        chunks[key] = encodeCanvas(chunk.canvas);
+        if (!chunk.encodedUrl) chunk.encodedUrl = encodeCanvas(chunk.canvas);
+        chunks[key] = chunk.encodedUrl;
       }
       localStorage.setItem(this._storageKey, JSON.stringify({ savedAt: Date.now(), chunks }));
     } catch {}
@@ -1002,6 +1020,7 @@ export class ChunkedFogManager {
             }
           }
         }
+        chunk.encodedUrl = null;
         chunk.texture.baseTexture.update();
         this.updateViewportCulling();
         finishPending();
@@ -1051,6 +1070,10 @@ export class ChunkedFogManager {
     if (this._saveTimer !== null) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
+    }
+    if (this._localCacheTimer !== null) {
+      clearTimeout(this._localCacheTimer);
+      this._localCacheTimer = null;
     }
     if (this._brushFlushTimer !== null) {
       clearTimeout(this._brushFlushTimer);
@@ -1248,14 +1271,22 @@ export class ChunkedFogManager {
       const step = Math.max(30, this.brushRadiusPx * 0.35);
       if (dist >= step) {
         const steps = Math.min(24, Math.ceil(dist / step));
+        const strokes = new Array(steps);
+        const r = Math.round(this.brushRadiusPx);
+        const er = this._brushErase ? 1 : 0;
         for (let i = 1; i <= steps; i++) {
           const t = i / steps;
-          this.brushStamp(
-            prev.x + (pos.x - prev.x) * t,
-            prev.y + (pos.y - prev.y) * t,
-            this.brushRadiusPx,
-            { erase: this._brushErase, broadcast: true }
-          );
+          strokes[i - 1] = [
+            Math.round(prev.x + (pos.x - prev.x) * t),
+            Math.round(prev.y + (pos.y - prev.y) * t),
+            r,
+            er
+          ];
+        }
+        // Apply all interpolated brush stamps in a single batch (1 GPU texture upload per chunk instead of up to 24)
+        this._applyBrushStrokes(strokes, { markDirty: true });
+        for (let i = 0; i < strokes.length; i++) {
+          this._queueBrushStrokeBroadcast(strokes[i]);
         }
         this._brushLastWorld = pos;
       }
@@ -1344,6 +1375,10 @@ export class ChunkedFogManager {
     if (this._saveTimer !== null) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
+    }
+    if (this._localCacheTimer !== null) {
+      clearTimeout(this._localCacheTimer);
+      this._localCacheTimer = null;
     }
 
     this._removeNativePatches();

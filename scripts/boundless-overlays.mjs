@@ -1136,8 +1136,16 @@ export const overlayMethods = {
         restoredAny = true;
       }
     }
+    let hiddenChanged = nextHidden.size !== this._roofHiddenTokens.size;
+    if (!hiddenChanged) {
+      for (const tok of nextHidden) {
+        if (!this._roofHiddenTokens.has(tok)) { hiddenChanged = true; break; }
+      }
+    }
     this._roofHiddenTokens = nextHidden;
-    this.tokenStreamer.onVisibilityChanged();
+    if (hiddenChanged || restoredAny) {
+      this.tokenStreamer.onVisibilityChanged();
+    }
     if (restoredAny && this.tokenStreamer.enabled) {
       this.tokenStreamer.scheduleSync(null, false);
     }
