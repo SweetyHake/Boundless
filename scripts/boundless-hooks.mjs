@@ -316,8 +316,8 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("updateLevel", (level, changes) => {
-    if (controller._suppressAutoMount) return;
     const parentScene = level?.parent;
+    if (parentScene?.id && controller._suppressAutoMountCounts?.get?.(parentScene.id) > 0) return;
     if (!globalThis.canvas?.ready || !parentScene || parentScene.id !== globalThis.canvas.scene?.id) return;
     const isForcedDel = (v) => Boolean(globalThis.foundry?.data?.operators?.ForcedDeletion && v instanceof foundry.data.operators.ForcedDeletion);
     const flagChanges = changes?.flags?.[MODULE_ID];

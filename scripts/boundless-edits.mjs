@@ -360,7 +360,7 @@ export const editsMethods = {
   },
 
   onSceneUpdate(scene, changes, userId = null) {
-    if (this._suppressAutoMount) return;
+    if (scene?.id && this._suppressAutoMountCounts?.get?.(scene.id) > 0) return;
     if (!globalThis.canvas?.ready || scene?.id !== globalThis.canvas.scene?.id) return;
 
     const isForcedDel = (v) => Boolean(globalThis.foundry?.data?.operators?.ForcedDeletion && v instanceof foundry.data.operators.ForcedDeletion);
@@ -567,8 +567,9 @@ export const editsMethods = {
     const dims = scene.getDimensions?.();
     const defaultCx = (dims?.sceneX ?? 0) + (dims?.sceneWidth ?? scene.width ?? 100000) * 0.5;
     const defaultCy = (dims?.sceneY ?? 0) + (dims?.sceneHeight ?? scene.height ?? 100000) * 0.5;
-    const rawX = Number(spec.x);
-    const rawY = Number(spec.y);
+    const toFiniteCoord = (v) => (v !== null && v !== undefined && v !== "" && typeof v !== "boolean" && Number.isFinite(Number(v))) ? Number(v) : NaN;
+    const rawX = toFiniteCoord(spec.x);
+    const rawY = toFiniteCoord(spec.y);
     const entry = {
       id: spec.id || foundry.utils.randomID(),
       name: spec.name || game.i18n.localize("BOUNDLESS.Config.PoiDefaultName"),
@@ -597,13 +598,14 @@ export const editsMethods = {
     delete updated._origKind;
     delete updated._isSecondaryProvince;
     delete updated._virtualSub;
+    const toFiniteCoord = (v) => (v !== null && v !== undefined && v !== "" && typeof v !== "boolean" && Number.isFinite(Number(v))) ? Number(v) : NaN;
     if ("x" in patch) {
-      const nx = Number(patch.x);
+      const nx = toFiniteCoord(patch.x);
       if (Number.isFinite(nx)) updated.x = Math.round(nx);
       else updated.x = existing[idx].x;
     }
     if ("y" in patch) {
-      const ny = Number(patch.y);
+      const ny = toFiniteCoord(patch.y);
       if (Number.isFinite(ny)) updated.y = Math.round(ny);
       else updated.y = existing[idx].y;
     }

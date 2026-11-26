@@ -577,15 +577,26 @@ export function disposeStaleSceneVramTextures() {
     const bt = t?.baseTexture ?? (t?.realWidth !== undefined ? t : null);
     if (bt) protectedBts.add(bt);
   };
+  const protectUniforms = (u) => {
+    if (!u || typeof u !== "object") return;
+    for (const k in u) {
+      const v = u[k];
+      if (v && typeof v === "object" && (v.baseTexture !== undefined || v.realWidth !== undefined)) {
+        protectTex(v);
+      }
+    }
+  };
   const walkDisplayTree = (node, depth = 0) => {
     if (!node || depth > 8) return;
     protectTex(node.texture);
-    const u = node.shader?.uniforms;
-    if (u) {
-      protectTex(u.uSampler);
-      protectTex(u.ringTexture);
-      protectTex(u.subjectTexture);
-      protectTex(u.ringSubjectTexture);
+    protectUniforms(node.shader?.uniforms);
+    if (node.mask && typeof node.mask === "object") {
+      protectTex(node.mask.texture);
+      if (node.mask.maskObject) protectTex(node.mask.maskObject.texture);
+    }
+    const filters = node.filters;
+    if (Array.isArray(filters)) {
+      for (let i = 0; i < filters.length; i++) protectUniforms(filters[i]?.uniforms);
     }
     const kids = node.children;
     if (Array.isArray(kids)) {
@@ -869,14 +880,20 @@ export function installAutoPerfEngine(controller) {
   // O(1) hover un-cull without triggering a full O(N) scene culling pass on every mouseover
   for (const h of ["hoverTile", "hoverAmbientLight", "hoverAmbientSound", "hoverNote", "hoverWall"]) {
     Hooks.on(h, (obj, hovered) => {
-      if (!hovered || !obj || obj.destroyed || !isStandardSceneActive()) return;
+      if (!hovered || !obj || obj.destroyed || !PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || !isStandardSceneActive()) return;
       if (obj.mesh && !obj.mesh.destroyed && obj.mesh._blStdCulled) {
         obj.mesh.renderable = true;
         obj.mesh._blStdCulled = false;
       }
       const icon = obj.controls ?? obj.controlIcon;
-      if (icon && !icon.destroyed) icon.renderable = true;
-      if (obj.renderable === false) obj.renderable = true;
+      if (icon && !icon.destroyed && icon._blStdCulled) {
+        icon.renderable = true;
+        icon._blStdCulled = false;
+      }
+      if (obj._blStdCulled) {
+        obj.renderable = true;
+        obj._blStdCulled = false;
+      }
     });
   }
 

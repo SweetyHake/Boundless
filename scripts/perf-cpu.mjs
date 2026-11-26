@@ -512,8 +512,7 @@ function patchVisibilityAndLos() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || options?.object) {
       return wrapped(points, options);
     }
-    // Fast-path when tokenVision is disabled (all players see the map), then match v14 when visionSources is empty
-    if (!this.tokenVision) return true;
+    // Match Foundry v14 CanvasVisibility#testVisibility: empty active visionSources returns game.user.isGM
     if (!globalThis.canvas?.effects?.visionSources?.some?.(s => s.active)) {
       return Boolean(globalThis.game?.user?.isGM);
     }
@@ -853,22 +852,15 @@ function patchDragAndMovement() {
     return wrapped(...args);
   }, { type: "WRAPPER" });
 
-  const cloneMeasureResult = (r) => {
-    if (!r || typeof r !== "object") return r;
-    const out = { ...r };
-    if (Array.isArray(r.spaces)) out.spaces = r.spaces.map((o) => (o && typeof o === "object" ? { ...o } : o));
-    if (Array.isArray(r.waypoints)) out.waypoints = r.waypoints.map((o) => (o && typeof o === "object" ? { ...o } : o));
-    return out;
-  };
-
   const okMeasure = wrapFoundryMethod("Token", "measureMovementPath", function (wrapped, waypoints, options = {}) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce || !Array.isArray(waypoints) || waypoints.length < 2) {
       return wrapped(waypoints, options);
     }
     const baseKey = buildMeasureCacheKey(waypoints, options);
     if (baseKey === null) return wrapped(waypoints, options);
-    const dragAct = globalThis.canvas?.tokens?._dragMovementAction ?? this.document?.movementAction ?? "";
-    const key = `${baseKey}|da:${dragAct}`;
+    const dragAct = globalThis.canvas?.tokens?._dragMovementAction ?? "";
+    const docAct = this.document?.movementAction ?? "";
+    const key = `${baseKey}|da:${dragAct}|ma:${docAct}|fv:${_exploredVer}`;
     let cache = _measureCaches.get(this);
     if (!cache) {
       cache = new Map();
@@ -911,15 +903,53 @@ function patchDragAndMovement() {
 // 5. Text Style Guard, Detection Filter Guard, Light Field Guard, Identical Sweep Skip, EnrichHTML Cache
 // ---------------------------------------------------------------------------
 
-function safeValuesEqual(a, b, depth = 0) {
+export function cloneMeasureResult(r) {
+  if (!r || typeof r !== "object") return r;
+  const out = { ...r };
+  if (Array.isArray(r.spaces)) out.spaces = r.spaces.map((o) => (o && typeof o === "object" ? { ...o } : o));
+  if (Array.isArray(r.waypoints)) {
+    out.waypoints = r.waypoints.map((o) => (o && typeof o === "object" ? { ...o, forward: null, backward: null } : o));
+  }
+  if (Array.isArray(r.segments)) {
+    out.segments = r.segments.map((seg, i) => {
+      if (!seg || typeof seg !== "object") return seg;
+      const copy = { ...seg };
+      if (Array.isArray(out.waypoints)) {
+        const fromWp = out.waypoints[i];
+        const toWp = out.waypoints[i + 1];
+        if (fromWp && typeof fromWp === "object") {
+          copy.from = fromWp;
+          fromWp.forward = copy;
+        }
+        if (toWp && typeof toWp === "object") {
+          copy.to = toWp;
+          toWp.backward = copy;
+        }
+      }
+      return copy;
+    });
+  }
+  return out;
+}
+
+export function safeValuesEqual(a, b, depth = 0) {
   if (Object.is(a, b)) return true;
   if (!a || !b || typeof a !== "object" || typeof b !== "object" || depth > 3) return false;
+  if (a instanceof Number || b instanceof Number) {
+    return (a instanceof Number && b instanceof Number) && Object.is(a.valueOf(), b.valueOf());
+  }
+  if (a instanceof Date || b instanceof Date) {
+    return (a instanceof Date && b instanceof Date) && Object.is(a.getTime(), b.getTime());
+  }
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (Array.isArray(a)) {
     if (a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) if (!safeValuesEqual(a[i], b[i], depth + 1)) return false;
     return true;
   }
+  const pa = Object.getPrototypeOf(a);
+  const pb = Object.getPrototypeOf(b);
+  if (pa !== pb || (pa !== Object.prototype && pa !== null)) return false;
   const ka = Object.keys(a);
   const kb = Object.keys(b);
   if (ka.length !== kb.length) return false;

@@ -2162,6 +2162,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
         if (w.lvl?.id) committedLevelIds.push(w.lvl.id);
       } else if (w.kind === "file") {
+        if (!w.levelTargets.length && !w.sceneTarget) continue;
         await ensureDirectoryRecursive(w.dir);
         const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
         const upRes = await uploadFileSilent(w.dir, file);
@@ -2562,8 +2563,20 @@ export async function unbakeSceneFromBoundless(controller, scene, {
       }
     }
 
-    const prevSuppress = Boolean(controller?._suppressAutoMount);
-    if (controller) controller._suppressAutoMount = true;
+    const suppressForScene = (sceneId) => {
+      if (!controller || !sceneId) return;
+      if (!controller._suppressAutoMountCounts) controller._suppressAutoMountCounts = new Map();
+      controller._suppressAutoMountCounts.set(sceneId, (controller._suppressAutoMountCounts.get(sceneId) || 0) + 1);
+    };
+    const releaseForScene = (sceneId) => {
+      const counts = controller?._suppressAutoMountCounts;
+      if (!counts || !sceneId) return;
+      const next = (counts.get(sceneId) || 0) - 1;
+      if (next > 0) counts.set(sceneId, next);
+      else counts.delete(sceneId);
+    };
+
+    suppressForScene(targetScene.id);
     try {
       if (targetScene.flags?.[MODULE_ID]) {
         if (!createCopy) {
@@ -2586,7 +2599,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         await lvl.update(patch);
       }
     } finally {
-      if (controller) controller._suppressAutoMount = prevSuppress;
+      releaseForScene(targetScene.id);
     }
 
     if (!createCopy) {
@@ -2620,8 +2633,8 @@ export async function unbakeSceneFromBoundless(controller, scene, {
           try { await targetScene.deleteEmbeddedDocuments(docName, createdDocIds[docName]); } catch {}
         }
       }
-      const prevSuppress = Boolean(controller?._suppressAutoMount);
-      if (controller) controller._suppressAutoMount = true;
+      const counts = controller ? (controller._suppressAutoMountCounts ??= new Map()) : null;
+      if (counts && targetScene?.id) counts.set(targetScene.id, (counts.get(targetScene.id) || 0) + 1);
       try {
         for (const { lvl, rollback } of modifiedLevelsRollback) {
           if (Object.keys(rollback).length) {
@@ -2632,7 +2645,11 @@ export async function unbakeSceneFromBoundless(controller, scene, {
           try { await targetScene.update({ [`flags.${MODULE_ID}`]: savedSceneFlagsForRollback }); } catch {}
         }
       } finally {
-        if (controller) controller._suppressAutoMount = prevSuppress;
+        if (counts && targetScene?.id) {
+          const next = (counts.get(targetScene.id) || 0) - 1;
+          if (next > 0) counts.set(targetScene.id, next);
+          else counts.delete(targetScene.id);
+        }
       }
       if (didUnmountActive && globalThis.canvas?.ready && canvas.scene?.id === targetScene.id && !controller?.active) {
         try { await controller.mount(targetScene); } catch {}

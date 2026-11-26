@@ -792,10 +792,16 @@ function renderBatchedTokenPasses(renderer, visibleTokens, passMask) {
 }
 
 export function isMainScreenRender(renderer) {
-  if (renderer?.projection?.transform) return false;
-  const fs = renderer?.filter?.defaultFilterStack;
-  const rootRt = (fs && fs.length > 1) ? fs[0]?.renderTexture : renderer?.renderTexture?.current;
-  return !rootRt;
+  if (!renderer || renderer.renderingToScreen === false || renderer.projection?.transform) return false;
+  const fs = renderer.filter?.defaultFilterStack;
+  if (fs && fs.length > 1) {
+    if (fs[0]?.renderTexture) return false;
+    for (let i = 1; i < fs.length; i++) {
+      if (fs[i]?.transform) return false;
+    }
+    return true;
+  }
+  return !renderer.renderTexture?.current;
 }
 
 function attachTokenUiBatcher() {

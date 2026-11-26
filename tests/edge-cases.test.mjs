@@ -3382,7 +3382,7 @@ test("LRUTextureManager._loadFallback uses transient backoff instead of permanen
   assert.ok(r3, "load must succeed after transient backoff expires");
 });
 
-test("CanvasVisibility#testVisibility returns true for players when tokenVision is false and keys cache by options.level", async () => {
+test("CanvasVisibility#testVisibility matches Foundry v14 when visionSources is empty and keys cache by options.level", async () => {
   installBaseGlobals();
   let wrappedCalls = 0;
   class MockCanvasVisibility {
@@ -3413,8 +3413,11 @@ test("CanvasVisibility#testVisibility returns true for players when tokenVision 
   try {
     installCpuPerfEngine();
     const vis = new MockCanvasVisibility();
-    // 1. tokenVision === false with empty visionSources -> MUST return true even for non-GM player
-    assert.equal(vis.testVisibility({ x: 100, y: 100 }), true, "non-GM must see map when tokenVision is disabled");
+    // 1. Empty visionSources -> Foundry v14 returns game.user.isGM regardless of tokenVision
+    assert.equal(vis.testVisibility({ x: 100, y: 100 }), false, "non-GM gets false from testVisibility when visionSources is empty (v14 contract)");
+    globalThis.game.user.isGM = true;
+    assert.equal(vis.testVisibility({ x: 100, y: 100 }), true, "GM gets true from testVisibility when visionSources is empty");
+    globalThis.game.user.isGM = false;
 
     // 2. tokenVision === true with active vision -> cache MUST separate options.level
     vis.tokenVision = true;
@@ -3671,8 +3674,10 @@ test("perf-gpu isMainScreenRender detects VoidFilter main pass vs offscreen Rend
   };
   assert.equal(isMainScreenRender(offscreenWithFilter), false, "offscreen RenderTexture at filter stack base must disable screen-frustum culling");
 
-  // Custom projection transform (offscreen capture)
+  // Custom projection transform (offscreen capture) & nested filter-stack transform / renderingToScreen=false
   assert.equal(isMainScreenRender({ projection: { transform: { a: 1 } }, renderTexture: { current: null }, filter: { defaultFilterStack: [] } }), false);
+  assert.equal(isMainScreenRender({ renderingToScreen: false, projection: { transform: null }, renderTexture: { current: { uid: 99 } }, filter: { defaultFilterStack: [{ renderTexture: null }, { renderTexture: { uid: 42 } }] } }), false);
+  assert.equal(isMainScreenRender({ renderingToScreen: true, projection: { transform: null }, renderTexture: { current: { uid: 42 } }, filter: { defaultFilterStack: [{ renderTexture: null }, { renderTexture: { uid: 42 }, transform: { a: 1 } }] } }), false);
 });
 
 test("buildGtaFlightPath avoids frame-1 zoom jump when orbital scale0 < 0.012", async () => {
@@ -3788,4 +3793,71 @@ test("scene-baker getSceneManifestInfo avoids demo URL with per-level manifests,
     }
   });
   assert.equal(merged.counts.walls, 3, "2500px native wall in 1000px sectors must be subdivided into 3 segments");
+});
+
+test("regression fixes: per-scene _suppressAutoMountCounts, addPOI/updatePOI null coords, and Color equality in sourceInitWrapper", async () => {
+  installBaseGlobals();
+  globalThis.foundry = { utils: { deepClone: (o) => structuredClone(o), randomID: () => "poiNew1" } };
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+
+  // 1. _suppressAutoMountCounts suppresses only the target scene, never another active scene
+  let mountCalls = 0;
+  const scActive = { id: "scA", flags: { boundless: { enabled: true } }, levels: [] };
+  globalThis.canvas = { ready: true, scene: scActive };
+  const ctrl = {
+    ...editsMethods,
+    active: true,
+    _suppressAutoMountCounts: new Map([["scClone", 1]]),
+    mount() { mountCalls++; }
+  };
+  ctrl.onSceneUpdate(scActive, { flags: { boundless: { enabled: false } } });
+  assert.equal(mountCalls, 1, "suppressing clone scene must not drop updates on active scene");
+  ctrl._suppressAutoMountCounts.set("scA", 1);
+  ctrl.onSceneUpdate(scActive, { flags: { boundless: { enabled: false } } });
+  assert.equal(mountCalls, 1, "suppressing active scene itself must skip onSceneUpdate");
+
+  // 2. addPOI / updatePOI treat null/empty x,y as missing instead of coercing to 0
+  let savedPois = null;
+  const poiScene = {
+    id: "scPoi",
+    width: 4000,
+    height: 2000,
+    flags: { boundless: { pois: [{ id: "p1", name: "Keep", x: 1234, y: 567, kind: "major" }] } },
+    async update(patch) { savedPois = patch["flags.boundless.pois"]; }
+  };
+  const poiCtrl = {
+    ...editsMethods,
+    poiManager: { resolvePois: (sc) => sc.flags.boundless.pois }
+  };
+  const added = await poiCtrl.addPOI({ name: "Center", x: null, y: "" }, poiScene);
+  assert.equal(added.x, 2000, "null x must fall back to scene center, not 0");
+  assert.equal(added.y, 1000, "empty-string y must fall back to scene center, not 0");
+  const updated = await poiCtrl.updatePOI("p1", { x: null, y: "" }, poiScene);
+  assert.equal(updated.x, 1234, "null x in updatePOI must preserve existing x");
+  assert.equal(updated.y, 567, "empty y in updatePOI must preserve existing y");
+  assert.ok(Array.isArray(savedPois));
+});
+
+test("regression fixes: safeValuesEqual distinguishes Color/Date/Set and cloneMeasureResult relinks segments <-> waypoints", async () => {
+  const { safeValuesEqual, cloneMeasureResult } = await import("../scripts/perf-cpu.mjs");
+
+  class FakeColor extends Number {}
+  assert.equal(safeValuesEqual(new FakeColor(0xff0000), new FakeColor(0x00ff00)), false, "different Color instances must NOT compare equal");
+  assert.equal(safeValuesEqual(new FakeColor(0xff0000), new FakeColor(0xff0000)), true, "identical Color values should compare equal");
+  assert.equal(safeValuesEqual(new Date(1000), new Date(2000)), false, "different Date instances must not compare equal");
+  assert.equal(safeValuesEqual(new Set([1]), new Set([2])), false, "different Set instances must not compare equal");
+  assert.equal(safeValuesEqual({ a: 1, b: [2, 3] }, { a: 1, b: [2, 3] }), true);
+
+  const w0 = { x: 0, y: 0, forward: null, backward: null };
+  const w1 = { x: 100, y: 0, forward: null, backward: null };
+  const seg = { from: w0, to: w1, distance: 5 };
+  w0.forward = seg;
+  w1.backward = seg;
+  const orig = { waypoints: [w0, w1], segments: [seg], distance: 5, spaces: 1 };
+  const cloned = cloneMeasureResult(orig);
+  assert.notEqual(cloned.segments[0], orig.segments[0], "cached segments must be cloned, not shared");
+  assert.equal(cloned.segments[0].from, cloned.waypoints[0], "cloned segment.from must reference cloned waypoint[0]");
+  assert.equal(cloned.segments[0].to, cloned.waypoints[1], "cloned segment.to must reference cloned waypoint[1]");
+  assert.equal(cloned.waypoints[0].forward, cloned.segments[0], "cloned waypoint[0].forward must reference cloned segment[0]");
+  assert.equal(cloned.waypoints[1].backward, cloned.segments[0], "cloned waypoint[1].backward must reference cloned segment[0]");
 });

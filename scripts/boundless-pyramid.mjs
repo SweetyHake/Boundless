@@ -1305,10 +1305,14 @@ export const pyramidMethods = {
       }
     }
     const isLowerLayer = Boolean(!layer.level?.isView && !layer.isUpper && this.visibleLevelLayers.length > 1);
-    if (visHigher.length === 0 && !isLowerLayer) return false;
     const rw = rx1 - rx0;
     const rh = ry1 - ry0;
+    if (visHigher.length === 0) {
+      return isLowerLayer && this._isRectOccludedByUpperLevels(layer, rx0, ry0, rw, rh);
+    }
     const fracs = [0.002, 0.25, 0.5, 0.75, 0.998];
+    const cellW = rw * 0.25;
+    const cellH = rh * 0.25;
     for (let yi = 0; yi < 5; yi++) {
       const py = ry0 + rh * fracs[yi];
       for (let xi = 0; xi < 5; xi++) {
@@ -1321,8 +1325,14 @@ export const pyramidMethods = {
             break;
           }
         }
-        if (!covered && isLowerLayer && this._isPointOccludedByUpperLevels(layer, px, py)) {
-          covered = true;
+        if (!covered && isLowerLayer) {
+          const cx0 = Math.max(rx0, px - cellW * 0.5);
+          const cy0 = Math.max(ry0, py - cellH * 0.5);
+          const cx1 = Math.min(rx1, px + cellW * 0.5);
+          const cy1 = Math.min(ry1, py + cellH * 0.5);
+          if (cx1 > cx0 && cy1 > cy0 && this._isRectOccludedByUpperLevels(layer, cx0, cy0, cx1 - cx0, cy1 - cy0)) {
+            covered = true;
+          }
         }
         if (!covered) return false;
       }
@@ -1447,13 +1457,15 @@ export const pyramidMethods = {
     if (rx1 <= rx0 || ry1 <= ry0) return true;
     const rw = rx1 - rx0;
     const rh = ry1 - ry0;
+    const halfW = rw * 0.5;
+    const halfH = rh * 0.5;
     const p0x = rx0 + rw * 0.25, p1x = rx0 + rw * 0.75;
     const p0y = ry0 + rh * 0.25, p1y = ry0 + rh * 0.75;
     const isLowerLayer = Boolean(e.layer && !e.layer.level?.isView && !e.layer.isUpper && this.visibleLevelLayers.length > 1);
-    let c0 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p0x, p0y);
-    let c1 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p1x, p0y);
-    let c2 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p0x, p1y);
-    let c3 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p1x, p1y);
+    let c0 = isLowerLayer && this._isRectOccludedByUpperLevels(e.layer, rx0, ry0, halfW, halfH);
+    let c1 = isLowerLayer && this._isRectOccludedByUpperLevels(e.layer, rx0 + halfW, ry0, rw - halfW, halfH);
+    let c2 = isLowerLayer && this._isRectOccludedByUpperLevels(e.layer, rx0, ry0 + halfH, halfW, rh - halfH);
+    let c3 = isLowerLayer && this._isRectOccludedByUpperLevels(e.layer, rx0 + halfW, ry0 + halfH, rw - halfW, rh - halfH);
     if (c0 && c1 && c2 && c3) return true;
     if (bucket) {
       for (let i = 0; i < bucket.length; i++) {
