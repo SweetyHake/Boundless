@@ -15,6 +15,8 @@
     }
   ],
   "url": "https://github.com/SweetyHake/Boundless",
+  "manifest": "https://github.com/SweetyHake/Boundless/releases/latest/download/module.json",
+  "download": "https://github.com/SweetyHake/Boundless/releases/download/1.2.0/boundless.zip",
   "esmodules": [
     "scripts/boundless.mjs"
   ],

@@ -1,42 +1,39 @@
-# Журнал изменений
+# Changelog
 
 ## 1.2.0
-- Добавлен встроенный zero-config движок производительности для всех сцен Foundry VTT v14 (батчинг UI токенов, атлас стен, иконок и пинов D&D 5e, LUT-шум для анимированных шейдеров света, оптимизация восприятия, мягкой геометрии света, дверей Showstopper, драга токенов, кэш `TextEditor.enrichHTML` и `Roll.validate`, авто-куллинг и очистка VRAM на стандартных сценах).
-- Добавлен встроенный ABBA-бенчмарк с попиксельной проверкой визуального равенства (`Boundless.perf.benchmark()`).
-- Добавлены IndexedDB-кэш полигонов света (`poly-cache-db.mjs`), предзапечённые `bakedPolys`, фоновый прогрев соседних этажей, профили бюджета VRAM, предиктивный префетч тайлов, а также инструменты впекания правок в манифест и распаковки сцен.
-- Добавлены умное двухступенчатое выделение `Ctrl+A` (сначала область видимости, повторно весь уровень), выделение рамкой, клик и двойной клик по импосторам на макро-зуме с масштабируемой рамкой выделения (`boundless-selection.mjs`) и `O(K)`-батчинг массового выделения.
-- Добавлены поддержка всех 23 анимаций света и 4 анимаций темноты, плавный кроссфейд между `MegaLightBatch` и живыми `PointLightSource` и покадровое бюджетирование загрузки тайлов, крыш, дверей и токенов для стабильных 120 FPS без микрофризов.
-- Проведена модульная декомпозиция `boundless.mjs` на 6 подсистем и исправлены ошибки аудита (включая `VoidFilter` токенов, мерцание света при зуме и сохранение камеры на всю сцену).
+
+- Add zero-config performance engine for all Foundry VTT v14 scenes: token UI layer batching, 2x sprite atlas for walls, control icons, doors, D&D 5e map location pins, and token status effects, precomputed Noise/FBM LUT for animated light shaders, CPU perception and drag optimization, standard-scene culling, and idle VRAM cleanup
+- Match vanilla Foundry VTT v14 visuals 1-to-1 across wall lines, endpoints, control/door/pin/effect icons, 3-slice token resource bars, and native 1.0x lighting scale on High/Max modes
+- Switch scene optimization and unbaking to an in-place single-scene workflow with lossless restoration of original background and foreground images
+- Add IndexedDB light polygon cache (`poly-cache-db.mjs`), prebaked `bakedPolys`, idle adjacent-level prewarming, VRAM budget profiles, predictive tile prefetching, and manifest edit baking
+- Add smart two-stage `Ctrl+A` selection, macro-zoom impostor box/click selection, and `O(K)` bulk selection batching
+- Add full support for all 23 light animations and 4 darkness animations, smooth light-batch crossfading, and frame-budgeted tile/roof/door/token streaming
+- Add built-in ABBA regression benchmark (`Boundless.perf.benchmark()`)
+- Modularize core architecture and fix multi-level lighting, fog, visibility, WebGL context recovery, `ForcedDeletion` sync, and non-GM edge cases
 
 ## 1.1.3
-- Добавлена полная поддержка расширенных параметров света `{speed, intensity, coloration, attenuation, luminosity}` из 9-го поля записи для живых `PointLightSource`, запечённого батча `MegaLightBatch` (атрибут `aStyle` с формулой `computedAttenuation` из Foundry v14), редактора света и сборщика сцен.
-- Добавлены события шины `dynamicLightMount` и `dynamicLightRetire` (отправляется до `destroy()`).
+
+- Add extended light parameter support (`speed`, `intensity`, `coloration`, `attenuation`, `luminosity`) for live lights, `MegaLightBatch`, light editor, and scene baker
+- Add `dynamicLightMount` and `dynamicLightRetire` event bus hooks
 
 ## 1.1.2
-- Добавлена поддержка второй `foreground`-пирамиды на уровень (`foregroundPyramidBaseUrl`, `foregroundMaxZoomZ`, `foregroundElevation`, разреженный индекс `foregroundTiles` и кэш отсутствующих тайлов в воркере) для отображения стен поверх токенов и под крышами, а также автоматическая нарезка `level.foreground.src` в `scene-baker.mjs`.
-- Исправлена засветка огнями нижних этажей (подвала) при максимальном отдалении (`z=0`) на многоуровневых сценах за счёт записи глубины базового тайла в `CanvasDepthMask`.
-- Модуль `Prime Performance` (`fvtt-perf-optim`) добавлен в рекомендуемые зависимости.
+
+- Add per-level `foreground` tile pyramid support (`foregroundPyramidBaseUrl`, sparse index, worker negative cache) and automatic foreground slicing in `scene-baker.mjs`
+- Fix lower-level light bleed at max zoom-out (`z=0`) on multi-level scenes
 
 ## 1.1.1
-- Оптимизировано масштабирование и рендер под 144 FPS: убран синхронный `gl.readPixels` на `PrimaryCanvasGroup#_onMouseMove`, фоновая очистка LRU-кэша перенесена в простой, включён ручной `PIXI.GC_MODES.MANUAL` с предбиндом текстур и лимитом декодирования 4K-крыш до 2048 px в воркере, а статичные декоративные пропы переведены на быстрый PIXI `batch`.
-- Нормализованы пороги LOD пирамиды, крыш и виртуальных пропов к абсолютным экранным пикселям на клетку, устранены чёрные границы чанков, мерцание при смене уровней пирамиды, пропадание зрения токена на макро-зуме и просвет токенов сквозь крыши при быстром приближении.
-- Добавлено автоматическое отсечение скрытых нижних этажей по `512×512` альфа-маске верхних полов и публичная событийная шина `Boundless.on/off` (плюс хуки `boundlessMount`/`boundlessUnmount`) для интеграций без покадрового опроса.
-- Исправлена работа `CanvasDepthMask` (сброс `pluginName = null` в пуле мешей), убрано преждевременное исчезновение дверей при отдалении (`DoorMesh` виден до `0.05x`), упрощён UI настройки сцены и вынесены общие утилиты в `scripts/utils.mjs`.
+
+- Optimize zoom and rendering for 144 FPS: eliminate `gl.readPixels` hover stalls, move LRU pruning to idle time, enable manual texture GC, cap worker roof decodes to 2048 px, and route static props through PIXI `batch`
+- Add hidden lower-level opacity-mask culling and public `Boundless.on/off` event bus
+- Fix `CanvasDepthMask` pooling (`pluginName = null`), door visibility at low zoom, and LOD thresholds
 
 ## 1.1.0
-- Модуль переименован в **Boundless** (`boundless`, API `window.Boundless`) с автоматической миграцией флагов сцен из `sh-megamap`.
-- Добавлен пул Web Worker для внепоточного декодирования тайлов (`TileWorkerPool` + `tile-decode.worker.mjs` через `createImageBitmap` и zero-copy transfer): загрузка и декодирование WebP/PNG/JPG пирамиды и оверлеев полностью вынесены с главного потока с приоритетной очередью (видимые тайлы обгоняют фоновый `prewarmArea`), отменой пролетевших мимо камеры загрузок через `AbortController`, безопасным освобождением `ImageBitmap.close()` в LRU-кэше и автоматическим откатом на `foundry.canvas.loadTexture` для SVG/видео.
-- Добавлен клиентский ленивый рендер токенов (`Lazy TokenLayer` в `TokenStreamer`): все `TokenDocument` остаются нативными документами сцены (0 записей в БД, 0 поддельных спрайтов и 100% совместимость с поворотами, `Hero in a Box`, `Dynamic Token Ring`, `MidiQOL`, `DAE`, `Multiple Rings`, `Showstopper` и туманом войны). Патч `TokenLayer.prototype.viewedDocuments` на старте монтирует только персонажей игроков, участников боя и источники света (не материализуя ленивый `ActorDelta` спящих НИП), а остальные токены рисуются нативно по области экрана каждого клиента порциями с бюджетом до `4.5 мс/кадр` и асинхронной предзагрузкой текстур, со скрытием мелких подписей/полосок при отдалении ниже `0.22x`, фрустум-куллингом через `renderable` и клиентской LRU-выгрузкой далёких PIXI-объектов. Также устранён `O(K²)`-фриз ядра при рамке выделения многих токенов (`installBulkSelectionPatch`).
-- Добавлена поддержка континентальных `superGrid`-миров и чанкового стриминга манифеста `boundless-chunked-v1` (`ChunkStreamer` + пер-чанковая time-sliced запечка огней `<= 6 мс/кадр` + орбитальный слой `macroLights`): индекс карты 6000×6000 весит 24.5 КБ, 36 чанков (160 668 стен, 12 888 дверей, 22 860 огней, 8 244 дома) подгружаются лениво с LRU-бюджетом до 8 чанков в RAM/VRAM, а облачный атлас переведён на быстрый CPU-генератор.
-- Добавлена гибридная GPU-система освещения (`MegaLightBatch`): все источники света запекаются через `ClockwiseSweepPolygon` со стенами в единый GPU-батч с секторным фрустум-куллингом и живым мерцанием, поэтому свет и тени сохраняются на любом отдалении вплоть до обзора всей карты целиком при 144 FPS.
-- Проведена оптимизация рендера под 144 FPS: отвязаны физические стены и динамические источники света от панорамирования камеры, добавлен ленивый `CanvasDepthMask`, ограничение разрешения `coloration`/`illumination` фильтров, отключение `SMAAFilter` и пустых FBO-проходов на сценах Boundless, а также бюджетирование загрузки тайлов по кадрам.
-- Добавлена полноценная поддержка многоуровневости Foundry VTT v14 (`Scene.levels`), виртуального стриминга тайлов с поддержкой `depthTexture` между этажами и инструментов запекания нативных уровней (`Boundless.bakeNativeToLevel`).
-- Добавлены запоминание позиции камеры после F5 и ограничение максимального отдаления при выбранном токене (`tokenMinScale`).
-- Добавлены сетевая синхронизация и сохранение состояния дверей (`socket` + флаги сцены), кликабельные метки локаций (POI) на макро-зуме с плавным перелётом, секторный стример эмбиент-звуков и вкладка настроек Boundless в `SceneConfig` и `LevelConfig` (`ru`/`en`).
-- Добавлен высокодетальный чанковый туман войны (чанки 50×50 клеток в обход лимита 4096 px) с полной поддержкой режимов тумана Foundry VTT v14 (`Отключён`, `Индивидуальный`, `Общий` с live-шарингом партии по сокету и серверным сохранением), интеграцией со штатным `canvas.fog` и кистью ручного открытия/скрытия тумана для мастера в панели инструментов освещения.
-- Добавлен атмосферный GPU-слой тумана, высотной дымки и плывущих теней облаков на макро-зуме с динамической палитрой времени суток (день, сумерки, ночь) и автоматическим отключением в тактическом бою и на подземных уровнях.
-- Добавлен единый нативный авто-стриминг всех слоёв редактора (`VirtualWallEditor` и `VirtualLayerEditors`): в обычной игре в видимой области (`scale >= 0.28`) стримятся нативные `Wall` для дверей (с родными `DoorControl`, ПКМ-замком, секретными дверями, текстурами/анимациями `DoorMesh` и звуками), а при переключении на вкладки «Стены», «Освещение», «Звуки» и «Тайлы» автоматически стримятся настоящие нативные `Wall`, `AmbientLight`, `AmbientSound` и `Tile` с полной поддержкой рамки выделения, перетаскивания, изменения радиуса, окон настроек и удаления по `Delete`. Все правки сохраняются компактными дельтами в флагах сцены (`wallEdits`, `lightEdits`, `soundEdits`, `tileEdits`) с мгновенным обновлением GPU-рендера и полной выгрузкой при выходе со слоя.
-- Исправлена окклюзия крыш, токенов и света при отдалении и по клавише `Alt`: крыши (`roofMesh`) остаются смонтированы с `textureAlphaThreshold = 0.75`, поддерживают нативную механику областей этажей Foundry VTT v14 (`CONST.OCCLUSION_MODES.SURFACE` и `defineSurface`), синхронизируют `CanvasDepthMask` при любых переходах, а на уровне `z=5` динамически подгружают локальные тайлы интерьера `z=6` и стены под раскрытыми зданиями.
+
+- Rename module to **Boundless** (`boundless`, `window.Boundless`) with automatic flag migration from `sh-megamap`
+- Add Web Worker tile decoding pool (`createImageBitmap`, priority queue, `AbortController`, LRU VRAM eviction)
+- Add client-side `Lazy TokenLayer` keeping 100% native `TokenDocument`s with viewport time-sliced `Token#draw()`, zoom LOD, and client-only LRU placeable eviction
+- Add continental `superGrid` chunked streaming (`boundless-chunked-v1`), GPU `MegaLightBatch`, multi-level `Scene.levels` support, chunked Fog of War, macro atmosphere, POI fast-travel, ambient audio streaming, and native on-demand layer editors
 
 ## 1.0.0
-- Первый прототип бесшовного рендера гигантских карт (500×500 клеток) для Foundry VTT v14: мультитекстурный GPU-шейдер ландшафта с анти-тайлингом, смешиванием по высоте и процедурной водой, а также пространственный чанковый стример объектов окружения.
+
+- Initial giant-world (500×500) streaming prototype for Foundry VTT v14
