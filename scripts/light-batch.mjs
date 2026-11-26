@@ -856,6 +856,7 @@ export class MegaLightBatch {
   clearPolyCache() {
     this._polyCache.clear();
     this._polyCacheSceneId = null;
+    this._polyCacheGen = (this._polyCacheGen || 0) + 1;
     this._hydratedPolyLevels.clear();
     this._deferredBakeGen++;
     this.lastPolyCacheHits = 0;
@@ -871,6 +872,7 @@ export class MegaLightBatch {
       this._hydratedPolyLevels.clear();
     }
     this._polyCacheSceneId = sceneId;
+    const gen = this._polyCacheGen || 0;
 
     const missingLevels = levelIds.filter(lid => lid && !this._hydratedPolyLevels.has(lid));
     if (!missingLevels.length) {
@@ -879,8 +881,8 @@ export class MegaLightBatch {
     }
 
     const loaded = await loadLevelPolysFromDB(worldId, sceneId, missingLevels);
-    // Abort hydration if another scene mounted while awaiting IndexedDB
-    if (this._polyCacheSceneId !== sceneId) return 0;
+    // Abort hydration if another scene mounted or clearPolyCache() ran while awaiting IndexedDB
+    if (this._polyCacheSceneId !== sceneId || (this._polyCacheGen || 0) !== gen) return 0;
 
     for (const lid of missingLevels) this._hydratedPolyLevels.add(lid);
     let added = 0;
@@ -1157,8 +1159,12 @@ export class MegaLightBatch {
 
     const emptyRect = new PIXI.Rectangle(-1e9, -1e9, 1, 1);
     const seenSharedLightKeys = visibleLevelLayers.length > 1 ? new Set() : null;
+    // Process currently viewed level first so shared multi-level lights bake shadows, dynamic bubbles, and edits on the active level!
+    const orderedLevelLayers = visibleLevelLayers.length > 1
+      ? visibleLevelLayers.slice().sort((a, b) => (b?.level?.isView ? 1 : 0) - (a?.level?.isView ? 1 : 0))
+      : visibleLevelLayers;
 
-    for (const layerEntry of visibleLevelLayers) {
+    for (const layerEntry of orderedLevelLayers) {
       const { level, spec } = layerEntry;
       if (!spec || !level) continue;
       // Chunked worlds stream detailed lights per-chunk via non-blocking time-sliced baking + lightweight orbital macroLights
@@ -1535,7 +1541,7 @@ export class MegaLightBatch {
           if (seenSharedLightKeys) {
             const lk = extra?.gid
               ? `g:${extra.gid}`
-              : `f:${lx}|${ly}|${dimFt}|${brightFt}|${elevation}|${colorHex || ""}|${alpha ?? 0.5}`;
+              : `f:${lx}|${ly}|${dimFt}|${brightFt}|${elevation}|${colorHex || ""}|${alpha ?? 0.5}|${angle}|${rotation}|${anim || ""}`;
             if (seenSharedLightKeys.has(lk)) continue;
             seenSharedLightKeys.add(lk);
           }
@@ -2525,11 +2531,27 @@ export class MegaLightBatch {
       lastVisKey: ""
     };
 
+    let addedLights = 0;
+    const dirtyPrevBatches = new Set();
     for (const meta of job.metas) {
+      const prevMeta = this.lightMetaById.get(meta.id);
+      if (prevMeta && prevMeta.batch && prevMeta.batch !== batch) {
+        // Retire duplicate border-sector light from the previous chunk so it doesn't leak GPU light or counters
+        if (prevMeta.weight > 0.001) {
+          this.activeLightsCount = Math.max(0, this.activeLightsCount - 1);
+          prevMeta.batch.activeCount = Math.max(0, prevMeta.batch.activeCount - 1);
+        }
+        prevMeta.weight = 0;
+        prevMeta.batch.weightArray?.fill?.(0, prevMeta.vStart, prevMeta.vStart + prevMeta.vCount);
+        prevMeta.batch.weightsDirty = true;
+        dirtyPrevBatches.add(prevMeta.batch);
+        this.totalLights = Math.max(0, this.totalLights - 1);
+      }
       meta.batch = batch;
       meta.baseWeight = this._isSuppressedFn?.(meta.id) ? 0.0 : 1.0;
       batch.lightIds.push(meta.id);
       this.lightMetaById.set(meta.id, meta);
+      addedLights++;
       const eff = this._computeEffectiveWeight(meta);
       meta.weight = eff;
       if (eff > 0.001) {
@@ -2540,6 +2562,12 @@ export class MegaLightBatch {
         batch.weightsDirty = true;
       }
     }
+    for (const pb of dirtyPrevBatches) {
+      if (pb.weightsDirty) {
+        pb.weightBuffer?.update?.();
+        pb.weightsDirty = false;
+      }
+    }
     if (batch.weightsDirty) {
       weightBuffer.update();
       batch.weightsDirty = false;
@@ -2547,7 +2575,7 @@ export class MegaLightBatch {
 
     this.chunkBatches.set(job.fullKey, batch);
     if (otherBatchesStale) this.syncDepthElevations(true);
-    this.totalLights += job.metas.length;
+    this.totalLights += addedLights;
     this.activeLightsCount += batch.activeCount;
     this.totalVertices += job.vertCursor;
 
@@ -2736,6 +2764,21 @@ export class MegaLightBatch {
     return this._frozenTime;
   }
 
+  invalidateUniformCache() {
+    this._lastIllumShader = null;
+    this._lastIllumTick = -1;
+    this._lastColorShader = null;
+    this._lastColorTick = -1;
+    if (this.illumShader?.uniforms && !isTextureUsable(this.bakedRoofMask)) {
+      this.illumShader.uniforms.uUseBakedRoofMask = false;
+      this.illumShader.uniforms.uBakedRoofMask = PIXI.Texture.EMPTY;
+    }
+    if (this.colorShader?.uniforms && !isTextureUsable(this.bakedRoofMask)) {
+      this.colorShader.uniforms.uUseBakedRoofMask = false;
+      this.colorShader.uniforms.uBakedRoofMask = PIXI.Texture.EMPTY;
+    }
+  }
+
   _updateIllumUniforms() {
     const u = this.illumShader?.uniforms;
     if (!u || !canvas?.ready) return;
@@ -2746,6 +2789,9 @@ export class MegaLightBatch {
     const dark = canvas.environment?.darknessLevel ?? 0;
     const animOn = canvas.effects?.animateLightSources !== false;
     const dynDark = Boolean(canvas.effects?.illumination?.hasDynamicDarknessLevel);
+    const illumTex = canvas.effects?.illumination?.renderTexture ?? null;
+    const depthTexCur = canvas.masks?.depth?.renderTexture ?? null;
+    const roofMaskUsable = Boolean(this.useBakedRoofMask && isTextureUsable(this.bakedRoofMask));
     // Deduplicate across up to 9 chunk meshes sharing the same illumShader in a single render frame
     if (
       tickTime > 0 &&
@@ -2758,8 +2804,11 @@ export class MegaLightBatch {
       animOn === this._lastIllumAnim &&
       dynDark === this._lastIllumDyn &&
       this.useDepthTexture === this._lastIllumDepth &&
-      this.useBakedRoofMask === this._lastIllumRoof &&
-      this.bakedRoofMask === this._lastIllumRoofTex
+      roofMaskUsable === this._lastIllumRoof &&
+      this.bakedRoofMask === this._lastIllumRoofTex &&
+      this.bakedRoofRepeat === this._lastIllumRoofRep &&
+      illumTex === this._lastIllumTex &&
+      depthTexCur === this._lastIllumDepthTex
     ) {
       return;
     }
@@ -2772,8 +2821,11 @@ export class MegaLightBatch {
     this._lastIllumAnim = animOn;
     this._lastIllumDyn = dynDark;
     this._lastIllumDepth = this.useDepthTexture;
-    this._lastIllumRoof = this.useBakedRoofMask;
+    this._lastIllumRoof = roofMaskUsable;
     this._lastIllumRoofTex = this.bakedRoofMask;
+    this._lastIllumRoofRep = this.bakedRoofRepeat;
+    this._lastIllumTex = illumTex;
+    this._lastIllumDepthTex = depthTexCur;
 
     this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
@@ -2839,6 +2891,9 @@ export class MegaLightBatch {
     const sw = canvas.screenDimensions?.[0] || 1;
     const sh = canvas.screenDimensions?.[1] || 1;
     const animOn = canvas.effects?.animateLightSources !== false;
+    const primTexCur = canvas.primary?.renderTexture ?? null;
+    const depthTexCur = canvas.masks?.depth?.renderTexture ?? null;
+    const roofMaskUsable = Boolean(this.useBakedRoofMask && isTextureUsable(this.bakedRoofMask));
     if (
       tickTime > 0 &&
       this._lastColorShader === this.colorShader &&
@@ -2848,8 +2903,11 @@ export class MegaLightBatch {
       sh === this._lastColorSh &&
       animOn === this._lastColorAnim &&
       this.useDepthTexture === this._lastColorDepth &&
-      this.useBakedRoofMask === this._lastColorRoof &&
-      this.bakedRoofMask === this._lastColorRoofTex
+      roofMaskUsable === this._lastColorRoof &&
+      this.bakedRoofMask === this._lastColorRoofTex &&
+      this.bakedRoofRepeat === this._lastColorRoofRep &&
+      primTexCur === this._lastColorPrimTex &&
+      depthTexCur === this._lastColorDepthTex
     ) {
       return;
     }
@@ -2860,8 +2918,11 @@ export class MegaLightBatch {
     this._lastColorSh = sh;
     this._lastColorAnim = animOn;
     this._lastColorDepth = this.useDepthTexture;
-    this._lastColorRoof = this.useBakedRoofMask;
+    this._lastColorRoof = roofMaskUsable;
     this._lastColorRoofTex = this.bakedRoofMask;
+    this._lastColorRoofRep = this.bakedRoofRepeat;
+    this._lastColorPrimTex = primTexCur;
+    this._lastColorDepthTex = depthTexCur;
 
     this._checkDepthElevationsDirty();
     u.uTime = this._getEffectiveShaderTime();
@@ -2911,7 +2972,7 @@ export class MegaLightBatch {
   syncDarknessLevel(darkness) {
     const next = Number.isFinite(darkness) ? darkness : 0;
     const prev = this._currentDarkness;
-    if (Math.abs(next - prev) <= 0.0001) return false;
+    if (next === prev) return false;
     this._currentDarkness = next;
     if (!this._hasDarknessRangedLights) return false;
     if (!this.weightArray && this.chunkBatches.size === 0) return false;

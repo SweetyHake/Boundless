@@ -628,9 +628,15 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
     return { ...initial, ...res };
   }
 
+  const dims = (canvas.ready && canvas.scene?.id === scene.id)
+    ? null
+    : (typeof scene.getDimensions === "function" ? scene.getDimensions() : null);
   const pivot = canvas.ready && canvas.scene?.id === scene.id
     ? canvas.stage.pivot
-    : { x: (scene.width || 100000) * 0.5, y: (scene.height || 100000) * 0.5 };
+    : {
+        x: (dims?.sceneX ?? 0) + (dims?.sceneWidth ?? scene.width ?? 100000) * 0.5,
+        y: (dims?.sceneY ?? 0) + (dims?.sceneHeight ?? scene.height ?? 100000) * 0.5
+      };
 
   return controller.addPOI({
     ...res,
@@ -1643,6 +1649,12 @@ export class PoiManager {
       const sy = wt.d * pinY + wt.ty;
       if (!entry.dragging && (sx < -240 || sx > sw + 240 || sy < -180 || sy > sh + 180)) {
         entry.root.visible = false;
+        if (entry.hovered) {
+          entry.hovered = false;
+          entry.drawMedal?.(false);
+          entry.drawPill?.(false);
+          entry.root.zIndex = entry.isMajor ? 20 : 10;
+        }
         return;
       }
 

@@ -313,7 +313,7 @@ export const editsMethods = {
       // Preserve non-editable Boundless tile metadata from raw spec (without re-injecting raw.anchorX/anchorY)
       const preserved = {};
       if (raw && typeof raw === "object") {
-        for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable"]) {
+        for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable", "gid"]) {
           if (raw[k] !== undefined) preserved[k] = raw[k];
         }
       }
@@ -676,7 +676,8 @@ export const editsMethods = {
       if (Number.isFinite(t.texture.scaleX) && t.texture.scaleX !== 1) tileSpec.scaleX = t.texture.scaleX;
       if (Number.isFinite(t.texture.scaleY) && t.texture.scaleY !== 1) tileSpec.scaleY = t.texture.scaleY;
       if (t.texture.fit && t.texture.fit !== "fill") tileSpec.fit = t.texture.fit;
-      if (t.levels?.size > 1 && t.id) tileSpec.gid = t.id;
+      const isMultiLevelTile = (t.levels?.size > 1) || (!t.levels?.size && (scene.levels?.size || 0) > 1);
+      if (isMultiLevelTile && t.id) tileSpec.gid = t.id;
       tiles.push(tileSpec);
       tileIdsToDelete.push(t.id);
 
@@ -801,7 +802,8 @@ export const editsMethods = {
       if (Number.isFinite(attenuation) && attenuation !== 0.5) extra.attenuation = attenuation;
       const luminosity = l.config?.luminosity;
       if (Number.isFinite(luminosity) && luminosity !== 0.5) extra.luminosity = luminosity;
-      if (l.levels?.size > 1 && l.id) extra.gid = l.id;
+      const isMultiLevelLight = (l.levels?.size > 1) || (!l.levels?.size && (scene.levels?.size || 0) > 1);
+      if (isMultiLevelLight && l.id) extra.gid = l.id;
       const tuple = [
         l.x, l.y,
         l.config?.dim || 0,
@@ -1084,18 +1086,17 @@ export const editsMethods = {
 
     const legacyPrefix = `modules/${LEGACY_ID}/`;
     const hasLegacyPath = (val, depth = 0) => {
-      if (!val || depth > 5) return false;
+      if (!val || depth > 10) return false;
       if (typeof val === "string") return val.includes(legacyPrefix);
+      if (typeof val !== "object") return false;
       if (Array.isArray(val)) {
         for (let i = 0; i < val.length; i++) if (hasLegacyPath(val[i], depth + 1)) return true;
         return false;
       }
-      if (typeof val === "object") {
-        for (const k in val) {
-          // Skip massive fog/edit payloads that cannot contain module asset URLs
-          if (k === "sharedFog" || k === "wallEdits" || k === "doorStates" || k === "sectors") continue;
-          if (hasLegacyPath(val[k], depth + 1)) return true;
-        }
+      for (const k in val) {
+        // Skip massive non-URL payloads while still scanning wallEdits & sectors (door textures, sound paths)
+        if (k === "sharedFog" || k === "doorStates" || k === "bakedPolys") continue;
+        if (hasLegacyPath(val[k], depth + 1)) return true;
       }
       return false;
     };

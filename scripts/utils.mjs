@@ -349,8 +349,19 @@ export function computePredictiveViewportRect(
 export function hasPlayerOwnerLazy(doc) {
   if (!doc) return false;
   if (!doc.isLazyDelta) return Boolean(doc.hasPlayerOwner);
+  const deltaOwn = doc._source?.delta?.ownership;
   const baseActorId = doc._source?.actorId ?? doc.actorId;
   const baseActor = baseActorId ? globalThis.game?.actors?.get?.(baseActorId) : null;
+  if (deltaOwn && typeof deltaOwn === "object") {
+    const users = globalThis.game?.users;
+    if (users) {
+      for (const u of users) {
+        if (!u || u.isGM) continue;
+        if (hasTokenPermissionLazy(doc, u, "OWNER")) return true;
+      }
+      return false;
+    }
+  }
   if (!baseActor) return false;
   return Boolean(baseActor.hasPlayerOwner);
 }

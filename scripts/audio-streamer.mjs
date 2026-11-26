@@ -38,6 +38,15 @@ export class MegaAudioStreamer {
             }
           }
         }
+        const lvlEdits = soundEditsMap?.get?.(l.level?.id);
+        if (lvlEdits?.size) {
+          for (const ov of lvlEdits.values()) {
+            if (!ov || ov.hidden) continue;
+            found = true;
+            const r = Number(ov.radius);
+            if (Number.isFinite(r) && r > maxR) maxR = r;
+          }
+        }
         l._hasVirtualSounds = found;
         l._maxSoundRadiusUnits = maxR;
         l._hasVirtualSoundsRev = editRev;
@@ -182,8 +191,7 @@ export class MegaAudioStreamer {
           const [sk, , idxStr] = parts;
           if (visitedSectors.has(sk)) continue;
           const si = Number(idxStr);
-          const raw = sectors[sk]?.s?.[si];
-          if (!raw) continue;
+          const raw = sectors[sk]?.s?.[si] ?? null;
           const item = resolveSoundFn
             ? resolveSoundFn(lid, sk, si, raw, level)
             : {

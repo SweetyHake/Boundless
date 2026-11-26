@@ -46,6 +46,7 @@ export class ChunkStreamer {
         sectorRefs: new Map(),  // sk -> count of loaded chunks referencing sk
         overlayRefs: new Map(), // oid -> count of loaded chunks referencing oid
         prewarmKeys: new Set(),
+        prewarmExpiry: new Map(), // ck -> expiresAtMs
         lastKey: ""
       });
     }
@@ -53,6 +54,11 @@ export class ChunkStreamer {
 
   unmount() {
     this._gen++;
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
+    this._lastVp = null;
     for (const [, st] of this.states) {
       for (const [, req] of st.pending) {
         try { req?.abort?.abort?.(); } catch {}
@@ -63,6 +69,8 @@ export class ChunkStreamer {
       st.loaded.clear();
       st.pending.clear();
       st.failed?.clear?.();
+      st.prewarmKeys?.clear?.();
+      st.prewarmExpiry?.clear?.();
     }
     this.states.clear();
   }
@@ -128,7 +136,8 @@ export class ChunkStreamer {
       );
     }
 
-    // Enforce MAX_LOADED_CHUNKS budget: prioritize token chunks first, then nearest viewport chunks to camera center
+    // Enforce MAX_LOADED_CHUNKS budget: guarantee at least half of slots for chunks right under the camera
+    // so dispersed mounted tokens can never starve viewport chunk streaming.
     const needed = new Set();
     const camX = vp ? (vp.x0 + vp.x1) * 0.5 : 0;
     const camY = vp ? (vp.y0 + vp.y1) * 0.5 : 0;
@@ -146,22 +155,19 @@ export class ChunkStreamer {
       return arr;
     };
 
-    if (tokenChunks.size <= MAX_LOADED_CHUNKS) {
-      for (const ck of tokenChunks) needed.add(ck);
-    } else {
+    const sortedVp = vpChunks.size > 0 ? sortByCamDist(vpChunks) : [];
+    const vpReserved = Math.min(sortedVp.length, Math.ceil(MAX_LOADED_CHUNKS / 2));
+    for (let i = 0; i < vpReserved; i++) needed.add(sortedVp[i].ck);
+
+    if (tokenChunks.size > 0 && needed.size < MAX_LOADED_CHUNKS) {
       const sortedTok = sortByCamDist(tokenChunks);
-      for (let i = 0; i < MAX_LOADED_CHUNKS && i < sortedTok.length; i++) needed.add(sortedTok[i].ck);
+      for (let i = 0; i < sortedTok.length && needed.size < MAX_LOADED_CHUNKS; i++) {
+        needed.add(sortedTok[i].ck);
+      }
     }
 
-    if (needed.size < MAX_LOADED_CHUNKS && vpChunks.size > 0) {
-      const remainingVp = new Set();
-      for (const ck of vpChunks) {
-        if (!needed.has(ck)) remainingVp.add(ck);
-      }
-      const sortedVp = sortByCamDist(remainingVp);
-      for (let i = 0; i < sortedVp.length && needed.size < MAX_LOADED_CHUNKS; i++) {
-        needed.add(sortedVp[i].ck);
-      }
+    for (let i = vpReserved; i < sortedVp.length && needed.size < MAX_LOADED_CHUNKS; i++) {
+      needed.add(sortedVp[i].ck);
     }
 
     return needed;
@@ -174,12 +180,25 @@ export class ChunkStreamer {
     return true;
   }
 
+  _isPrewarmActive(st, ck, now = performance.now()) {
+    if (!st.prewarmKeys?.has?.(ck)) return false;
+    const exp = st.prewarmExpiry?.get?.(ck);
+    if (exp !== undefined && now >= exp) {
+      st.prewarmKeys.delete(ck);
+      st.prewarmExpiry.delete(ck);
+      return false;
+    }
+    return true;
+  }
+
   /** Preload destination chunk silently while camera is flying to a distant POI. */
   prewarmPoint(worldX, worldY) {
     if (this.states.size === 0 || !Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
     const now = performance.now();
+    const exp = now + 10000;
     for (const [, st] of this.states) {
       st.prewarmKeys?.clear?.();
+      st.prewarmExpiry?.clear?.();
       const { cfg, populated, layer } = st;
       const cw = cfg.chunkWorldPx;
       const cols = cfg.cols || Math.ceil((layer.worldPx || cw) / cw);
@@ -189,10 +208,12 @@ export class ChunkStreamer {
       if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
       const ck = `${cx}_${cy}`;
       if (populated.size === 0 || populated.has(ck)) {
-        if (st.pending.has(ck)) {
+        if (st.loaded.has(ck) || st.pending.has(ck)) {
           st.prewarmKeys?.add?.(ck);
+          st.prewarmExpiry?.set?.(ck, exp);
         } else if (this._canFetchChunk(st, ck, now)) {
           st.prewarmKeys?.add?.(ck);
+          st.prewarmExpiry?.set?.(ck, exp);
           this._fetchChunk(st, ck);
         }
       }
@@ -201,6 +222,7 @@ export class ChunkStreamer {
 
   update(vp) {
     if (this._updating || this.states.size === 0) return;
+    if (vp) this._lastVp = vp;
     // Fast quantized early-exit on 120 Hz panning inside the same chunk grid cell
     if (vp) {
       let retryBucket = 0;
@@ -238,11 +260,19 @@ export class ChunkStreamer {
       const now = performance.now();
 
       for (const [, st] of this.states) {
+        if (st.prewarmExpiry?.size) {
+          for (const [pck, exp] of st.prewarmExpiry) {
+            if (now >= exp) {
+              st.prewarmExpiry.delete(pck);
+              st.prewarmKeys?.delete?.(pck);
+            }
+          }
+        }
         const needed = this._collectNeededChunks(st, vp);
         st.lastNeeded = needed;
         // Abort stale in-flight fetches that left the viewport/token budget (keep active flight prewarms)
         for (const [ck, req] of Array.from(st.pending.entries())) {
-          if (!needed.has(ck) && !st.prewarmKeys?.has?.(ck)) {
+          if (!needed.has(ck) && !this._isPrewarmActive(st, ck, now)) {
             st.pending.delete(ck);
             try { req?.abort?.abort?.(); } catch {}
           }
@@ -264,9 +294,10 @@ export class ChunkStreamer {
 
   _enforceLru(st, needed = st.lastNeeded, { deferRefresh = false } = {}) {
     if (st.loaded.size <= MAX_LOADED_CHUNKS) return;
+    const now = performance.now();
     const evictable = [];
     for (const [ck, rec] of st.loaded) {
-      if (!needed?.has?.(ck)) evictable.push(rec);
+      if (!needed?.has?.(ck) && !this._isPrewarmActive(st, ck, now)) evictable.push(rec);
     }
     evictable.sort((a, b) => a.lastUsedMs - b.lastUsedMs);
     const evictedKeys = [];
@@ -297,10 +328,9 @@ export class ChunkStreamer {
       })
       .then(data => {
         const isCurrent = st.pending.get(ck) === req;
-        const wasPrewarm = Boolean(st.prewarmKeys?.has?.(ck));
+        const wasPrewarm = this._isPrewarmActive(st, ck);
         if (isCurrent) {
           st.pending.delete(ck);
-          st.prewarmKeys?.delete?.(ck);
         }
         if (!isCurrent || gen !== this._gen || !this.states.has(st.layer.level.id)) return;
         st.failed?.delete?.(ck);
@@ -317,6 +347,14 @@ export class ChunkStreamer {
         if (err?.name === "AbortError" || gen !== this._gen || !isCurrent) return;
         const perm = err?.status === 404 || err?.status === 410;
         st.failed?.set?.(ck, perm ? Infinity : (performance.now() + 15000));
+        if (!perm && !this._retryTimer) {
+          this._retryTimer = setTimeout(() => {
+            this._retryTimer = null;
+            if (gen !== this._gen || this.states.size === 0) return;
+            this._lastUpdateQKey = "";
+            if (this._lastVp) this.update(this._lastVp);
+          }, 15100);
+        }
         console.warn(`${MODULE_ID} | Failed to load chunk ${url}:`, err);
       });
     req.promise = p;

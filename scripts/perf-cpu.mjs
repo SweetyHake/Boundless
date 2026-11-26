@@ -488,8 +488,10 @@ function patchVisibilityAndLos() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || options?.object) {
       return wrapped(points, options);
     }
-    // Fast-path when tokenVision is disabled (e.g. non-vision scenes or GM overview without sight)
-    if (!this.tokenVision) return true;
+    // Match Foundry v14 core: when no active vision sources exist, visibility depends on GM status
+    if (!globalThis.canvas?.effects?.visionSources?.some?.(s => s.active)) {
+      return Boolean(globalThis.game?.user?.isGM);
+    }
     const isSingleObj = points && !Array.isArray(points);
     if (!isSingleObj && (!Array.isArray(points) || points.length !== 1)) return wrapped(points, options);
     const p = isSingleObj ? points : points[0];
@@ -497,7 +499,7 @@ function patchVisibilityAndLos() {
     // Avoid polluting _cellVisCache with transient high-frequency mouse cursor coordinates from Canvas##onMouseMove
     if (p === globalThis.canvas?.mousePosition) return wrapped(points, options);
     const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
-    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv1|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;
@@ -535,11 +537,18 @@ function patchVisibilityAndLos() {
     const t = options?.tolerance ?? 2;
     const offsets = t === 0 ? ZERO_OFFSETS : (t === 2 ? TOL2_OFFSETS : (t > 0 ? [[0, 0], [-t, -t], [-t, 0], [-t, t], [0, -t], [0, t], [t, -t], [t, 0], [t, t]] : ZERO_OFFSETS));
     const object = options?.object ?? null;
+    const TokenCls = globalThis.foundry?.canvas?.placeables?.Token;
+    const isToken = Boolean(TokenCls && object instanceof TokenCls);
     const rawLevel = options?.level;
     const level = typeof rawLevel === "string"
       ? (globalThis.canvas?.scene?.levels?.get?.(rawLevel) ?? globalThis.canvas?.level)
-      : (rawLevel ?? globalThis.canvas?.level);
-    const defaultElev = level?.elevation?.bottom ?? 0;
+      : (rawLevel ?? (isToken ? (globalThis.canvas?.scene?.levels?.get?.(object.document?.level) ?? globalThis.canvas?.level) : globalThis.canvas?.level));
+    let defaultElev = pts[0]?.elevation;
+    if (defaultElev === undefined) {
+      defaultElev = isToken
+        ? (object.document?.getMovementOrigin?.()?.elevation ?? object.document?.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0)
+        : (globalThis.canvas?.level?.elevation?.base ?? 0);
+    }
     const tests = [];
     for (let i = 0; i < pts.length; i++) {
       const pt = pts[i];
@@ -1374,12 +1383,28 @@ function patchMiscCpuGuards() {
     return res;
   }, { staticOnly: true });
 
-  // Zero-alloc RenderedEffectSource#animate & animateTime MUST be wrapped BEFORE PointLightSource/PointDarknessSource
-  // so subclass wrappers delegate to the zero-alloc path instead of capturing the old unpatched prototype method!
+  // Zero-alloc RenderedEffectSource#animate & animateTime + offscreen light/darkness culling unified on base prototype
+  // (avoids DIRECT_WRAPPED prototype-chain collision on PointLightSource/PointDarknessSource when libWrapper is absent)
+  let okLightAnim = false;
+  let okDarkAnim = false;
   const RenderedSrcCls = globalThis.foundry?.canvas?.sources?.RenderedEffectSource;
   if (RenderedSrcCls?.prototype) {
     if (typeof RenderedSrcCls.prototype.animate === "function") {
-      wrapTargetMethod(RenderedSrcCls.prototype, "animate", "RenderedEffectSource.prototype.animate", function (wrapped, dt) {
+      const okAnim = wrapTargetMethod(RenderedSrcCls.prototype, "animate", "RenderedEffectSource.prototype.animate", function (wrapped, dt) {
+        if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling && this.layers) {
+          let hasAnyMesh = false;
+          let anyRenderable = false;
+          for (const k in this.layers) {
+            const m = this.layers[k]?.mesh;
+            if (!m) continue;
+            hasAnyMesh = true;
+            if (m.renderable !== false) { anyRenderable = true; break; }
+          }
+          if (hasAnyMesh && !anyRenderable) {
+            perfStats.lightAnimSkipped++;
+            return;
+          }
+        }
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(dt);
         if (!this.isAnimated) return;
         const anim = this.animation;
@@ -1391,20 +1416,25 @@ function patchMiscCpuGuards() {
           opts = {};
           let nKeys = 0;
           for (const k in anim) {
-            if (k !== "animation") { opts[k] = anim[k]; nKeys++; }
+            if (k !== "animation" && Object.hasOwn(anim, k)) { opts[k] = anim[k]; nKeys++; }
           }
           this._blAnimSrc = anim;
           this._blAnimOpts = opts;
           this._blAnimKeys = nKeys;
         } else {
           let nKeys = 0;
+          let keyAdded = false;
           for (const k in anim) {
-            if (k !== "animation") { opts[k] = anim[k]; nKeys++; }
+            if (k !== "animation" && Object.hasOwn(anim, k)) {
+              if (!(k in opts)) keyAdded = true;
+              opts[k] = anim[k];
+              nKeys++;
+            }
           }
-          if (nKeys !== this._blAnimKeys) {
+          if (keyAdded || nKeys !== this._blAnimKeys) {
             opts = {};
             for (const k in anim) {
-              if (k !== "animation") opts[k] = anim[k];
+              if (k !== "animation" && Object.hasOwn(anim, k)) opts[k] = anim[k];
             }
             this._blAnimOpts = opts;
             this._blAnimKeys = nKeys;
@@ -1412,6 +1442,8 @@ function patchMiscCpuGuards() {
         }
         return fn.call(this, dt, opts);
       });
+      okLightAnim = Boolean(okAnim);
+      okDarkAnim = Boolean(okAnim);
     }
     if (typeof RenderedSrcCls.prototype.animateTime === "function") {
       wrapTargetMethod(RenderedSrcCls.prototype, "animateTime", "RenderedEffectSource.prototype.animateTime", function (wrapped, dt, options) {
@@ -1434,41 +1466,6 @@ function patchMiscCpuGuards() {
       });
     }
   }
-
-  // Skip per-frame uniform/shader animation CPU work for offscreen-culled light & darkness sources
-  const okLightAnim = wrapFoundryMethod("PointLightSource", "animate", function (wrapped, dt) {
-    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
-      const bg = this.layers?.background?.mesh;
-      const il = this.layers?.illumination?.mesh;
-      const co = this.layers?.coloration?.mesh;
-      const bgOn = bg && bg.renderable !== false;
-      const ilOn = il && il.renderable !== false;
-      const coOn = co && co.renderable !== false;
-      if ((bg || il || co) && !bgOn && !ilOn && !coOn) {
-        perfStats.lightAnimSkipped++;
-        return;
-      }
-    }
-    return wrapped(dt);
-  });
-
-  const okDarkAnim = wrapFoundryMethod("PointDarknessSource", "animate", function (wrapped, dt) {
-    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
-      const dk = this.layers?.darkness?.mesh;
-      const bg = this.layers?.background?.mesh;
-      const il = this.layers?.illumination?.mesh;
-      const co = this.layers?.coloration?.mesh;
-      const dkOn = dk && dk.renderable !== false;
-      const bgOn = bg && bg.renderable !== false;
-      const ilOn = il && il.renderable !== false;
-      const coOn = co && co.renderable !== false;
-      if ((dk || bg || il || co) && !dkOn && !bgOn && !ilOn && !coOn) {
-        perfStats.lightAnimSkipped++;
-        return;
-      }
-    }
-    return wrapped(dt);
-  });
 
   // Lazy Actor#applyActiveEffects: skip 2x Actor#getRollData() + Map + expandObject on actors with 0 active AE changes (80-90% of NPCs)
   wrapFoundryMethod("Actor", "applyActiveEffects", function (wrapped, phase) {
@@ -1509,8 +1506,8 @@ function patchMiscCpuGuards() {
   // Skip no-op empty TokenRuler#refresh during scene load (avoids 2N measureMovementPath([]) + async DOM calls on idle tokens)
   const TokenRulerCls = globalThis.foundry?.canvas?.placeables?.tokens?.TokenRuler;
   if (TokenRulerCls?.prototype?.refresh) {
-    wrapTargetMethod(TokenRulerCls.prototype, "refresh", "TokenRuler.prototype.refresh", function (wrapped, data) {
-      if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && data) {
+    wrapTargetMethod(TokenRulerCls.prototype, "refresh", "TokenRuler.prototype.refresh.skipEmpty", function (wrapped, data) {
+      if (data) {
         const hasPassed = Boolean(data.passedWaypoints?.length);
         const hasPending = Boolean(data.pendingWaypoints?.length);
         let hasPlanned = false;
@@ -1519,7 +1516,7 @@ function patchMiscCpuGuards() {
           for (const _ in pm) { hasPlanned = true; break; }
         }
         if (!hasPassed && !hasPending && !hasPlanned) {
-          if (!this._blRulerHasContent) return;
+          if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && !this._blRulerHasContent) return;
           this._blRulerHasContent = false;
           return wrapped(data);
         }
@@ -1740,25 +1737,33 @@ function patchGeometryStructures() {
     }));
   }
 
-  // 2. Quadtree#remove (O(k) via root entry Map instead of full-tree walk)
+  // 2. Quadtree#remove (O(k) via root entry Map instead of full-tree walk; supports multi-entry targets per Foundry insert() semantics)
   const QT = globalThis.foundry?.canvas?.geometry?.Quadtree ?? globalThis.Quadtree;
   if (QT?.prototype) {
-    const okIns = wrapTargetMethod(QT.prototype, "insert", "Quadtree.prototype.insert", function (wrapped, obj) {
-      if (this.depth === 0 && obj?.t !== undefined && this._blEntries) {
-        const prev = this._blEntries.get(obj.t);
-        if (prev && prev !== obj && prev.n?.size) {
-          for (const leaf of prev.n) {
-            const arr = leaf.objects;
-            const idx = arr.indexOf(prev);
-            if (idx !== -1) arr.splice(idx, 1);
-          }
-          prev.n.clear();
-        }
+    const removeEntryFromLeaves = (entry) => {
+      if (!entry?.n?.size) return;
+      for (const leaf of entry.n) {
+        const arr = leaf.objects;
+        const idx = arr.indexOf(entry);
+        if (idx !== -1) arr.splice(idx, 1);
       }
+      entry.n.clear();
+    };
+    const okIns = wrapTargetMethod(QT.prototype, "insert", "Quadtree.prototype.insert", function (wrapped, obj) {
       const res = wrapped(obj);
       if (this.depth === 0 && obj?.t !== undefined) {
         if (!this._blEntries) this._blEntries = new Map();
-        this._blEntries.set(obj.t, obj);
+        const prev = this._blEntries.get(obj.t);
+        if (prev === undefined || prev === obj) {
+          this._blEntries.set(obj.t, obj);
+        } else if (prev instanceof Set) {
+          prev.add(obj);
+        } else {
+          const s = new Set();
+          s.add(prev);
+          s.add(obj);
+          this._blEntries.set(obj.t, s);
+        }
       }
       return res;
     });
@@ -1768,13 +1773,10 @@ function patchGeometryStructures() {
         const entry = this._blEntries.get(target);
         if (entry) {
           this._blEntries.delete(target);
-          if (entry.n?.size) {
-            for (const leaf of entry.n) {
-              const arr = leaf.objects;
-              const idx = arr.indexOf(entry);
-              if (idx !== -1) arr.splice(idx, 1);
-            }
-            entry.n.clear();
+          if (entry instanceof Set) {
+            for (const e of entry) removeEntryFromLeaves(e);
+          } else {
+            removeEntryFromLeaves(entry);
           }
           return this;
         }

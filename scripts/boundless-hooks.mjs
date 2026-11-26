@@ -18,11 +18,13 @@ export function installLosHorizonPatch() {
     const cfg = orig.apply(this, args);
     const megaCfg = globalThis.canvas?.scene?.flags?.[MODULE_ID];
     const lvlCfg = globalThis.canvas?.level?.flags?.[MODULE_ID];
-    const activeForLevel = Boolean(
-      globalThis.Boundless?.active
-      || lvlCfg?.enabled === true
-      || (megaCfg?.enabled && lvlCfg?.enabled !== false)
-    );
+    const activeForLevel = (globalThis.canvas?.ready && !globalThis.Boundless?._mounting)
+      ? Boolean(globalThis.Boundless?.active)
+      : Boolean(
+          globalThis.Boundless?.active
+          || lvlCfg?.enabled === true
+          || (megaCfg?.enabled && lvlCfg?.enabled !== false)
+        );
     if (activeForLevel) {
       const maxLos = lvlCfg?.maxLosPx || megaCfg?.maxLosPx || MAX_LOS_RADIUS_PX;
       if (cfg.radius > maxLos) cfg.radius = maxLos;
@@ -281,6 +283,7 @@ export function registerBoundlessHooks(controller) {
     syncPerfConfigFromSettings();
     controller.applyVramProfile();
     if (!game.settings?.get?.("core", "noCanvas")) {
+      installLosHorizonPatch();
       installLazyTokenLayerPatch();
       installBulkSelectionPatch(controller);
       installHoverFadeHitTestPatch(controller);
@@ -315,7 +318,8 @@ export function registerBoundlessHooks(controller) {
     if (!globalThis.canvas?.ready || !parentScene || parentScene.id !== globalThis.canvas.scene?.id) return;
     const flagChanges = changes?.flags?.[MODULE_ID];
     const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
-    if (flagChanges || flagDeleted) {
+    const elevChanged = Boolean(changes && "elevation" in changes && (controller.levelLayers?.has?.(level.id) || level.isVisible));
+    if (flagChanges || flagDeleted || elevChanged) {
       controller.mount(parentScene);
     }
   });
@@ -462,6 +466,7 @@ export function registerBoundlessHooks(controller) {
   Hooks.on("drawToken", (tok) => {
     if (!isRuntimeReady() || tok?.document?.parent?.id !== canvas.scene?.id) return;
     controller.tokenStreamer.onTokenDrawn(tok);
+    controller._roofTokenOccDirty = true;
     if (!tok.isPreview) queueTokenBatchFlush({ voidFilter: true, voidFilterForce: true });
   });
 
@@ -574,22 +579,23 @@ export function registerBoundlessHooks(controller) {
       controller.clearSceneCache();
     }
     // Evict manifestCache URLs only referenced by the deleted scene
+    const normUrl = (u) => String(u).replaceAll("modules/sh-megamap/", `modules/${MODULE_ID}/`);
     const deletedUrls = new Set();
     const sUrl = scene.flags?.[MODULE_ID]?.manifestUrl;
-    if (sUrl) deletedUrls.add(sUrl);
+    if (sUrl) deletedUrls.add(normUrl(sUrl));
     for (const lvl of scene.levels || []) {
       const lUrl = lvl.flags?.[MODULE_ID]?.manifestUrl;
-      if (lUrl) deletedUrls.add(lUrl);
+      if (lUrl) deletedUrls.add(normUrl(lUrl));
     }
     if (deletedUrls.size && controller.manifestCache?.size) {
       const stillUsed = new Set();
       for (const sc of game.scenes || []) {
         if (!sc || sc.id === sid) continue;
         const u = sc.flags?.[MODULE_ID]?.manifestUrl;
-        if (u) stillUsed.add(u);
+        if (u) stillUsed.add(normUrl(u));
         for (const lvl of sc.levels || []) {
           const lu = lvl.flags?.[MODULE_ID]?.manifestUrl;
-          if (lu) stillUsed.add(lu);
+          if (lu) stillUsed.add(normUrl(lu));
         }
       }
       for (const u of deletedUrls) {
@@ -658,6 +664,7 @@ export function registerBoundlessHooks(controller) {
       const sc = doc?.parent?.documentName === "Scene" ? doc.parent : doc?.parent?.parent;
       if (sc && sc.id !== canvas.scene?.id) return;
       controller._regionsRev = (controller._regionsRev || 0) + 1;
+      controller.syncPyramidSurfaceOcclusion?.();
       controller._depthDirty = true;
       controller._occlusionDirty = true;
     });

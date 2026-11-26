@@ -139,20 +139,23 @@ export class ChunkedFogManager {
     this._refreshControlsUI();
   }
 
-  _incSavingShared(levelId) {
+  _incSavingShared(levelId, gen = this._fogGen) {
     if (!levelId) return;
-    this._savingSharedByLevel.set(levelId, (this._savingSharedByLevel.get(levelId) || 0) + 1);
+    const key = `${levelId}::${gen}`;
+    this._savingSharedByLevel.set(key, (this._savingSharedByLevel.get(key) || 0) + 1);
   }
 
-  _decSavingShared(levelId) {
+  _decSavingShared(levelId, gen = this._fogGen) {
     if (!levelId) return;
-    const next = (this._savingSharedByLevel.get(levelId) || 1) - 1;
-    if (next <= 0) this._savingSharedByLevel.delete(levelId);
-    else this._savingSharedByLevel.set(levelId, next);
+    const key = `${levelId}::${gen}`;
+    const next = (this._savingSharedByLevel.get(key) || 1) - 1;
+    if (next <= 0) this._savingSharedByLevel.delete(key);
+    else this._savingSharedByLevel.set(key, next);
   }
 
-  _isSavingShared(levelId) {
-    return Boolean(levelId && (this._savingSharedByLevel.get(levelId) || 0) > 0);
+  _isSavingShared(levelId, gen = this._fogGen) {
+    if (!levelId) return false;
+    return (this._savingSharedByLevel.get(`${levelId}::${gen}`) || 0) > 0;
   }
 
   _refreshControlsUI() {
@@ -649,7 +652,9 @@ export class ChunkedFogManager {
   }
 
   _filterReasonablePolygons(polygons) {
-    const MAX_SPAN = 12000;
+    const dimW = Number(globalThis.canvas?.dimensions?.width) || 0;
+    const dimH = Number(globalThis.canvas?.dimensions?.height) || 0;
+    const MAX_SPAN = Math.max(12000, this.worldW || 0, this.worldH || 0, dimW, dimH);
     const out = [];
     const cap = Math.min(polygons.length, 64);
     for (let i = 0; i < cap; i++) {
@@ -907,7 +912,7 @@ export class ChunkedFogManager {
 
   onSceneFogFlagsChanged(scene, sharedFogChanges, userId = null) {
     if (!this.enabled || !this.isSharedMode) return;
-    if (this._isSavingShared(this.levelId) && (!userId || userId === game.user?.id)) return;
+    if (this._isSavingShared(this.levelId, this._fogGen) && (!userId || userId === game.user?.id)) return;
     if (sharedFogChanges === null) {
       this._clearAllSharedChunksLocal();
       return;
@@ -1048,10 +1053,8 @@ export class ChunkedFogManager {
     }
     if (!sharedKeys.length && !privateKeys.length) return;
 
-    // 1. Fast local cache update
-    this._saveLocalCacheOnly();
-
-    // 2. Pre-encode both server payloads synchronously while chunks are still live
+    // 1. Pre-encode both server payloads synchronously while chunks are still live, and prune fully empty chunks
+    const emptyToPrune = new Set();
     let sharedUpdate = null;
     if (isSharedMode && sharedKeys.length && game.user?.isGM) {
       const update = {};
@@ -1062,6 +1065,7 @@ export class ChunkedFogManager {
         const srcCtx = chunk.sharedCtx || chunk.ctx;
         if (isCanvasEmpty(srcCtx)) {
           update[`flags.${MODULE_ID}.sharedFog.${levelId}.-=${key}`] = null;
+          if (!chunk.hasPrivate || (chunk.privateCtx && isCanvasEmpty(chunk.privateCtx))) emptyToPrune.add(key);
         } else {
           update[`flags.${MODULE_ID}.sharedFog.${levelId}.${key}`] = encodeCanvas(srcCanvas);
         }
@@ -1079,6 +1083,7 @@ export class ChunkedFogManager {
         const privCtx = (isSharedMode && chunk.privateCtx) ? chunk.privateCtx : chunk.ctx;
         if (isCanvasEmpty(privCtx)) {
           update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.-=${key}`] = null;
+          if (!isSharedMode || !chunk.sharedCtx || isCanvasEmpty(chunk.sharedCtx)) emptyToPrune.add(key);
         } else {
           update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.${key}`] = encodeCanvas(privCanvas);
         }
@@ -1092,9 +1097,21 @@ export class ChunkedFogManager {
       }
     }
 
-    // 3. Persist to server asynchronously with per-level re-entrancy guard & retry-on-failure requeue
+    for (const key of emptyToPrune) {
+      const chunk = this.chunks.get(key);
+      if (chunk && isCanvasEmpty(chunk.ctx)) {
+        this._destroyChunkEntry(chunk);
+        this.chunks.delete(key);
+      }
+    }
+
+    // 2. Fast local cache update (after pruning empty chunks so they don't persist in localStorage)
+    this._saveLocalCacheOnly();
+
+    // 3. Persist to server asynchronously with per-mount-generation re-entrancy guard & retry-on-failure requeue
     if (sharedUpdate) {
-      this._incSavingShared(levelId);
+      const saveGen = this._fogGen;
+      this._incSavingShared(levelId, saveGen);
       try {
         await scene.update(sharedUpdate);
       } catch (err) {
@@ -1104,7 +1121,7 @@ export class ChunkedFogManager {
           this._scheduleSave();
         }
       } finally {
-        this._decSavingShared(levelId);
+        this._decSavingShared(levelId, saveGen);
       }
     }
 
@@ -1126,6 +1143,7 @@ export class ChunkedFogManager {
     const mountSceneId = this.sceneId;
     const mountLevelId = this.levelId;
     const gen = this._fogGen;
+    let anyDeleted = false;
 
     for (const [rawKey, dataUrl] of Object.entries(mapObj)) {
       const isDeletion = rawKey.startsWith("-=") || dataUrl === null;
@@ -1141,6 +1159,7 @@ export class ChunkedFogManager {
       if (isDeletion) {
         const existing = this.chunks.get(key);
         if (!existing) continue;
+        anyDeleted = true;
         if (intoShared && existing.hasPrivate && existing.sharedCtx) {
           existing.sharedCtx.clearRect(0, 0, CHUNK_TEX_PX, CHUNK_TEX_PX);
           this._recompositeChunk(existing);
@@ -1224,6 +1243,10 @@ export class ChunkedFogManager {
       };
       img.onerror = finishPending;
       img.src = dataUrl;
+    }
+    if (anyDeleted && reapplyVision && this.enabled && this._fogGen === gen && this.sceneId === mountSceneId && this.levelId === mountLevelId) {
+      this._lastPolySigs.clear();
+      this.revealFromActiveVision({ broadcast: false });
     }
   }
 

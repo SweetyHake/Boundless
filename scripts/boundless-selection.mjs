@@ -317,14 +317,14 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         if (missing?.length) {
           const normRect = callArgs[0];
           const remainingBudget = Math.max(0, MAX_MARQUEE_MATERIALIZE - (this.controlled?.length || 0));
-          const hexRect = (canvas?.grid?.isHexagonal && normRect && typeof PIXI?.Rectangle === "function")
+          const selRect = (normRect && typeof PIXI?.Rectangle === "function")
             ? new PIXI.Rectangle(normRect.x, normRect.y, normRect.width, normRect.height)
             : null;
           if (remainingBudget > 0) {
             streamer.materializeAndSelect(missing, {
               releaseOthers: false,
               maxCount: remainingBudget,
-              selectionRect: hexRect,
+              selectionRect: selRect,
               bulkRunner: (fn) => runBulkOnTokenLayer(this, fn)
             });
           }
@@ -550,6 +550,13 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
               Promise.resolve(streamer.materializeDoc?.(hitDoc)).then((tok) => {
                 if (!tok || tok.destroyed) return;
                 tok.setTarget?.(!tok.isTargeted, { releaseOthers });
+                if (!streamer._nativeTokensActive) {
+                  queueMicrotask(() => {
+                    if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
+                      streamer.scheduleSync(null, true);
+                    }
+                  });
+                }
               }).catch(() => {});
               return;
             }
@@ -614,6 +621,13 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
             } else if (hitDoc.flags?.["item-piles"]?.data?.enabled) {
               Promise.resolve(streamer.materializeDoc?.(hitDoc)).then((tok) => {
                 if (tok && !tok.destroyed) tok._onClickLeft2?.(event);
+                if (!streamer._nativeTokensActive) {
+                  queueMicrotask(() => {
+                    if (controller.active && streamer.enabled && !streamer._nativeTokensActive) {
+                      streamer.scheduleSync(null, true);
+                    }
+                  });
+                }
               }).catch(() => {});
               return;
             } else {

@@ -554,6 +554,7 @@ export class VirtualLayerEditors {
     // Zero-alloc macro overview fast-path when level has no lightEdits: avoid creating thousands of resolved objects just to draw dots
     if (!inZoom && !lvlLightEdits?.size) {
       this._clearLights({ keepProtected: true });
+      this._syncProtectedLightsInMacro(lid, layer, level, curRev);
       if (this.lightMacroGfx) {
         const g = this.lightMacroGfx;
         g.clear();
@@ -622,6 +623,7 @@ export class VirtualLayerEditors {
 
     if (!inZoom || items.length > MAX_LIGHTS_IN_VIEW) {
       this._clearLights({ keepProtected: true });
+      this._syncProtectedLightsInMacro(lid, layer, level, curRev);
       if (this.lightMacroGfx) {
         const g = this.lightMacroGfx;
         g.clear();
@@ -802,10 +804,148 @@ export class VirtualLayerEditors {
     }
 
     if (Object.keys(flagUpdate).length) {
-      this.controller.applyVirtualLightChangesLocal();
+      if (this.controller?.active && canvas.scene === scene) {
+        this.controller.applyVirtualLightChangesLocal();
+      }
       await scene.update(flagUpdate);
     }
     return docs;
+  }
+
+  _syncProtectedLightsInMacro(lid, layer, level, curRev) {
+    if (!this.lightsByKey.size) return;
+    const lvlEdits = this.controller.lightEdits?.get(lid);
+    for (const existing of Array.from(this.lightsByKey.values())) {
+      const sheet = getExistingSheet(existing.doc);
+      const raw = existing.levelId === lid ? layer?.spec?.sectors?.[existing.sk]?.l?.[existing.idx] : null;
+      const it = (existing.levelId === lid && raw && lvlEdits?.get(existing.key) !== null)
+        ? this.controller.resolveVirtualLight(lid, existing.sk, existing.idx, raw, level)
+        : null;
+      if (!it) {
+        this._destroyPlaceable(canvas.lighting, existing, this.lightsByKey, this.lightsById, { closeSheet: true });
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      existing.editsRev = curRev;
+      if (existing.sig === nextSig) continue;
+      existing.sig = nextSig;
+      const patch = {
+        x: it.x, y: it.y, elevation: it.elevation, rotation: it.rotation || 0,
+        hidden: Boolean(it.hidden), walls: it.walls !== false,
+        config: {
+          dim: it.dim, bright: it.bright, angle: it.angle ?? 360,
+          color: it.color || null, alpha: it.alpha ?? 0.5,
+          attenuation: it.attenuation ?? 0.5, luminosity: it.luminosity ?? 0.5,
+          ...(Number.isFinite(it.coloration) ? { coloration: it.coloration } : {}),
+          darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 },
+          animation: { type: it.anim || null, speed: it.speed ?? 3, intensity: it.intensity ?? 3 }
+        }
+      };
+      existing.doc.updateSource(patch);
+      if (existing.placeable && !existing.placeable.destroyed) {
+        existing.placeable.renderFlags.set({ refresh: true });
+        existing.placeable.applyRenderFlags();
+        existing.placeable._updateQuadtree?.();
+      }
+      if (sheet?.rendered) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(patch);
+          else sheet._preview?.updateSource?.(patch);
+          sheet.render(false);
+        } catch {}
+      }
+    }
+  }
+
+  _syncProtectedSoundsInMacro(lid, layer, level, curRev) {
+    if (!this.soundsByKey.size) return;
+    const lvlEdits = this.controller.soundEdits?.get(lid);
+    for (const existing of Array.from(this.soundsByKey.values())) {
+      const sheet = getExistingSheet(existing.doc);
+      const raw = existing.levelId === lid ? layer?.spec?.sectors?.[existing.sk]?.s?.[existing.idx] : null;
+      const it = (existing.levelId === lid && raw && lvlEdits?.get(existing.key) !== null)
+        ? this.controller.resolveVirtualSound(lid, existing.sk, existing.idx, raw, level)
+        : null;
+      if (!it) {
+        this._destroyPlaceable(canvas.sounds, existing, this.soundsByKey, this.soundsById, { closeSheet: true });
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      existing.editsRev = curRev;
+      if (existing.sig === nextSig) continue;
+      existing.sig = nextSig;
+      const patch = {
+        x: it.x, y: it.y, radius: it.radius, path: it.path,
+        volume: it.volume, walls: it.walls !== false, easing: it.easing !== false,
+        elevation: it.elevation, hidden: Boolean(it.hidden),
+        darkness: { min: it.darkMin ?? 0, max: it.darkMax ?? 1 }
+      };
+      existing.doc.updateSource(patch);
+      if (existing.placeable && !existing.placeable.destroyed) {
+        existing.placeable.renderFlags.set({ refresh: true });
+        existing.placeable.applyRenderFlags();
+        existing.placeable._updateQuadtree?.();
+      }
+      if (sheet?.rendered) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(patch);
+          else sheet._preview?.updateSource?.(patch);
+          sheet.render(false);
+        } catch {}
+      }
+    }
+  }
+
+  _syncProtectedTilesInMacro(lid, layer, level, curRev) {
+    if (!this.tilesByKey.size) return;
+    const lvlEdits = this.controller.tileEdits?.get(lid);
+    const specTiles = layer?.spec?.tiles;
+    for (const existing of Array.from(this.tilesByKey.values())) {
+      const sheet = getExistingSheet(existing.doc);
+      const raw = existing.levelId === lid ? specTiles?.[existing.tid] : null;
+      const it = (existing.levelId === lid && raw && lvlEdits?.get(existing.key) !== null)
+        ? this.controller.resolveVirtualTile(lid, existing.tid, raw, level)
+        : null;
+      if (!it) {
+        this._setRawVirtualTileVisible(existing.fullId, true);
+        this._destroyPlaceable(canvas.tiles, existing, this.tilesByKey, this.tilesById, { closeSheet: true });
+        continue;
+      }
+      if (existing.editsRev === curRev) continue;
+      const nextSig = JSON.stringify(it);
+      existing.editsRev = curRev;
+      if (existing.sig === nextSig) continue;
+      existing.sig = nextSig;
+      const ax = it.anchorX ?? 0.5;
+      const ay = it.anchorY ?? 0.5;
+      const patch = {
+        x: it.anchorX == null ? (it.x + it.w * 0.5) : it.x,
+        y: it.anchorY == null ? (it.y + it.h * 0.5) : it.y,
+        width: it.w, height: it.h, rotation: it.rot || 0, elevation: it.elevation,
+        sort: it.sort || 0, alpha: it.alpha ?? 1, hidden: Boolean(it.hidden),
+        texture: {
+          src: it.src, tint: (it.tint !== undefined && it.tint !== null && it.tint !== "") ? it.tint : "#ffffff", alphaThreshold: it.alphaThreshold ?? 0.75,
+          anchorX: ax, anchorY: ay, scaleX: it.scaleX ?? 1, scaleY: it.scaleY ?? 1, fit: it.fit ?? "fill"
+        },
+        occlusion: { modes: resolveOcclusionModeArray(it.occlusionMode), alpha: it.occludedAlpha ?? 0.2 },
+        restrictions: { light: Boolean(it.restrictsLight), weather: Boolean(it.restrictsWeather) }
+      };
+      existing.doc.updateSource(patch);
+      if (existing.placeable && !existing.placeable.destroyed) {
+        existing.placeable.renderFlags.set({ refresh: true });
+        existing.placeable.applyRenderFlags();
+        existing.placeable._updateQuadtree?.();
+      }
+      if (sheet?.rendered) {
+        try {
+          if (sheet._preview && typeof sheet._previewChanges === "function") sheet._previewChanges(patch);
+          else sheet._preview?.updateSource?.(patch);
+          sheet.render(false);
+        } catch {}
+      }
+    }
   }
 
   async _commitLightDeletes(ids) {
@@ -825,7 +965,9 @@ export class VirtualLayerEditors {
     }
 
     if (Object.keys(flagUpdate).length) {
-      this.controller.applyVirtualLightChangesLocal();
+      if (this.controller?.active && canvas.scene === scene) {
+        this.controller.applyVirtualLightChangesLocal();
+      }
       await scene.update(flagUpdate);
     }
     return docs;
@@ -987,6 +1129,7 @@ export class VirtualLayerEditors {
     // Zero-alloc macro overview fast-path when level has no soundEdits
     if (!inZoom && !lvlSoundEdits?.size) {
       this._clearSounds({ keepProtected: true });
+      this._syncProtectedSoundsInMacro(lid, layer, level, curRev);
       if (this.soundMacroGfx) {
         const g = this.soundMacroGfx;
         g.clear();
@@ -1055,6 +1198,7 @@ export class VirtualLayerEditors {
 
     if (!inZoom || items.length > MAX_SOUNDS_IN_VIEW) {
       this._clearSounds({ keepProtected: true });
+      this._syncProtectedSoundsInMacro(lid, layer, level, curRev);
       if (this.soundMacroGfx) {
         const g = this.soundMacroGfx;
         g.clear();
@@ -1380,6 +1524,12 @@ export class VirtualLayerEditors {
       }
       this._cleanupLeakedTileMesh(placeable);
       this._destroyPlaceable(canvas.tiles, entry, this.tilesByKey, this.tilesById);
+      // If a newer Tile with the same deterministic objectId mounted while our stale draw() was in flight,
+      // re-apply its texture in case stale addTile() overwrote the shared PrimarySpriteMesh texture
+      const livePlaceable = this.tilesById.get(id)?.placeable;
+      if (livePlaceable && livePlaceable !== placeable && !livePlaceable.destroyed) {
+        livePlaceable.renderFlags?.set?.({ redraw: true });
+      }
       return;
     }
 
@@ -1419,6 +1569,7 @@ export class VirtualLayerEditors {
 
     if (!inZoom) {
       this._clearTiles({ keepProtected: true });
+      this._syncProtectedTilesInMacro(lid, layer, level, curRev);
       return;
     }
 
@@ -1557,10 +1708,18 @@ export class VirtualLayerEditors {
         existing.editsRev = curRev;
         const srcChanged = (it.src || "") !== prevSrc;
         if (existing.placeable && !existing.placeable.destroyed) {
-          Promise.resolve(srcChanged ? existing.placeable.draw() : null).then(() => {
+          const targetSrc = it.src;
+          const redrawAsync = async () => {
+            if (srcChanged) {
+              if (targetSrc && typeof foundry.canvas?.loadTexture === "function") {
+                try { await foundry.canvas.loadTexture(targetSrc, { fallback: "icons/svg/hazard.svg" }); } catch {}
+              }
+              if (gen !== this._tileGen || existing.placeable.destroyed || existing.doc.texture?.src !== targetSrc) return;
+              await existing.placeable.draw();
+            }
             if (existing.placeable.destroyed) {
               this._cleanupLeakedTileMesh(existing.placeable);
-            } else {
+            } else if (gen === this._tileGen) {
               existing.placeable.renderFlags.set({ refresh: true });
               existing.placeable.applyRenderFlags();
               existing.placeable._updateQuadtree?.();
@@ -1568,7 +1727,8 @@ export class VirtualLayerEditors {
                 sheet._preview.object?.renderFlags?.set?.({ redraw: true });
               }
             }
-          }).catch(() => {
+          };
+          redrawAsync().catch(() => {
             if (existing.placeable?.destroyed) this._cleanupLeakedTileMesh(existing.placeable);
           });
         }
@@ -1669,7 +1829,9 @@ export class VirtualLayerEditors {
     }
 
     if (Object.keys(flagUpdate).length) {
-      this.controller.applyVirtualTileChangesLocal();
+      if (this.controller?.active && canvas.scene === scene) {
+        this.controller.applyVirtualTileChangesLocal();
+      }
       await scene.update(flagUpdate);
     }
     return docs;
@@ -1692,7 +1854,9 @@ export class VirtualLayerEditors {
     }
 
     if (Object.keys(flagUpdate).length) {
-      this.controller.applyVirtualTileChangesLocal();
+      if (this.controller?.active && canvas.scene === scene) {
+        this.controller.applyVirtualTileChangesLocal();
+      }
       await scene.update(flagUpdate);
     }
     return docs;

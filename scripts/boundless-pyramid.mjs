@@ -1124,6 +1124,31 @@ export const pyramidMethods = {
     return found;
   },
 
+  syncPyramidSurfaceOcclusion() {
+    const hasSurface = this._hasDefineSurfaceRegions();
+    const targetMode = hasSurface ? CONST.OCCLUSION_MODES.SURFACE : CONST.OCCLUSION_MODES.NONE;
+    let changed = false;
+    for (const e of this.tilesByKey.values()) {
+      const m = e?.mesh;
+      if (!m || m.destroyed || e.channel === "fg" || e.layer?.isUpper) continue;
+      if (m.occlusionMode !== targetMode) {
+        m.occlusionMode = targetMode;
+        changed = true;
+      }
+      if (e.z === 0) {
+        const wantPlugin = hasSurface ? null : "batch";
+        if (m.pluginName !== wantPlugin) {
+          m.pluginName = wantPlugin;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      this._markDepthDirty?.({ elev: true, syncElev: true });
+      this._occlusionDirty = true;
+    }
+  },
+
   _mountTileMesh(e, tex, instant) {
     if (!e || e.ready || e.fadingOut || (!e.desired && e.z > 0)) return false;
     const isFg = e.channel === "fg";
@@ -1579,7 +1604,18 @@ export const pyramidMethods = {
         }
       }
     }
-    // Track light/weather-restricting virtual & native tiles with occlusion using 0-allocation integer hashing
+    // Track light/weather-restricting virtual, native, and upper-level tiles with occlusion (including hoverFade/vision states!)
+    const hashOccMesh = (tag, idx, m) => {
+      const os = m._occlusionState;
+      const fade = Math.round((os?.fade ?? m.alpha ?? 1) * 100) & 255;
+      const vis = Math.round((os?.vision ?? 0) * 100) & 255;
+      const hov = Math.round((m._hoverFadeState?.occlusion ?? 0) * 100) & 255;
+      const flags = (m.visible ? 1 : 0) | (m.occluded ? 2 : 0);
+      const v = (tag ^ (idx << 10) ^ fade ^ (vis << 8) ^ (hov << 16) ^ (flags << 24)) | 0;
+      occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
+      occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
+      occCount++;
+    };
     // Iterate only tracked occludable virtual tiles (typically 0-5) instead of scanning 500-1000 decorative props @ 120Hz!
     const trackedOccVt = this._trackedOccVirtualTiles;
     if (trackedOccVt && trackedOccVt.size > 0) {
@@ -1590,10 +1626,7 @@ export const pyramidMethods = {
         if (!m || m.destroyed) { trackedOccVt.delete(fullId); continue; }
         vtIdx++;
         if ((!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
-        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
-        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
-        occCount++;
+        hashOccMesh(0x100000, vtIdx, m);
       }
     } else if (!trackedOccVt && this.activeVirtualTiles.size > 0) {
       let vtIdx = 0;
@@ -1601,10 +1634,7 @@ export const pyramidMethods = {
         vtIdx++;
         const m = vt?.mesh;
         if (!m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        const v = (0x100000 ^ (vtIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
-        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
-        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
-        occCount++;
+        hashOccMesh(0x100000, vtIdx, m);
       }
     }
     const nativeTiles = canvas.tiles?.placeables;
@@ -1612,22 +1642,16 @@ export const pyramidMethods = {
       for (let i = 0; i < nativeTiles.length; i++) {
         const m = nativeTiles[i]?.mesh;
         if (!m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather) || m.occlusionMode === CONST.OCCLUSION_MODES.NONE) continue;
-        const v = (0x200000 ^ (i << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
-        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
-        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
-        occCount++;
+        hashOccMesh(0x200000, i, m);
       }
     }
     if (this.visibleLevelLayers.length > 1 && this.tilesByKey.size > 0) {
       let ptIdx = 0;
       for (const e of this.tilesByKey.values()) {
         const m = e?.mesh;
-        if (!e?.ready || !e.layer?.isUpper || !m || m.destroyed || !m.visible || (!m.restrictsLight && !m.restrictsWeather)) continue;
+        if (!e?.ready || !e.layer?.isUpper || !m || m.destroyed || (!m.restrictsLight && !m.restrictsWeather)) continue;
         ptIdx++;
-        const v = (0x300000 ^ (ptIdx << 8) ^ Math.round((m._occlusionState?.fade ?? m.alpha ?? 1) * 100)) | 0;
-        occH1 = Math.imul(occH1 ^ v, 16777619) >>> 0;
-        occH2 = ((occH2 << 5) - occH2 + v + 1) | 0;
-        occCount++;
+        hashOccMesh(0x300000, ptIdx, m);
       }
     }
     if (occH1 !== this._lastRoofOccH1 || occH2 !== this._lastRoofOccH2 || occCount !== this._lastRoofOccCount) {
@@ -2076,19 +2100,33 @@ export const pyramidMethods = {
     for (const [ovKey, ov] of this.activeOverlays) {
       const layer = this.levelLayers.get(ov.levelId);
       const localZ = layer ? (layer.lastTargetZ - layer.zOffset) : -1;
-      const roofsMounted = this._shouldMountRoofs(layer, vp.scale);
+      const roofsMounted = Boolean(layer?._roofsMountedMode);
       const st = levelReadyState.get(ov.levelId);
       if (ov.retiring) {
-        const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || layer.lastTargetZ <= 0;
-        const spec = ov.ovSpec;
-        const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
-        const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);
-        if (!roofsMounted && (z4Ready || offScreen)) {
-          retiringOvKeys.push(ovKey);
-        } else if (!roofsMounted) {
-          stillActive = true;
+        if (roofsMounted) {
+          // User zoomed back in before retirement finished — un-retire and restore roof occlusion/light properties
+          ov.retiring = false;
+          if (ov.roofMesh && !ov.roofMesh.destroyed) {
+            ov.roofMesh.restrictsLight = true;
+            ov.roofMesh.restrictsWeather = true;
+            ov.roofMesh.occlusionMode = ov.ovSpec?.occlusionMode ?? CONST.OCCLUSION_MODES.FADE;
+            ov.roofMesh.hoverFade = ov.ovSpec?.hoverFade ?? true;
+          }
+          if (layer) layer.lastOverlayKey = "";
+          this._depthDirty = true;
+          this._occlusionDirty = true;
+        } else {
+          const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || layer.lastTargetZ <= 0;
+          const spec = ov.ovSpec;
+          const halfDiag = spec ? Math.hypot(spec.w || 0, spec.h || 0) * 0.5 : 0;
+          const offScreen = !spec || (spec.cx + halfDiag < vp.x0 || spec.cx - halfDiag > vp.x1 || spec.cy + halfDiag < vp.y0 || spec.cy - halfDiag > vp.y1);
+          if (z4Ready || offScreen) {
+            retiringOvKeys.push(ovKey);
+          } else {
+            stillActive = true;
+          }
+          continue;
         }
-        continue;
       }
       const isZ6 = localZ >= 6;
       const canReveal = roofsMounted;

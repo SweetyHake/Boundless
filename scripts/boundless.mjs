@@ -335,35 +335,54 @@ class MegaWorld1000 {
     url = String(url).replaceAll("modules/sh-megamap/", `modules/${MODULE_ID}/`);
     if (this.manifestCache.has(url)) {
       const cached = this.manifestCache.get(url);
+      // Refresh LRU recency on hit
+      this.manifestCache.delete(url);
+      this.manifestCache.set(url, cached);
       if (cached?.chunks?.baseUrl) {
         return { ...cached, sectors: {}, overlays: {} };
       }
       return cached;
     }
-    const routed = resolveFoundryRoute(url);
-    const sep = routed.includes("?") ? "&" : "?";
-    const resp = await fetch(`${routed}${sep}v=${Date.now()}`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} loading manifest ${url}`);
-    let data = await resp.json();
-    // Chunked world manifests (`boundless-chunked-v1`) stream sectors/overlays lazily per-chunk; never expand all 36 provinces into RAM upfront!
-    if (data?.chunks?.baseUrl) {
-      if (Array.isArray(data.superGrid?.tints) && !data.superGrid.parsedTints) {
-        data.superGrid.parsedTints = data.superGrid.tints.map(row =>
-          row.map(hex => {
-            if (typeof hex === "number") return Number.isFinite(hex) ? hex : 0xffffff;
-            const parsed = parseInt(String(hex).replace("#", ""), 16);
-            return Number.isFinite(parsed) ? parsed : 0xffffff;
-          })
-        );
-      }
-      if (!data.sectors) data.sectors = {};
-      if (!data.overlays) data.overlays = {};
-      this._setManifestCache(url, data);
-      return { ...data, sectors: {}, overlays: {} };
-    } else if (data?.superGrid?.baseManifestUrl) {
-      data = await this._expandSuperGridManifest(data);
+    if (!this._manifestInFlight) this._manifestInFlight = new Map();
+    let inFlight = this._manifestInFlight.get(url);
+    if (!inFlight) {
+      inFlight = (async () => {
+        const routed = resolveFoundryRoute(url);
+        const sep = routed.includes("?") ? "&" : "?";
+        const resp = await fetch(`${routed}${sep}v=${Date.now()}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} loading manifest ${url}`);
+        let data = await resp.json();
+        // Chunked world manifests (`boundless-chunked-v1`) stream sectors/overlays lazily per-chunk; never expand all 36 provinces into RAM upfront!
+        if (data?.chunks?.baseUrl) {
+          if (Array.isArray(data.superGrid?.tints) && !data.superGrid.parsedTints) {
+            data.superGrid.parsedTints = data.superGrid.tints.map(row =>
+              row.map(hex => {
+                if (typeof hex === "number") return Number.isFinite(hex) ? hex : 0xffffff;
+                const parsed = parseInt(String(hex).replace("#", ""), 16);
+                return Number.isFinite(parsed) ? parsed : 0xffffff;
+              })
+            );
+          }
+          if (!data.sectors) data.sectors = {};
+          if (!data.overlays) data.overlays = {};
+          this._setManifestCache(url, data);
+          return data;
+        } else if (data?.superGrid?.baseManifestUrl) {
+          data = await this._expandSuperGridManifest(data);
+        }
+        this._setManifestCache(url, data);
+        return data;
+      })().finally(() => {
+        if (this._manifestInFlight?.get(url) === inFlight) {
+          this._manifestInFlight.delete(url);
+        }
+      });
+      this._manifestInFlight.set(url, inFlight);
     }
-    this._setManifestCache(url, data);
+    const data = await inFlight;
+    if (data?.chunks?.baseUrl) {
+      return { ...data, sectors: {}, overlays: {} };
+    }
     return data;
   }
 
@@ -614,6 +633,7 @@ class MegaWorld1000 {
               await new Promise(r => setTimeout(r, 120));
             }
           }
+          if (isStale()) return;
           if (completedTex) this._prewarmedLevels.add(lvl.id);
         } else {
           this._prewarmedLevels.add(lvl.id);
@@ -797,7 +817,7 @@ class MegaWorld1000 {
 
     const { layers, sceneManifest } = await this._resolveVisibleLevelLayers(scene, cfg || {});
     if (this._mountGen !== mountGen) return;
-    if (canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+    if (!globalThis.canvas?.ready || !globalThis.canvas?.app?.ticker || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
       this.unmount();
       return;
     }
@@ -840,8 +860,9 @@ class MegaWorld1000 {
         this.texMgr.clear(false);
       };
       this._webglContextRestoredFn = () => {
+        const restoreGen = this._mountGen;
         const runRestore = () => {
-          if (!this.active) return;
+          if (!this.active || this._mountGen !== restoreGen || !globalThis.canvas?.ready) return;
           console.info(`${MODULE_ID} | WebGL context restored; rebuilding GPU roof mask and broken textures.`);
           this.pendingTileMounts.length = 0;
           this.pendingOverlayMounts.length = 0;
@@ -877,11 +898,8 @@ class MegaWorld1000 {
             layer.lastOverlayKey = "";
             layer.lastTileKey = "";
           }
-          if (this.lightBatch?.bakedRoofMask) {
-            try { this.lightBatch.bakedRoofMask.destroy(true); } catch {}
-            this.lightBatch.bakedRoofMask = null;
-            this.lightBatch.useBakedRoofMask = false;
-          }
+          this.lightBatch?.disposeBakedRoofMask?.();
+          this.lightBatch?.invalidateUniformCache?.();
           this._syncIndoorLightVisibility?.();
           this._bakeRoofMask(this.visibleLevelLayers, canvas.scene?.id, canvas.level?.id);
           if (this.tokenStreamer?.impostors?.atlasTexture?.baseTexture) {
@@ -960,7 +978,7 @@ class MegaWorld1000 {
     const worldId = game.world?.id || "world";
     const visibleLevelIds = layers.map(l => l.level.id);
     await this.lightBatch.hydratePolyCacheFromDB(worldId, scene.id, visibleLevelIds);
-    if (this._mountGen !== mountGen || !this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+    if (this._mountGen !== mountGen || !this.active || !globalThis.canvas?.ready || !globalThis.canvas?.app?.ticker || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
       if (this._mountGen === mountGen) this.unmount();
       return;
     }
@@ -997,7 +1015,7 @@ class MegaWorld1000 {
 
     await Promise.all(preloadTasks);
     if (this._mountGen !== mountGen) return;
-    if (!this.active || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
+    if (!this.active || !globalThis.canvas?.ready || !globalThis.canvas?.app?.ticker || canvas.scene?.id !== scene.id || canvas.level?.id !== mountedLevelId) {
       this.unmount();
       return;
     }
@@ -1390,6 +1408,10 @@ class MegaWorld1000 {
     this._tilesDirty = false;
     this._lastOverlayAlpha = -1;
     this._occlusionDirty = false;
+    this._defineSurfaceCacheRef = null;
+    this._defineSurfaceCacheRev = -1;
+    this._defineSurfaceCacheLen = -1;
+    this._defineSurfaceCacheVal = false;
   }
 }
 

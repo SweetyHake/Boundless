@@ -8,7 +8,7 @@
 
 import { resolveFoundryRoute } from "./utils.mjs";
 
-const RASTER_EXT_RE = /\.(webp|png|jpe?g|avif|bmp|gif)([?#].*)?$/i;
+const RASTER_EXT_RE = /^[^?#]+\.(webp|png|jpe?g|avif|bmp|gif)([?#].*)?$/i;
 const MAX_INFLIGHT_PER_WORKER = 2;
 const MAX_RESPAWNS_PER_SLOT = 3;
 
@@ -88,7 +88,10 @@ export class TileWorkerPool {
         ? this._workerFactory(idx)
         : new Worker(this._workerUrl, { type: "module" });
       w.onmessage = (ev) => {
-        if (this._workers[idx] !== w) return;
+        if (this._workers[idx] !== w) {
+          try { ev?.data?.bitmap?.close?.(); } catch {}
+          return;
+        }
         this._onWorkerMessage(idx, ev);
       };
       w.onerror = (err) => {
@@ -467,7 +470,9 @@ export class TileWorkerPool {
   destroy() {
     this.cancelAll();
     for (const w of this._workers) {
-      try { w?.terminate?.(); } catch {}
+      if (!w) continue;
+      try { w.onmessage = null; w.onerror = null; w.onmessageerror = null; } catch {}
+      try { w.terminate?.(); } catch {}
     }
     this._workers = [];
     this._workerLoad = [];

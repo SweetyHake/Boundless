@@ -620,7 +620,10 @@ export const overlayMethods = {
     const PrimaryCanvasGroup = foundry.canvas.groups.PrimaryCanvasGroup;
     const localZNow = layer.lastTargetZ - layer.zOffset;
     const roofsMountedNow = this._shouldMountRoofs(layer, curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
-    if (!roofsMountedNow) return false;
+    if (!roofsMountedNow) {
+      layer.lastOverlayKey = "";
+      return false;
+    }
 
     const tWalls = isTextureUsable(item.tWalls) ? item.tWalls : (item.tWalls && ovSpec.walls ? this.texMgr.getSync(ovSpec.walls) : null);
     const tRoof = isTextureUsable(item.tRoof) ? item.tRoof : (item.tRoof && ovSpec.roof ? this.texMgr.getSync(ovSpec.roof) : null);
@@ -735,7 +738,15 @@ export const overlayMethods = {
     const moveBucket = isMoving
       ? `_m_${Math.floor(vp.x0 / vpCellW)}_${Math.floor(vp.y0 / vpCellH)}_${Math.floor(vp.x1 / vpCellW)}_${Math.floor(vp.y1 / vpCellH)}`
       : "_s";
-    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}_d${sharedVtSeen ? sharedVtSeen.size : 0}`;
+    let sharedDedupHash = 0;
+    if (sharedVtSeen && sharedVtSeen.size > 0) {
+      let h = sharedVtSeen.size | 0;
+      for (const dk of sharedVtSeen) {
+        for (let ci = 0; ci < dk.length; ci++) h = (Math.imul(h, 31) + dk.charCodeAt(ci)) | 0;
+      }
+      sharedDedupHash = h;
+    }
+    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}_d${sharedVtSeen ? sharedVtSeen.size : 0}_${sharedDedupHash}`;
     if (tileKey === layer.lastTileKey && !sharedVtSeen) return false;
     const canSkipSameKey = tileKey === layer.lastTileKey;
     layer.lastTileKey = tileKey;
@@ -753,16 +764,21 @@ export const overlayMethods = {
       ? `g:${t.gid}`
       : `f:${t.src}|${t.x}|${t.y}|${t.w}|${t.h}|${t.elevation ?? 0}|${t.rot || 0}|${t.sort || 0}`;
 
-    // When this layer's tileKey did not change on a multi-level scene, still register its active tiles into sharedVtSeen
-    // so lower levels continue deduplicating shared multi-level tiles without re-scanning sectors.
+    // When this layer's tileKey did not change on a multi-level scene, still register all its tiles (mounted + pending)
+    // into sharedVtSeen so lower levels continue deduplicating shared multi-level tiles without re-scanning sectors.
     if (canSkipSameKey && sharedVtSeen) {
-      for (const [, vt] of this.activeVirtualTiles) {
-        if (vt.levelId === lid && vt.tSpec) sharedVtSeen.add(vtDedupKey(vt.tSpec));
+      if (layer._lastVtDedupKeys?.length) {
+        for (let i = 0; i < layer._lastVtDedupKeys.length; i++) sharedVtSeen.add(layer._lastVtDedupKeys[i]);
+      } else {
+        for (const [, vt] of this.activeVirtualTiles) {
+          if (vt.levelId === lid && vt.tSpec) sharedVtSeen.add(vtDedupKey(vt.tSpec));
+        }
       }
       return false;
     }
 
     const needed = new Map();
+    const layerDedupKeys = sharedVtSeen ? [] : null;
     const checkUpperOcc = !level?.isView && !layer.isUpper;
     const isGM = Boolean(game.user?.isGM);
     const candidateTids = this._collectVirtualTileCandidates(lid, spec, sx0, sy0, sx1, sy1);
@@ -777,10 +793,12 @@ export const overlayMethods = {
           const dk = vtDedupKey(tSpec);
           if (sharedVtSeen.has(dk)) continue;
           sharedVtSeen.add(dk);
+          layerDedupKeys.push(dk);
         }
         needed.set(`${lid}::${tid}`, { tid, tSpec });
       }
     }
+    layer._lastVtDedupKeys = layerDedupKeys;
 
     let changed = false;
     let removedAny = false;
@@ -881,9 +899,9 @@ export const overlayMethods = {
     const zNow = layer.lastTargetZ;
     const showInteriorNow = this._shouldMountInteriorTiles(layer, curVp?.scale ?? canvas.stage?.scale?.x ?? 1);
     const effZNow = Math.max(zNow, showInteriorNow ? (layer.zOffset + 5) : 0);
-    if (tSpec.minZ !== undefined && effZNow < tSpec.minZ) return null;
-    if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) return null;
-    if (!layer.level?.isView && !layer.isUpper && this._isVirtualTileOccludedByUpper(layer, tSpec)) return null;
+    if (tSpec.minZ !== undefined && effZNow < tSpec.minZ) { layer.lastTileKey = ""; return null; }
+    if (tSpec.maxZ !== undefined && zNow > tSpec.maxZ) { layer.lastTileKey = ""; return null; }
+    if (!layer.level?.isView && !layer.isUpper && this._isVirtualTileOccludedByUpper(layer, tSpec)) { layer.lastTileKey = ""; return null; }
 
     const { simGrid, simSectorPx } = layer;
     const { pivX, pivY, halfDiag } = getVirtualTileBounds(tSpec);
@@ -896,6 +914,7 @@ export const overlayMethods = {
     const secX1 = (curSx1 + 1) * simSectorPx;
     const secY1 = (curSy1 + 1) * simSectorPx;
     if (pivX + halfDiag < secX0 || pivX - halfDiag > secX1 || pivY + halfDiag < secY0 || pivY - halfDiag > secY1) {
+      layer.lastTileKey = "";
       return null;
     }
 
@@ -906,7 +925,7 @@ export const overlayMethods = {
     const ay = tSpec.anchorY ?? 0.5;
     m.anchor.set(ax, ay);
     m.texture = tex;
-    m.position.set(tSpec.x + (tSpec.anchorX === undefined ? tSpec.w * 0.5 : 0), tSpec.y + (tSpec.anchorY === undefined ? tSpec.h * 0.5 : 0));
+    m.position.set(tSpec.x + (tSpec.anchorX == null ? tSpec.w * 0.5 : 0), tSpec.y + (tSpec.anchorY == null ? tSpec.h * 0.5 : 0));
     const sx = Number.isFinite(tSpec.scaleX) ? tSpec.scaleX : 1;
     const sy = Number.isFinite(tSpec.scaleY) ? tSpec.scaleY : 1;
     const fit = ["fill", "cover", "contain", "width", "height"].includes(tSpec.fit) ? tSpec.fit : "fill";
@@ -988,13 +1007,13 @@ export const overlayMethods = {
     const sy = Number.isFinite(tSpec.scaleY) && tSpec.scaleY !== 0 ? tSpec.scaleY : 1;
     const w = rawW * Math.abs(sx);
     const h = rawH * Math.abs(sy);
-    // Anchor pivot matches syncVirtualTiles(): if anchorX is omitted, x/y is top-left and pivot is (x + w/2, y + h/2)
-    const rawAx = tSpec.anchorX !== undefined ? tSpec.anchorX : 0.5;
-    const rawAy = tSpec.anchorY !== undefined ? tSpec.anchorY : 0.5;
+    // Anchor pivot matches syncVirtualTiles(): if anchorX is omitted/null, x/y is top-left and pivot is (x + w/2, y + h/2)
+    const rawAx = tSpec.anchorX != null ? tSpec.anchorX : 0.5;
+    const rawAy = tSpec.anchorY != null ? tSpec.anchorY : 0.5;
     const ax = sx < 0 ? (1 - rawAx) : rawAx;
     const ay = sy < 0 ? (1 - rawAy) : rawAy;
-    const pivX = tSpec.anchorX === undefined ? (tSpec.x + rawW * 0.5) : tSpec.x;
-    const pivY = tSpec.anchorY === undefined ? (tSpec.y + rawH * 0.5) : tSpec.y;
+    const pivX = tSpec.anchorX == null ? (tSpec.x + rawW * 0.5) : tSpec.x;
+    const pivY = tSpec.anchorY == null ? (tSpec.y + rawH * 0.5) : tSpec.y;
     const dx = px - pivX;
     const dy = py - pivY;
     const rot = tSpec.rot || 0;
@@ -1081,8 +1100,8 @@ export const overlayMethods = {
         }
       }
 
-      // 2. Check virtual tiles with minZ (or elevated roof/canopy tiles) sitting above this point that are NOT yet mounted & opaque
-      if (layer._hasMinZTiles && spec.tiles?.length) {
+      // 2. Check virtual roof/canopy tiles with minZ baked into the pyramid that sit above this point and are NOT yet mounted & opaque
+      if (layer.hasPyramid !== false && layer._hasMinZTiles && spec.tiles?.length) {
         const candidateTids = this._collectVirtualTileCandidates(
           layerId, spec,
           Math.max(0, sx - 1), Math.max(0, sy - 1),
@@ -1091,6 +1110,7 @@ export const overlayMethods = {
         const curTargetZ = layer.lastTargetZ ?? 0;
         const hasTileEditsOnLevel = Boolean(this.tileEdits?.get?.(layerId)?.size);
         const defaultLvlElev = getLevelBaseElevation(level);
+        const checkUpperOcc = !level.isView && !layer.isUpper;
         for (const tid of candidateTids) {
           const rawTile = spec.tiles[tid];
           if (!rawTile) continue;
@@ -1103,6 +1123,15 @@ export const overlayMethods = {
           if (!tSpec || tSpec.hidden || (tSpec.alpha ?? 1) < 0.35 || (tSpec.elevation ?? 0) <= tokElev) continue;
           if (tSpec.maxZ !== undefined && curTargetZ > tSpec.maxZ) continue;
           if (tSpec.minZ !== undefined) {
+            // Skip decorative interior props explicitly marked non-occluding and non-light-blocking
+            const occNone = CONST.OCCLUSION_MODES.NONE;
+            const explicitlyNonOccluding = !tSpec.restrictsLight && (
+              tSpec.occlusionMode === occNone ||
+              (Array.isArray(tSpec.occlusionMode) && tSpec.occlusionMode.length === 0)
+            );
+            if (explicitlyNonOccluding) continue;
+            if (!level.isView && viewedBottom >= (tSpec.elevation ?? 0)) continue;
+            if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, tSpec)) continue;
             if (tSpec.src && missingSrcs?.has?.(tSpec.src)) continue;
             const mountedVt = this.activeVirtualTiles.get(`${layerId}::${tid}`)?.mesh;
             const targetAlpha = tSpec.alpha ?? 1;
@@ -1284,7 +1313,8 @@ export const overlayMethods = {
         tok.renderable = true;
         if (tok.mesh && !tok.mesh.destroyed) {
           tok.mesh.renderable = true;
-          if (tok.visible !== false && !tok._ssHideMesh && tok.mesh.visible === false) tok.mesh.visible = true;
+          const hiddenByShowstopper = Boolean(tok._ssHideMesh || (typeof tok._ssOcclusionAlpha === "number" && tok._ssOcclusionAlpha <= 0.01));
+          if (tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) tok.mesh.visible = true;
         }
         if (tok._ssJumpShadow && !tok._ssJumpShadow.destroyed) tok._ssJumpShadow.renderable = true;
         restoredAny = true;

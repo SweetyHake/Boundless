@@ -244,13 +244,16 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
         } else {
           handleDbTxError(err);
         }
-        try { tx.abort?.(); } catch {}
-        done({ saved: false, quotaHit });
+        try {
+          tx.abort?.();
+        } catch {
+          done({ saved: false, quotaHit });
+        }
       };
       tx.onabort = (ev) => {
         const err = ev?.target?.error || tx.error;
         if (err?.name === "QuotaExceededError") quotaHit = true;
-        else if (err) handleDbTxError(err);
+        else if (!quotaHit && err) handleDbTxError(err);
         done({ saved: false, quotaHit });
       };
     } catch (err) {
@@ -268,8 +271,11 @@ export async function saveLevelPolysToDB(worldId, sceneId, entriesByLevel, { max
     if (freshDb && _clearGen === startGen) {
       const evicted = await _pruneHalfRecords(freshDb);
       if (evicted > 0 && _clearGen === startGen) {
-        const retry = await writeOnce(freshDb);
-        saved = retry.saved;
+        const retryDb = await openPolyCacheDB();
+        if (retryDb && _clearGen === startGen) {
+          const retry = await writeOnce(retryDb);
+          saved = retry.saved;
+        }
       }
     }
   } else if (saved && maxRecords > 0 && _clearGen === startGen) {
@@ -297,8 +303,8 @@ function _pruneHalfRecords(db) {
             try {
               const cursor = cursorReq.result;
               if (!cursor || deleted >= toDelete) return;
-              if (typeof cursor.delete === "function") cursor.delete();
-              else store.delete(cursor.primaryKey);
+              // W3C IndexedDB: cursor.delete() on a key-only cursor always throws InvalidStateError
+              store.delete(cursor.primaryKey);
               deleted++;
               cursor.continue();
             } catch {}
@@ -343,8 +349,8 @@ function _pruneOldRecords(db, maxRecords) {
             try {
               const cursor = cursorReq.result;
               if (!cursor || deleted >= excess) return;
-              if (typeof cursor.delete === "function") cursor.delete();
-              else store.delete(cursor.primaryKey);
+              // W3C IndexedDB: cursor.delete() on a key-only cursor always throws InvalidStateError
+              store.delete(cursor.primaryKey);
               deleted++;
               cursor.continue();
             } catch {}

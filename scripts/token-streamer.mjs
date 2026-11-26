@@ -564,10 +564,12 @@ export class TokenStreamer {
     const y1 = worldY + halfH;
     this._flightPrewarmTarget = { x0, y0, x1, y1, cx: worldX, cy: worldY };
 
-    const sx0 = Math.floor(x0 / TOKEN_SECTOR_PX);
-    const sy0 = Math.floor(y0 / TOKEN_SECTOR_PX);
-    const sx1 = Math.floor(x1 / TOKEN_SECTOR_PX);
-    const sy1 = Math.floor(y1 / TOKEN_SECTOR_PX);
+    const grid = canvas.grid?.size || 100;
+    const sectorPad = grid * 8;
+    const sx0 = Math.floor((x0 - sectorPad) / TOKEN_SECTOR_PX);
+    const sy0 = Math.floor((y0 - sectorPad) / TOKEN_SECTOR_PX);
+    const sx1 = Math.floor((x1 + sectorPad) / TOKEN_SECTOR_PX);
+    const sy1 = Math.floor((y1 + sectorPad) / TOKEN_SECTOR_PX);
 
     const candidates = [];
     const scene = canvas.scene;
@@ -581,10 +583,9 @@ export class TokenStreamer {
           if (!doc || !doc.viewed) continue;
           const existing = doc._object;
           if (existing && !existing.destroyed && existing.parent === canvas.tokens?.objects) continue;
-          const dx = Number(doc._source?.x ?? doc.x ?? 0);
-          const dy = Number(doc._source?.y ?? doc.y ?? 0);
-          if (dx < x0 || dx > x1 || dy < y0 || dy > y1) continue;
-          const distSq = (dx - worldX) ** 2 + (dy - worldY) ** 2;
+          const b = getTokenDocBounds(doc, grid);
+          if (b.x + b.w < x0 || b.x > x1 || b.y + b.h < y0 || b.y > y1) continue;
+          const distSq = (b.cx - worldX) ** 2 + (b.cy - worldY) ** 2;
           candidates.push({ doc, distSq, isPrewarm: true });
         }
       }
@@ -657,6 +658,13 @@ export class TokenStreamer {
       if (keepVisible) this.lastSeenMs.set(doc.id, now);
 
       let blockedByRoof = Boolean(roofHidden?.has?.(tok));
+      // Re-verify already-blocked tokens when controlled, roof occlusion dirtied, or forced (so selected tokens under baked roofs become visible)
+      if (blockedByRoof && keepVisible && (tok.controlled || this.controller?._roofTokenOccDirty || force)) {
+        if (!this.controller?.isTokenUnderBakedRoof?.(tok)) {
+          roofHidden?.delete?.(tok);
+          blockedByRoof = false;
+        }
+      }
       // Synchronous roof check ONLY when revealing a previously hidden token or when roof occlusion changed
       // (avoids O(tokens * levels * tiles) scans on already-visible tokens during every 120Hz pan!)
       if (!blockedByRoof && keepVisible && (!tok.renderable || this.controller?._roofTokenOccDirty || force) && this.controller?.isTokenUnderBakedRoof?.(tok)) {
@@ -735,10 +743,11 @@ export class TokenStreamer {
     const mountY0 = curVp.y0 - MOUNT_VP_PAD_PX;
     const mountX1 = curVp.x1 + MOUNT_VP_PAD_PX;
     const mountY1 = curVp.y1 + MOUNT_VP_PAD_PX;
-    const sx0 = Math.floor(mountX0 / TOKEN_SECTOR_PX);
-    const sy0 = Math.floor(mountY0 / TOKEN_SECTOR_PX);
-    const sx1 = Math.floor(mountX1 / TOKEN_SECTOR_PX);
-    const sy1 = Math.floor(mountY1 / TOKEN_SECTOR_PX);
+    const sectorPad = grid * 8;
+    const sx0 = Math.floor((mountX0 - sectorPad) / TOKEN_SECTOR_PX);
+    const sy0 = Math.floor((mountY0 - sectorPad) / TOKEN_SECTOR_PX);
+    const sx1 = Math.floor((mountX1 + sectorPad) / TOKEN_SECTOR_PX);
+    const sy1 = Math.floor((mountY1 + sectorPad) / TOKEN_SECTOR_PX);
     const viewedLevelId = canvas.level?.id || "";
 
     const streamKey = showTokens
@@ -765,11 +774,10 @@ export class TokenStreamer {
             const existing = doc._object;
             if (existing && !existing.destroyed && existing.parent === canvas.tokens.objects) continue;
 
-            const dx = Number(doc._source?.x ?? doc.x ?? 0);
-            const dy = Number(doc._source?.y ?? doc.y ?? 0);
-            if (dx < mountX0 || dx > mountX1 || dy < mountY0 || dy > mountY1) continue;
+            const b = getTokenDocBounds(doc, grid);
+            if (b.x + b.w < mountX0 || b.x > mountX1 || b.y + b.h < mountY0 || b.y > mountY1) continue;
 
-            const distSq = (dx - focusX) ** 2 + (dy - focusY) ** 2;
+            const distSq = (b.cx - focusX) ** 2 + (b.cy - focusY) ** 2;
             this._drawQueue.push({ doc, distSq });
             this._queuedIds.add(docId);
             addedAny = true;
@@ -1000,7 +1008,7 @@ export class TokenStreamer {
           }
 
           this.lastSeenMs.set(doc.id, performance.now());
-          if ((doc.sight?.enabled ?? doc._source?.sight?.enabled) && (doc.baseActor?.hasPlayerOwner || obj.controlled)) {
+          if ((doc.sight?.enabled ?? doc._source?.sight?.enabled) && (obj.controlled || doc.baseActor?.hasPlayerOwner || hasTokenPermissionLazy(doc, game.user, "OBSERVER"))) {
             anyVisionDrawn = true;
           }
 
@@ -1019,7 +1027,7 @@ export class TokenStreamer {
           // Start smooth 160ms over-composite crossfade via mesh.unoccludedAlpha (never touches tok.alpha or mesh.alpha!)
           if (shouldFade && obj.mesh && !obj.mesh.destroyed) {
             const hasUnoccluded = "unoccludedAlpha" in obj.mesh;
-            const targetOccluded = (Number.isFinite(obj.mesh.occludedAlpha) && obj.mesh.occludedAlpha > 0) ? obj.mesh.occludedAlpha : 0.5;
+            const targetOccluded = (Number.isFinite(obj.mesh.occludedAlpha) && obj.mesh.occludedAlpha >= 0) ? obj.mesh.occludedAlpha : 0.5;
             const isTranslucent = Boolean(doc._source?.hidden || (Number(doc.alpha ?? doc._source?.alpha ?? 1) < 0.99));
             if (hasUnoccluded) {
               obj.mesh.unoccludedAlpha = 0.0;
@@ -1206,7 +1214,7 @@ export class TokenStreamer {
   onTokenUpdated(doc, changes) {
     if (!this.enabled || !doc || doc.parent?.id !== this.sceneId) return;
     const moved = "x" in changes || "y" in changes || "level" in changes;
-    const alwaysMountChanged = "light" in changes || "sight" in changes || "actorLink" in changes || Boolean(changes.flags?.[MODULE_ID]);
+    const alwaysMountChanged = "light" in changes || "sight" in changes || "actorLink" in changes || "delta" in changes || Boolean(changes.flags?.[MODULE_ID]);
     const visualChanged = moved
       || "elevation" in changes
       || "hidden" in changes
@@ -1218,6 +1226,7 @@ export class TokenStreamer {
       || "height" in changes
       || "ring" in changes
       || "disposition" in changes
+      || "delta" in changes
       || Boolean(changes.flags?.["multiple-rings"]);
 
     if (moved) {
@@ -1323,6 +1332,9 @@ export class TokenStreamer {
 
   _canUserControlDoc(doc, minPermission = "OWNER") {
     if (!doc || doc.viewed === false) return false;
+    // Only allow selecting/controlling tokens belonging to the currently viewed level on multi-level scenes
+    const docLid = doc._source?.level ?? doc.level;
+    if (canvas?.level?.id && docLid && docLid !== canvas.level.id) return false;
     const isGM = Boolean(game.user?.isGM);
     if (!isGM) {
       if (doc._source?.hidden ?? doc.hidden) return false;
@@ -1335,18 +1347,32 @@ export class TokenStreamer {
     } else if (!isGM) {
       const grid = canvas.grid?.size || 100;
       const b = getTokenDocBounds(doc, grid);
-      const lid = doc._source?.level ?? doc.level ?? canvas.level?.id;
+      const lid = docLid ?? canvas.level?.id;
       const elev = Number(doc._source?.elevation ?? doc.elevation ?? 0) || 0;
       if (this.controller?.isPointUnderBakedRoof?.(lid, b.cx, b.cy, elev)) return false;
       const isOwner = hasTokenPermissionLazy(doc, game.user, "OWNER");
       if (!isOwner) {
-        // Prevent double-click / target leaks through fog of war or invisible/burrowed status
+        // Prevent double-click / target leaks through fog of war or invisible/burrowed status without materializing lazy ActorDelta
         const inv = globalThis.CONFIG?.specialStatusEffects?.INVISIBLE || "invisible";
         const bur = globalThis.CONFIG?.specialStatusEffects?.BURROW || "burrow";
-        if (doc.hasStatusEffect?.(inv) || doc.hasStatusEffect?.(bur)) return false;
+        if (doc.isLazyDelta) {
+          const baseSt = doc.baseActor?.statuses;
+          if (baseSt?.has?.(inv) || baseSt?.has?.(bur)) return false;
+          const dEff = doc._source?.delta?.effects;
+          if (Array.isArray(dEff)) {
+            for (let ei = 0; ei < dEff.length; ei++) {
+              const ef = dEff[ei];
+              if (!ef || ef.disabled) continue;
+              const sts = ef.statuses;
+              if (Array.isArray(sts) ? (sts.includes(inv) || sts.includes(bur)) : (sts?.has?.(inv) || sts?.has?.(bur))) return false;
+            }
+          }
+        } else if (doc.hasStatusEffect?.(inv) || doc.hasStatusEffect?.(bur)) {
+          return false;
+        }
         if (canvas?.visibility?.tokenVision && typeof canvas.visibility.testVisibility === "function") {
           const tol = Math.min(grid * 0.5, Math.max(b.w, b.h) * 0.45);
-          if (!canvas.visibility.testVisibility({ x: b.cx, y: b.cy }, { tolerance: tol })) return false;
+          if (!canvas.visibility.testVisibility({ x: b.cx, y: b.cy, elevation: elev }, { tolerance: tol })) return false;
         }
       }
     }
@@ -1356,19 +1382,61 @@ export class TokenStreamer {
   async materializeDoc(doc) {
     if (!this.enabled || !doc || !canvas?.ready || !canvas.tokens?.objects) return null;
     if (doc.parent?.id !== this.sceneId || !doc.viewed) return null;
+    const revealObjMesh = (obj) => {
+      if (!obj || obj.destroyed) return;
+      const blockedByRoof = Boolean(
+        !obj.controlled && (
+          this.controller?._roofHiddenTokens?.has?.(obj) ||
+          this.controller?.isTokenUnderBakedRoof?.(obj)
+        )
+      );
+      if (blockedByRoof) {
+        this.controller?._roofHiddenTokens?.add?.(obj);
+        obj.renderable = false;
+        if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = false;
+        return;
+      }
+      obj.renderable = true;
+      if (obj.mesh && !obj.mesh.destroyed) {
+        obj.mesh.renderable = true;
+        const hiddenByShowstopper = Boolean(obj._ssHideMesh || (typeof obj._ssOcclusionAlpha === "number" && Number.isFinite(obj._ssOcclusionAlpha) && obj._ssOcclusionAlpha <= 0.01));
+        if (obj.visible !== false && !hiddenByShowstopper && obj.mesh.visible === false) {
+          obj.mesh.visible = true;
+        }
+      }
+    };
     let obj = doc._object;
-    if (obj && !obj.destroyed && obj.parent === canvas.tokens.objects) {
-      if (!obj.renderable && !this.isTokenDrawing(obj)) {
-        obj.renderable = true;
-        if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = true;
+    if (obj && !obj.destroyed && obj.parent === canvas.tokens.objects && !this.isTokenDrawing(obj)) {
+      if (!obj.renderable || (obj.mesh && !obj.mesh.destroyed && (!obj.mesh.renderable || obj.mesh.visible === false))) {
+        revealObjMesh(obj);
         invalidateTokenLayerCache();
         this.impostors.upsertToken(doc);
         this.impostors.flush();
       }
       return obj;
     }
-    if (this._drawingIds.has(doc.id) || (obj && this.isTokenDrawing(obj))) return null;
     const gen = this._gen;
+    if (this._drawingIds.has(doc.id) || (obj && this.isTokenDrawing(obj))) {
+      // Wait for concurrent in-flight draw instead of silently dropping clicks/targeting
+      const inFlight = obj ? coreDrawPromises.get(obj) : null;
+      if (inFlight) {
+        try { await inFlight; } catch {}
+      } else {
+        for (let w = 0; w < 20 && this._drawingIds.has(doc.id) && gen === this._gen; w++) {
+          await new Promise(r => setTimeout(r, 16));
+        }
+      }
+      if (!this.enabled || gen !== this._gen || !canvas?.ready || !canvas.scene?.tokens?.has?.(doc.id)) return null;
+      obj = doc._object;
+      if (obj && !obj.destroyed && obj.parent === canvas.tokens?.objects) {
+        revealObjMesh(obj);
+        invalidateTokenLayerCache();
+        this.impostors.upsertToken(doc);
+        this.impostors.flush();
+        return obj;
+      }
+      return null;
+    }
     const layer = canvas.tokens;
     this._drawingIds.add(doc.id);
     try {
@@ -1385,9 +1453,17 @@ export class TokenStreamer {
       doc._object = obj;
       if (obj.parent !== layer.objects) layer.objects.addChild(obj);
       await obj.draw();
+      if (!this.enabled || gen !== this._gen || !canvas?.ready || !canvas.scene?.tokens?.has?.(doc.id) || obj.destroyed) {
+        if (obj && !obj.destroyed && !canvas?.scene?.tokens?.has?.(doc.id)) {
+          try {
+            layer.objects?.removeChild?.(obj);
+            obj.destroy({ children: true });
+          } catch {}
+        }
+        return null;
+      }
       obj.applyRenderFlags?.();
-      obj.renderable = true;
-      if (obj.mesh && !obj.mesh.destroyed) obj.mesh.renderable = true;
+      revealObjMesh(obj);
       this.lastSeenMs.set(doc.id, performance.now());
       invalidateTokenLayerCache();
       this.impostors.upsertToken(doc);
@@ -1471,7 +1547,7 @@ export class TokenStreamer {
     const scene = canvas?.scene;
     if (!this.enabled || !scene?.tokens) return null;
     const grid = canvas.grid?.size || 100;
-    const pad = Math.max(grid * 4, Number(minHitRadiusWorld) || 0);
+    const pad = Math.max(grid * 8, Number(minHitRadiusWorld) || 0);
     const sx0 = Math.floor((wx - pad) / TOKEN_SECTOR_PX);
     const sy0 = Math.floor((wy - pad) / TOKEN_SECTOR_PX);
     const sx1 = Math.floor((wx + pad) / TOKEN_SECTOR_PX);
@@ -1574,6 +1650,7 @@ export class TokenStreamer {
       return !(b.x + b.w < vp.x0 - CULL_VP_PAD_PX || b.x > vp.x1 + CULL_VP_PAD_PX || b.y + b.h < vp.y0 - CULL_VP_PAD_PX || b.y > vp.y1 + CULL_VP_PAD_PX);
     };
 
+    const roofHidden = this.controller?._roofHiddenTokens;
     let immediate = 0;
     const controlledTokens = [];
     runBulk(() => {
@@ -1582,7 +1659,7 @@ export class TokenStreamer {
         const tok = doc?._object;
         if (tok && !tok.destroyed && tok.parent === layer.objects) {
           if (selectionRect && typeof tok._overlapsSelection === "function" && !tok._overlapsSelection(selectionRect)) {
-            if (!this._nativeTokensActive && !tok.controlled) {
+            if ((!this._nativeTokensActive || roofHidden?.has?.(tok)) && !tok.controlled) {
               tok.renderable = false;
               if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
             }
@@ -1597,6 +1674,13 @@ export class TokenStreamer {
             if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) {
               immediate++;
               controlledTokens.push(tok);
+              if (roofHidden?.has?.(tok)) {
+                roofHidden.delete(tok);
+                if (onScr) {
+                  tok.renderable = true;
+                  if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = true;
+                }
+              }
             }
           } else {
             controlledTokens.push(tok);
@@ -1747,7 +1831,7 @@ export class TokenStreamer {
             const { tok, onScr } = newlyMounted[i];
             if (!tok || tok.destroyed) continue;
             if (selectionRect && typeof tok._overlapsSelection === "function" && !tok._overlapsSelection(selectionRect)) {
-              if (!this._nativeTokensActive && !tok.controlled) {
+              if ((!this._nativeTokensActive || roofHidden?.has?.(tok)) && !tok.controlled) {
                 tok.renderable = false;
                 if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
               }
@@ -1756,6 +1840,17 @@ export class TokenStreamer {
             if (!tok.controlled) {
               if (tok.control({ force: !onScr, releaseOthers: false, renderSidebar: false })) {
                 controlledTokens.push(tok);
+                if (roofHidden?.has?.(tok)) {
+                  roofHidden.delete(tok);
+                  if (onScr) {
+                    tok.renderable = true;
+                    if (tok.mesh && !tok.mesh.destroyed) {
+                      tok.mesh.renderable = true;
+                      const hiddenByShowstopper = Boolean(tok._ssHideMesh || (typeof tok._ssOcclusionAlpha === "number" && Number.isFinite(tok._ssOcclusionAlpha) && tok._ssOcclusionAlpha <= 0.01));
+                      if (tok.visible !== false && !hiddenByShowstopper && tok.mesh.visible === false) tok.mesh.visible = true;
+                    }
+                  }
+                }
               }
             } else {
               controlledTokens.push(tok);
@@ -1771,6 +1866,7 @@ export class TokenStreamer {
         this._selectRafId = sched(() => { step(); });
       } else if (selectGen === this._selectGen) {
         this._selectingBatch = false;
+        if (this.controller) this.controller._roofTokenOccDirty = true;
         this.impostors.refreshVisibility(true);
         this.impostors.flush();
         this.controller?.selectionOverlay?.refresh?.();

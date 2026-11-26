@@ -1097,6 +1097,7 @@ function patchTokenUiCaching() {
     }
     // Delegate D&D 5e HP bars to Token5e#_drawHPBar patch (which handles temp / tempmax cleanly)
     if (data.attribute === "attributes.hp" && typeof this._drawHPBar === "function") {
+      hideBar3SliceSprites(bar);
       return wrapped(number, bar, data, ...rest);
     }
     const max = Number(data.max);
@@ -1160,6 +1161,8 @@ function patchTokenUiCaching() {
           !ch.children?.length &&
           !ch.filters?.length &&
           !ch.customDnd5eBaseScale &&
+          (ch.anchor?.x ?? 0) === 0 &&
+          (ch.anchor?.y ?? 0) === 0 &&
           (!ch.eventMode || ch.eventMode === "none" || ch.eventMode === "passive" || ch.eventMode === "auto")
         ) {
           statusIcons.push(ch);
@@ -1168,7 +1171,24 @@ function patchTokenUiCaching() {
           break;
         }
       }
-      if (allStandard && statusIcons.length >= 1 && statusIcons.length <= 4) {
+      // Verify bg only holds standard black rounded-rect backdrops before replacing with atlas sprites
+      let bgIsStandardRRect = allStandard && statusIcons.length >= 1 && statusIcons.length <= 4;
+      if (bgIsStandardRRect) {
+        const gData = bg.geometry?.graphicsData;
+        if (!Array.isArray(gData) || gData.length !== statusIcons.length) {
+          bgIsStandardRRect = false;
+        } else {
+          const rrecType = globalThis.PIXI?.SHAPES?.RREC;
+          for (let i = 0; i < gData.length; i++) {
+            const gd = gData[i];
+            if ((rrecType !== undefined && gd?.shape?.type !== rrecType) || gd?.fillStyle?.color !== 0x000000) {
+              bgIsStandardRRect = false;
+              break;
+            }
+          }
+        }
+      }
+      if (bgIsStandardRRect) {
         // Batch 1-4 status effect backgrounds onto shared _uiAtlas sprites (merges all combat tokens into 1 draw call!)
         const atlas = getUiAtlas();
         if (atlas?.effectBg) {
@@ -1217,6 +1237,20 @@ function patchTokenUiCaching() {
       !this.border.visible && !this.controlled && !this.hover && !this.layer?.highlightObjects
     ) {
       this._blBorderDirty = true;
+      // Guard against third-party modules toggling token.border.visible = true directly without calling _refreshState()
+      if (!this.border._blLazyRenderGuard && typeof this.border._render === "function") {
+        const border = this.border;
+        const tok = this;
+        const origRender = border._render;
+        border._blLazyRenderGuard = true;
+        border._render = function (renderer) {
+          if (tok._blBorderDirty && !tok.destroyed && !border.destroyed) {
+            tok._blBorderDirty = false;
+            try { tok._refreshBorder(); } catch {}
+          }
+          return origRender.call(this, renderer);
+        };
+      }
       return;
     }
     this._blBorderDirty = false;
@@ -1227,13 +1261,7 @@ function patchTokenUiCaching() {
     const res = wrapped(...args);
     if (this._blBorderDirty && this.border && !this.border.destroyed && this.border.visible) {
       this._blBorderDirty = false;
-      if (this.renderFlags?.set) {
-        if (!this.renderFlags.has?.("refreshBorder")) {
-          this.renderFlags.set({ refreshBorder: true });
-        }
-      } else {
-        this._refreshBorder();
-      }
+      this._refreshBorder();
     }
     return res;
   }, { type: "WRAPPER" });
@@ -1679,6 +1707,7 @@ function patchV14CoreRenderPasses() {
           const kids = hud.children;
           for (let i = 0; i < kids.length; i++) {
             const el = kids[i];
+            if (el.tagName === "TEMPLATE" || el.hidden || el.classList?.contains("hidden")) continue;
             if (el.id === "measurement") {
               const mKids = el.children;
               for (let j = 0; j < mKids.length; j++) {
@@ -1690,7 +1719,13 @@ function patchV14CoreRenderPasses() {
               if (hasActiveHud) break;
               continue;
             }
-            if (el.childElementCount > 0) { hasActiveHud = true; break; }
+            if (el.id === "chat-bubbles" || el.id === "token-hud" || el.id === "tile-hud" || el.id === "drawing-hud") {
+              if (el.childElementCount > 0) { hasActiveHud = true; break; }
+              continue;
+            }
+            // Any other visible third-party HUD element (including leaf divs/buttons/svgs with childElementCount === 0)
+            hasActiveHud = true;
+            break;
           }
         }
         if (!hasActiveHud) {
@@ -1793,6 +1828,38 @@ function patchV14CoreRenderPasses() {
       }));
     }
 
+    const computeDepthSig = () => {
+      const primaryLen = globalThis.canvas?.primary?.children?.length ?? 0;
+      if (pcoListDirty || primaryLen !== lastPrimaryLen) rebuildDepthPcos();
+      let h1 = 2166136261 >>> 0;
+      let h2 = 0;
+      let count = 0;
+      let forceDirty = false;
+      for (let i = 0; i < depthPcos.length; i++) {
+        const p = depthPcos[i];
+        if (!p || p.destroyed) { pcoListDirty = true; forceDirty = true; break; }
+        if (p.children?.length > 0 || (p.isVideo && p.sourceElement && !p.sourceElement.paused)) {
+          forceDirty = true;
+          break;
+        }
+        const vis = (p.visible && p.renderable) ? 1 : 0;
+        const os = p._occlusionState;
+        const occBits = os
+          ? ((Math.round((os.fade || 0) * 100) & 255) | ((Math.round((os.radial || 0) * 100) & 255) << 8) | ((Math.round((os.vision || 0) * 100) & 255) << 16) | ((Math.round((os.surface || 0) * 100) & 255) << 24))
+          : 0;
+        const bt = p.texture?.baseTexture;
+        const fr = p.texture?.frame;
+        const alphaBits = ((Math.round((p.alpha ?? 1) * 100) & 255) | ((Math.round((p.unoccludedAlpha ?? 1) * 100) & 255) << 8) | ((Math.round((p.occludedAlpha ?? 0) * 100) & 255) << 16));
+        const frHash = fr ? (((fr.x | 0) ^ ((fr.y | 0) << 7) ^ ((fr.width | 0) << 14) ^ ((fr.height | 0) << 21)) | 0) : 0;
+        const v1 = ((p.transform?._worldID | 0) ^ ((bt?._updateID | 0) << 5) ^ ((bt?.uid | 0) << 9) ^ ((p._restrictionState | 0) << 12) ^ (vis << 20) ^ frHash) | 0;
+        const v2 = (occBits ^ (Math.round((p.textureAlphaThreshold ?? 0.75) * 100) << 3) ^ alphaBits) | 0;
+        h1 = Math.imul(h1 ^ v1 ^ v2, 16777619) >>> 0;
+        h2 = ((h2 << 5) - h2 + v1 + v2 + 1) | 0;
+        count++;
+      }
+      return { forceDirty, count, h1, h2 };
+    };
+
     results.push(wrapTargetMethod(DepthMaskCls.prototype, "render", "CanvasDepthMask.prototype.render", function (wrapped, renderer) {
       // Boundless mega-scenes manage depthMask.autoRender themselves; only optimize standard scenes here
       if (globalThis.Boundless?.active) return wrapped(renderer);
@@ -1809,43 +1876,19 @@ function patchV14CoreRenderPasses() {
         this._blStdAutoRenderPatched = true;
         pcoListDirty = true;
       }
-      if (!this.renderDirty) {
-        const stageId = globalThis.canvas?.stage?.transform?._worldID ?? -1;
-        const primaryLen = globalThis.canvas?.primary?.children?.length ?? 0;
-        if (stageId !== lastStageWorldId) {
-          lastStageWorldId = stageId;
-          this.renderDirty = true;
-        } else {
-          if (pcoListDirty || primaryLen !== lastPrimaryLen) rebuildDepthPcos();
-          let h1 = 2166136261 >>> 0;
-          let h2 = 0;
-          let count = 0;
-          let forceVideo = false;
-          for (let i = 0; i < depthPcos.length; i++) {
-            const p = depthPcos[i];
-            if (!p || p.destroyed) { pcoListDirty = true; this.renderDirty = true; break; }
-            if (p.isVideo && p.sourceElement && !p.sourceElement.paused) { forceVideo = true; break; }
-            const vis = (p.visible && p.renderable) ? 1 : 0;
-            const os = p._occlusionState;
-            const occBits = os
-              ? ((Math.round((os.fade || 0) * 100) & 255) | ((Math.round((os.radial || 0) * 100) & 255) << 8) | ((Math.round((os.vision || 0) * 100) & 255) << 16) | ((Math.round((os.surface || 0) * 100) & 255) << 24))
-              : 0;
-            const bt = p.texture?.baseTexture;
-            const v1 = ((p.transform?._worldID | 0) ^ ((bt?._updateID | 0) << 5) ^ ((bt?.uid | 0) << 9) ^ ((p._restrictionState | 0) << 12) ^ (vis << 20)) | 0;
-            const v2 = (occBits ^ (Math.round((p.textureAlphaThreshold ?? 0.75) * 100) << 3)) | 0;
-            h1 = Math.imul(h1 ^ v1 ^ v2, 16777619) >>> 0;
-            h2 = ((h2 << 5) - h2 + v1 + v2 + 1) | 0;
-            count++;
-          }
-          if (forceVideo || count !== lastDepthSigCount || h1 !== lastDepthSigH1 || h2 !== lastDepthSigH2) {
-            lastDepthSigCount = count;
-            lastDepthSigH1 = h1;
-            lastDepthSigH2 = h2;
-            this.renderDirty = true;
-          }
-        }
-      } else {
-        lastStageWorldId = globalThis.canvas?.stage?.transform?._worldID ?? -1;
+      const stageId = globalThis.canvas?.stage?.transform?._worldID ?? -1;
+      const sig = computeDepthSig();
+      if (
+        !this.renderDirty &&
+        (stageId !== lastStageWorldId || sig.forceDirty || sig.count !== lastDepthSigCount || sig.h1 !== lastDepthSigH1 || sig.h2 !== lastDepthSigH2)
+      ) {
+        this.renderDirty = true;
+      }
+      if (this.renderDirty) {
+        lastStageWorldId = stageId;
+        lastDepthSigCount = sig.forceDirty ? -1 : sig.count;
+        lastDepthSigH1 = sig.h1;
+        lastDepthSigH2 = sig.h2;
       }
       return wrapped(renderer);
     }));
@@ -1861,7 +1904,16 @@ function patchV14CoreRenderPasses() {
 
   // Dirty-tracked PrimaryCanvasGroup#update: skip 5-level updateCanvasTransform chain on unchanged leaf PrimarySpriteMeshes @ 120Hz
   const PrimGroupCls = globalThis.foundry?.canvas?.groups?.PrimaryCanvasGroup;
-  if (PrimGroupCls?.prototype?.update) {
+  const PrimSpriteCls = globalThis.foundry?.canvas?.primary?.PrimarySpriteMesh;
+  if (PrimGroupCls?.prototype?.update && PrimSpriteCls?.prototype) {
+    // Reset cached init flag on removal so re-parented PCOs always re-register into canvas.primary.quadtree
+    if (typeof PrimSpriteCls.prototype._onRemovedPrimary === "function") {
+      results.push(wrapTargetMethod(PrimSpriteCls.prototype, "_onRemovedPrimary", "PrimarySpriteMesh.prototype._onRemovedPrimary", function (wrapped, ...args) {
+        this._blPrimInit = false;
+        return wrapped(...args);
+      }));
+    }
+    const baseUpdateCanvasTransform = PrimSpriteCls.prototype.updateCanvasTransform;
     results.push(wrapTargetMethod(PrimGroupCls.prototype, "update", "PrimaryCanvasGroup.prototype.update", function (wrapped) {
       if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || globalThis.CONFIG?.debug?.canvas?.primary?.bounds) {
         return wrapped();
@@ -1872,7 +1924,9 @@ function patchV14CoreRenderPasses() {
       for (let i = 0, n = children.length; i < n; i++) {
         const c = children[i];
         const t = c.transform;
+        const isPureSprite = (c instanceof PrimSpriteCls) && !c._geometry && c.updateCanvasTransform === baseUpdateCanvasTransform;
         if (
+          isPureSprite &&
           c._blPrimInit &&
           c.children?.length === 0 &&
           t &&
@@ -1889,7 +1943,7 @@ function patchV14CoreRenderPasses() {
           continue;
         }
         c.updateCanvasTransform?.();
-        if (t && c.children?.length === 0 && c._canvasBounds) {
+        if (isPureSprite && t && c.children?.length === 0 && c._canvasBounds) {
           c._blPrimInit = true;
           c._blPrimLocalID = t._currentLocalID;
           c._blPrimParentCid = parentCid;
@@ -1904,21 +1958,18 @@ function patchV14CoreRenderPasses() {
   }
 
   // Zero-alloc GridLayer#highlightPosition on square grids: direct drawRect instead of getShape() + new PIXI.Polygon per cell
-  const GridLayerCls = globalThis.foundry?.canvas?.layers?.GridLayer;
-  if (GridLayerCls?.prototype?.highlightPosition) {
-    results.push(wrapTargetMethod(GridLayerCls.prototype, "highlightPosition", "GridLayer.prototype.highlightPosition", function (wrapped, name, opts) {
-      if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || !opts) return wrapped(name, opts);
-      const grid = globalThis.canvas?.grid;
-      if (!grid?.isSquare) return wrapped(name, opts);
-      const layer = this.highlightLayers?.[name];
-      if (!layer) return;
-      const { x, y, color = 0x33BBFF, border = null, alpha = 0.25 } = opts;
-      if (!layer.highlight(x, y)) return;
-      layer.beginFill(color, alpha);
-      if (border !== null) layer.lineStyle(grid.thickness, border, Math.min(alpha * 1.5, 1.0));
-      layer.drawRect(x, y, grid.sizeX, grid.sizeY).endFill();
-    }));
-  }
+  results.push(wrapFoundryMethod("GridLayer", "highlightPosition", function (wrapped, name, opts) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfAutoCulling || !opts) return wrapped(name, opts);
+    const grid = globalThis.canvas?.grid;
+    if (!grid?.isSquare) return wrapped(name, opts);
+    const layer = this.highlightLayers?.[name];
+    if (!layer) return;
+    const { x, y, color = 0x33BBFF, border = null, alpha = 0.25 } = opts;
+    if (!layer.highlight(x, y)) return;
+    layer.beginFill(color, alpha);
+    if (border !== null) layer.lineStyle(grid.thickness, border, Math.min(alpha * 1.5, 1.0));
+    layer.drawRect(x, y, grid.sizeX, grid.sizeY).endFill();
+  }, { type: "MIXED" }));
 
   return results;
 }

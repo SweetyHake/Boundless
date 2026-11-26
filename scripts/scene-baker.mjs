@@ -175,6 +175,8 @@ async function loadImageSource(src, signal = null, { fallbackW = 0, fallbackH = 
       let w = img.naturalWidth || img.width || 0;
       let h = img.naturalHeight || img.height || 0;
       if (isSvg) {
+        const natW = img.naturalWidth || 0;
+        const natH = img.naturalHeight || 0;
         if (!w || !h) {
           w = fallbackW || 1024;
           h = fallbackH || 1024;
@@ -183,6 +185,26 @@ async function loadImageSource(src, signal = null, { fallbackW = 0, fallbackH = 
           const scale = Math.max(fallbackW / w, fallbackH / h);
           w = Math.round(w * scale);
           h = Math.round(h * scale);
+        }
+        // Rasterize upscaled SVG onto a work canvas because 9-arg drawImage indexes source rect in naturalWidth x naturalHeight
+        if (w !== natW || h !== natH) {
+          try {
+            const safeW = Math.min(16384, Math.max(1, w));
+            const safeH = Math.min(16384, Math.max(1, h));
+            const rast = createWorkCanvas(safeW, safeH);
+            rast.ctx.clearRect(0, 0, safeW, safeH);
+            rast.ctx.drawImage(img, 0, 0, safeW, safeH);
+            resolve({
+              source: rast.canvas,
+              width: safeW,
+              height: safeH,
+              close: () => {
+                rast.canvas.width = 0;
+                rast.canvas.height = 0;
+              }
+            });
+            return;
+          } catch {}
         }
         try {
           if (!img.width) img.width = w;
@@ -294,9 +316,8 @@ async function sliceAndUploadPyramid({
   allPendingUploads,
   onTileProgress
 }) {
-  const texCfg = skipEmptyAlpha
-    ? (level.foreground || {})
-    : (level.textures || level.background || {});
+  // Foundry v14 stores shared texture transforms (offset/scale/rotation/anchor/fit) in level.textures for both background and foreground
+  const texCfg = level.textures || (skipEmptyAlpha ? level.foreground : level.background) || {};
   const bgOffX = Number(texCfg.offsetX) || 0;
   const bgOffY = Number(texCfg.offsetY) || 0;
   const bgScaleX = Number.isFinite(Number(texCfg.scaleX)) && Number(texCfg.scaleX) !== 0 ? Number(texCfg.scaleX) : 1;
@@ -1039,6 +1060,7 @@ function encodeWallToSector(seg) {
 
 function resolveLightItem(sk, idx, raw, lightEditsObj, defaultElev) {
   const lKey = `${sk}:l:${idx}`;
+  const rawGid = (raw?.[8] && typeof raw[8] === "object" && raw[8].gid) ? raw[8].gid : undefined;
   if (lightEditsObj && Object.prototype.hasOwnProperty.call(lightEditsObj, lKey)) {
     const ov = lightEditsObj[lKey];
     if (ov === null) return null;
@@ -1057,6 +1079,7 @@ function resolveLightItem(sk, idx, raw, lightEditsObj, defaultElev) {
       rotation: ov.rotation ?? 0,
       darkMin: ov.darkMin ?? 0,
       darkMax: ov.darkMax ?? 1,
+      gid: ov.gid || rawGid,
       ...extractLightStyle(ov)
     };
   }
@@ -1077,6 +1100,7 @@ function resolveLightItem(sk, idx, raw, lightEditsObj, defaultElev) {
     rotation: ex?.rotation ?? 0,
     darkMin: ex?.darkMin ?? 0,
     darkMax: ex?.darkMax ?? 1,
+    gid: ex?.gid || undefined,
     ...extractLightStyle(ex)
   };
 }
@@ -1096,6 +1120,7 @@ function encodeLightTuple(item) {
   if (Number.isFinite(item.coloration) && item.coloration !== 1) extra.coloration = item.coloration;
   if (Number.isFinite(item.attenuation) && item.attenuation !== 0.5) extra.attenuation = item.attenuation;
   if (Number.isFinite(item.luminosity) && item.luminosity !== 0.5) extra.luminosity = item.luminosity;
+  if (item.gid) extra.gid = item.gid;
   const tuple = [
     item.x,
     item.y,
@@ -1170,7 +1195,7 @@ function resolveTileItem(tid, raw, tileEditsObj, defaultElev) {
     if (ov === null) return null;
     const preserved = {};
     if (raw && typeof raw === "object") {
-      for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable"]) {
+      for (const k of ["minZ", "maxZ", "sortLayer", "hoverFade", "surfaceMode", "walkable", "gid"]) {
         if (raw[k] !== undefined) preserved[k] = raw[k];
       }
     }
@@ -1359,28 +1384,46 @@ export function mergeEditsIntoLevelSpec(spec, {
       const target = (newSectors[sk] ??= { w: [], d: [], l: [], t: [], o: [], s: [] });
       target.o.push(...sec.o);
     }
+    const pushWallSeg = (seg) => {
+      const [x1, y1, x2, y2] = seg.c;
+      if (!seg.door) {
+        const segLen = Math.hypot(x2 - x1, y2 - y1);
+        const parts = segLen > simSectorPx ? Math.ceil(segLen / simSectorPx) : 1;
+        if (parts > 1) {
+          for (let pi = 0; pi < parts; pi++) {
+            const t0 = pi / parts;
+            const t1 = (pi + 1) / parts;
+            const ax = pi === 0 ? x1 : Math.round(x1 + (x2 - x1) * t0);
+            const ay = pi === 0 ? y1 : Math.round(y1 + (y2 - y1) * t0);
+            const bx = pi === parts - 1 ? x2 : Math.round(x1 + (x2 - x1) * t1);
+            const by = pi === parts - 1 ? y2 : Math.round(y1 + (y2 - y1) * t1);
+            const dst = ensureSec(Math.floor(((ax + bx) * 0.5) / simSectorPx), Math.floor(((ay + by) * 0.5) / simSectorPx));
+            const enc = encodeWallToSector({ ...seg, c: [ax, ay, bx, by] });
+            dst[enc.kind].push(enc.tuple);
+            walls++;
+          }
+          return;
+        }
+      }
+      const cx = (x1 + x2) * 0.5;
+      const cy = (y1 + y2) * 0.5;
+      const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
+      const enc = encodeWallToSector(seg);
+      dst[enc.kind].push(enc.tuple);
+      walls++;
+    };
     if (sec.w?.length) {
       for (let wi = 0; wi < sec.w.length; wi++) {
         const seg = resolveWallItem(sk, "w", wi, sec.w[wi], wEdits, dStates, levelId);
         if (!seg) continue;
-        const cx = (seg.c[0] + seg.c[2]) * 0.5;
-        const cy = (seg.c[1] + seg.c[3]) * 0.5;
-        const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
-        const enc = encodeWallToSector(seg);
-        dst[enc.kind].push(enc.tuple);
-        walls++;
+        pushWallSeg(seg);
       }
     }
     if (sec.d?.length) {
       for (let di = 0; di < sec.d.length; di++) {
         const seg = resolveWallItem(sk, "d", di, sec.d[di], wEdits, dStates, levelId);
         if (!seg) continue;
-        const cx = (seg.c[0] + seg.c[2]) * 0.5;
-        const cy = (seg.c[1] + seg.c[3]) * 0.5;
-        const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
-        const enc = encodeWallToSector(seg);
-        dst[enc.kind].push(enc.tuple);
-        walls++;
+        pushWallSeg(seg);
       }
     }
     if (sec.l?.length) {
@@ -1722,21 +1765,32 @@ async function stitchPyramidToWebp({
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const url = `${pyramidBaseUrl}/${chosenZ}/${tx}_${ty}.webp`;
       let img = null;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          img = await loadImageSource(url, signal);
+          lastErr = null;
+          break;
+        } catch (err) {
+          if (err?.name === "AbortError") throw err;
+          lastErr = err;
+          if (attempt === 0) await new Promise(r => setTimeout(r, 250));
+        }
+      }
+      if (!img) {
+        throw lastErr || new Error(`Failed to load pyramid tile while stitching: ${url}`);
+      }
       try {
-        img = await loadImageSource(url, signal);
         const dx = tx * tileWorld * scaleZ;
         const dy = ty * tileWorld * scaleZ;
         const dw = tileWorld * scaleZ;
         const dh = tileWorld * scaleZ;
         work.ctx.drawImage(img.source, dx, dy, dw, dh);
         drawn++;
-      } catch (err) {
-        if (err?.name === "AbortError") throw err;
-        console.warn(`${MODULE_ID} | Failed to load pyramid tile while stitching ${url}:`, err);
       } finally {
         img?.close?.();
       }
-    });
+    }, signal);
     if (!drawn) return null;
     return await canvasToWebpBlob(work, quality);
   } finally {
@@ -2001,35 +2055,50 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     throw new Error("No Boundless manifest found on this scene.");
   }
 
-  // Stage 2: Commit validated manifests now that all levels passed validation
+  // Stage 2: Commit validated manifests now that all levels passed validation.
+  // Track committed levels so a mid-commit failure still clears their stale index-based edits.
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-  for (const w of pendingWrites) {
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    if (w.kind === "inline") {
-      // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
-      await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
-    } else if (w.kind === "file") {
-      await ensureDirectoryRecursive(w.dir);
-      const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
-      const upRes = await uploadFileSilent(w.dir, file);
-      const finalUrl = upRes?.path || `${w.dir}/${w.filename}`;
-      for (const origUrl of w.origUrls) controller.manifestCache?.delete?.(origUrl);
-      controller.manifestCache?.delete?.(finalUrl);
-      const cleanFinal = String(finalUrl || "").split("?")[0].replace(/^\/+/, "");
-      const sameUrl = (orig) => String(orig || "").split("?")[0].replace(/^\/+/, "") === cleanFinal;
-      for (const lt of w.levelTargets) {
-        if (lt.redirected || !sameUrl(lt.origUrl)) {
-          await lt.lvl.update?.({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+  const committedLevelIds = [];
+  try {
+    for (const w of pendingWrites) {
+      if (w.kind === "inline") {
+        // Force full replacement (`==`) so deleted sectors/keys never survive Foundry recursive deep merge
+        await w.lvl.update({ [`flags.${MODULE_ID}.==inlineManifest`]: w.spec });
+        if (w.lvl?.id) committedLevelIds.push(w.lvl.id);
+      } else if (w.kind === "file") {
+        await ensureDirectoryRecursive(w.dir);
+        const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
+        const upRes = await uploadFileSilent(w.dir, file);
+        const finalUrl = upRes?.path || `${w.dir}/${w.filename}`;
+        for (const origUrl of w.origUrls) controller.manifestCache?.delete?.(origUrl);
+        controller.manifestCache?.delete?.(finalUrl);
+        const cleanFinal = String(finalUrl || "").split("?")[0].replace(/^\/+/, "");
+        const sameUrl = (orig) => String(orig || "").split("?")[0].replace(/^\/+/, "") === cleanFinal;
+        for (const lt of w.levelTargets) {
+          if (lt.lvl?.id) committedLevelIds.push(lt.lvl.id);
+          if (lt.redirected || !sameUrl(lt.origUrl)) {
+            await lt.lvl.update?.({ [`flags.${MODULE_ID}.manifestUrl`]: finalUrl });
+          }
+        }
+        if (w.sceneTarget) {
+          if (w.sceneTarget.levelId) committedLevelIds.push(w.sceneTarget.levelId);
+          if (w.sceneTarget.redirected || !sameUrl(w.sceneTarget.origUrl)) {
+            scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+          }
         }
       }
-      if (w.sceneTarget && (w.sceneTarget.redirected || !sameUrl(w.sceneTarget.origUrl))) {
-        scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
+    }
+  } catch (err) {
+    if (committedLevelIds.length) {
+      const recoveryPatch = { ...scenePatch, ...buildLevelEditClearPatch(prevFlags, committedLevelIds) };
+      if (Object.keys(recoveryPatch).length) {
+        try { await scene.update(recoveryPatch); } catch {}
       }
     }
+    throw err;
   }
 
-  // 3. Remove or prune absorbed native documents (preserving unbaked levels on multi-level scenes)
-  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  // 3. Remove or prune absorbed native documents (do NOT abort here — manifests are already committed on disk/flags)
   report(85, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
   if (absorbNative) {
     const editedLevelIdSet = new Set(editedLevelIds);

@@ -250,6 +250,7 @@ export function wrapFoundryMethod(className, method, wrapperFn, opts = {}) {
 
 /**
  * Wrap a method directly on an object/prototype (for classes not in `foundry.canvas.*` namespaces).
+ * Deduplicates by `(targetObj, label || method)` so distinct Boundless patches can safely chain on the same method.
  */
 export function wrapTargetMethod(targetObj, method, label, wrapperFn) {
   if (!targetObj || typeof targetObj[method] !== "function") return null;
@@ -258,7 +259,9 @@ export function wrapTargetMethod(targetObj, method, label, wrapperFn) {
     wrappedSet = new Set();
     DIRECT_WRAPPED.set(targetObj, wrappedSet);
   }
-  if (wrappedSet.has(method)) return { original: targetObj[method], fullPath: label };
+  const dedupKey = label ? `${method}::${label}` : method;
+  if (wrappedSet.has(dedupKey)) return { original: targetObj[method], fullPath: label };
+  wrappedSet.add(dedupKey);
   wrappedSet.add(method);
 
   const prev = targetObj[method];

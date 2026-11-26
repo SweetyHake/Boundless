@@ -3134,3 +3134,90 @@ test("resolveVirtualLight inline fast-path matches extractLightStyle defaults wh
   assert.equal(res.coloration, def.coloration);
   assert.equal(res.elevation, 16);
 });
+
+test("wrapTargetMethod chains distinct labels on same method without colliding", async () => {
+  const { wrapTargetMethod } = await import("../scripts/perf-patcher.mjs");
+  const order = [];
+  const obj = { run(x) { order.push("orig"); return x + 1; } };
+  wrapTargetMethod(obj, "run", "TestObj.run.first", function (wrapped, x) { order.push("first"); return wrapped(x); });
+  wrapTargetMethod(obj, "run", "TestObj.run.second", function (wrapped, x) { order.push("second"); return wrapped(x); });
+  wrapTargetMethod(obj, "run", "TestObj.run.second", function (wrapped, x) { order.push("dup"); return wrapped(x); });
+  assert.equal(obj.run(5), 6);
+  assert.deepEqual(order, ["second", "first", "orig"]);
+});
+
+test("isWorkerDecodableUrl rejects svg with raster query/hash and hasPlayerOwnerLazy honors delta.ownership", async () => {
+  installBaseGlobals();
+  const { isWorkerDecodableUrl } = await import("../scripts/tile-worker-pool.mjs");
+  const { hasPlayerOwnerLazy } = await import("../scripts/utils.mjs");
+  assert.equal(isWorkerDecodableUrl("tiles/floor.webp?v=2"), true);
+  assert.equal(isWorkerDecodableUrl("icons/sword.svg?fallback=a.png"), false);
+  assert.equal(isWorkerDecodableUrl("icons/sword.svg#v.webp"), false);
+
+  const player = { id: "p1", isGM: false };
+  globalThis.game = {
+    users: [player],
+    actors: new Map([["a1", { hasPlayerOwner: true, ownership: { p1: 3, default: 0 } }]])
+  };
+  const revokedDoc = { isLazyDelta: true, _source: { actorId: "a1", delta: { ownership: { p1: 0 } } }, baseActor: globalThis.game.actors.get("a1") };
+  assert.equal(hasPlayerOwnerLazy(revokedDoc), false, "explicit delta NONE must revoke baseActor player ownership");
+});
+
+test("mergeEditsIntoLevelSpec preserves multi-level gid on lights/tiles and subdivides long edited walls", async () => {
+  installBaseGlobals();
+  const { mergeEditsIntoLevelSpec } = await import("../scripts/scene-baker.mjs");
+  const spec = {
+    worldPx: 4000,
+    simGrid: 4,
+    simSectorPx: 1000,
+    tiles: [{ src: "floor.webp", x: 0, y: 0, w: 100, h: 100, elevation: 0, gid: "tileShared1" }],
+    sectors: {
+      "0_0": {
+        w: [[0, 0, 500, 0, 20, 20, 20, 20, 0]],
+        d: [],
+        l: [[100, 100, 40, 20, "#ffaa00", 0.5, "torch", 6, { gid: "lightShared1" }]],
+        t: [0],
+        o: [],
+        s: []
+      }
+    }
+  };
+  const out = mergeEditsIntoLevelSpec(spec, {
+    levelId: "lvl1",
+    wallEdits: { "0_0:w:0": { c: [0, 0, 2500, 0], move: 20, sight: 20, light: 20, sound: 20, dir: 0, door: 0, ds: 0 } },
+    lightEdits: { "0_0:l:0": { x: 150, y: 150, dim: 60, bright: 30, color: "#ffffff", alpha: 0.5 } },
+    tileEdits: { "t:0": { src: "floor.webp", x: 10, y: 10, w: 100, h: 100, elevation: 0 } }
+  });
+  assert.equal(out.spec.tiles[0].gid, "tileShared1", "tile gid must survive tileEdits merge");
+  const allLights = Object.values(out.spec.sectors).flatMap(s => s.l || []);
+  assert.equal(allLights[0]?.[8]?.gid, "lightShared1", "light gid must survive lightEdits merge");
+  const allWalls = Object.values(out.spec.sectors).flatMap(s => s.w || []);
+  assert.equal(allWalls.length, 3, "2500px wall in 1000px sectors must subdivide into 3 segments");
+});
+
+test("ChunkStreamer reserves viewport slots even when dispersed tokens exceed MAX_LOADED_CHUNKS", async () => {
+  installBaseGlobals();
+  const { ChunkStreamer } = await import("../scripts/chunk-streamer.mjs");
+  const streamer = new ChunkStreamer(null);
+  const layer = {
+    level: { id: "lvl1" },
+    worldPx: 200000,
+    spec: { chunks: { baseUrl: "chunks", chunkWorldPx: 10000, cols: 20, rows: 20, populated: [] }, sectors: {}, overlays: {} }
+  };
+  streamer.mount([layer]);
+  // 12 dispersed tokens in chunks 0_0 .. 11_0, while camera is at chunk 15_15
+  globalThis.canvas = {
+    level: { id: "lvl1" },
+    tokens: {
+      placeables: Array.from({ length: 12 }, (_, i) => ({
+        destroyed: false,
+        isPreview: false,
+        document: { level: "lvl1" },
+        center: { x: i * 10000 + 5000, y: 5000 }
+      }))
+    }
+  };
+  const st = streamer.states.get("lvl1");
+  const needed = streamer._collectNeededChunks(st, { x0: 151000, y0: 151000, x1: 158000, y1: 158000, scale: 0.5 });
+  assert.equal(needed.has("15_15"), true, "camera chunk must not be starved by dispersed tokens");
+});

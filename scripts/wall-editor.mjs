@@ -514,10 +514,13 @@ export class VirtualWallEditor {
     this._clearGen++;
     this._cancelPendingMounts();
     const keptKeys = keepProtected ? new Set() : null;
+    const viewedLvlId = keepProtected ? this._getViewedLayer()?.level?.id : null;
     for (const entry of Array.from(this.mountedByKey.values())) {
       if (keepProtected) {
+        const wrongLevel = Boolean(viewedLvlId && entry.levelId !== viewedLvlId);
+        const isDeleted = !wrongLevel && this.controller?.wallEdits?.get?.(entry.levelId)?.get?.(entry.wKey) === null;
         const sheet = getExistingSheet(entry.doc);
-        if (entry.wall?.controlled || isSheetActiveOrRendering(sheet, entry.wall)) {
+        if (!wrongLevel && !isDeleted && (entry.wall?.controlled || isSheetActiveOrRendering(sheet, entry.wall))) {
           keptKeys.add(entry.mKey || `${entry.levelId}::${entry.wKey}`);
           continue;
         }
@@ -663,6 +666,7 @@ export class VirtualWallEditor {
       sk: seg.sk,
       idx: seg.idx,
       isDoor: Boolean(seg.door > 0),
+      defaultDs: seg.ds || 0,
       editsRev: this.controller?.wallEditsRev || 0,
       liveDs,
       sig,
@@ -719,6 +723,7 @@ export class VirtualWallEditor {
     const diff = entry.doc.updateSource(patch);
     entry.sig = nextSig;
     entry.isDoor = Boolean(seg.door > 0);
+    entry.defaultDs = seg.ds || 0;
     if (entry.dKey && entry.dKey !== dKey) {
       if (this.mountedByDoorKey.get(entry.dKey) === entry) this.mountedByDoorKey.delete(entry.dKey);
     }
@@ -729,6 +734,11 @@ export class VirtualWallEditor {
         try { entry.wall._onUpdate(diff, { sound: false }, game.user?.id); } catch {}
         this._syncDoorMeshesElevation(entry.wall, entry.levelId);
         if (!this.active) entry.wall.visible = false;
+        if (entry.wall.doorControl && !entry.wall.doorControl.destroyed) {
+          const viewedLvlId = canvas?.level?.id;
+          const onViewedLevel = !viewedLvlId || !entry.levelId || entry.levelId === viewedLvlId;
+          entry.wall.doorControl.visible = onViewedLevel && (this._showDoorControls !== false) && entry.wall.doorControl.isVisible;
+        }
         entry.wall._updateQuadtree?.();
       }
       this._syncOpenWallSheet(entry, diff, { syncDoorControl: ("door" in diff) || ("ds" in diff) });
@@ -839,9 +849,27 @@ export class VirtualWallEditor {
     }
     if (!isWallsEditMode) this._doorsCapped = false;
 
-    // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview (keeping controlled/open-sheet walls intact)
+    // WallsLayer zoomed way out or ultra-dense block: show lightweight macro overview (keeping controlled/open-sheet walls intact & synced)
     if (isWallsEditMode && (!inNativeZoom || segments.length > MAX_NATIVE_WALLS_IN_VIEW)) {
       this._clearMountedWalls({ keepProtected: true });
+      for (const entry of Array.from(this.mountedByKey.values())) {
+        const entryLayer = this.controller?.levelLayers?.get?.(entry.levelId);
+        const raw = entryLayer?.spec?.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx];
+        const resolved = raw ? this.controller.resolveVirtualWall(entry.levelId, entry.kind, entry.sk, entry.idx, raw) : null;
+        if (!resolved) {
+          this._removeMountedEntry(entry, { closeSheet: true });
+          continue;
+        }
+        const dKey = this._buildDoorKey(resolved);
+        const liveDs = dKey ? this.controller.getCurrentDoorState(dKey, resolved.ds) : (resolved.ds || 0);
+        if (entry.editsRev === rev && entry.liveDs === liveDs) continue;
+        const nextSig = this._wallSig(resolved, liveDs);
+        entry.editsRev = rev;
+        entry.liveDs = liveDs;
+        if (entry.sig !== nextSig) {
+          this._syncMountedEntryInPlace(entry, resolved, dKey, liveDs, nextSig);
+        }
+      }
       this._drawMacroOverview(segments, curVp.scale);
       return;
     }
@@ -1006,6 +1034,13 @@ export class VirtualWallEditor {
         ? { light: thresh.light ?? null, sight: thresh.sight ?? null, sound: thresh.sound ?? null, attenuation: Boolean(thresh.attenuation) }
         : null;
 
+      const prevDKey = entry.dKey;
+      const dsEditedInDiff = Boolean(diff && "ds" in diff);
+      const nextDefaultDs = entry.doc.door
+        ? ((dsEditedInDiff || !prevDKey) ? (entry.doc.ds || 0) : (entry.defaultDs ?? 0))
+        : 0;
+      const nextLiveDs = entry.doc.door ? (entry.doc.ds || 0) : 0;
+
       const nextState = {
         c: entry.doc.c.map(v => Math.round(v)),
         move: entry.doc.move,
@@ -1014,16 +1049,17 @@ export class VirtualWallEditor {
         sound: entry.doc.sound,
         dir: entry.doc.dir || 0,
         door: entry.doc.door || 0,
-        ds: entry.doc.door ? (entry.doc.ds || 0) : 0,
+        ds: nextDefaultDs,
         doorSound: entry.doc.doorSound || "",
         threshold: threshOut,
         animation: animOut
       };
 
-      entry.sig = this._wallSig({ levelId: entry.levelId, ...nextState }, nextState.ds);
+      entry.defaultDs = nextDefaultDs;
+      entry.liveDs = nextLiveDs;
+      entry.sig = this._wallSig({ levelId: entry.levelId, ...nextState }, nextLiveDs);
 
       // Update door-key index and doorStates/openDoors if wall was converted to/from a door or ds changed in WallConfig
-      const prevDKey = entry.dKey;
       const nextIsDoor = Boolean(nextState.door > 0);
       const nextDKey = nextIsDoor
         ? (entry.kind === "w" ? `${entry.levelId}::${entry.sk}_w${entry.idx}` : `${entry.levelId}::${entry.sk}_${entry.idx}`)
@@ -1038,27 +1074,29 @@ export class VirtualWallEditor {
       entry.dKey = nextDKey;
       if (nextDKey) {
         this.mountedByDoorKey.set(nextDKey, entry);
-        if (diff && "ds" in diff) {
-          this.controller.doorStates.set(nextDKey, nextState.ds);
-          if (nextState.ds === 1) {
+        if (dsEditedInDiff) {
+          this.controller.doorStates.set(nextDKey, nextLiveDs);
+          if (nextLiveDs === 1) {
             const skParts = String(entry.sk || "").split("_");
+            const eidStr = `${entry.kind === "w" ? "mw" : "md"}_${entry.sk}_${entry.idx}`;
             this.controller.openDoors.set(nextDKey, {
               levelId: entry.levelId,
               sx: Number(skParts[0]) || 0,
               sy: Number(skParts[1]) || 0,
-              eid: entry.eid ?? entry.idx,
+              eid: eidStr,
               x: (nextState.c[0] + nextState.c[2]) * 0.5,
               y: (nextState.c[1] + nextState.c[3]) * 0.5
             });
           } else {
             this.controller.openDoors.delete(nextDKey);
           }
-          flagUpdate[`flags.${MODULE_ID}.doorStates.${nextDKey}`] = nextState.ds;
+          flagUpdate[`flags.${MODULE_ID}.doorStates.${nextDKey}`] = nextLiveDs;
         }
       }
 
       flagUpdate[`flags.${MODULE_ID}.wallEdits.${entry.levelId}.${entry.wKey}`] = nextState;
       this.controller.setVirtualWallEditLocal(entry.levelId, entry.wKey, nextState);
+      entry.editsRev = this.controller.wallEditsRev || 0;
 
       if (entry.wall && !entry.wall.destroyed) {
         if (diff && !foundry.utils.isEmpty(diff)) {
@@ -1072,6 +1110,11 @@ export class VirtualWallEditor {
         entry.wall.applyRenderFlags();
         this._syncDoorMeshesElevation(entry.wall, entry.levelId);
         if (!this.active) entry.wall.visible = false;
+        if (entry.wall.doorControl && !entry.wall.doorControl.destroyed) {
+          const viewedLvlId = canvas?.level?.id;
+          const onViewedLevel = !viewedLvlId || !entry.levelId || entry.levelId === viewedLvlId;
+          entry.wall.doorControl.visible = onViewedLevel && (this._showDoorControls !== false) && entry.wall.doorControl.isVisible;
+        }
         entry.wall._updateQuadtree?.();
       }
       if (diff && !foundry.utils.isEmpty(diff)) {

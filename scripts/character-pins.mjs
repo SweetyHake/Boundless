@@ -743,11 +743,20 @@ export class CharacterPinManager {
     const placedEdges = [];
     let otherLevelCount = 0;
 
+    const resetPinHover = (entry) => {
+      if (!entry.hovered) return;
+      entry.hovered = false;
+      entry.drawFrame?.(false);
+      if (entry.namePill) entry.namePill.visible = Boolean(entry.isSelf);
+      entry.root.zIndex = entry.isSelf ? 20 : 10;
+    };
+
     for (const entry of this.entries) {
       const doc = entry.tokenDoc;
       if (!doc || !doc.parent) {
         entry.root.visible = false;
         entry.worldVisible = false;
+        resetPinHover(entry);
         this._setEdgeDom(entry, { display: "none" });
         continue;
       }
@@ -760,6 +769,7 @@ export class CharacterPinManager {
       if (isOtherLevel) {
         entry.root.visible = false;
         entry.worldVisible = false;
+        resetPinHover(entry);
         const levelObj = canvas.scene?.levels?.get?.(doc.level);
         const levelName = levelObj?.name || loc("BOUNDLESS.CharPin.OtherLevel", "Другой уровень");
         const ex = Math.min(safe.right - 8, safe.left + 8 + otherLevelCount * 56);
@@ -793,11 +803,13 @@ export class CharacterPinManager {
         } else {
           entry.root.visible = false;
           entry.worldVisible = false;
+          resetPinHover(entry);
         }
       } else {
         // Off-screen: hide world pin, show sticky edge indicator pointing toward character
         entry.root.visible = false;
         entry.worldVisible = false;
+        resetPinHover(entry);
 
         const dx = sx - cx;
         const dy = sy - cy;

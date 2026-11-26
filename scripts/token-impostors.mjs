@@ -684,6 +684,16 @@ export class TokenImpostorLayer {
     let slot = this.slotsByKey.get(spec.slotKey);
     if (slot) {
       slot.lastUsedMs = now;
+      // Retry transient failures after backoff instead of permanently freezing the token as a black circle
+      if (slot.failed && !slot.ready && !slot.decoding && now >= (slot.retryAfterMs ?? Infinity)) {
+        slot.failed = false;
+        slot.retryAfterMs = 0;
+        if (!this._decodeQueuedSet.has(spec.slotKey)) {
+          this._decodeQueuedSet.add(spec.slotKey);
+          this._decodeQueue.push(spec.slotKey);
+          this._pumpDecodeQueue();
+        }
+      }
       return slot;
     }
 
@@ -812,7 +822,7 @@ export class TokenImpostorLayer {
     } catch {}
 
     // 2. Animated video tokens (.webm / .mp4): capture first decoded frame via temporary <video> without retaining a live element
-    const lower = String(resolvedSrc).split("?")[0].toLowerCase();
+    const lower = String(resolvedSrc).split(/[?#]/)[0].toLowerCase();
     const isVideo = Boolean(
       globalThis.foundry?.helpers?.media?.VideoHelper?.hasVideoExtension?.(resolvedSrc) ||
       /\.(webm|mp4|m4v|ogv|ogg|mov)$/.test(lower)
@@ -873,7 +883,9 @@ export class TokenImpostorLayer {
         if (bmp) return { drawable: bmp, shouldClose: true };
       } catch (err) {
         // Do not retry 404/410 or cancelled decodes on the main thread
-        if (err?.notFound || err?.aborted) return { drawable: null, shouldClose: false };
+        if (err?.notFound || err?.aborted) {
+          return { drawable: null, shouldClose: false, aborted: Boolean(err?.aborted), notFound: Boolean(err?.notFound) };
+        }
       }
     }
     if (!isSvg && typeof fetch === "function" && typeof createImageBitmap === "function") {
@@ -947,18 +959,35 @@ export class TokenImpostorLayer {
     if (!this.mounted || gen !== this._gen || !this.atlasCtx) return;
     let drawable = null;
     let shouldClose = false;
+    let aborted = false;
+    let notFound = false;
 
     try {
       const loaded = await this._loadDrawable(slot.spec.artSrc);
       drawable = loaded.drawable;
       shouldClose = loaded.shouldClose;
+      aborted = Boolean(loaded.aborted);
+      notFound = Boolean(loaded.notFound);
     } catch {
-      if (this.slotsByKey.get(slotKey) === slot) slot.failed = true;
+      if (this.slotsByKey.get(slotKey) === slot) {
+        slot.failed = true;
+        slot.retryAfterMs = performance.now() + 15000;
+      }
       return;
     }
 
     if (!drawable || !this.mounted || gen !== this._gen || !this.atlasCtx || this.slotsByKey.get(slotKey) !== slot) {
       if (shouldClose) try { drawable?.close?.(); } catch {}
+      if (!drawable && this.mounted && gen === this._gen && this.slotsByKey.get(slotKey) === slot) {
+        if (aborted) {
+          // Release aborted slot so subsequent renders / context restores re-queue decode cleanly
+          this.slotsByKey.delete(slotKey);
+          this._decodeQueuedSet.delete(slotKey);
+        } else {
+          slot.failed = true;
+          slot.retryAfterMs = notFound ? Infinity : (performance.now() + 15000);
+        }
+      }
       return;
     }
 
@@ -1457,6 +1486,20 @@ export class TokenImpostorLayer {
     const o = idx * 16;
     const prevVisible = this.stateArr[o] > 0.002;
     const nextVisible = st.alpha > 0.002;
+    if (nextVisible && this.atlasRectArr && this.atlasRectArr[o + 3] < 0.5) {
+      const existingKey = this.docKeyById.get(doc.id);
+      const existingSlot = existingKey ? this.slotsByKey.get(existingKey) : null;
+      if (!existingSlot || existingSlot.ready || (existingSlot.failed && !existingSlot.decoding && performance.now() >= (existingSlot.retryAfterMs ?? Infinity))) {
+        const spec = getTokenRenderSpec(doc);
+        if (spec?.artSrc) {
+          const slot = this._requestAtlasSlot(spec);
+          if (slot?.ready) {
+            this._writeQuad4(this.atlasRectArr, idx, slot.u0, slot.v0, slot.uSpan, 1.0);
+            this._bufDirty.atlasRect = true;
+          }
+        }
+      }
+    }
     if (
       Math.abs(this.stateArr[o] - st.alpha) > 0.001 ||
       this.stateArr[o + 1] !== st.needsVision ||
