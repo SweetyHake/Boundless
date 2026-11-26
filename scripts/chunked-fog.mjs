@@ -1417,13 +1417,14 @@ export class ChunkedFogManager {
             scenePatch[`flags.${MODULE_ID}.sharedFog.-=${lid}`] = null;
           }
         }
-        this._incSavingShared(levelId);
+        const resetGen = this._fogGen;
+        this._incSavingShared(levelId, resetGen);
         try {
           await scene.update(scenePatch);
         } catch (err) {
           console.warn(`${MODULE_ID} | Failed to clear shared fog flags:`, err);
         } finally {
-          this._decSavingShared(levelId);
+          this._decSavingShared(levelId, resetGen);
         }
       }
       if (game.user?.isGM && game.users) {

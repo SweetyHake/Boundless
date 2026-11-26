@@ -1042,7 +1042,8 @@ export class TokenStreamer {
           // Start smooth 160ms over-composite crossfade via mesh.unoccludedAlpha (never touches tok.alpha or mesh.alpha!)
           if (shouldFade && obj.mesh && !obj.mesh.destroyed) {
             const hasUnoccluded = "unoccludedAlpha" in obj.mesh;
-            const targetOccluded = (Number.isFinite(obj.mesh.occludedAlpha) && obj.mesh.occludedAlpha >= 0) ? obj.mesh.occludedAlpha : 0.5;
+            // In Foundry v14 PrimaryOccludableObjectMixin starts at occludedAlpha=0 until Token#_refreshMesh sets 0.5 on next frame
+            const targetOccluded = (Number.isFinite(obj.mesh.occludedAlpha) && obj.mesh.occludedAlpha > 0) ? obj.mesh.occludedAlpha : 0.5;
             const isTranslucent = Boolean(doc._source?.hidden || (Number(doc.alpha ?? doc._source?.alpha ?? 1) < 0.99));
             if (hasUnoccluded) {
               obj.mesh.unoccludedAlpha = 0.0;
@@ -1707,7 +1708,7 @@ export class TokenStreamer {
       for (let i = 0; i < targetDocs.length; i++) {
         const doc = targetDocs[i];
         const tok = doc?._object;
-        if (tok && !tok.destroyed && tok.parent === layer.objects) {
+        if (tok && !tok.destroyed && tok.parent === layer.objects && !this.isTokenDrawing(tok)) {
           if (selectionRect && typeof tok._overlapsSelection === "function" && !tok._overlapsSelection(selectionRect)) {
             if ((!this._nativeTokensActive || roofHidden?.has?.(tok)) && !tok.controlled) {
               tok.renderable = false;

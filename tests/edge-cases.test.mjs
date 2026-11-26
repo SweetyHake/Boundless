@@ -3861,3 +3861,65 @@ test("regression fixes: safeValuesEqual distinguishes Color/Date/Set and cloneMe
   assert.equal(cloned.waypoints[0].forward, cloned.segments[0], "cloned waypoint[0].forward must reference cloned segment[0]");
   assert.equal(cloned.waypoints[1].backward, cloned.segments[0], "cloned waypoint[1].backward must reference cloned segment[0]");
 });
+
+test("regression fixes: ChunkedFogManager.reset pins _fogGen for _savingSharedByLevel and TokenStreamer skips drawing tokens in materializeAndSelect", async () => {
+  installBaseGlobals();
+  globalThis.game.users = [];
+  globalThis.foundry = { utils: { randomID: () => "rid1" } };
+  const { ChunkedFogManager } = await import("../scripts/chunked-fog.mjs");
+  const { TokenStreamer } = await import("../scripts/token-streamer.mjs");
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+
+  // 1. ChunkedFogManager.reset must decrement the SAME generation key it incremented even if _fogGen advances mid-await
+  let releaseUpdate;
+  const updateWait = new Promise(r => { releaseUpdate = r; });
+  const scene = {
+    id: "scFogR",
+    levels: [{ id: "lvl1" }],
+    flags: { boundless: { sharedFog: { lvl1: {} } } },
+    async update() { await updateWait; }
+  };
+  globalThis.canvas = { ready: true, scene, level: { id: "lvl1" } };
+  const fog = new ChunkedFogManager();
+  fog.sceneId = "scFogR";
+  fog.levelId = "lvl1";
+  fog.fogMode = 1;
+  fog._fogGen = 5;
+  const pReset = fog.reset({ persist: true });
+  // Simulate unmount/remount advancing _fogGen and starting a new save on gen 6
+  fog._fogGen = 6;
+  fog._incSavingShared("lvl1", 6);
+  releaseUpdate();
+  await pReset;
+  assert.equal(fog._savingSharedByLevel.get("lvl1::5"), undefined, "gen 5 reset counter must be cleaned up cleanly");
+  assert.equal(fog._savingSharedByLevel.get("lvl1::6"), 1, "gen 6 saveNow counter must NOT be decremented by stale gen 5 reset");
+
+  // 2. TokenStreamer.materializeAndSelect must NOT synchronously control an in-flight drawing token before draw() completes
+  let syncControlCalls = 0;
+  const layerObjects = { addChild(c) { c.parent = this; } };
+  const drawingTok = {
+    id: "tokDraw1",
+    destroyed: false,
+    parent: layerObjects,
+    controlled: false,
+    mesh: undefined,
+    control() { syncControlCalls++; this.controlled = true; return true; }
+  };
+  const doc = { id: "tokDraw1", viewed: true, _source: { x: 100, y: 100, width: 1, height: 1 }, _object: drawingTok };
+  drawingTok.document = doc;
+  globalThis.ui = { controls: { rendered: false }, notifications: { info() {}, warn() {} } };
+  globalThis.canvas = {
+    ready: true,
+    grid: { size: 100 },
+    stage: { scale: { x: 1 } },
+    scene: { id: "sc1", tokens: new Map([["tokDraw1", doc]]) },
+    tokens: { active: true, objects: layerObjects, createObject: () => drawingTok }
+  };
+  const streamer = new TokenStreamer({ active: true });
+  streamer.enabled = true;
+  streamer.impostors = new TokenImpostorLayer({}, streamer);
+  streamer._drawingIds.add("tokDraw1");
+  streamer.materializeAndSelect([doc], { releaseOthers: false, maxCount: 1 });
+  assert.equal(syncControlCalls, 0, "in-flight drawing token must NOT be controlled synchronously before draw() finishes");
+  streamer._selectGen++; // cancel async pump
+});
