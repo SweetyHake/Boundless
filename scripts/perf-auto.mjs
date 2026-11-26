@@ -1,4 +1,4 @@
-import { MODULE_ID, loc } from "./utils.mjs";
+import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, perfStats } from "./perf-patcher.mjs";
 
 /**
@@ -7,7 +7,6 @@ import { PERF_CONFIG, perfStats } from "./perf-patcher.mjs";
  *  1. Viewport frustum culling for dense tiles, light/sound/note control icons.
  *  2. Smart idle VRAM disposal of stale large textures (>= 1024x1024) from previous scenes.
  *  3. Quiet idle pre-warming of sibling level backgrounds on multi-level v14 scenes.
- *  4. One-time gentle GM hint to 1-click optimize genuinely giant/heavy scenes.
  */
 
 let _autoInstalled = false;
@@ -19,7 +18,6 @@ let _prewarmTimer = null;
 let _prewarmGen = 0;
 let _hasStandardCulling = false;
 let _tileShadersSynced = false;
-const _hintedScenes = new Set();
 
 function isStandardSceneActive() {
   if (!globalThis.canvas?.ready || !globalThis.canvas?.scene) return false;
@@ -756,8 +754,6 @@ export function isHeavyStandardScene(scene) {
   return pixels >= 36_000_000 || tiles >= 30 || lights >= 60;
 }
 
-let _hintTimer = null;
-
 export function cancelAutoPerfTimers() {
   _prewarmGen++;
   if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
@@ -771,21 +767,6 @@ export function cancelAutoPerfTimers() {
   }
   if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
   if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }
-  if (_hintTimer) { clearTimeout(_hintTimer); _hintTimer = null; }
-}
-
-function maybeHintHeavyScene(scene) {
-  if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfHeavySceneHint) return;
-  if (!globalThis.game?.user?.isGM) return;
-  if (!isStandardSceneActive() || !scene?.id || globalThis.canvas?.scene?.id !== scene.id) return;
-  if (_hintedScenes.has(scene.id)) return;
-  if (!isHeavyStandardScene(scene)) return;
-
-  _hintedScenes.add(scene.id);
-  const msg = globalThis.game.i18n?.format?.("BOUNDLESS.Perf.HeavySceneHint", {
-    scene: scene.name || scene.id
-  }) || loc("BOUNDLESS.Perf.HeavySceneHint");
-  globalThis.ui?.notifications?.info?.(msg, { permanent: false });
 }
 
 // ---------------------------------------------------------------------------
@@ -808,17 +789,11 @@ export function installAutoPerfEngine(controller) {
 
   if (globalThis.game?.settings?.get?.("core", "noCanvas")) return;
 
-  Hooks.on("canvasReady", (c) => {
+  Hooks.on("canvasReady", () => {
     syncDecorativeTileShaders(true);
     updateStandardSceneCulling();
     scheduleVramCleanup();
     scheduleStandardLevelPrewarm();
-    if (_hintTimer) clearTimeout(_hintTimer);
-    const readyScene = c?.scene;
-    _hintTimer = setTimeout(() => {
-      _hintTimer = null;
-      maybeHintHeavyScene(readyScene);
-    }, 1500);
   });
 
   Hooks.on("canvasPan", () => {

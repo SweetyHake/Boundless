@@ -33,8 +33,7 @@ export const PERF_CONFIG = {
   // Standard Scene Auto-Optimizer
   perfAutoCulling: true,
   perfVramCleanup: true,
-  perfIdleLevelPrewarm: true,
-  perfHeavySceneHint: true
+  perfIdleLevelPrewarm: true
 };
 
 export const perfStats = {

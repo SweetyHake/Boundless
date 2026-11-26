@@ -130,8 +130,7 @@
       "DisableUiBlur": "Disable UI Backdrop Blur",
       "DisableUiBlurHint": "Disables backdrop-filter blur on interface windows and panels to help low-end GPUs and laptops.",
       "IdleFpsLimit": "Limit FPS While Idle",
-      "IdleFpsLimitHint": "Drops ticker frame rate to 20 FPS after 6 seconds of inactivity to reduce heat and battery drain.",
-      "HeavySceneHint": "Scene \"{scene}\" is quite heavy. Right-click it in the Scenes directory and choose \"Optimize with Boundless\" for maximum smoothness."
+      "IdleFpsLimitHint": "Drops ticker frame rate to 20 FPS after 6 seconds of inactivity to reduce heat and battery drain."
     },
     "Optimize": {
       "ContextMenu": "Optimize with Boundless",

@@ -155,7 +155,6 @@ export function syncPerfConfigFromSettings() {
   PERF_CONFIG.perfAutoCulling = auto;
   PERF_CONFIG.perfVramCleanup = auto;
   PERF_CONFIG.perfIdleLevelPrewarm = auto;
-  PERF_CONFIG.perfHeavySceneHint = auto;
 }
 
 export function registerBoundlessHooks(controller) {
