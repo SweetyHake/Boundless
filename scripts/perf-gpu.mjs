@@ -791,6 +791,13 @@ function renderBatchedTokenPasses(renderer, visibleTokens, passMask) {
   }
 }
 
+export function isMainScreenRender(renderer) {
+  if (renderer?.projection?.transform) return false;
+  const fs = renderer?.filter?.defaultFilterStack;
+  const rootRt = (fs && fs.length > 1) ? fs[0]?.renderTexture : renderer?.renderTexture?.current;
+  return !rootRt;
+}
+
 function attachTokenUiBatcher() {
   const objects = globalThis.canvas?.tokens?.objects;
   if (!objects || objects._blBatcherAttached) return;
@@ -812,7 +819,7 @@ function attachTokenUiBatcher() {
     if (count < 4) return wrapped(renderer);
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
-    const vp = (PERF_CONFIG.perfAutoCulling && !renderer?.renderTexture?.current) ? getStageViewportWorldRect(260) : null;
+    const vp = (PERF_CONFIG.perfAutoCulling && isMainScreenRender(renderer)) ? getStageViewportWorldRect(260) : null;
     batchTokens.length = 0;
     let passMask = 0;
 
@@ -914,7 +921,7 @@ function attachLightingLayerBatcher() {
     if (count < 8) return wrapped(renderer);
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
-    const vp = (PERF_CONFIG.perfAutoCulling && !renderer?.renderTexture?.current) ? getStageViewportWorldRect(260) : null;
+    const vp = (PERF_CONFIG.perfAutoCulling && isMainScreenRender(renderer)) ? getStageViewportWorldRect(260) : null;
     const distPx = globalThis.canvas?.dimensions?.distancePixels || 20;
     visLights.length = 0;
     complexLights.length = 0;

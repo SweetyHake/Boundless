@@ -276,6 +276,7 @@ export const lightingMethods = {
           const cx = (vp.x0 + vp.x1) * 0.5;
           const cy = (vp.y0 + vp.y1) * 0.5;
           const vpCandidates = [];
+          const seenVpIds = new Set();
           for (let li = 0; li < this.visibleLevelLayers.length; li++) {
             const layer = this.visibleLevelLayers[li];
             const levelId = layer?.level?.id;
@@ -287,7 +288,6 @@ export const lightingMethods = {
             const sx1 = Math.min(simGrid - 1, Math.floor((vpSticky.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             const sy1 = Math.min(simGrid - 1, Math.floor((vpSticky.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             const visitedVpSectors = new Set();
-            const seenVpIds = new Set();
             for (let sy = sy0; sy <= sy1; sy++) {
               for (let sx = sx0; sx <= sx1; sx++) {
                 const sk = `${sx}_${sy}`;
@@ -383,8 +383,7 @@ export const lightingMethods = {
           if (parts.length !== 3) continue;
           const [origSk, kind, idxStr] = parts;
           const idx = Number(idxStr);
-          const raw = sectors[origSk]?.[kind]?.[idx];
-          if (!raw) continue;
+          const raw = sectors[origSk]?.[kind]?.[idx] ?? null;
           const seg = this.resolveVirtualWall(lid, kind, origSk, idx, raw);
           if (!seg || !Array.isArray(seg.c) || seg.c.length < 4) continue;
           const [x1, y1, x2, y2] = seg.c;

@@ -1035,6 +1035,7 @@ export class TokenStreamer {
             this.impostors.upsertToken(doc);
             this.impostors.setFadeOverride(doc.id, null);
             this.impostors.flush();
+            drawnThisFrame++;
             continue;
           }
 

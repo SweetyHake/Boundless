@@ -332,7 +332,7 @@ function buildFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScal
  *   3. Gradual, unhurried vertical descent onto the target character with silky landing cushion
  * Overlapping C1-smooth phase windows keep transitions completely seamless with zero corner stops.
  */
-function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScale, maxScale }) {
+export function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minScale, maxScale }) {
   const V = Math.max(256, viewportSize || 1200);
   const dx = x1 - x0;
   const dy = y1 - y0;
@@ -353,7 +353,7 @@ function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minS
   let apexScale;
   if (dist < 480 && scale0 >= 0.42 && scale1 >= 0.42) {
     // Short room-scale hop: subtle lift -> glide -> settle (responsive in combat)
-    apexScale = Math.max(safeMin, lowScale * 0.62);
+    apexScale = Math.min(lowScale, Math.max(safeMin, lowScale * 0.62));
   } else {
     const distAltitude = (V * 0.40) / Math.max(dist, 1);
     const alreadyElevatedAndVisible = scale0 <= 0.22 && dist <= w0 * 0.75;
@@ -367,7 +367,7 @@ function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minS
     } else {
       desiredApex = lowScale;
     }
-    const floorApex = Math.max(safeMin * 1.12, 0.012);
+    const floorApex = Math.min(lowScale, Math.max(safeMin * 1.12, 0.012));
     apexScale = Math.max(floorApex, Math.min(lowScale, desiredApex));
   }
 
@@ -377,9 +377,9 @@ function buildGtaFlightPath({ x0, y0, scale0, x1, y1, scale1, viewportSize, minS
 
   const upSpan = Math.max(0, logS0 - logApex);
   const downSpan = Math.max(0, logS1 - logApex);
-  const needUp = upSpan > 0.06;
+  const needUp = upSpan > 1e-4;
   const needCruise = dist > 14;
-  const needDown = downSpan > 0.06;
+  const needDown = downSpan > 1e-4;
 
   const wApex = V / Math.max(apexScale, 1e-4);
   const cruiseScreens = dist / Math.max(wApex, 1);
@@ -492,7 +492,7 @@ export async function openPoiEditorDialog(controller, scene, initial = {}) {
     ? Math.max(0.15, Math.min(1.5, Number(canvas.stage.scale.x.toFixed(2))))
     : 0.45;
   const defaultIcon = inferPoiIcon(initial);
-  const defaultKind = normalizePoiKind(initial.kind || (isEdit ? "major" : "minor"));
+  const defaultKind = normalizePoiKind((initial._origKind ?? initial.kind) || (isEdit ? "major" : "minor"));
   const rawDefaultColor = initial.color || POI_ICON_META[defaultIcon]?.defaultColor || "#f5c96b";
   const parsedDefaultColor = foundry.utils?.Color?.from?.(rawDefaultColor);
   const defaultColor = parsedDefaultColor?.valid ? parsedDefaultColor.css : "#f5c96b";
@@ -650,9 +650,10 @@ export class PoiManager {
   controller = null;
   container = null;
   pins = []; // [{ poi, root, medalGroup, pillGroup, hitBoxFull, hitBoxCompact, hovered, dragging, isMajor, iconKey, ... }]
-  enabled = true;
+  enabled = false;
   placementActive = false;
   lastScale = -1;
+  _lastLayoutScale = -1;
   lastPivotX = NaN;
   lastPivotY = NaN;
   _layoutDirty = true;
@@ -708,7 +709,14 @@ export class PoiManager {
 
   resolvePois(scene, manifest) {
     const cfg = scene?.flags?.[MODULE_ID] || {};
-    if (Array.isArray(cfg.pois)) return cfg.pois;
+    if (Array.isArray(cfg.pois)) {
+      if (manifest?.superGrid) {
+        return cfg.pois.map(p => (p?.kind === "minor" && !p.levelId && (p.targetScale ?? 0.085) <= 0.12)
+          ? { ...p, _origKind: p.kind, kind: "major", _isSecondaryProvince: true, targetScale: Number.isFinite(p.targetScale) ? p.targetScale : 0.085 }
+          : p);
+      }
+      return cfg.pois;
+    }
     if (Array.isArray(manifest?.pois) && manifest.pois.length > 0) {
       // On continental superGrid worlds (e.g. 6000x6000), province pins should land at city overview (0.085x)
       // so sub-location pins appear inside the province instead of diving straight onto rooftops
@@ -850,6 +858,7 @@ export class PoiManager {
 
     this._layoutDirty = true;
     this.lastScale = -1;
+    this._lastLayoutScale = -1;
     this.updateViewport();
   }
 
@@ -1161,6 +1170,7 @@ export class PoiManager {
       drawMedal(true);
       drawPill(true);
       pillGroup.visible = true;
+      root.alpha = 1;
       root.hitArea = hitFull;
       root.zIndex = 500;
       this.container.sortDirty = true;
@@ -1609,7 +1619,7 @@ export class PoiManager {
     const px = pivot?.x || 0;
     const py = pivot?.y || 0;
 
-    const prevScale = this.lastScale;
+    const prevScale = this._lastLayoutScale;
     const wasLayoutDirty = Boolean(this._layoutDirty);
     if (
       !wasLayoutDirty &&
@@ -1637,7 +1647,16 @@ export class PoiManager {
     if (!includeSubPins && this._superGridSubProvinces.size > 0) {
       for (const bucket of this._superGridSubProvinces.values()) {
         for (const p of bucket.entries) {
-          if (p.root && !p.root.destroyed) p.root.visible = false;
+          if (p.root && !p.root.destroyed) {
+            p.root.visible = false;
+            if (p.hovered) {
+              p.hovered = false;
+              p.drawMedal?.(false);
+              p.drawPill?.(false);
+              p.root.zIndex = p.isMajor ? 30 : (p.isDetail ? 10 : 20);
+              this.container.sortDirty = true;
+            }
+          }
         }
       }
     }
@@ -1656,7 +1675,8 @@ export class PoiManager {
           entry.hovered = false;
           entry.drawMedal?.(false);
           entry.drawPill?.(false);
-          entry.root.zIndex = entry.isMajor ? 20 : 10;
+          entry.root.zIndex = entry.isMajor ? 30 : (entry.isDetail ? 10 : 20);
+          this.container.sortDirty = true;
         }
         return;
       }
@@ -1682,6 +1702,7 @@ export class PoiManager {
     if (onScreen.length === 0) {
       this._lastOnScreenH1 = 0;
       this._lastOnScreenCount = 0;
+      this._lastLayoutScale = stageScale;
       this.container.visible = false;
       return;
     }
@@ -1704,6 +1725,7 @@ export class PoiManager {
     if (isPurePan && onScreen.length === this._lastOnScreenCount && onH1 === this._lastOnScreenH1 && onH2 === this._lastOnScreenH2) {
       return;
     }
+    this._lastLayoutScale = stageScale;
     this._lastOnScreenCount = onScreen.length;
     this._lastOnScreenH1 = onH1;
     this._lastOnScreenH2 = onH2;
@@ -2100,6 +2122,7 @@ export class PoiManager {
     }
     this.pins = [];
     this.lastScale = -1;
+    this._lastLayoutScale = -1;
     this.lastPivotX = NaN;
     this.lastPivotY = NaN;
     this._layoutDirty = true;

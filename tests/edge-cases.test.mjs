@@ -3590,3 +3590,202 @@ test("restoreAllStandardCulling preserves third-party renderable=false objects v
     PERF_CONFIG.perfAutoCulling = prevC;
   }
 });
+
+test("onSceneUpdate handles Foundry v14 ForcedDeletion for flags, doorStates, sharedFog and manifestRev cache invalidation", async () => {
+  installBaseGlobals();
+  class FakeForcedDeletion {}
+  globalThis.foundry = { data: { operators: { ForcedDeletion: FakeForcedDeletion } } };
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+
+  let mountCount = 0;
+  let polyCleared = 0;
+  let fogChanged = null;
+  let simUpdated = 0;
+  const scene = {
+    id: "scFD",
+    flags: { boundless: { enabled: true, manifestUrl: "worlds/w/m.json" } },
+    levels: [{ id: "lvl1", flags: { boundless: { manifestUrl: "worlds/w/lvl1.json" } } }]
+  };
+  globalThis.canvas = { ready: true, scene, perception: { update() {} } };
+
+  const makeCtrl = () => ({
+    ...editsMethods,
+    active: true,
+    _mounting: false,
+    manifestCache: new Map([["worlds/w/m.json", {}], ["worlds/w/lvl1.json", {}]]),
+    doorStates: new Map([["lvl1::0_0_0", 1], ["lvl1::0_0_1", 1]]),
+    openDoors: new Map([["lvl1::0_0_0", {}], ["lvl1::0_0_1", {}]]),
+    lightBatch: { clearPolyCacheDB: async () => { polyCleared++; } },
+    fogManager: { onSceneFogFlagsChanged(_sc, val) { fogChanged = val; } },
+    _pendingDoorCommits: new Set(),
+    _clearClosingDoorTimer() {},
+    _restoreDoorStates() {},
+    _resolveDoorByKey: (dKey) => ({ dKey, defaultDs: 0 }),
+    _applyDoorStateLocal() { return true; },
+    _normalizeDoorState: (v) => Number(v) || 0,
+    updateSimAndLightBubbles() { simUpdated++; },
+    mount() { mountCount++; }
+  });
+
+  // 1. ForcedDeletion on flags.boundless triggers remount/unmount
+  const c1 = makeCtrl();
+  c1.onSceneUpdate(scene, { flags: { boundless: new FakeForcedDeletion() } });
+  assert.equal(mountCount, 1, "ForcedDeletion on flags.boundless must trigger mount()");
+
+  // 2. manifestRev invalidates scene + level manifestCache, clears poly cache, and remounts
+  const c2 = makeCtrl();
+  c2.onSceneUpdate(scene, { flags: { boundless: { manifestRev: 123456 } } });
+  assert.equal(c2.manifestCache.size, 0, "manifestRev must evict scene and per-level cached manifests");
+  assert.equal(polyCleared, 1, "manifestRev must clear IndexedDB light poly cache");
+  assert.equal(mountCount, 2, "manifestRev must trigger mount() for multiplayer sync");
+
+  // 3. ForcedDeletion on single doorStates key deletes entry without writing 0; ForcedDeletion on sharedFog passes null
+  const c3 = makeCtrl();
+  c3.onSceneUpdate(scene, { flags: { boundless: { doorStates: { "lvl1::0_0_0": new FakeForcedDeletion() }, sharedFog: new FakeForcedDeletion() } } });
+  assert.equal(c3.doorStates.has("lvl1::0_0_0"), false, "ForcedDeletion on a door key must delete it from doorStates");
+  assert.equal(c3.doorStates.has("lvl1::0_0_1"), true, "sibling doorStates entry must remain intact");
+  assert.equal(fogChanged, null, "ForcedDeletion on sharedFog must pass null to onSceneFogFlagsChanged");
+
+  // 4. ForcedDeletion on whole doorStates object clears all entries
+  c3.onSceneUpdate(scene, { flags: { boundless: { doorStates: new FakeForcedDeletion() } } });
+  assert.equal(c3.doorStates.size, 0, "ForcedDeletion on entire doorStates must clear map");
+  assert.ok(simUpdated >= 1);
+});
+
+test("perf-gpu isMainScreenRender detects VoidFilter main pass vs offscreen RenderTexture", async () => {
+  const { isMainScreenRender } = await import("../scripts/perf-gpu.mjs");
+
+  // Standard Foundry v14 canvas.interface pass: VoidFilter active -> renderTexture.current is filter RT, but defaultFilterStack[0].renderTexture is null
+  const mainWithVoidFilter = {
+    projection: { transform: null },
+    renderTexture: { current: { uid: 42 } },
+    filter: { defaultFilterStack: [{ renderTexture: null }, { renderTexture: { uid: 42 } }] }
+  };
+  assert.equal(isMainScreenRender(mainWithVoidFilter), true, "VoidFilter / SMAAFilter on main screen must still be recognized as main screen render");
+
+  // Offscreen render (CanvasTransition / thumbnail) with filter active -> root stack frame points to offscreen RT
+  const offscreenWithFilter = {
+    projection: { transform: null },
+    renderTexture: { current: { uid: 42 } },
+    filter: { defaultFilterStack: [{ renderTexture: { uid: 7 } }, { renderTexture: { uid: 42 } }] }
+  };
+  assert.equal(isMainScreenRender(offscreenWithFilter), false, "offscreen RenderTexture at filter stack base must disable screen-frustum culling");
+
+  // Custom projection transform (offscreen capture)
+  assert.equal(isMainScreenRender({ projection: { transform: { a: 1 } }, renderTexture: { current: null }, filter: { defaultFilterStack: [] } }), false);
+});
+
+test("buildGtaFlightPath avoids frame-1 zoom jump when orbital scale0 < 0.012", async () => {
+  const { buildGtaFlightPath } = await import("../scripts/poi.mjs");
+
+  const path = buildGtaFlightPath({
+    x0: 10000, y0: 10000, scale0: 0.004,
+    x1: 50000, y1: 50000, scale1: 0.085,
+    viewportSize: 1200, minScale: 0.002, maxScale: 3
+  });
+  const s0 = path.sample(0);
+  const sEarly = path.sample(0.01);
+  assert.ok(Math.abs(s0.scale - 0.004) < 1e-4, `frame 0 scale (${s0.scale}) must start at orbital scale0 (0.004) without jumping to 0.012`);
+  assert.ok(sEarly.scale < 0.006, `early frame scale (${sEarly.scale}) must ramp smoothly from 0.004`);
+});
+
+test("MegaLightBatch.setLightWeight does not overwrite canonical baseWeight when retiring suppressed duplicate and notifies visibility change", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+
+  const lb = new MegaLightBatch();
+  lb.weightArray = new Float32Array(8);
+  lb.weightBuffer = { update() {} };
+  lb._currentDarkness = 0.5;
+  const canon = { id: "lvl1::0_0_0", levelId: "lvl1", vStart: 0, vCount: 4, baseWeight: 0, weight: 0, isIndoor: false, darkMin: 0, darkMax: 1, batch: null };
+  const dup = { id: "lvl2::0_0_0", levelId: "lvl2", vStart: 4, vCount: 4, baseWeight: 0, weight: 0, isIndoor: false, darkMin: 0, darkMax: 1, batch: null };
+  lb.lightMetaById.set(canon.id, canon);
+  lb.lightMetaById.set(dup.id, dup);
+  lb.sharedLightAlias.set(dup.id, canon.id);
+
+  // Retiring suppressed duplicate (which has its own meta slot) must update dup, NOT overwrite canonical active dynamic light
+  lb.setLightWeight(dup.id, 1);
+  assert.equal(canon.baseWeight, 0, "retiring suppressed duplicate must not reset canonical light baseWeight to 1");
+  assert.equal(dup.baseWeight, 1);
+
+  // Viewport culling visibility change must trigger _onBatchChanged
+  let changed = 0;
+  lb._onBatchChanged = () => { changed++; };
+  lb.macroBatch = {
+    illumMesh: { visible: true },
+    colorMesh: { visible: true },
+    lastAlpha: 1,
+    weightArray: new Float32Array(4),
+    weightBuffer: { update() {} }
+  };
+  lb.updateViewport({ x0: 0, y0: 0, x1: 1000, y1: 1000, scale: 1 });
+  assert.equal(lb.macroBatch.illumMesh.visible, false);
+  assert.equal(changed, 1, "updateViewport must notify _onBatchChanged when batch mesh visibility toggles");
+});
+
+test("overlayMethods.isTokenUnderBakedRoof preserves negative underground elevation when _ssVisualElevation is null", async () => {
+  installBaseGlobals();
+  const { overlayMethods } = await import("../scripts/boundless-overlays.mjs");
+
+  let observedElev = null;
+  const ctrl = {
+    ...overlayMethods,
+    active: true,
+    isPointUnderBakedRoof(_lid, _x, _y, elev) {
+      observedElev = elev;
+      return true;
+    }
+  };
+  globalThis.canvas = { level: { id: "lvl1" } };
+
+  const tok = {
+    center: { x: 200, y: 200 },
+    _ssVisualElevation: null,
+    document: { level: "lvl1", elevation: -10 }
+  };
+  ctrl.isTokenUnderBakedRoof(tok);
+  assert.equal(observedElev, -10, "null _ssVisualElevation must fall back to tok.document.elevation (-10), not Number(null) === 0");
+});
+
+test("scene-baker getSceneManifestInfo avoids demo URL with per-level manifests, preserves wall/sound gids, and subdivides nativeSpatial long walls", async () => {
+  installBaseGlobals();
+  const { getSceneManifestInfo, extractNativeDocsFromLevelSpec, mergeEditsIntoLevelSpec } = await import("../scripts/scene-baker.mjs");
+
+  const kartografScene = {
+    flags: { boundless: { enabled: true } },
+    levels: [{ id: "lvl1", flags: { boundless: { enabled: true, manifestUrl: "worlds/w/lvl1.json" } } }]
+  };
+  assert.equal(getSceneManifestInfo(kartografScene).sceneManifestUrl, "", "per-level manifest scenes must not fall back to demo pyramid_manifest.json");
+
+  const extracted = extractNativeDocsFromLevelSpec({
+    sectors: {
+      "0_0": {
+        w: [[0, 0, 100, 0, 20, 20, 20, 20, 0, { gid: "wallGid1" }]],
+        d: [[100, 0, 200, 0, 1, 0, { gid: "doorGid1" }]],
+        s: [[50, 50, 20, "sfx/wind.ogg", 0.5, true, true, 0, 1, 5, { gid: "sndGid1" }]],
+        l: []
+      }
+    },
+    tiles: []
+  }, { levelId: "lvl1", targetLevelId: "lvl1" });
+  assert.deepEqual(extracted.wallGids, ["wallGid1", "doorGid1"]);
+  assert.deepEqual(extracted.soundGids, ["sndGid1"]);
+
+  // Long native wall absorbed into smaller simSectorPx must be subdivided
+  const merged = mergeEditsIntoLevelSpec({
+    worldPx: 4000,
+    simGrid: 4,
+    simSectorPx: 1000,
+    sectors: {},
+    tiles: []
+  }, {
+    levelId: "lvl1",
+    nativeSpatial: {
+      sectors: {
+        "0_0": { w: [[0, 100, 2500, 100, 20, 20, 20, 20, 0, { gid: "longW" }]] }
+      },
+      tiles: []
+    }
+  });
+  assert.equal(merged.counts.walls, 3, "2500px native wall in 1000px sectors must be subdivided into 3 segments");
+});

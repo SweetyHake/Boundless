@@ -54,6 +54,7 @@ export const editsMethods = {
         animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null
       };
     }
+    if (!raw) return null;
     if (kind === "d") {
       const [x1, y1, x2, y2, doorType, defaultDs, extra] = raw;
       return {
@@ -212,6 +213,7 @@ export const editsMethods = {
         ...extractLightStyle(ov)
       };
     }
+    if (!raw) return null;
     const [x, y, dim, bright, color, alpha, anim, customElev, extra] = raw;
     const ex = extra && typeof extra === "object" ? extra : null;
     if (!ex) {
@@ -358,13 +360,34 @@ export const editsMethods = {
   },
 
   onSceneUpdate(scene, changes, userId = null) {
+    if (this._suppressAutoMount) return;
     if (!globalThis.canvas?.ready || scene?.id !== globalThis.canvas.scene?.id) return;
 
+    const isForcedDel = (v) => Boolean(globalThis.foundry?.data?.operators?.ForcedDeletion && v instanceof foundry.data.operators.ForcedDeletion);
     const flagChanges = changes?.flags?.[MODULE_ID];
-    const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
+    const flagDeleted = Boolean(
+      (changes?.flags && (`-=${MODULE_ID}` in changes.flags)) ||
+      flagChanges === null ||
+      isForcedDel(flagChanges)
+    );
 
+    const hasManifestRev = Boolean(flagChanges && typeof flagChanges === "object" && "manifestRev" in flagChanges);
     // Handle enabling/disabling or manifest changes even when controller is currently inactive
-    if (flagDeleted || (flagChanges && ("enabled" in flagChanges || "manifestUrl" in flagChanges || "-=manifestUrl" in flagChanges || "levelId" in flagChanges || "-=levelId" in flagChanges))) {
+    if (flagDeleted || (flagChanges && typeof flagChanges === "object" && (
+      "enabled" in flagChanges || "-=enabled" in flagChanges ||
+      "manifestUrl" in flagChanges || "-=manifestUrl" in flagChanges ||
+      "levelId" in flagChanges || "-=levelId" in flagChanges ||
+      hasManifestRev
+    ))) {
+      if (hasManifestRev) {
+        const sceneUrl = scene?.flags?.[MODULE_ID]?.manifestUrl;
+        if (sceneUrl) this.manifestCache?.delete?.(sceneUrl);
+        for (const l of scene?.levels || []) {
+          const lu = l?.flags?.[MODULE_ID]?.manifestUrl;
+          if (lu) this.manifestCache?.delete?.(lu);
+        }
+        this.lightBatch?.clearPolyCacheDB?.(scene.id, game.world?.id)?.catch?.(() => {});
+      }
       this.mount(scene);
       return;
     }
@@ -407,7 +430,7 @@ export const editsMethods = {
       this.applyVirtualTileChangesLocal();
     }
 
-    if ("-=doorStates" in flagChanges || flagChanges.doorStates === null) {
+    if ("-=doorStates" in flagChanges || flagChanges.doorStates === null || isForcedDel(flagChanges.doorStates)) {
       const prevKeys = Array.from(this.doorStates.keys());
       let anyDoorChanged = false;
       // Keep this.doorStates intact while reverting so _applyDoorStateLocal sees curDs !== defaultDs
@@ -438,7 +461,7 @@ export const editsMethods = {
       const batchMode = entries.length > 1;
       let anyDoorChanged = false;
       for (const [rawKey, rawVal] of entries) {
-        if (rawKey.startsWith("-=") || rawVal === null) {
+        if (rawKey.startsWith("-=") || rawVal === null || isForcedDel(rawVal)) {
           const dKey = rawKey.startsWith("-=") ? rawKey.slice(2) : rawKey;
           this._clearClosingDoorTimer?.(dKey);
           const info = this._resolveDoorByKey(dKey);
@@ -497,12 +520,12 @@ export const editsMethods = {
       this.fogManager.mount(scene);
     } else {
       if ("sharedFog" in flagChanges || "-=sharedFog" in flagChanges) {
-        this.fogManager.onSceneFogFlagsChanged(scene, flagChanges.sharedFog ?? null, userId);
+        this.fogManager.onSceneFogFlagsChanged(scene, isForcedDel(flagChanges.sharedFog) ? null : (flagChanges.sharedFog ?? null), userId);
       }
-      if (flagChanges.fogResetAt && typeof flagChanges.fogResetAt === "object") {
+      if (flagChanges.fogResetAt && typeof flagChanges.fogResetAt === "object" && !isForcedDel(flagChanges.fogResetAt)) {
         this.fogManager.onSceneFogResetChanged(scene, flagChanges.fogResetAt);
       }
-      if (flagChanges.fogBrush && typeof flagChanges.fogBrush === "object") {
+      if (flagChanges.fogBrush && typeof flagChanges.fogBrush === "object" && !isForcedDel(flagChanges.fogBrush)) {
         this.fogManager.onSceneFogBrushChanged(scene, flagChanges.fogBrush);
       }
     }
@@ -536,26 +559,29 @@ export const editsMethods = {
     });
   },
 
-  async addPOI(poiSpec, scene = canvas.scene) {
+  async addPOI(poiSpec = {}, scene = canvas.scene) {
     if (!scene || !game.user?.isGM) return null;
+    const spec = poiSpec && typeof poiSpec === "object" ? poiSpec : {};
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
-    const kind = poiSpec.kind === "detail" ? "detail" : (poiSpec.kind === "minor" ? "minor" : "major");
+    const kind = spec.kind === "detail" ? "detail" : (spec.kind === "minor" ? "minor" : "major");
     const dims = scene.getDimensions?.();
     const defaultCx = (dims?.sceneX ?? 0) + (dims?.sceneWidth ?? scene.width ?? 100000) * 0.5;
     const defaultCy = (dims?.sceneY ?? 0) + (dims?.sceneHeight ?? scene.height ?? 100000) * 0.5;
+    const rawX = Number(spec.x);
+    const rawY = Number(spec.y);
     const entry = {
-      id: poiSpec.id || foundry.utils.randomID(),
-      name: poiSpec.name || game.i18n.localize("BOUNDLESS.Config.PoiDefaultName"),
-      subtitle: poiSpec.subtitle || "",
-      x: Math.round(poiSpec.x ?? defaultCx),
-      y: Math.round(poiSpec.y ?? defaultCy),
-      levelId: poiSpec.levelId || null,
-      targetScale: Number(poiSpec.targetScale ?? poiSpec.scale) || (kind === "major" ? 0.085 : (kind === "detail" ? 0.68 : 0.26)),
-      color: poiSpec.color || "#f5c96b",
+      id: spec.id || foundry.utils.randomID(),
+      name: spec.name || game.i18n.localize("BOUNDLESS.Config.PoiDefaultName"),
+      subtitle: spec.subtitle || "",
+      x: Math.round(Number.isFinite(rawX) ? rawX : defaultCx),
+      y: Math.round(Number.isFinite(rawY) ? rawY : defaultCy),
+      levelId: spec.levelId || null,
+      targetScale: Number(spec.targetScale ?? spec.scale) || (kind === "major" ? 0.085 : (kind === "detail" ? 0.68 : 0.26)),
+      color: spec.color || "#f5c96b",
       kind,
-      icon: poiSpec.icon || "",
-      journalUuid: poiSpec.journalUuid || "",
-      hidden: Boolean(poiSpec.hidden)
+      icon: spec.icon || "",
+      journalUuid: spec.journalUuid || "",
+      hidden: Boolean(spec.hidden)
     };
     existing.push(entry);
     await scene.update({ [`flags.${MODULE_ID}.pois`]: existing });
@@ -563,15 +589,24 @@ export const editsMethods = {
   },
 
   async updatePOI(poiId, patch, scene = canvas.scene) {
-    if (!scene || !poiId || !patch || !game.user?.isGM) return null;
+    if (!scene || !poiId || !patch || typeof patch !== "object" || !game.user?.isGM) return null;
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const idx = existing.findIndex(p => p.id === poiId);
     if (idx < 0) return null;
     const updated = { ...existing[idx], ...patch, id: poiId };
+    delete updated._origKind;
     delete updated._isSecondaryProvince;
     delete updated._virtualSub;
-    if ("x" in patch) updated.x = Math.round(patch.x);
-    if ("y" in patch) updated.y = Math.round(patch.y);
+    if ("x" in patch) {
+      const nx = Number(patch.x);
+      if (Number.isFinite(nx)) updated.x = Math.round(nx);
+      else updated.x = existing[idx].x;
+    }
+    if ("y" in patch) {
+      const ny = Number(patch.y);
+      if (Number.isFinite(ny)) updated.y = Math.round(ny);
+      else updated.y = existing[idx].y;
+    }
     if ("targetScale" in patch) {
       updated.targetScale = Number(patch.targetScale) || 0.45;
       delete updated.scale;
@@ -672,7 +707,11 @@ export const editsMethods = {
         sort: t.sort || 0,
         alpha: t.alpha ?? 1,
         hidden: Boolean(t.hidden),
-        tint: (t.texture.tint !== undefined && t.texture.tint !== null && t.texture.tint !== "") ? foundry.utils.Color.from(t.texture.tint).css : null,
+        tint: (() => {
+          if (t.texture.tint === undefined || t.texture.tint === null || t.texture.tint === "") return null;
+          const c = foundry.utils.Color.from(t.texture.tint);
+          return c?.valid ? c.css : null;
+        })(),
         alphaThreshold: t.texture.alphaThreshold ?? 0.75,
         occlusionMode: occModes.length ? occModes : CONST.OCCLUSION_MODES.NONE,
         occludedAlpha: t.occlusion?.alpha ?? 0.2,
@@ -718,6 +757,7 @@ export const editsMethods = {
     const wallIdsToDelete = [];
     for (const w of scene.walls) {
       if (w.levels?.size && !w.levels.has(levelId)) continue;
+      const isMultiLevelWall = (w.levels?.size > 1) || (!w.levels?.size && (scene.levels?.size || 0) > 1);
       const [x1, y1, x2, y2] = w.c;
       if (w.door) {
         const cx = (x1 + x2) * 0.5, cy = (y1 + y2) * 0.5;
@@ -729,6 +769,7 @@ export const editsMethods = {
         if (w.sound !== undefined && w.sound !== 20) extra.sound = w.sound;
         if (w.dir) extra.dir = w.dir;
         if (w.doorSound) extra.doorSound = w.doorSound;
+        if (isMultiLevelWall && w.id) extra.gid = w.id;
         if (w.animation?.type && w.animation?.texture) {
           extra.animation = {
             type: w.animation.type,
@@ -755,14 +796,12 @@ export const editsMethods = {
         // Subdivide long non-door walls (> simSectorPx) so endpoints never fall outside 3x3 neighbor sector queries
         const segLen = Math.hypot(x2 - x1, y2 - y1);
         const parts = segLen > simSectorPx ? Math.ceil(segLen / simSectorPx) : 1;
-        const thresholdObj = (w.threshold && (w.threshold.light || w.threshold.sight || w.threshold.sound))
+        const thresholdVal = (w.threshold && (w.threshold.light || w.threshold.sight || w.threshold.sound))
           ? {
-              threshold: {
-                light: w.threshold.light ?? null,
-                sight: w.threshold.sight ?? null,
-                sound: w.threshold.sound ?? null,
-                attenuation: Boolean(w.threshold.attenuation)
-              }
+              light: w.threshold.light ?? null,
+              sight: w.threshold.sight ?? null,
+              sound: w.threshold.sound ?? null,
+              attenuation: Boolean(w.threshold.attenuation)
             }
           : null;
         for (let pi = 0; pi < parts; pi++) {
@@ -774,7 +813,10 @@ export const editsMethods = {
           const by = pi === parts - 1 ? y2 : Math.round(y1 + (y2 - y1) * t1);
           const sec = ensureSec(Math.floor(((ax + bx) * 0.5) / simSectorPx), Math.floor(((ay + by) * 0.5) / simSectorPx));
           const row = [ax, ay, bx, by, w.move, w.sight, w.light, w.sound, w.dir || 0];
-          if (thresholdObj) row.push(thresholdObj);
+          const wExtra = {};
+          if (thresholdVal) wExtra.threshold = thresholdVal;
+          if (isMultiLevelWall && w.id) wExtra.gid = parts > 1 ? `${w.id}:${pi}` : w.id;
+          if (Object.keys(wExtra).length) row.push(wExtra);
           sec.w.push(row);
         }
       }
@@ -788,7 +830,11 @@ export const editsMethods = {
       if (l.config?.negative || l.vision || (l.config?.priority ?? 0) > 0) continue;
       const sec = ensureSec(Math.floor(l.x / simSectorPx), Math.floor(l.y / simSectorPx));
       const rawColor = l.config?.color;
-      const colorCss = (rawColor !== undefined && rawColor !== null && rawColor !== "") ? foundry.utils.Color.from(rawColor).css : null;
+      const colorCss = (() => {
+        if (rawColor === undefined || rawColor === null || rawColor === "") return null;
+        const c = foundry.utils.Color.from(rawColor);
+        return c?.valid ? c.css : null;
+      })();
       const extra = {};
       if (l.hidden) extra.hidden = true;
       if (l.walls === false) extra.walls = false;
@@ -840,7 +886,11 @@ export const editsMethods = {
         snd.darkness?.max ?? 1,
         snd.elevation
       ];
-      if (snd.hidden) row.push({ hidden: true });
+      const isMultiLevelSound = (snd.levels?.size > 1) || (!snd.levels?.size && (scene.levels?.size || 0) > 1);
+      const sExtra = {};
+      if (snd.hidden) sExtra.hidden = true;
+      if (isMultiLevelSound && snd.id) sExtra.gid = snd.id;
+      if (Object.keys(sExtra).length) row.push(sExtra);
       sec.s.push(row);
       soundIdsToDelete.push(snd.id);
     }
@@ -896,12 +946,8 @@ export const editsMethods = {
     const inlineManifest = { worldPx, simGrid: resolvedSimGrid, simSectorPx, tiles, sectors };
     const existingCfg = foundry.utils.deepClone(level.flags?.[MODULE_ID] || {});
     delete existingCfg.inlineManifest;
-    await level.update({
-      [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true },
-      [`flags.${MODULE_ID}.==inlineManifest`]: inlineManifest
-    });
 
-    // Clear stale index-keyed edits & doorStates for this re-baked level on targetScene
+    // Clear stale index-keyed edits & doorStates and remove originals BEFORE updating level so updateLevel mounts cleanly once
     const prevSceneFlags = targetScene.flags?.[MODULE_ID] || {};
     const stalePatch = {};
     for (const mapKey of ["wallEdits", "lightEdits", "soundEdits", "tileEdits"]) {
@@ -955,6 +1001,12 @@ export const editsMethods = {
       await pruneOrDelete("AmbientLight", lightIdsToDelete);
       await pruneOrDelete("AmbientSound", soundIdsToDelete);
     }
+
+    await this.lightBatch?.clearPolyCacheDB?.(targetScene.id, game.world?.id)?.catch?.(() => {});
+    await level.update({
+      [`flags.${MODULE_ID}`]: { ...existingCfg, enabled: true },
+      [`flags.${MODULE_ID}.==inlineManifest`]: inlineManifest
+    });
 
     if (canvas.scene?.id === targetScene.id) {
       await this.mount(targetScene);

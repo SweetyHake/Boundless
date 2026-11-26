@@ -105,7 +105,7 @@ export const overlayMethods = {
         this.overlayPending.delete(`${fullId}:w`);
       }
       const cur = this.activeOverlays.get(fullId);
-      if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || !cur || cur.wallsMesh || !isTextureUsable(tWalls)) return;
+      if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || !cur || cur.retiring || cur.wallsMesh || !isTextureUsable(tWalls)) return;
       const wallsMesh = this.acquireMesh();
       wallsMesh.name = `Tile.BoundlessWalls.${fullId}`;
       wallsMesh.anchor.set(0.5, 0.5);
@@ -126,8 +126,8 @@ export const overlayMethods = {
       wallsMesh.restrictsLight = false;
       wallsMesh.restrictsWeather = false;
       const localZ = layer.lastTargetZ - layer.zOffset;
-      const revealOnZ5 = localZ === 5 && this._isRoofRevealed(cur.roofMesh, canvas.masks?.occlusion?.occludedSurfaces);
-      wallsMesh.visible = localZ >= 6 || revealOnZ5;
+      const revealOnLowerZ = localZ < 6 && this._isRoofRevealed(cur.roofMesh, canvas.masks?.occlusion?.occludedSurfaces);
+      wallsMesh.visible = localZ >= 6 || revealOnLowerZ;
       canvas.primary.addChild(wallsMesh);
       wallsMesh.updateCanvasTransform?.();
       this._syncShowstopperMeshDof(wallsMesh);
@@ -212,6 +212,7 @@ export const overlayMethods = {
     let rt = null;
     let container = null;
     try {
+      if (renderer.gl?.isContextLost?.()) return;
       const maxTex = renderer.gl?.getParameter?.(renderer.gl.MAX_TEXTURE_SIZE) || 2048;
       const maskSize = maxTex >= 2048 ? 2048 : 1024;
 
@@ -221,7 +222,7 @@ export const overlayMethods = {
       if (roofMaskUrl) {
         // Prebaked single-file roof alpha mask supplied by exporter (0 per-house texture loads!)
         maskTex = await this.texMgr.load(roofMaskUrl, { mipmap: false, isPinned: false });
-        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId || renderer.gl?.isContextLost?.()) {
           return;
         }
         if (!isTextureUsable(maskTex)) {
@@ -233,7 +234,7 @@ export const overlayMethods = {
         // Small reusable template roof set (<= 24 shared textures): load into LRU cache without permanently pinning VRAM across levels
         const urlList = Array.from(roofUrls);
         const loaded = await Promise.all(urlList.map(url => this.texMgr.load(url, { mipmap: true, isPinned: false, maxDim: 2048 })));
-        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId) {
+        if (!this.active || this._roofMaskGen !== gen || canvas.scene?.id !== sceneId || canvas.level?.id !== mountedLevelId || renderer.gl?.isContextLost?.()) {
           return;
         }
         texByUrl = new Map();
@@ -544,8 +545,8 @@ export const overlayMethods = {
           }
           ov.roofMesh.hoverFade = canReveal;
         }
-        const revealOnZ5 = localZ === 5 && ov.roofMesh && this._isRoofRevealed(ov.roofMesh, occSurfaces);
-        if (ov.wallsMesh) ov.wallsMesh.visible = showWalls || revealOnZ5;
+        const revealOnLowerZ = !showWalls && ov.roofMesh && this._isRoofRevealed(ov.roofMesh, occSurfaces);
+        if (ov.wallsMesh) ov.wallsMesh.visible = showWalls || revealOnLowerZ;
       }
     }
     if (retiredAnyRoof) this.invalidateShowstopperSurfaces();
@@ -590,6 +591,12 @@ export const overlayMethods = {
         if (!this.active || this._mountGen !== gen || this.levelLayers.get(lid) !== layer || this.activeOverlays.has(fullId) || this._pendingOverlayKeys.has(fullId)) return;
         const okWalls = isTextureUsable(tWalls) ? tWalls : null;
         const okRoof = isTextureUsable(tRoof) ? tRoof : null;
+        const roofTransientFail = Boolean(needRoof && !okRoof && !this.texMgr?.missingSrcs?.has?.(ovSpec.roof));
+        const wallsTransientFail = Boolean(needWalls && !okWalls && !this.texMgr?.missingSrcs?.has?.(ovSpec.walls));
+        if (roofTransientFail || (!okWalls && !okRoof && wallsTransientFail)) {
+          layer.lastOverlayKey = "";
+          if (roofTransientFail || !okWalls) return;
+        }
         if (!okWalls && !okRoof) return;
         this._pendingOverlayKeys.add(fullId);
         this.pendingOverlayMounts.push({ fullId, lid, oid: rawOid, layer, ovSpec, topElev, tWalls: okWalls, tRoof: okRoof });
@@ -748,7 +755,7 @@ export const overlayMethods = {
       }
       sharedDedupHash = h;
     }
-    const tileKey = `${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}_d${sharedVtSeen ? sharedVtSeen.size : 0}_${sharedDedupHash}`;
+    const tileKey = `${targetZ}_${effectiveZ}_${sx0}_${sy0}_${sx1}_${sy1}${moveBucket}_r${this.tileEditsRev}_d${sharedVtSeen ? sharedVtSeen.size : 0}_${sharedDedupHash}`;
     if (tileKey === layer.lastTileKey && !sharedVtSeen) return false;
     const canSkipSameKey = tileKey === layer.lastTileKey;
     layer.lastTileKey = tileKey;
@@ -1127,17 +1134,18 @@ export const overlayMethods = {
           if (tSpec.minZ !== undefined) {
             // Skip decorative interior props explicitly marked non-occluding and non-light-blocking
             const occNone = CONST.OCCLUSION_MODES.NONE;
-            const explicitlyNonOccluding = !tSpec.restrictsLight && (
-              tSpec.occlusionMode === occNone ||
-              (Array.isArray(tSpec.occlusionMode) && tSpec.occlusionMode.length === 0)
-            );
+            const hasExplicitOcc = tSpec.occlusionMode !== undefined && tSpec.occlusionMode !== null;
+            const explicitlyNonOccluding = !tSpec.restrictsLight && hasExplicitOcc
+              && resolveOcclusionMode(tSpec.occlusionMode, occNone) === occNone;
             if (explicitlyNonOccluding) continue;
             if (!level.isView && viewedBottom >= (tSpec.elevation ?? 0)) continue;
             if (checkUpperOcc && this._isVirtualTileOccludedByUpper(layer, tSpec)) continue;
             if (tSpec.src && missingSrcs?.has?.(tSpec.src)) continue;
+            const edTile = this.layerEditors?.tileActive ? this.layerEditors.tilesByKey?.get?.(`t:${tid}`) : null;
+            const editedNativeActive = Boolean(edTile && edTile.levelId === layerId && edTile.placeable && !edTile.placeable.destroyed);
             const mountedVt = this.activeVirtualTiles.get(`${layerId}::${tid}`)?.mesh;
             const targetAlpha = tSpec.alpha ?? 1;
-            const vtReadyOpaque = Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= targetAlpha * 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
+            const vtReadyOpaque = editedNativeActive || Boolean(mountedVt && !mountedVt.destroyed && mountedVt.visible && (mountedVt.alpha >= targetAlpha * 0.9 || this._isRoofRevealed(mountedVt, occSurfaces)));
             if (!vtReadyOpaque && this._isPointInsideVirtualTile(tx, ty, tSpec, 0)) {
               return true;
             }
@@ -1261,13 +1269,14 @@ export const overlayMethods = {
   },
 
   isTokenUnderBakedRoof(tok) {
-    if (!this.active || !tok || tok.destroyed || tok.isPreview || tok.controlled) return false;
+    if (!this.active || !tok || tok.destroyed || tok.isPreview || tok.controlled || !tok.center) return false;
     const doc = tok.document;
     const lid = doc?.level || canvas.level?.id;
     const rawElev = Number(doc?.elevation ?? 0);
-    const visElev = Number.isFinite(Number(tok._ssJumpState?.elevation))
-      ? Number(tok._ssJumpState.elevation)
-      : (Number.isFinite(Number(tok._ssVisualElevation)) ? Number(tok._ssVisualElevation) : rawElev);
+    const isValidNum = (v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+    const rawJump = tok._ssJumpState?.elevation;
+    const rawVis = tok._ssVisualElevation;
+    const visElev = isValidNum(rawJump) ? Number(rawJump) : (isValidNum(rawVis) ? Number(rawVis) : rawElev);
     const tokElev = Math.max(rawElev, visElev);
     return this.isPointUnderBakedRoof(lid, tok.center.x, tok.center.y, tokElev);
   },

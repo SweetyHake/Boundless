@@ -26,7 +26,7 @@
       "VirtualizeTokensHint": "Draws native non-player token placeables strictly inside each client's viewport with a per-frame budget and LRU-unmounts distant PIXI objects without modifying scene documents.",
       "PoiHeading": "Points of Interest (POI)",
       "PoiEmpty": "No location pins configured.",
-      "PoiAddHere": "Add Pin at Camera Center",
+      "PoiAddHere": "Add Location Pin",
       "PoiReset": "Reset to Manifest",
       "PoiEditTitle": "Edit Location Pin",
       "PoiNamePrompt": "Location Name",

@@ -70,14 +70,15 @@ async function ensureDirectoryRecursive(targetDir) {
   let cur = "";
   for (const part of parts) {
     cur = cur ? `${cur}/${part}` : part;
+    const encCur = encodePathSegments(cur);
     try {
-      await FP.createDirectory("data", cur);
+      await FP.createDirectory("data", encCur);
     } catch (err) {
       const msg = String(err?.message || err || "");
       if (!/exist|EEXIST|already/i.test(msg)) {
         // Double-check if directory is already browsable before throwing
         try {
-          await FP.browse("data", cur);
+          await FP.browse("data", encCur);
         } catch {
           throw err;
         }
@@ -89,7 +90,8 @@ async function ensureDirectoryRecursive(targetDir) {
 async function uploadFileSilent(targetDir, file) {
   const FP = getFilePickerImpl();
   if (!FP?.upload) throw new Error("FilePicker.upload is unavailable.");
-  const res = await FP.upload("data", targetDir, file, {}, { notify: false });
+  const encDir = encodePathSegments(targetDir);
+  const res = await FP.upload("data", encDir, file, {}, { notify: false });
   if (!res || !res.path) {
     throw new Error(`Upload failed for ${targetDir}/${file?.name || "file"}`);
   }
@@ -189,8 +191,9 @@ async function loadImageSource(src, signal = null, { fallbackW = 0, fallbackH = 
         // Rasterize upscaled SVG onto a work canvas because 9-arg drawImage indexes source rect in naturalWidth x naturalHeight
         if (w !== natW || h !== natH) {
           try {
-            const safeW = Math.min(16384, Math.max(1, w));
-            const safeH = Math.min(16384, Math.max(1, h));
+            const clampScale = Math.min(1, 16384 / Math.max(1, w, h));
+            const safeW = Math.max(1, Math.round(w * clampScale));
+            const safeH = Math.max(1, Math.round(h * clampScale));
             const rast = createWorkCanvas(safeW, safeH);
             rast.ctx.clearRect(0, 0, safeW, safeH);
             rast.ctx.drawImage(img, 0, 0, safeW, safeH);
@@ -392,6 +395,9 @@ async function sliceAndUploadPyramid({
         } else {
           work.ctx.scale(scaleToTile, scaleToTile);
           work.ctx.translate(-wx0, -wy0);
+          work.ctx.beginPath();
+          work.ctx.rect(0, 0, sceneBounds.w, sceneBounds.h);
+          work.ctx.clip();
           work.ctx.translate(sceneBounds.w * 0.5 + bgOffX, sceneBounds.h * 0.5 + bgOffY);
           if (bgRotRad) work.ctx.rotate(bgRotRad);
           work.ctx.scale(bgScaleX, bgScaleY);
@@ -613,8 +619,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       const pct = 10 + Math.round((processedTiles / Math.max(1, grandTotalTiles)) * 78);
       report(pct, game.i18n.format("BOUNDLESS.Baker.StepUploading", {
         done: processedTiles,
-        total: grandTotalTiles,
-        z
+        total: grandTotalTiles
       }));
     };
 
@@ -738,7 +743,9 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
               mergedLevelSpecs = { [prevLid]: flatSpec, ...levelSpecs };
             }
           }
-        } catch {}
+        } catch (err) {
+          if (err?.name === "AbortError" || signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        }
       }
     }
     const manifestObj = singleLevelId
@@ -761,6 +768,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       manifestName,
       { type: "application/json" }
     );
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const manifestUpRes = await uploadFileSilent(outDir, manifestFile);
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const manifestUrl = manifestUpRes?.path || `${encodePathSegments(outDir)}/${manifestName}`;
@@ -835,7 +843,8 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
     const scenePatch = {
       [`flags.${MODULE_ID}.showPois`]: prevFlags.showPois !== false,
       [`flags.${MODULE_ID}.chunkedFog`]: prevFlags.chunkedFog !== false,
-      [`flags.${MODULE_ID}.virtualizeTokens`]: prevFlags.virtualizeTokens !== false
+      [`flags.${MODULE_ID}.virtualizeTokens`]: prevFlags.virtualizeTokens !== false,
+      [`flags.${MODULE_ID}.manifestRev`]: Math.max(Date.now(), (Number(prevFlags.manifestRev) || 0) + 1)
     };
     for (const mapKey of ["wallEdits", "lightEdits", "soundEdits", "tileEdits"]) {
       if (prevFlags[mapKey] && typeof prevFlags[mapKey] === "object") {
@@ -883,6 +892,17 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
         if ("foregroundPyramidBaseUrl" in prevLvlFlags) lvlPatch[`flags.${MODULE_ID}.-=foregroundPyramidBaseUrl`] = null;
         if (prevLvlFlags.enabled === false) lvlPatch[`flags.${MODULE_ID}.-=enabled`] = null;
         if (Object.keys(lvlPatch).length) await lvl.update(lvlPatch);
+      }
+
+      // Mark remaining unbaked levels on partial multi-level bakes as disabled so they stay eligible for future baking
+      if (isPartialMultiLevel) {
+        const coveredIds = new Set(Object.keys(mergedLevelSpecs));
+        for (const lvl of targetLevels) {
+          if (coveredIds.has(lvl.id)) continue;
+          const lFlags = lvl.flags?.[MODULE_ID];
+          if (lFlags?.manifestUrl || lFlags?.inlineManifest || lFlags?.enabled === false) continue;
+          await lvl.update({ [`flags.${MODULE_ID}.enabled`]: false });
+        }
       }
 
       scenePatch[`flags.${MODULE_ID}.enabled`] = true;
@@ -987,6 +1007,8 @@ function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelI
     ? doorStatesObj[dKey]
     : ((doorStatesObj && legacyDKey in doorStatesObj) ? doorStatesObj[legacyDKey] : undefined);
   const liveDs = normalizePersistedDoorState(rawLiveDs);
+  const rawExtra = kind === "d" ? raw?.[6] : raw?.[9];
+  const rawGid = (rawExtra && typeof rawExtra === "object" && rawExtra.gid) ? rawExtra.gid : undefined;
 
   if (wallEditsObj && Object.prototype.hasOwnProperty.call(wallEditsObj, wKey)) {
     const ov = wallEditsObj[wKey];
@@ -1002,7 +1024,8 @@ function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelI
       ds: ov.door ? (liveDs !== undefined ? liveDs : (ov.ds || 0)) : 0,
       doorSound: ov.doorSound || "",
       threshold: ov.threshold || null,
-      animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null
+      animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null,
+      gid: ov.gid || rawGid
     };
   }
   if (kind === "d") {
@@ -1018,7 +1041,8 @@ function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelI
       ds: liveDs !== undefined ? liveDs : (defaultDs || 0),
       doorSound: extra?.doorSound || "",
       threshold: extra?.threshold || null,
-      animation: (extra?.animation?.type && extra?.animation?.texture) ? extra.animation : null
+      animation: (extra?.animation?.type && extra?.animation?.texture) ? extra.animation : null,
+      gid: extra?.gid || undefined
     };
   }
   const [x1, y1, x2, y2, move, sight, light, sound, dir, extra] = raw;
@@ -1033,7 +1057,8 @@ function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelI
     ds: 0,
     doorSound: "",
     threshold: extra?.threshold || null,
-    animation: null
+    animation: null,
+    gid: extra?.gid || undefined
   };
 }
 
@@ -1047,6 +1072,7 @@ function encodeWallToSector(seg) {
     if (seg.sound !== undefined && seg.sound !== 20) extra.sound = seg.sound;
     if (seg.dir) extra.dir = seg.dir;
     if (seg.doorSound) extra.doorSound = seg.doorSound;
+    if (seg.gid) extra.gid = seg.gid;
     if (seg.animation?.type && seg.animation?.texture) extra.animation = { ...seg.animation };
     if (seg.threshold && (seg.threshold.light || seg.threshold.sight || seg.threshold.sound)) {
       extra.threshold = { ...seg.threshold };
@@ -1059,9 +1085,12 @@ function encodeWallToSector(seg) {
     };
   }
   const tuple = [x1, y1, x2, y2, seg.move, seg.sight, seg.light, seg.sound, seg.dir || 0];
+  const extra = {};
   if (seg.threshold && (seg.threshold.light || seg.threshold.sight || seg.threshold.sound)) {
-    tuple.push({ threshold: { ...seg.threshold } });
+    extra.threshold = { ...seg.threshold };
   }
+  if (seg.gid) extra.gid = seg.gid;
+  if (Object.keys(extra).length) tuple.push(extra);
   return { kind: "w", tuple };
 }
 
@@ -1144,6 +1173,7 @@ function encodeLightTuple(item) {
 
 function resolveSoundItem(sk, idx, raw, soundEditsObj, defaultElev) {
   const sKey = `${sk}:s:${idx}`;
+  const rawGid = (raw?.[10] && typeof raw[10] === "object" && raw[10].gid) ? raw[10].gid : undefined;
   if (soundEditsObj && Object.prototype.hasOwnProperty.call(soundEditsObj, sKey)) {
     const ov = soundEditsObj[sKey];
     if (ov === null) return null;
@@ -1158,7 +1188,8 @@ function resolveSoundItem(sk, idx, raw, soundEditsObj, defaultElev) {
       darkMin: ov.darkMin ?? 0,
       darkMax: ov.darkMax ?? 1,
       elevation: Number.isFinite(ov.elevation) ? ov.elevation : defaultElev,
-      hidden: Boolean(ov.hidden)
+      hidden: Boolean(ov.hidden),
+      gid: ov.gid || rawGid
     };
   }
   const [x, y, radius, path, volume, walls, easing, darkMin, darkMax, customElev, extra] = raw;
@@ -1174,7 +1205,8 @@ function resolveSoundItem(sk, idx, raw, soundEditsObj, defaultElev) {
     darkMin: darkMin ?? 0,
     darkMax: darkMax ?? 1,
     elevation: Number.isFinite(customElev) ? customElev : defaultElev,
-    hidden: Boolean(ex?.hidden)
+    hidden: Boolean(ex?.hidden),
+    gid: ex?.gid || undefined
   };
 }
 
@@ -1191,7 +1223,10 @@ function encodeSoundTuple(item) {
     item.darkMax ?? 1,
     item.elevation
   ];
-  if (item.hidden) row.push({ hidden: true });
+  const extra = {};
+  if (item.hidden) extra.hidden = true;
+  if (item.gid) extra.gid = item.gid;
+  if (Object.keys(extra).length) row.push(extra);
   return row;
 }
 
@@ -1384,6 +1419,36 @@ export function mergeEditsIntoLevelSpec(spec, {
   let lights = 0;
   let sounds = 0;
 
+  const pushWallSeg = (seg) => {
+    const [x1, y1, x2, y2] = seg.c;
+    if (!seg.door) {
+      const segLen = Math.hypot(x2 - x1, y2 - y1);
+      const parts = segLen > simSectorPx ? Math.ceil(segLen / simSectorPx) : 1;
+      if (parts > 1) {
+        for (let pi = 0; pi < parts; pi++) {
+          const t0 = pi / parts;
+          const t1 = (pi + 1) / parts;
+          const ax = pi === 0 ? x1 : Math.round(x1 + (x2 - x1) * t0);
+          const ay = pi === 0 ? y1 : Math.round(y1 + (y2 - y1) * t0);
+          const bx = pi === parts - 1 ? x2 : Math.round(x1 + (x2 - x1) * t1);
+          const by = pi === parts - 1 ? y2 : Math.round(y1 + (y2 - y1) * t1);
+          const dst = ensureSec(Math.floor(((ax + bx) * 0.5) / simSectorPx), Math.floor(((ay + by) * 0.5) / simSectorPx));
+          const subGid = seg.gid ? `${seg.gid}:${pi}` : undefined;
+          const enc = encodeWallToSector({ ...seg, c: [ax, ay, bx, by], gid: subGid });
+          dst[enc.kind].push(enc.tuple);
+          walls++;
+        }
+        return;
+      }
+    }
+    const cx = (x1 + x2) * 0.5;
+    const cy = (y1 + y2) * 0.5;
+    const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
+    const enc = encodeWallToSector(seg);
+    dst[enc.kind].push(enc.tuple);
+    walls++;
+  };
+
   const oldSectors = spec.sectors || {};
   for (const [sk, sec] of Object.entries(oldSectors)) {
     if (!sec) continue;
@@ -1391,34 +1456,6 @@ export function mergeEditsIntoLevelSpec(spec, {
       const target = (newSectors[sk] ??= { w: [], d: [], l: [], t: [], o: [], s: [] });
       target.o.push(...sec.o);
     }
-    const pushWallSeg = (seg) => {
-      const [x1, y1, x2, y2] = seg.c;
-      if (!seg.door) {
-        const segLen = Math.hypot(x2 - x1, y2 - y1);
-        const parts = segLen > simSectorPx ? Math.ceil(segLen / simSectorPx) : 1;
-        if (parts > 1) {
-          for (let pi = 0; pi < parts; pi++) {
-            const t0 = pi / parts;
-            const t1 = (pi + 1) / parts;
-            const ax = pi === 0 ? x1 : Math.round(x1 + (x2 - x1) * t0);
-            const ay = pi === 0 ? y1 : Math.round(y1 + (y2 - y1) * t0);
-            const bx = pi === parts - 1 ? x2 : Math.round(x1 + (x2 - x1) * t1);
-            const by = pi === parts - 1 ? y2 : Math.round(y1 + (y2 - y1) * t1);
-            const dst = ensureSec(Math.floor(((ax + bx) * 0.5) / simSectorPx), Math.floor(((ay + by) * 0.5) / simSectorPx));
-            const enc = encodeWallToSector({ ...seg, c: [ax, ay, bx, by] });
-            dst[enc.kind].push(enc.tuple);
-            walls++;
-          }
-          return;
-        }
-      }
-      const cx = (x1 + x2) * 0.5;
-      const cy = (y1 + y2) * 0.5;
-      const dst = ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx));
-      const enc = encodeWallToSector(seg);
-      dst[enc.kind].push(enc.tuple);
-      walls++;
-    };
     if (sec.w?.length) {
       for (let wi = 0; wi < sec.w.length; wi++) {
         const seg = resolveWallItem(sk, "w", wi, sec.w[wi], wEdits, dStates, levelId);
@@ -1468,10 +1505,21 @@ export function mergeEditsIntoLevelSpec(spec, {
     for (const sec of Object.values(nativeSpatial.sectors || {})) {
       if (!sec) continue;
       for (const w of sec.w || []) {
-        const cx = (w[0] + w[2]) * 0.5;
-        const cy = (w[1] + w[3]) * 0.5;
-        ensureSec(Math.floor(cx / simSectorPx), Math.floor(cy / simSectorPx)).w.push(w);
-        walls++;
+        const [x1, y1, x2, y2, move, sight, light, sound, dir, extra] = w;
+        pushWallSeg({
+          c: [x1, y1, x2, y2],
+          move: move ?? 20,
+          sight: sight ?? 20,
+          light: light ?? 20,
+          sound: sound ?? 20,
+          dir: dir || 0,
+          door: 0,
+          ds: 0,
+          doorSound: "",
+          threshold: extra?.threshold || null,
+          animation: null,
+          gid: extra?.gid || undefined
+        });
       }
       for (const d of sec.d || []) {
         const cx = (d[0] + d[2]) * 0.5;
@@ -1538,9 +1586,11 @@ export function extractNativeDocsFromLevelSpec(spec, {
   const dStates = toPlainEditRecord(doorStates);
 
   const walls = [];
+  const wallGids = [];
   const lights = [];
   const lightGids = [];
   const sounds = [];
+  const soundGids = [];
   const tiles = [];
   const tileGids = [];
 
@@ -1549,13 +1599,19 @@ export function extractNativeDocsFromLevelSpec(spec, {
     if (sec.w?.length) {
       for (let wi = 0; wi < sec.w.length; wi++) {
         const seg = resolveWallItem(sk, "w", wi, sec.w[wi], wEdits, dStates, levelId);
-        if (seg) walls.push(virtualWallToDocData(seg, targetLevelId));
+        if (seg) {
+          walls.push(virtualWallToDocData(seg, targetLevelId));
+          wallGids.push(seg.gid || null);
+        }
       }
     }
     if (sec.d?.length) {
       for (let di = 0; di < sec.d.length; di++) {
         const seg = resolveWallItem(sk, "d", di, sec.d[di], wEdits, dStates, levelId);
-        if (seg) walls.push(virtualWallToDocData(seg, targetLevelId));
+        if (seg) {
+          walls.push(virtualWallToDocData(seg, targetLevelId));
+          wallGids.push(seg.gid || null);
+        }
       }
     }
     if (sec.l?.length) {
@@ -1570,7 +1626,10 @@ export function extractNativeDocsFromLevelSpec(spec, {
     if (sec.s?.length) {
       for (let si = 0; si < sec.s.length; si++) {
         const item = resolveSoundItem(sk, si, sec.s[si], sEdits, baseElevation + 5);
-        if (item) sounds.push(virtualSoundToDocData(item, targetLevelId));
+        if (item) {
+          sounds.push(virtualSoundToDocData(item, targetLevelId));
+          soundGids.push(item.gid || null);
+        }
       }
     }
   }
@@ -1584,14 +1643,18 @@ export function extractNativeDocsFromLevelSpec(spec, {
     }
   }
 
-  return { walls, lights, lightGids, sounds, tiles, tileGids };
+  return { walls, wallGids, lights, lightGids, sounds, soundGids, tiles, tileGids };
 }
 
-function getSceneManifestInfo(scene) {
+export function getSceneManifestInfo(scene) {
   const cfg = scene?.flags?.[MODULE_ID] || {};
+  const hasAnyLevelManifest = Array.from(scene?.levels || []).some(l => {
+    const lc = l?.flags?.[MODULE_ID];
+    return Boolean(lc?.manifestUrl || lc?.inlineManifest);
+  });
   return {
     cfg,
-    sceneManifestUrl: cfg.manifestUrl || (cfg.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : ""),
+    sceneManifestUrl: cfg.manifestUrl || ((cfg.enabled && !hasAnyLevelManifest) ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : ""),
     sceneLevelId: cfg.levelId || null
   };
 }
@@ -1956,7 +2019,9 @@ export async function bakeSceneEditsToManifest(controller, scene, {
       const levelFallback = `${fallbackDir}/lvl_${i}_${slugifyPathPart(lvl.name, "lvl")}_${lid.slice(0, 6)}`;
       const { entry, redirected } = await getOrCreateFileEntry(lcfg.manifestUrl, levelFallback);
       const rawManifest = entry.manifest;
-      const targetSpec = rawManifest.levels?.[lid] || rawManifest;
+      const isMultiLevel = Boolean(rawManifest.levels && typeof rawManifest.levels === "object");
+      const targetSpec = isMultiLevel ? (rawManifest.levels[lid] || null) : rawManifest;
+      if (!targetSpec) continue;
       if (targetSpec.chunks?.baseUrl || targetSpec.superGrid) {
         throw new Error("Chunked and superGrid manifests cannot be edited in place.");
       }
@@ -1972,7 +2037,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         nativeSpatial
       });
       attachBakedPolysIfPossible(merged.spec, scene, lvl);
-      entry.manifest = rawManifest.levels?.[lid]
+      entry.manifest = isMultiLevel
         ? { ...rawManifest, levels: { ...rawManifest.levels, [lid]: merged.spec } }
         : merged.spec;
       entry.levelTargets.push({ lvl, origUrl: lcfg.manifestUrl, redirected });
@@ -2100,7 +2165,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         await ensureDirectoryRecursive(w.dir);
         const file = new File([JSON.stringify(w.manifest)], w.filename, { type: "application/json" });
         const upRes = await uploadFileSilent(w.dir, file);
-        const finalUrl = upRes?.path || `${w.dir}/${w.filename}`;
+        const finalUrl = upRes?.path || `${encodePathSegments(w.dir)}/${encodeURIComponent(w.filename)}`;
         for (const origUrl of w.origUrls) controller.manifestCache?.delete?.(origUrl);
         controller.manifestCache?.delete?.(finalUrl);
         const cleanFinal = String(finalUrl || "").split("?")[0].replace(/^\/+/, "");
@@ -2167,6 +2232,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
   }
 
   Object.assign(scenePatch, buildLevelEditClearPatch(prevFlags, editedLevelIds));
+  scenePatch[`flags.${MODULE_ID}.manifestRev`] = Math.max(Date.now(), (Number(prevFlags.manifestRev) || 0) + 1);
   if (Object.keys(scenePatch).length) {
     await scene.update(scenePatch);
   }
@@ -2213,14 +2279,9 @@ export async function unbakeSceneFromBoundless(controller, scene, {
   const srcLevels = Array.from(scene.levels || []);
   const prevFlags = scene.flags?.[MODULE_ID] || {};
 
-  // 1. Load manifests and resolve per-level specs before cloning so unsupported formats fail cleanly
+  // 1. Load manifests lazily and resolve per-level specs before cloning so unsupported formats fail cleanly
   let sceneManifest = null;
-  if (cfg.enabled && sceneManifestUrl) {
-    sceneManifest = await fetchManifestJson(sceneManifestUrl, signal);
-    if (sceneManifest.chunks?.baseUrl || sceneManifest.superGrid) {
-      throw new Error("Chunked and superGrid scenes are too large to unbake into native Foundry documents.");
-    }
-  }
+  let sceneManifestLoaded = false;
 
   const defaultFlatLevelId = sceneLevelId
     || (typeof scene.initialLevel === "string" ? scene.initialLevel : scene.initialLevel?.id)
@@ -2240,11 +2301,20 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     } else if (lcfg?.manifestUrl) {
       const lm = await fetchManifestJson(lcfg.manifestUrl, signal);
       spec = (lm.levels && typeof lm.levels === "object") ? (lm.levels[lvl.id] || null) : lm;
-    } else if (cfg.enabled && sceneManifest) {
-      if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
-        spec = sceneManifest.levels[lvl.id] || null;
-      } else if (lvl.id === defaultFlatLevelId) {
-        spec = sceneManifest;
+    } else if (cfg.enabled && sceneManifestUrl) {
+      if (!sceneManifestLoaded) {
+        sceneManifest = await fetchManifestJson(sceneManifestUrl, signal);
+        sceneManifestLoaded = true;
+        if (sceneManifest.chunks?.baseUrl || sceneManifest.superGrid) {
+          throw new Error("Chunked and superGrid scenes are too large to unbake into native Foundry documents.");
+        }
+      }
+      if (sceneManifest) {
+        if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
+          spec = sceneManifest.levels[lvl.id] || null;
+        } else if (lvl.id === defaultFlatLevelId) {
+          spec = sceneManifest;
+        }
       }
     }
     if (!spec) continue;
@@ -2264,6 +2334,8 @@ export async function unbakeSceneFromBoundless(controller, scene, {
   let didUnmountActive = false;
   const levelIdMap = new Map();
   const createdDocIds = { Tile: [], Wall: [], AmbientLight: [], AmbientSound: [] };
+  const modifiedLevelsRollback = [];
+  let savedSceneFlagsForRollback = null;
 
   try {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -2290,7 +2362,9 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     const allLights = [];
     const allSounds = [];
     const allTiles = [];
+    const wallsByGid = new Map();
     const lightsByGid = new Map();
+    const soundsByGid = new Map();
     const tilesByGid = new Map();
     const docSigWithoutLevels = (doc) => {
       const copy = { ...doc };
@@ -2320,7 +2394,20 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         tileEdits: prevFlags.tileEdits?.[srcLid],
         doorStates: prevFlags.doorStates
       });
-      allWalls.push(...extracted.walls);
+      for (let wi = 0; wi < extracted.walls.length; wi++) {
+        const doc = extracted.walls[wi];
+        const gid = extracted.wallGids?.[wi];
+        if (gid) {
+          const mergeKey = `${gid}\0${docSigWithoutLevels(doc)}`;
+          const prevDoc = wallsByGid.get(mergeKey);
+          if (prevDoc) {
+            if (!prevDoc.levels.includes(dstLid)) prevDoc.levels.push(dstLid);
+            continue;
+          }
+          wallsByGid.set(mergeKey, doc);
+        }
+        allWalls.push(doc);
+      }
       for (let li = 0; li < extracted.lights.length; li++) {
         const doc = extracted.lights[li];
         const gid = extracted.lightGids?.[li];
@@ -2335,7 +2422,20 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         }
         allLights.push(doc);
       }
-      allSounds.push(...extracted.sounds);
+      for (let si = 0; si < extracted.sounds.length; si++) {
+        const doc = extracted.sounds[si];
+        const gid = extracted.soundGids?.[si];
+        if (gid) {
+          const mergeKey = `${gid}\0${docSigWithoutLevels(doc)}`;
+          const prevDoc = soundsByGid.get(mergeKey);
+          if (prevDoc) {
+            if (!prevDoc.levels.includes(dstLid)) prevDoc.levels.push(dstLid);
+            continue;
+          }
+          soundsByGid.set(mergeKey, doc);
+        }
+        allSounds.push(doc);
+      }
       for (let ti = 0; ti < extracted.tiles.length; ti++) {
         const doc = extracted.tiles[ti];
         const gid = extracted.tileGids?.[ti];
@@ -2354,13 +2454,17 @@ export async function unbakeSceneFromBoundless(controller, scene, {
       if (restoreImages) {
         const lvlPatch = {};
         const lvlSlug = slugifyPathPart(dstLevel.name, dstLid.slice(0, 6));
-        if (!dstLevel.background?.src && spec.pyramidBaseUrl) {
+        const srcLcfg = srcLevel.flags?.[MODULE_ID] || {};
+        const bgPyramidUrl = srcLcfg.pyramidBaseUrl || spec.pyramidBaseUrl;
+        const fgPyramidUrl = srcLcfg.foregroundPyramidBaseUrl || spec.foregroundPyramidBaseUrl;
+        const effectiveBounds = srcLcfg.bounds || spec.bounds || null;
+        if (!dstLevel.background?.src && bgPyramidUrl) {
           const blob = await stitchPyramidToWebp({
-            pyramidBaseUrl: spec.pyramidBaseUrl,
+            pyramidBaseUrl: bgPyramidUrl,
             maxZoomZ: spec.maxZoomZ ?? 0,
             worldPx: spec.worldPx || targetScene.width || 4096,
             tilePx: spec.tilePx || TILE_PX,
-            bounds: spec.bounds || null,
+            bounds: effectiveBounds,
             maxDim: maxImageDim,
             signal
           });
@@ -2373,13 +2477,13 @@ export async function unbakeSceneFromBoundless(controller, scene, {
             if (Number.isFinite(spec.backgroundAlphaThreshold)) lvlPatch["background.alphaThreshold"] = spec.backgroundAlphaThreshold;
           }
         }
-        if (!dstLevel.foreground?.src && spec.foregroundPyramidBaseUrl) {
+        if (!dstLevel.foreground?.src && fgPyramidUrl) {
           const fgBlob = await stitchPyramidToWebp({
-            pyramidBaseUrl: spec.foregroundPyramidBaseUrl,
+            pyramidBaseUrl: fgPyramidUrl,
             maxZoomZ: spec.foregroundMaxZoomZ ?? spec.maxZoomZ ?? 0,
             worldPx: spec.worldPx || targetScene.width || 4096,
             tilePx: spec.tilePx || TILE_PX,
-            bounds: spec.bounds || null,
+            bounds: effectiveBounds,
             sparseTiles: spec.foregroundTiles || null,
             maxDim: maxImageDim,
             signal
@@ -2444,18 +2548,45 @@ export async function unbakeSceneFromBoundless(controller, scene, {
 
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-    // 5. Commit restored level textures and clear Boundless flags from levels & scene
+    // 5. Commit restored level textures and clear Boundless flags from levels & scene without triggering mid-unbake remounts
     report(93, game.i18n.localize("BOUNDLESS.Baker.StepUpdatingScene"));
+    const patchByLevelId = new Map();
     for (const { dstLevel, lvlPatch } of pendingLevelPatches) {
-      await dstLevel.update(lvlPatch);
+      patchByLevelId.set(dstLevel.id, { lvl: dstLevel, patch: { ...lvlPatch } });
     }
     for (const lvl of targetScene.levels || []) {
       if (lvl.flags?.[MODULE_ID]) {
-        await lvl.update({ [`flags.-=${MODULE_ID}`]: null });
+        const entry = patchByLevelId.get(lvl.id) || { lvl, patch: {} };
+        entry.patch[`flags.-=${MODULE_ID}`] = null;
+        patchByLevelId.set(lvl.id, entry);
       }
     }
-    if (targetScene.flags?.[MODULE_ID]) {
-      await targetScene.update({ [`flags.-=${MODULE_ID}`]: null });
+
+    const prevSuppress = Boolean(controller?._suppressAutoMount);
+    if (controller) controller._suppressAutoMount = true;
+    try {
+      if (targetScene.flags?.[MODULE_ID]) {
+        if (!createCopy) {
+          savedSceneFlagsForRollback = foundry.utils.deepClone(targetScene.flags[MODULE_ID]);
+        }
+        await targetScene.update({ [`flags.-=${MODULE_ID}`]: null });
+      }
+      for (const { lvl, patch } of patchByLevelId.values()) {
+        if (!createCopy) {
+          const rollback = {};
+          for (const key of Object.keys(patch)) {
+            if (key === `flags.-=${MODULE_ID}`) {
+              if (lvl.flags?.[MODULE_ID]) rollback[`flags.${MODULE_ID}`] = foundry.utils.deepClone(lvl.flags[MODULE_ID]);
+            } else {
+              rollback[key] = foundry.utils.getProperty(lvl, key);
+            }
+          }
+          modifiedLevelsRollback.push({ lvl, rollback });
+        }
+        await lvl.update(patch);
+      }
+    } finally {
+      if (controller) controller._suppressAutoMount = prevSuppress;
     }
 
     if (!createCopy) {
@@ -2488,6 +2619,20 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         if (createdDocIds[docName].length) {
           try { await targetScene.deleteEmbeddedDocuments(docName, createdDocIds[docName]); } catch {}
         }
+      }
+      const prevSuppress = Boolean(controller?._suppressAutoMount);
+      if (controller) controller._suppressAutoMount = true;
+      try {
+        for (const { lvl, rollback } of modifiedLevelsRollback) {
+          if (Object.keys(rollback).length) {
+            try { await lvl.update(rollback); } catch {}
+          }
+        }
+        if (savedSceneFlagsForRollback) {
+          try { await targetScene.update({ [`flags.${MODULE_ID}`]: savedSceneFlagsForRollback }); } catch {}
+        }
+      } finally {
+        if (controller) controller._suppressAutoMount = prevSuppress;
       }
       if (didUnmountActive && globalThis.canvas?.ready && canvas.scene?.id === targetScene.id && !controller?.active) {
         try { await controller.mount(targetScene); } catch {}

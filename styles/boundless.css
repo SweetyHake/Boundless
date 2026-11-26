@@ -50,8 +50,11 @@
 .boundless-poi-menu-item {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
   width: 100%;
+  height: auto;
+  min-height: 0;
   padding: 5px 8px;
   margin: 0;
   border: none;
@@ -63,6 +66,11 @@
   text-align: left;
   cursor: pointer;
   transition: background 110ms ease, color 110ms ease;
+}
+
+.boundless-poi-menu-item:focus {
+  outline: none;
+  box-shadow: none;
 }
 
 .boundless-poi-menu-item i {
@@ -92,7 +100,7 @@
   top: 58px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 25;
+  z-index: 35;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -135,6 +143,7 @@
   background: transparent;
   pointer-events: auto;
   cursor: pointer;
+  transition: none;
   will-change: transform;
   outline: none;
   box-shadow: none;

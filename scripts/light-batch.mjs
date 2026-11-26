@@ -1247,39 +1247,7 @@ export class MegaLightBatch {
         const rows = sg.rows || 1;
         const regionPx = sg.regionPx || 100000;
 
-        const baseSectorEdges = new Map();
-        for (const [bsk, bsec] of Object.entries(baseSectors)) {
-          const arr = [];
-          if (bsec.w) {
-            for (let wi = 0; wi < bsec.w.length; wi++) {
-              const w = bsec.w[wi];
-              if (w[6] === 0) continue;
-              const wEx = w[9] && typeof w[9] === "object" ? w[9] : null;
-              const threshold = buildEdgeThresholdPx(wEx?.threshold, pxPerFt);
-              arr.push(new EdgeCls({ x: w[0], y: w[1] }, { x: w[2], y: w[3] }, {
-                id: `sgw_${levelId}_${bsk}_${wi}`, type: "wall",
-                move: w[4], sight: w[5], light: w[6], darkness: w[6], sound: w[7], direction: w[8] || 0,
-                ...(threshold ? { threshold } : {})
-              }));
-            }
-          }
-          if (bsec.d) {
-            for (let di = 0; di < bsec.d.length; di++) {
-              const d = bsec.d[di];
-              if (d[5] === 1) continue;
-              const dEx = d[6] && typeof d[6] === "object" ? d[6] : null;
-              const dLight = dEx?.light ?? 20;
-              if (dLight === 0) continue;
-              const threshold = buildEdgeThresholdPx(dEx?.threshold, pxPerFt);
-              arr.push(new EdgeCls({ x: d[0], y: d[1] }, { x: d[2], y: d[3] }, {
-                id: `sgd_${levelId}_${bsk}_${di}`, type: "wall",
-                move: dEx?.move ?? 20, sight: dEx?.sight ?? 20, light: dLight, darkness: dLight, sound: dEx?.sound ?? 20, direction: dEx?.dir ?? 0,
-                ...(threshold ? { threshold } : {})
-              }));
-            }
-          }
-          if (arr.length) baseSectorEdges.set(bsk, arr);
-        }
+        const baseSectorEdges = buildSectorEdgeMap(baseSectors, levelId, pxPerFt, EdgeCls, null, sgBaseSectorPx);
 
         const baseOuterBounds = [
           new EdgeCls({ x: 0, y: 0 }, { x: regionPx, y: 0 }, { id: "sgb_t", type: "outerBounds" }),
@@ -1316,14 +1284,7 @@ export class MegaLightBatch {
         for (const [bsk, bsec] of Object.entries(baseSectors)) {
           if (!bsec?.l?.length) continue;
           const [bsx, bsy] = bsk.split("_").map(Number);
-          const localEdges = [];
-          for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-              const arr = baseSectorEdges.get(`${bsx + dx}_${bsy + dy}`);
-              if (arr) for (const e of arr) localEdges.push(e);
-            }
-          }
-          baseEdgeStore._list = localEdges;
+          const localEdges = collectEdgesInRadius(baseSectorEdges, [], 0, 0, 0, 0, bsx, bsy);
 
           const bakedLights = [];
           for (let li = 0; li < bsec.l.length; li++) {
@@ -1350,9 +1311,14 @@ export class MegaLightBatch {
             }
             const basePhase = Math.abs(Math.sin(lx * 0.0137 + ly * 0.0193 + elevation * 0.31) * 100.0);
 
+            const lightEdges = (sgBaseSectorPx > 0 && (dimPx > sgBaseSectorPx || Math.floor(lx / sgBaseSectorPx) !== bsx || Math.floor(ly / sgBaseSectorPx) !== bsy))
+              ? collectEdgesInRadius(baseSectorEdges, [], lx, ly, dimPx, sgBaseSectorPx, bsx, bsy)
+              : localEdges;
+            baseEdgeStore._list = lightEdges;
+
             let hasNearbyWall = false;
             if (useWalls) {
-              for (const e of localEdges) {
+              for (const e of lightEdges) {
                 if (Math.max(e.a.x, e.b.x) >= lx - dimPx && Math.min(e.a.x, e.b.x) <= lx + dimPx &&
                     Math.max(e.a.y, e.b.y) >= ly - dimPx && Math.min(e.a.y, e.b.y) <= ly + dimPx) {
                   hasNearbyWall = true;
@@ -1864,6 +1830,7 @@ export class MegaLightBatch {
       return { computed: 0, skipped: 0, aborted: true };
     }
     if (curSceneId) this._polyCacheSceneId = curSceneId;
+    const cacheGen = this._polyCacheGen || 0;
 
     const levelId = level.id;
     const sectors = spec.sectors;
@@ -1904,7 +1871,7 @@ export class MegaLightBatch {
     let sliceStart = performance.now();
 
     for (const [sk, sec] of Object.entries(sectors)) {
-      if (shouldAbort?.() || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
+      if (shouldAbort?.() || (this._polyCacheGen || 0) !== cacheGen || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
         return { computed, skipped, aborted: true };
       }
       if (!sec?.l?.length) continue;
@@ -1931,7 +1898,7 @@ export class MegaLightBatch {
       };
 
       for (let li = 0; li < sec.l.length; li++) {
-        if (shouldAbort?.() || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
+        if (shouldAbort?.() || (this._polyCacheGen || 0) !== cacheGen || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
           return { computed, skipped, aborted: true };
         }
         const raw = sec.l[li];
@@ -1999,7 +1966,10 @@ export class MegaLightBatch {
       }
     }
 
-    if (computed > 0 && curSceneId && !shouldAbort?.()) {
+    if (shouldAbort?.() || (this._polyCacheGen || 0) !== cacheGen || (curSceneId && this._polyCacheSceneId !== curSceneId)) {
+      return { computed, skipped, aborted: true };
+    }
+    if (computed > 0 && curSceneId) {
       this._hydratedPolyLevels.add(levelId);
       await this.persistPolyCacheToDB(worldId, curSceneId, [levelId]).catch(() => {});
     }
@@ -2070,11 +2040,12 @@ export class MegaLightBatch {
   }
 
   _cullBatch(batch, x0, y0, x1, y1, allowVisible) {
-    if (!batch?.indexBuffer || !batch.illumMesh || !batch.colorMesh) return;
+    if (!batch?.indexBuffer || !batch.illumMesh || !batch.colorMesh) return false;
+    const prevVis = Boolean(batch.illumMesh.visible || batch.colorMesh.visible);
     if (!allowVisible) {
       batch.illumMesh.visible = false;
       batch.colorMesh.visible = false;
-      return;
+      return prevVis;
     }
     const cb = batch._lastCullBox;
     const vw = x1 - x0;
@@ -2087,7 +2058,7 @@ export class MegaLightBatch {
       const hasVisible = batch.visibleIndexCount > 0 && batch.activeCount > 0;
       batch.illumMesh.visible = hasVisible;
       batch.colorMesh.visible = hasVisible;
-      return;
+      return hasVisible !== prevVis;
     }
     const HYST_PX = 450;
     const cx0 = x0 - HYST_PX;
@@ -2138,6 +2109,7 @@ export class MegaLightBatch {
     const hasVisible = batch.visibleIndexCount > 0 && batch.activeCount > 0;
     batch.illumMesh.visible = hasVisible;
     batch.colorMesh.visible = hasVisible;
+    return hasVisible !== prevVis;
   }
 
   /**
@@ -2725,13 +2697,14 @@ export class MegaLightBatch {
 
   _updateMacroCrossfade(scale) {
     const mb = this.macroBatch;
-    if (!mb) return;
+    if (!mb) return false;
+    const prevVis = Boolean(mb.illumMesh.visible || mb.colorMesh.visible);
     const effScale = getEffectiveScale(scale);
     const showMacro = effScale < 0.036;
     if (!showMacro) {
       mb.illumMesh.visible = false;
       mb.colorMesh.visible = false;
-      return;
+      return prevVis;
     }
     // Smoothly fade orbital glow out across [0.018..0.035] (in 100-PPI equivalent scale) once detailed chunks are mounted
     const targetAlpha = this.chunkBatches.size > 0
@@ -2745,6 +2718,7 @@ export class MegaLightBatch {
     const vis = targetAlpha > 0.01;
     mb.illumMesh.visible = vis;
     mb.colorMesh.visible = vis;
+    return vis !== prevVis;
   }
 
   hasVisibleLights() {
@@ -2774,21 +2748,25 @@ export class MegaLightBatch {
     const x1 = vp.x1 + LIGHT_PAD_WORLD_PX;
     const y1 = vp.y1 + LIGHT_PAD_WORLD_PX;
 
+    let visChanged = false;
     // 1. Orbital macro glow layer for chunked continental worlds (smooth crossfade out over [0.035..0.068])
     if (this.macroBatch) {
-      this._updateMacroCrossfade(vp.scale);
+      if (this._updateMacroCrossfade(vp.scale)) visChanged = true;
     }
 
     // 2. Streamed per-chunk detailed shadowed light batches (active when zoomed below orbital scale)
     if (this.chunkBatches.size > 0) {
       const showDetail = !this.macroBatch || getEffectiveScale(vp.scale) >= 0.020;
       for (const batch of this.chunkBatches.values()) {
-        this._cullBatch(batch, x0, y0, x1, y1, showDetail);
+        if (this._cullBatch(batch, x0, y0, x1, y1, showDetail)) visChanged = true;
       }
     }
 
     // 3. Monolithic single-buffer batch (classic 1000x1000 scenes)
-    if (!this.indexBuffer || !this.illumMesh || !this.colorMesh) return;
+    if (!this.indexBuffer || !this.illumMesh || !this.colorMesh) {
+      if (visChanged) this._onBatchChanged?.();
+      return;
+    }
     // O(1) hysteresis box check: skip sector scan & GPU indexBuffer re-pack while camera stays inside buffered cull box
     // Also rebuild when viewport shrinks significantly on Zoom-In so frustum culling stays tight!
     const cb = this._lastCullBox;
@@ -2799,6 +2777,7 @@ export class MegaLightBatch {
       x0 >= cb.x0 && y0 >= cb.y0 && x1 <= cb.x1 && y1 <= cb.y1 &&
       (cb.x1 - cb.x0) <= vw * 1.5 + 1800 && (cb.y1 - cb.y0) <= vh * 1.5 + 1800
     ) {
+      if (visChanged) this._onBatchChanged?.();
       return;
     }
     const HYST_PX = 450;
@@ -2822,6 +2801,7 @@ export class MegaLightBatch {
       }
     }
     if (this.lastVisKey && visCount === this._lastVisCount && h1 === this._lastVisH1 && h2 === this._lastVisH2) {
+      if (visChanged) this._onBatchChanged?.();
       return;
     }
     this._lastVisCount = visCount;
@@ -2846,15 +2826,18 @@ export class MegaLightBatch {
       }
     }
 
+    const prevMonoVis = Boolean(this.illumMesh.visible || this.colorMesh.visible);
     this.visibleIndexCount = cursor;
     this.illumMesh.size = cursor;
     this.colorMesh.size = cursor;
     const hasVisible = cursor > 0 && this.activeLightsCount > 0;
     this.illumMesh.visible = hasVisible;
     this.colorMesh.visible = hasVisible;
+    if (hasVisible !== prevMonoVis) visChanged = true;
     if (cursor > 0) {
       this.indexBuffer.update();
     }
+    if (visChanged) this._onBatchChanged?.();
   }
 
   _getEffectiveShaderTime() {
@@ -3091,8 +3074,7 @@ export class MegaLightBatch {
   }
 
   setLightWeight(lightId, weight) {
-    const resolvedId = this.resolveLightId(lightId);
-    const meta = this.lightMetaById.get(resolvedId);
+    const meta = this.lightMetaById.get(lightId) || this.lightMetaById.get(this.resolveLightId(lightId));
     if (!meta || (!meta.batch && !this.weightArray)) return;
     meta.baseWeight = Math.max(0, Math.min(1, weight));
     this._applyMetaEffectiveWeight(meta);
@@ -3113,6 +3095,7 @@ export class MegaLightBatch {
     this.bakedRoofRepeat = Boolean(repeat);
     this.bakedRoofElevation = Number.isFinite(roofElevation) ? roofElevation : Infinity;
     this.bakedRoofLevelId = roofLevelId || null;
+    this.invalidateUniformCache();
     this.syncDepthElevations(this.useDepthTexture);
     if ((this.useBakedRoofMask || prevUse) && (this.bakedRoofLevelId || prevRoofLevelId)) {
       this._refreshMultiLevelRoofMaskWeights();
@@ -3140,6 +3123,7 @@ export class MegaLightBatch {
 
   disposeBakedRoofMask() {
     const hadMultiLevelMask = Boolean(this.useBakedRoofMask && this.bakedRoofLevelId);
+    const hadRoofElev = Number.isFinite(this.bakedRoofElevation);
     this.useBakedRoofMask = false;
     this.bakedRoofElevation = Infinity;
     this.bakedRoofLevelId = null;
@@ -3147,6 +3131,8 @@ export class MegaLightBatch {
       this.bakedRoofMask.destroy(true);
     }
     this.bakedRoofMask = null;
+    this.invalidateUniformCache();
+    if (hadRoofElev) this.syncDepthElevations(this.useDepthTexture);
     if (hadMultiLevelMask) this._refreshMultiLevelRoofMaskWeights();
   }
 
@@ -3274,6 +3260,9 @@ export class MegaLightBatch {
     this._lastVp = null;
     this._depthElevCheckMap.clear();
     this._hasDarknessRangedLights = false;
+    this._resolveWallFn = null;
+    this._resolveLightFn = null;
+    this._getLevelCacheSigFn = null;
     this._isSuppressedFn = null;
     this._hasLevelEditsFn = null;
     this._onBatchChanged = null;

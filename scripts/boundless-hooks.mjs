@@ -316,10 +316,16 @@ export function registerBoundlessHooks(controller) {
   });
 
   Hooks.on("updateLevel", (level, changes) => {
+    if (controller._suppressAutoMount) return;
     const parentScene = level?.parent;
     if (!globalThis.canvas?.ready || !parentScene || parentScene.id !== globalThis.canvas.scene?.id) return;
+    const isForcedDel = (v) => Boolean(globalThis.foundry?.data?.operators?.ForcedDeletion && v instanceof foundry.data.operators.ForcedDeletion);
     const flagChanges = changes?.flags?.[MODULE_ID];
-    const flagDeleted = Boolean(changes?.flags && (`-=${MODULE_ID}` in changes.flags));
+    const flagDeleted = Boolean(
+      (changes?.flags && (`-=${MODULE_ID}` in changes.flags)) ||
+      flagChanges === null ||
+      isForcedDel(flagChanges)
+    );
     const elevChanged = Boolean(changes && "elevation" in changes && (controller.levelLayers?.has?.(level.id) || level.isVisible));
     if (flagChanges || flagDeleted || elevChanged) {
       controller.mount(parentScene);

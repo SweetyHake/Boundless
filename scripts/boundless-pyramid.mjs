@@ -398,6 +398,7 @@ export const pyramidMethods = {
         if (other !== layer && !other.level?.isView && isLevelAbove(layer.level, other.level)) {
           other.lastTileKey = "";
           other.lastPyramidKey = "";
+          other.lastForegroundPyramidKey = "";
           invalidatedLower = true;
         }
       }
@@ -409,6 +410,24 @@ export const pyramidMethods = {
     } catch (err) {
       console.warn(`${MODULE_ID} | Failed to build opacity mask for level "${layer.level?.name}":`, err);
     }
+  },
+
+  _isPointOccludedByUpperLevels(layer, wx, wy) {
+    if (!layer || layer.level?.isView || layer.isUpper) return false;
+    const layers = this.visibleLevelLayers;
+    if (!layers || layers.length < 2) return false;
+    for (let i = 0; i < layers.length; i++) {
+      const up = layers[i];
+      if (up === layer || !up.opacityMask || !isLevelAbove(up.level, layer.level)) continue;
+      const m = up.opacityMask;
+      const u = (wx - m.x0) / m.worldW;
+      const v = (wy - m.y0) / m.worldH;
+      if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+      const px = Math.min(m.w - 1, Math.max(0, Math.floor(u * m.w)));
+      const py = Math.min(m.h - 1, Math.max(0, Math.floor(v * m.h)));
+      if (m.alpha[py * m.w + px] >= 240) return true;
+    }
+    return false;
   },
 
   /**
@@ -1078,6 +1097,10 @@ export const pyramidMethods = {
       if (!tex || !isTextureUsable(tex)) {
         if (!e.ready) {
           this.tilesByKey.delete(spec.key);
+          if (!this.texMgr.missingSrcs.has(spec.src) && e.layer) {
+            if (e.channel === "fg") e.layer.lastForegroundPyramidKey = "";
+            else e.layer.lastPyramidKey = "";
+          }
           this._tilesDirty = true;
         }
         return;
@@ -1281,7 +1304,8 @@ export const pyramidMethods = {
         visHigher.push(other);
       }
     }
-    if (visHigher.length === 0) return false;
+    const isLowerLayer = Boolean(!layer.level?.isView && !layer.isUpper && this.visibleLevelLayers.length > 1);
+    if (visHigher.length === 0 && !isLowerLayer) return false;
     const rw = rx1 - rx0;
     const rh = ry1 - ry0;
     const fracs = [0.002, 0.25, 0.5, 0.75, 0.998];
@@ -1296,6 +1320,9 @@ export const pyramidMethods = {
             covered = true;
             break;
           }
+        }
+        if (!covered && isLowerLayer && this._isPointOccludedByUpperLevels(layer, px, py)) {
+          covered = true;
         }
         if (!covered) return false;
       }
@@ -1326,7 +1353,7 @@ export const pyramidMethods = {
         const fgZ0 = this.tilesByKey.get(`${lid}::fg::0_0_0`);
         // For sparse foreground pyramids, once targetZ > 0 and all visible desired fg tiles are ready
         // (even 0 tiles in an empty open-field area), hide the coarse z=0 fallback so walls never double-render.
-        let allVisDesiredFgReady = Boolean(stFg?.visDesiredReady);
+        let allVisDesiredFgReady = Boolean(layer.foregroundTileSet && stFg?.visDesiredReady);
         if (!stFg && layer.lastForegroundTargetZ > 0 && layer.foregroundTileSet) {
           allVisDesiredFgReady = true;
           for (const [, tile] of this.tilesByKey) {
@@ -1422,7 +1449,12 @@ export const pyramidMethods = {
     const rh = ry1 - ry0;
     const p0x = rx0 + rw * 0.25, p1x = rx0 + rw * 0.75;
     const p0y = ry0 + rh * 0.25, p1y = ry0 + rh * 0.75;
-    let c0 = false, c1 = false, c2 = false, c3 = false;
+    const isLowerLayer = Boolean(e.layer && !e.layer.level?.isView && !e.layer.isUpper && this.visibleLevelLayers.length > 1);
+    let c0 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p0x, p0y);
+    let c1 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p1x, p0y);
+    let c2 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p0x, p1y);
+    let c3 = isLowerLayer && this._isPointOccludedByUpperLevels(e.layer, p1x, p1y);
+    if (c0 && c1 && c2 && c3) return true;
     if (bucket) {
       for (let i = 0; i < bucket.length; i++) {
         const other = bucket[i];
@@ -2067,7 +2099,11 @@ export const pyramidMethods = {
           || (isFg
               ? Boolean(st?.visDesiredReady && curTargetZ > 0)
               : Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero && replacedByDesired));
-        if (canDropOld || !inVis || (st?.visDesiredReady && !st.hasVisDesiredNonZero && e.z > curTargetZ)) {
+        if (
+          canDropOld ||
+          !inVis ||
+          (st?.visDesiredReady && !st.hasVisDesiredNonZero && (e.z > curTargetZ || (!isFg && !e.layer?.level?.isView && !e.layer?.isUpper && replacedByDesired)))
+        ) {
           toDelete.push(k);
           anyPyramidSwapped = true;
           if (!isFg) anyBgPyramidSwapped = true;
