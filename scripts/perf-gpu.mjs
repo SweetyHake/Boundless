@@ -2095,9 +2095,10 @@ export function resolveLightingScalePreset(mode, perfMode = 2) {
   if (mode === "full" || mode === "balanced" || mode === "performance") {
     return LIGHTING_SCALE_PRESETS[mode];
   }
-  // "auto": keep illumination/darkness soft & cheap (visually indistinguishable), preserve coloration crispness
+  // "auto": 100% native 1.0x on High/Max (pixel-identical shadow edges), balanced on Medium, performance on Low
   if (perfMode <= 0) return LIGHTING_SCALE_PRESETS.performance;
-  return LIGHTING_SCALE_PRESETS.balanced;
+  if (perfMode === 1) return LIGHTING_SCALE_PRESETS.balanced;
+  return LIGHTING_SCALE_PRESETS.full;
 }
 
 const _origFilterResDescs = new WeakMap();

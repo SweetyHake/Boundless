@@ -119,7 +119,7 @@
       "LightShadersHint": "Replaces expensive procedural noise loops in animated light shaders with a precomputed lookup texture.",
       "LightingScale": "Lighting Effects Render Scale",
       "LightingScaleHint": "Scales internal resolution of soft illumination and darkness passes to reduce GPU load with minimal visual impact.",
-      "LightingScaleAuto": "Auto (Balanced quality and FPS)",
+      "LightingScaleAuto": "Auto (Follows Foundry performance mode)",
       "LightingScaleFull": "Full Resolution (No scaling)",
       "LightingScaleBalanced": "Balanced (Recommended for most maps)",
       "LightingScalePerformance": "Performance (Laptops and integrated GPUs)",

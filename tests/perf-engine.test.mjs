@@ -89,7 +89,8 @@ test("resolveLightingScalePreset returns expected multipliers", () => {
   assert.deepEqual(resolveLightingScalePreset("full", 2), { illumination: 1, coloration: 1, darkness: 1 });
   assert.deepEqual(resolveLightingScalePreset("performance", 2), { illumination: 0.4, coloration: 0.65, darkness: 0.45 });
   assert.deepEqual(resolveLightingScalePreset("auto", 0), { illumination: 0.4, coloration: 0.65, darkness: 0.45 });
-  assert.deepEqual(resolveLightingScalePreset("auto", 2), { illumination: 0.55, coloration: 0.85, darkness: 0.55 });
+  assert.deepEqual(resolveLightingScalePreset("auto", 1), { illumination: 0.55, coloration: 0.85, darkness: 0.55 });
+  assert.deepEqual(resolveLightingScalePreset("auto", 2), { illumination: 1, coloration: 1, darkness: 1 });
 });
 
 test("rectInRange accurately tests circle-rectangle intersection", () => {
