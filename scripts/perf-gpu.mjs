@@ -40,28 +40,40 @@ function getUiAtlas() {
 
   const canvasEl = document.createElement("canvas");
   canvasEl.width = 512;
-  canvasEl.height = 320;
+  canvasEl.height = 384;
   const ctx = canvasEl.getContext("2d");
   if (!ctx) return null;
 
-  // (A) Wall Line texture at (2, 2, 12, 36):
-  // Outer black border (top/bottom 12px each), inner white core (12px) so sprite.tint tints only the core!
-  ctx.clearRect(0, 0, 512, 320);
+  // (A) Wall Line texture at (0, 2, 16, 48):
+  // Exact 1/3 white core (16px) inside 48px black band -> matches Wall#_refreshLine (lw*3 black + lw color)
+  ctx.clearRect(0, 0, 512, 384);
   ctx.fillStyle = "rgba(0,0,0,1)";
-  ctx.fillRect(0, 2, 16, 36);
+  ctx.fillRect(0, 2, 16, 48);
   ctx.fillStyle = "rgba(255,255,255,1)";
-  ctx.fillRect(0, 14, 16, 12);
+  ctx.fillRect(0, 18, 16, 16);
 
-  // (B) Wall Endpoint circle at (32, 0, 64, 64):
-  // Black outer stroke, white interior so sprite.tint paints interior while border stays black!
+  // (B1) Wall Endpoint circle (normal cr = 3*lw -> outer 3.5*lw, inner 2.5*lw => 20/28 = 5/7) at (24, 0, 64, 64)
   ctx.save();
-  ctx.translate(64, 32);
+  ctx.translate(56, 32);
   ctx.beginPath();
-  ctx.arc(0, 0, 29, 0, Math.PI * 2);
+  ctx.arc(0, 0, 28, 0, Math.PI * 2);
   ctx.fillStyle = "rgba(0,0,0,1)";
   ctx.fill();
   ctx.beginPath();
-  ctx.arc(0, 0, 22, 0, Math.PI * 2);
+  ctx.arc(0, 0, 20, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,1)";
+  ctx.fill();
+  ctx.restore();
+
+  // (B2) Wall Endpoint circle (hover cr = 4*lw -> outer 4.5*lw, inner 3.5*lw => 21/27 = 7/9) at (24, 304, 64, 64)
+  ctx.save();
+  ctx.translate(56, 336);
+  ctx.beginPath();
+  ctx.arc(0, 0, 27, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,1)";
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0, 0, 21, 0, Math.PI * 2);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
   ctx.restore();
@@ -135,27 +147,26 @@ function getUiAtlas() {
   ctx.stroke();
   ctx.restore();
 
-  // (J) 3-slice Token Resource Bar Background capsule at (0, 240, 48, 24):
-  // Black 0.5 fill + 3px black outer border -> renders crisp rounded bar at any width via 3 sprites!
+  // (J) 3-slice Token Resource Bar Background capsule at (0, 240, 48, 18) — exact 2x of 9*s height (8*s rect + 1*s stroke, r=3*s)
   ctx.save();
-  roundedRectPath(1.5, 241.5, 45, 21, 7);
+  roundedRectPath(1, 241, 46, 16, 6);
   ctx.fillStyle = "rgba(0,0,0,0.5)";
   ctx.fill();
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(0,0,0,1)";
   ctx.stroke();
   ctx.restore();
 
-  // (K) 3-slice Token Resource Bar Fill capsule at (64, 240, 48, 24) + black border overlay at (128, 240, 48, 24)
+  // (K) 3-slice Token Resource Bar Fill capsule at (64, 240, 48, 18) + black border overlay at (128, 240, 48, 18) — exact 2x (r=2*s, lw=1*s)
   ctx.save();
-  roundedRectPath(65.5, 241.5, 45, 21, 5.5);
+  roundedRectPath(65, 241, 46, 16, 4);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
   ctx.restore();
 
   ctx.save();
-  roundedRectPath(129.5, 241.5, 45, 21, 5.5);
-  ctx.lineWidth = 3;
+  roundedRectPath(129, 241, 46, 16, 4);
+  ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(0,0,0,1)";
   ctx.stroke();
   ctx.restore();
@@ -177,8 +188,9 @@ function getUiAtlas() {
 
   _uiAtlas = {
     base,
-    wallLine: new PIXI.Texture(base, new PIXI.Rectangle(4, 2, 8, 36)),
-    wallDot: new PIXI.Texture(base, new PIXI.Rectangle(32, 0, 64, 64)),
+    wallLine: new PIXI.Texture(base, new PIXI.Rectangle(4, 2, 8, 48)),
+    wallDot: new PIXI.Texture(base, new PIXI.Rectangle(24, 0, 64, 64)),
+    wallDotHover: new PIXI.Texture(base, new PIXI.Rectangle(24, 304, 64, 64)),
     iconBg: new PIXI.Texture(base, new PIXI.Rectangle(104, 0, 92, 92)),
     iconBorder: new PIXI.Texture(base, new PIXI.Rectangle(204, 0, 92, 92)),
     doorBg: new PIXI.Texture(base, new PIXI.Rectangle(304, 0, 92, 92)),
@@ -186,15 +198,15 @@ function getUiAtlas() {
     softShadowCircle: new PIXI.Texture(base, new PIXI.Rectangle(0, 104, 128, 128)),
     solidCircle: new PIXI.Texture(base, new PIXI.Rectangle(136, 104, 128, 128)),
     circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(272, 104, 128, 128)),
-    barBgL: new PIXI.Texture(base, new PIXI.Rectangle(0, 240, 10, 24)),
-    barBgM: new PIXI.Texture(base, new PIXI.Rectangle(12, 240, 24, 24)),
-    barBgR: new PIXI.Texture(base, new PIXI.Rectangle(38, 240, 10, 24)),
-    barFillL: new PIXI.Texture(base, new PIXI.Rectangle(64, 240, 10, 24)),
-    barFillM: new PIXI.Texture(base, new PIXI.Rectangle(76, 240, 24, 24)),
-    barFillR: new PIXI.Texture(base, new PIXI.Rectangle(102, 240, 10, 24)),
-    barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 240, 10, 24)),
-    barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 240, 24, 24)),
-    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 240, 10, 24)),
+    barBgL: new PIXI.Texture(base, new PIXI.Rectangle(0, 240, 8, 18)),
+    barBgM: new PIXI.Texture(base, new PIXI.Rectangle(12, 240, 24, 18)),
+    barBgR: new PIXI.Texture(base, new PIXI.Rectangle(40, 240, 8, 18)),
+    barFillL: new PIXI.Texture(base, new PIXI.Rectangle(64, 240, 8, 18)),
+    barFillM: new PIXI.Texture(base, new PIXI.Rectangle(76, 240, 24, 18)),
+    barFillR: new PIXI.Texture(base, new PIXI.Rectangle(104, 240, 8, 18)),
+    barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 240, 8, 18)),
+    barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 240, 24, 18)),
+    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(168, 240, 8, 18)),
     effectBg: new PIXI.Texture(base, new PIXI.Rectangle(0, 272, 38, 38))
   };
   return _uiAtlas;
@@ -236,19 +248,18 @@ function makeEndpointsHitArea(x0, y0, x1, y1, r) {
 }
 
 function getWallLineWidth() {
-  const s = globalThis.canvas?.dimensions?.uiScale || 1;
-  return Math.max(2, Math.round(2 * s));
+  return 2 * (globalThis.canvas?.dimensions?.uiScale || 1);
 }
 
 function patchWallSprites() {
   const okLine = wrapFoundryMethod("Wall", "_refreshLine", function (wrapped) {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfWallSprites) {
+      if (this._blLineBg) this._blLineBg.visible = false;
       if (this._blLineSprite) this._blLineSprite.visible = false;
       if (this.line) this.line.hitArea = null;
       return wrapped();
     }
-    const atlas = getUiAtlas();
-    if (!atlas || !this.line || this.line.destroyed) return wrapped();
+    if (!globalThis.PIXI?.Texture?.WHITE || !this.line || this.line.destroyed) return wrapped();
 
     const c = this.document?.c;
     if (!c || c.length < 4) return wrapped();
@@ -256,23 +267,43 @@ function patchWallSprites() {
     const lw = getWallLineWidth();
 
     if (this.line.geometry?.graphicsData?.length) this.line.clear();
+    let bg = this._blLineBg;
+    if (!bg || bg.destroyed) {
+      bg = new PIXI.Sprite(PIXI.Texture.WHITE);
+      bg.anchor.set(0, 0.5);
+      bg.eventMode = "none";
+      bg.tint = 0x000000;
+      this._blLineBg = bg;
+      this.line.addChild(bg);
+    } else if (bg.parent !== this.line) {
+      this.line.addChild(bg);
+    }
     let sp = this._blLineSprite;
     if (!sp || sp.destroyed) {
-      sp = new PIXI.Sprite(atlas.wallLine);
+      sp = new PIXI.Sprite(PIXI.Texture.WHITE);
       sp.anchor.set(0, 0.5);
       sp.eventMode = "none";
       this._blLineSprite = sp;
+      this.line.addChild(sp);
+    } else if (sp.parent !== this.line) {
       this.line.addChild(sp);
     }
 
     const dx = c[2] - c[0];
     const dy = c[3] - c[1];
     const len = Math.hypot(dx, dy);
-    sp.visible = len > 0.1;
+    const vis = len > 0.1;
+    const rot = Math.atan2(dy, dx);
+    bg.visible = vis;
+    bg.position.set(c[0], c[1]);
+    bg.rotation = rot;
+    bg.width = len;
+    bg.height = lw * 3;
+    sp.visible = vis;
     sp.position.set(c[0], c[1]);
-    sp.rotation = Math.atan2(dy, dx);
+    sp.rotation = rot;
     sp.width = len;
-    sp.height = lw * 3;
+    sp.height = lw;
     sp.tint = wc;
 
     const hitPad = Math.max(6, lw * 2);
@@ -312,21 +343,28 @@ function patchWallSprites() {
     if (!c || c.length < 4) return wrapped();
     const wc = this._getWallColor();
     const lw = getWallLineWidth();
-    const cr = (this.hover || this.layer?.highlightObjects) ? lw * 4 : lw * 3;
-    const dia = (cr + lw * 0.6) * 2;
+    const isLarge = Boolean(this.hover || this.layer?.highlightObjects);
+    const cr = isLarge ? lw * 4 : lw * 3;
+    const dotTex = isLarge ? atlas.wallDotHover : atlas.wallDot;
+    // Exact outer radius = cr + 0.5*lw matching PIXI lineStyle(lw, alignment=0.5); atlas rOuter = 27 (hover) or 28 (normal) inside 64x64
+    const dia = (cr + lw * 0.5) * 2 * (32 / (isLarge ? 27 : 28));
 
     if (this.endpoints.geometry?.graphicsData?.length) this.endpoints.clear();
     if (!this._blEndA || this._blEndA.destroyed) {
-      this._blEndA = new PIXI.Sprite(atlas.wallDot);
+      this._blEndA = new PIXI.Sprite(dotTex);
       this._blEndA.anchor.set(0.5);
       this._blEndA.eventMode = "none";
       this.endpoints.addChild(this._blEndA);
+    } else if (this._blEndA.texture !== dotTex) {
+      this._blEndA.texture = dotTex;
     }
     if (!this._blEndB || this._blEndB.destroyed) {
-      this._blEndB = new PIXI.Sprite(atlas.wallDot);
+      this._blEndB = new PIXI.Sprite(dotTex);
       this._blEndB.anchor.set(0.5);
       this._blEndB.eventMode = "none";
       this.endpoints.addChild(this._blEndB);
+    } else if (this._blEndB.texture !== dotTex) {
+      this._blEndB.texture = dotTex;
     }
 
     this._blEndA.visible = true;
@@ -1018,7 +1056,7 @@ function layoutBar3Slice(sprites, x, y, w, h, tint = 0xffffff, visible = true) {
     l.visible = m.visible = r.visible = false;
     return;
   }
-  const capW = Math.min(w * 0.5, h * (10 / 24));
+  const capW = Math.min(w * 0.5, h * (8 / 18));
   const midW = Math.max(0, w - capW * 2);
   l.visible = true;
   l.position.set(x, y);
@@ -1072,19 +1110,23 @@ function ensureBar3SliceSprites(bar, atlas) {
 }
 
 function drawBatched3SliceBar(tok, number, bar, pct, colorVal) {
+  // Large (>=2-grid-tall) tokens use 12*s height with different radius/stroke ratios; keep them native Graphics for 1-to-1 parity
+  if ((tok.document?.height ?? 1) >= 2) return false;
   const atlas = getUiAtlas();
   if (!atlas || !bar || bar.destroyed) return false;
   if (bar.geometry?.graphicsData?.length) bar.clear();
   const size = tok.document?.getSize?.() ?? { width: tok.w || 100, height: tok.h || 100 };
   const s = globalThis.canvas?.dimensions?.uiScale || 1;
   const bw = size.width;
-  const bh = 8 * ((tok.document?.height ?? 1) >= 2 ? 1.5 : 1) * s;
+  const bh = 8 * s;
+  const halfS = 0.5 * s;
+  const totalH = bh + s;
   const g = ensureBar3SliceSprites(bar, atlas);
-  layoutBar3Slice(g.bg, 0, 0, bw, bh, 0xffffff, true);
-  const fillW = pct * bw;
-  const showFill = fillW > 0.5;
-  layoutBar3Slice(g.fill, 0, 0, fillW, bh, colorVal, showFill);
-  layoutBar3Slice(g.stroke, 0, 0, fillW, bh, 0xffffff, showFill);
+  layoutBar3Slice(g.bg, -halfS, -halfS, bw + s, totalH, 0xffffff, true);
+  const fillRaw = pct * bw;
+  const showFill = fillRaw > 0.5;
+  layoutBar3Slice(g.fill, -halfS, -halfS, fillRaw + s, totalH, colorVal, showFill);
+  layoutBar3Slice(g.stroke, -halfS, -halfS, fillRaw + s, totalH, 0xffffff, showFill);
   bar.position.set(0, number === 0 ? size.height - bh : 0);
   perfStats.tokenBarsCached++;
   return true;
