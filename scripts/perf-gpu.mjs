@@ -39,14 +39,14 @@ function getUiAtlas() {
   if (typeof document === "undefined" || !globalThis.PIXI) return null;
 
   const canvasEl = document.createElement("canvas");
-  canvasEl.width = 256;
-  canvasEl.height = 256;
+  canvasEl.width = 512;
+  canvasEl.height = 320;
   const ctx = canvasEl.getContext("2d");
   if (!ctx) return null;
 
   // (A) Wall Line texture at (2, 2, 12, 36):
   // Outer black border (top/bottom 12px each), inner white core (12px) so sprite.tint tints only the core!
-  ctx.clearRect(0, 0, 256, 256);
+  ctx.clearRect(0, 0, 512, 320);
   ctx.fillStyle = "rgba(0,0,0,1)";
   ctx.fillRect(0, 2, 16, 36);
   ctx.fillStyle = "rgba(255,255,255,1)";
@@ -66,75 +66,79 @@ function getUiAtlas() {
   ctx.fill();
   ctx.restore();
 
-  // Helper for rounded rect path
+  // Helper for rounded rect path (circular arcs matching PIXI.RoundedRectangle)
   const roundedRectPath = (x, y, w, h, r) => {
+    const rr = Math.min(r, w * 0.5, h * 0.5);
     ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
     ctx.closePath();
   };
 
-  // (C) ControlIcon / DoorControl Background rounded square at (104, 4, 60, 60): pure white (tintable)
-  roundedRectPath(104, 4, 60, 60, 8);
+  // (C) ControlIcon Background at (104, 0, 92, 92) — exact 2x of 46x46 canvas (3px pad + 40x40 rect, r=5)
+  roundedRectPath(110, 6, 80, 80, 10);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
 
-  // (D) ControlIcon Border rounded square at (176, 4, 64, 64):
-  // Outer black stroke + inner white stroke (matches Foundry ControlIcon._refresh)
-  roundedRectPath(180, 8, 56, 56, 8);
-  ctx.lineWidth = 4.5;
+  // (D) ControlIcon Border at (204, 0, 92, 92) — exact 2x of Foundry ControlIcon._refresh:
+  // Outer black stroke (width 2*s, alignment 0.75 -> centered 0.5*s outside rect => 82x82 at +5,+5, r=11, lw=4)
+  // Inner white stroke (width 1*s, alignment 1.0 -> centered 0.5*s outside rect => 82x82 at +5,+5, r=11, lw=2)
+  roundedRectPath(209, 5, 82, 82, 11);
+  ctx.lineWidth = 4;
   ctx.strokeStyle = "rgba(0,0,0,1)";
   ctx.stroke();
-  ctx.lineWidth = 2.2;
+  ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(255,255,255,1)";
   ctx.stroke();
 
-  // (E) Plain tintable rounded border (for DoorControl orange border) at (0, 80, 64, 64)
-  roundedRectPath(4, 84, 56, 56, 7);
-  ctx.lineWidth = 3;
+  // (E) DoorControl Background at (304, 0, 92, 92) — exact 2x of 46x46 canvas (1px pad + 44x44 rect, r=5)
+  roundedRectPath(306, 2, 88, 88, 10);
+  ctx.fillStyle = "rgba(255,255,255,1)";
+  ctx.fill();
+
+  // (F) DoorControl Border at (404, 0, 92, 92) — exact 2x of Foundry DoorControl.draw (44x44, r=5, lw=1*s)
+  roundedRectPath(406, 2, 88, 88, 10);
+  ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(255,255,255,1)";
   ctx.stroke();
 
-  // (F) Soft blurred drop-shadow circle at (64, 80, 64, 64) (replaces PIXI.BlurFilter on D&D 5e MapLocation pins!)
+  // (G) Soft blurred drop-shadow circle at (0, 104, 128, 128) (replaces PIXI.BlurFilter(16) on D&D 5e MapLocation pins)
+  // Exact 1x gaussian blur of circle r=30 (alpha 0.65) matching PIXI BlurFilter(16) sigma (~7px)
   ctx.save();
-  const sg = ctx.createRadialGradient(96, 112, 16, 96, 112, 31);
-  sg.addColorStop(0, "rgba(255,255,255,0.68)");
-  sg.addColorStop(0.68, "rgba(255,255,255,0.52)");
-  sg.addColorStop(1, "rgba(255,255,255,0)");
-  ctx.fillStyle = sg;
   ctx.beginPath();
-  ctx.arc(96, 112, 31, 0, Math.PI * 2);
+  ctx.rect(0, 104, 128, 128);
+  ctx.clip();
+  try { ctx.filter = "blur(7px)"; } catch {}
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.beginPath();
+  ctx.arc(64, 168, 30, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
-  // (G) Clean anti-aliased white circle at (128, 80, 64, 64) (for MapLocation extrude & bg fill)
+  // (H) Clean anti-aliased white circle at (136, 104, 128, 128) (r=60 inside 128x128 for MapLocation extrude & bg fill)
   ctx.save();
   ctx.beginPath();
-  ctx.arc(160, 112, 30, 0, Math.PI * 2);
+  ctx.arc(200, 168, 60, 0, Math.PI * 2);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
   ctx.restore();
 
-  // (H) Clean anti-aliased white circle outline at (192, 80, 64, 64) (for MapLocation border stroke)
+  // (I) Clean anti-aliased white circle outline at (272, 104, 128, 128) (2x of r=28, lw=2 for MapLocation border stroke)
   ctx.save();
   ctx.beginPath();
-  ctx.arc(224, 112, 29, 0, Math.PI * 2);
-  ctx.lineWidth = 3.2;
+  ctx.arc(336, 168, 56, 0, Math.PI * 2);
+  ctx.lineWidth = 4;
   ctx.strokeStyle = "rgba(255,255,255,1)";
   ctx.stroke();
   ctx.restore();
 
-  // (I) 3-slice Token Resource Bar Background capsule at (0, 160, 48, 24):
+  // (J) 3-slice Token Resource Bar Background capsule at (0, 240, 48, 24):
   // Black 0.5 fill + 3px black outer border -> renders crisp rounded bar at any width via 3 sprites!
   ctx.save();
-  roundedRectPath(1.5, 161.5, 45, 21, 7);
+  roundedRectPath(1.5, 241.5, 45, 21, 7);
   ctx.fillStyle = "rgba(0,0,0,0.5)";
   ctx.fill();
   ctx.lineWidth = 3;
@@ -142,26 +146,23 @@ function getUiAtlas() {
   ctx.stroke();
   ctx.restore();
 
-  // (J) 3-slice Token Resource Bar Fill capsule at (64, 160, 48, 24):
-  // Pure white interior (tinted via sprite.tint) + 3px black outer border (tint stays black on border? No:
-  // use separate pure-white fill capsule at (64,160) + black border overlay at (128,160) so border stays pure black!)
+  // (K) 3-slice Token Resource Bar Fill capsule at (64, 240, 48, 24) + black border overlay at (128, 240, 48, 24)
   ctx.save();
-  roundedRectPath(65.5, 161.5, 45, 21, 5.5);
+  roundedRectPath(65.5, 241.5, 45, 21, 5.5);
   ctx.fillStyle = "rgba(255,255,255,1)";
   ctx.fill();
   ctx.restore();
 
   ctx.save();
-  roundedRectPath(129.5, 161.5, 45, 21, 5.5);
+  roundedRectPath(129.5, 241.5, 45, 21, 5.5);
   ctx.lineWidth = 3;
   ctx.strokeStyle = "rgba(0,0,0,1)";
   ctx.stroke();
   ctx.restore();
 
-  // (K) Status Effect Icon Background tile at (0, 192, 36, 36):
-  // Matches Foundry v14 Token#_refreshEffects bg.beginFill(0x000000, 0.40).lineStyle(s, 0x000000).drawRoundedRect(..., 2*s)
+  // (L) Status Effect Icon Background tile at (0, 272, 38, 38) — exact 2x of 19x19 (18x18 rect, r=2, lw=1*s)
   ctx.save();
-  roundedRectPath(2, 194, 32, 32, 3.6);
+  roundedRectPath(1, 273, 36, 36, 4);
   ctx.fillStyle = "rgba(0,0,0,0.40)";
   ctx.fill();
   ctx.lineWidth = 2;
@@ -178,22 +179,23 @@ function getUiAtlas() {
     base,
     wallLine: new PIXI.Texture(base, new PIXI.Rectangle(4, 2, 8, 36)),
     wallDot: new PIXI.Texture(base, new PIXI.Rectangle(32, 0, 64, 64)),
-    iconBg: new PIXI.Texture(base, new PIXI.Rectangle(104, 4, 60, 60)),
-    iconBorder: new PIXI.Texture(base, new PIXI.Rectangle(176, 4, 64, 64)),
-    plainBorder: new PIXI.Texture(base, new PIXI.Rectangle(0, 80, 64, 64)),
-    softShadowCircle: new PIXI.Texture(base, new PIXI.Rectangle(64, 80, 64, 64)),
-    solidCircle: new PIXI.Texture(base, new PIXI.Rectangle(128, 80, 64, 64)),
-    circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(192, 80, 64, 64)),
-    barBgL: new PIXI.Texture(base, new PIXI.Rectangle(0, 160, 10, 24)),
-    barBgM: new PIXI.Texture(base, new PIXI.Rectangle(12, 160, 24, 24)),
-    barBgR: new PIXI.Texture(base, new PIXI.Rectangle(38, 160, 10, 24)),
-    barFillL: new PIXI.Texture(base, new PIXI.Rectangle(64, 160, 10, 24)),
-    barFillM: new PIXI.Texture(base, new PIXI.Rectangle(76, 160, 24, 24)),
-    barFillR: new PIXI.Texture(base, new PIXI.Rectangle(102, 160, 10, 24)),
-    barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 160, 10, 24)),
-    barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 160, 24, 24)),
-    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 160, 10, 24)),
-    effectBg: new PIXI.Texture(base, new PIXI.Rectangle(0, 192, 36, 36))
+    iconBg: new PIXI.Texture(base, new PIXI.Rectangle(104, 0, 92, 92)),
+    iconBorder: new PIXI.Texture(base, new PIXI.Rectangle(204, 0, 92, 92)),
+    doorBg: new PIXI.Texture(base, new PIXI.Rectangle(304, 0, 92, 92)),
+    doorBorder: new PIXI.Texture(base, new PIXI.Rectangle(404, 0, 92, 92)),
+    softShadowCircle: new PIXI.Texture(base, new PIXI.Rectangle(0, 104, 128, 128)),
+    solidCircle: new PIXI.Texture(base, new PIXI.Rectangle(136, 104, 128, 128)),
+    circleOutline: new PIXI.Texture(base, new PIXI.Rectangle(272, 104, 128, 128)),
+    barBgL: new PIXI.Texture(base, new PIXI.Rectangle(0, 240, 10, 24)),
+    barBgM: new PIXI.Texture(base, new PIXI.Rectangle(12, 240, 24, 24)),
+    barBgR: new PIXI.Texture(base, new PIXI.Rectangle(38, 240, 10, 24)),
+    barFillL: new PIXI.Texture(base, new PIXI.Rectangle(64, 240, 10, 24)),
+    barFillM: new PIXI.Texture(base, new PIXI.Rectangle(76, 240, 24, 24)),
+    barFillR: new PIXI.Texture(base, new PIXI.Rectangle(102, 240, 10, 24)),
+    barStrokeL: new PIXI.Texture(base, new PIXI.Rectangle(128, 240, 10, 24)),
+    barStrokeM: new PIXI.Texture(base, new PIXI.Rectangle(140, 240, 24, 24)),
+    barStrokeR: new PIXI.Texture(base, new PIXI.Rectangle(166, 240, 10, 24)),
+    effectBg: new PIXI.Texture(base, new PIXI.Rectangle(0, 272, 38, 38))
   };
   return _uiAtlas;
 }
@@ -359,8 +361,9 @@ function syncGraphicsChildTint(gfx, sprite) {
 }
 
 function patchControlIcons() {
+  const ControlIconCls = globalThis.foundry?.canvas?.containers?.ControlIcon ?? globalThis.ControlIcon;
   const okRefresh = wrapFoundryMethod("ControlIcon", "_refresh", function (wrapped) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfControlIconCache) {
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfControlIconCache || isPrimePerfActive()) {
       if (this._blBgSprite) this._blBgSprite.visible = false;
       if (this._blBorderSprite) this._blBorderSprite.visible = false;
       return wrapped();
@@ -368,13 +371,24 @@ function patchControlIcons() {
     const atlas = getUiAtlas();
     if (!atlas || !this.bg || !this.border) return wrapped();
 
-    // Let core set pivot, icon texture, tooltip, hitArea, etc. first,
-    // then replace the expensive PIXI.Graphics geometry on bg & border with atlas sprites!
+    // Let core set pivot, icon texture, tooltip, hitArea, etc. first
     wrapped();
 
-    const size = this.size || 40;
+    // Only batch exact standard ControlIcon (40*uiScale rounded square) so custom subclasses & non-standard sizes stay pixel-identical to vanilla
     const s = globalThis.canvas?.dimensions?.uiScale || 1;
-    const pad = Math.max(2, 2.5 * s);
+    const size = this.size || 0;
+    const isExactStandard = (!ControlIconCls || this.constructor === ControlIconCls)
+      && Math.abs(size - 40 * s) <= 0.5
+      && this.bg.geometry?.graphicsData?.length === 1
+      && (globalThis.PIXI?.SHAPES?.RREC === undefined || this.bg.geometry.graphicsData[0]?.shape?.type === PIXI.SHAPES.RREC);
+    if (!isExactStandard) {
+      if (this._blBgSprite) this._blBgSprite.visible = false;
+      if (this._blBorderSprite) this._blBorderSprite.visible = false;
+      return;
+    }
+
+    const pad = 3 * s;
+    const spSize = 46 * s;
 
     this.bg.clear();
     let bgSp = this._blBgSprite;
@@ -387,9 +401,9 @@ function patchControlIcons() {
       this.bg.addChild(bgSp);
     }
     bgSp.visible = true;
-    bgSp.position.set(0, 0);
-    bgSp.width = size;
-    bgSp.height = size;
+    bgSp.position.set(-pad, -pad);
+    bgSp.width = spSize;
+    bgSp.height = spSize;
     bgSp.tint = this.bg.tint;
 
     this.border.clear();
@@ -404,8 +418,8 @@ function patchControlIcons() {
     }
     bdSp.visible = true;
     bdSp.position.set(-pad, -pad);
-    bdSp.width = size + pad * 2;
-    bdSp.height = size + pad * 2;
+    bdSp.width = spSize;
+    bdSp.height = spSize;
     bdSp.tint = this.border.tint;
 
     // Keep sprite tint synced whenever Foundry mutates bg.tint / border.tint (e.g. hover/controlled)
@@ -455,14 +469,15 @@ function patchDoorControls() {
     if (!atlas || !this.bg || !this.border || this.destroyed) return res;
 
     const s = globalThis.canvas?.dimensions?.uiScale || 1;
-    const x = -2 * s;
-    const y = -2 * s;
-    const sz = 44 * s;
+    // Atlas doorBg/doorBorder are 2x of 46x46 (1*s pad around exact 44*s x 44*s rect at -2*s, -2*s)
+    const x = -3 * s;
+    const y = -3 * s;
+    const sz = 46 * s;
 
     this.bg.clear();
     let bgSp = this._blDoorBg;
     if (!bgSp || bgSp.destroyed) {
-      bgSp = new PIXI.Sprite(atlas.iconBg);
+      bgSp = new PIXI.Sprite(atlas.doorBg);
       bgSp.eventMode = "none";
       this._blDoorBg = bgSp;
       this.bg.addChild(bgSp);
@@ -478,7 +493,7 @@ function patchDoorControls() {
     this.border.clear();
     let bdSp = this._blDoorBorder;
     if (!bdSp || bdSp.destroyed) {
-      bdSp = new PIXI.Sprite(atlas.plainBorder);
+      bdSp = new PIXI.Sprite(atlas.doorBorder);
       bdSp.eventMode = "none";
       this._blDoorBorder = bdSp;
       this.border.addChild(bdSp);
@@ -490,7 +505,7 @@ function patchDoorControls() {
     bdSp.width = sz;
     bdSp.height = sz;
     bdSp.tint = 0xFF5500;
-    bdSp.alpha = 0.85;
+    bdSp.alpha = 0.8;
 
     perfStats.controlIconsBatched++;
     return res;
@@ -530,7 +545,7 @@ function patchDnd5eMapLocationIcons() {
     const r = this.radius || (this.size || 40) / 2;
     const style = this.style || {};
 
-    // Remove the expensive per-note PIXI.BlurFilter FBO pass!
+    // Remove the expensive per-note PIXI.BlurFilter FBO pass using exact-scale pre-blurred shadow texture
     if (this._blOrigShadowFilters === undefined) {
       this._blOrigShadowFilters = this.shadow.filters;
     }
@@ -548,10 +563,12 @@ function patchDnd5eMapLocationIcons() {
     }
     shSp.visible = true;
     shSp.position.set(r + 8, r + 8);
-    shSp.width = shSp.height = (r + 14) * 2;
+    // softShadowCircle is 128x128 around circle r=30; scale proportionally to (r + 10)
+    shSp.width = shSp.height = (r + 10) * (128 / 30);
     shSp.tint = style.shadowColor ?? 0x000000;
 
-    // 3D extrude disc
+    // 3D extrude disc — solidCircle has radius 60 inside 128x128 (ratio 128/60)
+    const circleScale = 128 / 60;
     this.extrude.clear();
     let exSp = this._blExtrudeSp;
     if (!exSp || exSp.destroyed) {
@@ -565,40 +582,46 @@ function patchDnd5eMapLocationIcons() {
     }
     exSp.visible = true;
     exSp.position.set(r + 2, r + 2);
-    exSp.width = exSp.height = (r + 9.5) * 2;
+    exSp.width = exSp.height = (r + 9) * circleScale;
     exSp.tint = style.borderColor ?? 0x000000;
 
-    // Main background disc + outline stroke
-    this.bg.clear();
-    let fillSp = this._blFillSp;
-    if (!fillSp || fillSp.destroyed) {
-      fillSp = new PIXI.Sprite(atlas.solidCircle);
-      fillSp.anchor.set(0.5);
-      fillSp.eventMode = "none";
-      this._blFillSp = fillSp;
-      this.bg.addChild(fillSp);
-    } else if (fillSp.parent !== this.bg) {
-      this.bg.addChild(fillSp);
-    }
-    fillSp.visible = true;
-    fillSp.position.set(r, r);
-    fillSp.width = fillSp.height = (r + 8.5) * 2;
-    fillSp.tint = style.backgroundColor ?? 0xFFFFFF;
+    // Main background disc + outline stroke (use exact atlas sprites at standard size=40, keep native Graphics for custom sizes so stroke stays 2px)
+    if (Math.abs(r - 20) <= 0.5) {
+      this.bg.clear();
+      let fillSp = this._blFillSp;
+      if (!fillSp || fillSp.destroyed) {
+        fillSp = new PIXI.Sprite(atlas.solidCircle);
+        fillSp.anchor.set(0.5);
+        fillSp.eventMode = "none";
+        this._blFillSp = fillSp;
+        this.bg.addChild(fillSp);
+      } else if (fillSp.parent !== this.bg) {
+        this.bg.addChild(fillSp);
+      }
+      fillSp.visible = true;
+      fillSp.position.set(r, r);
+      fillSp.width = fillSp.height = (r + 8) * circleScale;
+      fillSp.tint = style.backgroundColor ?? 0xFFFFFF;
 
-    let stSp = this._blStrokeSp;
-    if (!stSp || stSp.destroyed) {
-      stSp = new PIXI.Sprite(atlas.circleOutline);
-      stSp.anchor.set(0.5);
-      stSp.eventMode = "none";
-      this._blStrokeSp = stSp;
-      this.bg.addChild(stSp);
-    } else if (stSp.parent !== this.bg) {
-      this.bg.addChild(stSp);
+      let stSp = this._blStrokeSp;
+      if (!stSp || stSp.destroyed) {
+        stSp = new PIXI.Sprite(atlas.circleOutline);
+        stSp.anchor.set(0.5);
+        stSp.eventMode = "none";
+        this._blStrokeSp = stSp;
+        this.bg.addChild(stSp);
+      } else if (stSp.parent !== this.bg) {
+        this.bg.addChild(stSp);
+      }
+      stSp.visible = true;
+      stSp.position.set(r, r);
+      // circleOutline is 2x of r=28 (56px inside 128x128) with lw=4 (exact 2px at r=20)
+      stSp.width = stSp.height = (r + 8) * (128 / 56);
+      stSp.tint = style.borderColor ?? 0x000000;
+    } else {
+      if (this._blFillSp) this._blFillSp.visible = false;
+      if (this._blStrokeSp) this._blStrokeSp.visible = false;
     }
-    stSp.visible = true;
-    stSp.position.set(r, r);
-    stSp.width = stSp.height = (r + 9) * 2;
-    stSp.tint = style.borderColor ?? 0x000000;
 
     perfStats.controlIconsBatched++;
   });
@@ -1232,9 +1255,9 @@ function patchTokenUiCaching() {
             } else if (sp.parent !== bg) {
               bg.addChild(sp);
             }
-            const sz = Math.max(1, (ic.width || (20 * s)) - 2 * s);
+            const sz = Math.max(1, (ic.width || (20 * s)) - s);
             sp.visible = true;
-            sp.position.set((ic.x || 0) + s, (ic.y || 0) + s);
+            sp.position.set((ic.x || 0) + 0.5 * s, (ic.y || 0) + 0.5 * s);
             sp.width = sz;
             sp.height = sz;
           }

@@ -556,7 +556,7 @@ export function collectSceneActiveAssetUrls(scene) {
     add(tok.turnMarker?.src);
   }
   for (const d of scene.drawings ?? []) add(d.texture);
-  for (const tpl of scene.templates ?? []) add(tpl.texture);
+  for (const reg of scene.regions ?? []) add(reg.texture?.src ?? reg.texture);
   for (const n of scene.notes ?? []) add(n.texture?.src);
   add(globalThis.CONFIG?.Combat?.settings?.turnMarker?.src);
   return used;
@@ -625,7 +625,7 @@ export function disposeStaleSceneVramTextures() {
     protectTex(tok?.turnMarker?.mesh?.texture);
   }
   for (const d of c?.drawings?.placeables ?? []) protectTex(d?.shape?.texture);
-  for (const tpl of c?.templates?.placeables ?? []) protectTex(tpl?.texture);
+  for (const reg of c?.regions?.placeables ?? []) protectTex(reg?.mesh?.texture ?? reg?.texture);
   protectTex(c?.visibility?.visibilityOverlay?.texture);
 
   let disposed = 0;
