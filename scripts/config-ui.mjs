@@ -92,35 +92,26 @@ export async function openOptimizeSceneDialog(controller, scene) {
   const content = `
     <div class="boundless-baker-form">
       <p class="hint">${escapeHtml(desc)}</p>
-      <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Optimize.CreateCopy"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" name="createCopy" checked>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Optimize.CreateCopyHint"))}</p>
-      </div>
     </div>
   `;
 
-  let opts = null;
+  let confirmed = false;
   try {
-    opts = await DialogV2.prompt({
+    confirmed = Boolean(await DialogV2.prompt({
       window: { title: loc("BOUNDLESS.Optimize.DialogTitle"), icon: "fa-solid fa-bolt" },
       position: { width: 420 },
       content,
       ok: {
         label: loc("BOUNDLESS.Optimize.StartButton"),
         icon: "fa-solid fa-bolt",
-        callback: (_event, button) => ({
-          createCopy: Boolean(button.form.elements.createCopy?.checked)
-        })
+        callback: () => true
       },
       rejectClose: false
-    });
+    }));
   } finally {
     openBakeDialogs.delete(scene.id);
   }
-  if (!opts) return;
+  if (!confirmed) return;
   const liveScene = game.scenes?.get?.(scene.id);
   const unbaked = liveScene ? getUnbakedSceneLevels(liveScene) : [];
   if (!liveScene || !unbaked.length) return;
@@ -130,11 +121,11 @@ export async function openOptimizeSceneDialog(controller, scene) {
     bakeSceneToBoundless(controller, liveScene, {
       targetDir: null,
       levelIds: targetLevelIds,
-      createCopy: opts.createCopy,
+      createCopy: false,
       removeOriginals: true,
       clearBackground: true,
       quality: 0.85,
-      activateCopy: true,
+      activateCopy: false,
       signal,
       onProgress
     }),
@@ -242,13 +233,6 @@ export async function openUnbakeSceneDialog(controller, scene) {
     <div class="boundless-baker-form">
       <p class="hint">${escapeHtml(desc)}</p>
       <div class="form-group">
-        <label>${escapeHtml(loc("BOUNDLESS.Unbake.CreateCopy"))}</label>
-        <div class="form-fields">
-          <input type="checkbox" name="createCopy" checked>
-        </div>
-        <p class="hint">${escapeHtml(loc("BOUNDLESS.Unbake.CreateCopyHint"))}</p>
-      </div>
-      <div class="form-group">
         <label>${escapeHtml(loc("BOUNDLESS.Unbake.RestoreImages"))}</label>
         <div class="form-fields">
           <input type="checkbox" name="restoreImages" checked>
@@ -268,7 +252,6 @@ export async function openUnbakeSceneDialog(controller, scene) {
         label: loc("BOUNDLESS.Unbake.StartButton"),
         icon: "fa-solid fa-box-open",
         callback: (_event, button) => ({
-          createCopy: Boolean(button.form.elements.createCopy?.checked),
           restoreImages: Boolean(button.form.elements.restoreImages?.checked)
         })
       },
@@ -283,9 +266,9 @@ export async function openUnbakeSceneDialog(controller, scene) {
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Unbake.ProgressTitle", ({ signal, onProgress }) =>
     unbakeSceneFromBoundless(controller, liveScene, {
-      createCopy: opts.createCopy,
+      createCopy: false,
       restoreImages: opts.restoreImages,
-      activateCopy: true,
+      activateCopy: false,
       signal,
       onProgress
     }),

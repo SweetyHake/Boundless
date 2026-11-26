@@ -464,7 +464,7 @@ async function sliceAndUploadPyramid({
 export async function bakeSceneToBoundless(controller, sourceScene, {
   targetDir = null,
   levelIds = null,        // null = all levels on scene, or array of level IDs
-  createCopy = true,
+  createCopy = false,
   removeOriginals = true,
   clearBackground = true,
   quality = 0.85,
@@ -701,6 +701,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       if (hasBg) {
         spec.pyramidBaseUrl = bgBaseUrl;
         spec.maxZoomZ = plan.maxZoomZ;
+        if (job.bgSrc) spec.origBackgroundSrc = job.bgSrc;
         const bgTint = normalizeColorCss(level.background?.tint);
         if (bgTint) spec.backgroundTint = bgTint;
         if (Number.isFinite(level.background?.alphaThreshold) && level.background.alphaThreshold !== 0.75) {
@@ -710,6 +711,7 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
       if (hasFg) {
         spec.foregroundPyramidBaseUrl = fgBaseUrl;
         spec.foregroundMaxZoomZ = fgPlan.maxZoomZ;
+        if (job.fgSrc) spec.origForegroundSrc = job.fgSrc;
         if (fgSparseTiles) spec.foregroundTiles = fgSparseTiles;
         const fgTint = normalizeColorCss(level.foreground?.tint);
         if (fgTint) spec.foregroundTint = fgTint;
@@ -2261,7 +2263,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
  * and removes Boundless flags.
  */
 export async function unbakeSceneFromBoundless(controller, scene, {
-  createCopy = true,
+  createCopy = false,
   activateCopy = true,
   restoreImages = true,
   maxImageDim = UNBAKE_MAX_IMAGE_PX,
@@ -2459,51 +2461,81 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         const bgPyramidUrl = srcLcfg.pyramidBaseUrl || spec.pyramidBaseUrl;
         const fgPyramidUrl = srcLcfg.foregroundPyramidBaseUrl || spec.foregroundPyramidBaseUrl;
         const effectiveBounds = srcLcfg.bounds || spec.bounds || null;
-        if (!dstLevel.background?.src && bgPyramidUrl) {
-          const blob = await stitchPyramidToWebp({
-            pyramidBaseUrl: bgPyramidUrl,
-            maxZoomZ: spec.maxZoomZ ?? 0,
-            worldPx: spec.worldPx || targetScene.width || 4096,
-            tilePx: spec.tilePx || TILE_PX,
-            bounds: effectiveBounds,
-            maxDim: maxImageDim,
-            signal
-          });
-          if (blob) {
-            await ensureDirectoryRecursive(outDir);
-            const fname = `bg_${i}_${lvlSlug}.webp`;
-            const res = await uploadFileSilent(outDir, new File([blob], fname, { type: "image/webp" }));
-            lvlPatch["background.src"] = res.path;
+        const checkAssetExists = async (src) => {
+          if (!src || typeof fetch !== "function") return false;
+          try {
+            const r = await fetch(resolveFoundryRoute(src), signal ? { method: "HEAD", signal } : { method: "HEAD" });
+            return Boolean(r?.ok);
+          } catch (err) {
+            if (err?.name === "AbortError" || signal?.aborted) throw new DOMException("Aborted", "AbortError");
+            return false;
+          }
+        };
+        let restoredOrigBg = false;
+        let restoredOrigFg = false;
+        let stitchedBg = false;
+        let stitchedFg = false;
+        if (!dstLevel.background?.src) {
+          if (spec.origBackgroundSrc && await checkAssetExists(spec.origBackgroundSrc)) {
+            lvlPatch["background.src"] = spec.origBackgroundSrc;
+            restoredOrigBg = true;
             if (spec.backgroundTint) lvlPatch["background.tint"] = spec.backgroundTint;
             if (Number.isFinite(spec.backgroundAlphaThreshold)) lvlPatch["background.alphaThreshold"] = spec.backgroundAlphaThreshold;
+          } else if (bgPyramidUrl) {
+            const blob = await stitchPyramidToWebp({
+              pyramidBaseUrl: bgPyramidUrl,
+              maxZoomZ: spec.maxZoomZ ?? 0,
+              worldPx: spec.worldPx || targetScene.width || 4096,
+              tilePx: spec.tilePx || TILE_PX,
+              bounds: effectiveBounds,
+              maxDim: maxImageDim,
+              signal
+            });
+            if (blob) {
+              await ensureDirectoryRecursive(outDir);
+              const fname = `bg_${i}_${lvlSlug}.webp`;
+              const res = await uploadFileSilent(outDir, new File([blob], fname, { type: "image/webp" }));
+              lvlPatch["background.src"] = res.path;
+              stitchedBg = true;
+              if (spec.backgroundTint) lvlPatch["background.tint"] = spec.backgroundTint;
+              if (Number.isFinite(spec.backgroundAlphaThreshold)) lvlPatch["background.alphaThreshold"] = spec.backgroundAlphaThreshold;
+            }
           }
         }
-        if (!dstLevel.foreground?.src && fgPyramidUrl) {
-          const fgBlob = await stitchPyramidToWebp({
-            pyramidBaseUrl: fgPyramidUrl,
-            maxZoomZ: spec.foregroundMaxZoomZ ?? spec.maxZoomZ ?? 0,
-            worldPx: spec.worldPx || targetScene.width || 4096,
-            tilePx: spec.tilePx || TILE_PX,
-            bounds: effectiveBounds,
-            sparseTiles: spec.foregroundTiles || null,
-            maxDim: maxImageDim,
-            signal
-          });
-          if (fgBlob) {
-            await ensureDirectoryRecursive(outDir);
-            const fname = `fg_${i}_${lvlSlug}.webp`;
-            const res = await uploadFileSilent(outDir, new File([fgBlob], fname, { type: "image/webp" }));
-            lvlPatch["foreground.src"] = res.path;
+        if (!dstLevel.foreground?.src) {
+          if (spec.origForegroundSrc && await checkAssetExists(spec.origForegroundSrc)) {
+            lvlPatch["foreground.src"] = spec.origForegroundSrc;
+            restoredOrigFg = true;
             if (spec.foregroundTint) lvlPatch["foreground.tint"] = spec.foregroundTint;
             if (Number.isFinite(spec.foregroundAlphaThreshold)) lvlPatch["foreground.alphaThreshold"] = spec.foregroundAlphaThreshold;
+          } else if (fgPyramidUrl) {
+            const fgBlob = await stitchPyramidToWebp({
+              pyramidBaseUrl: fgPyramidUrl,
+              maxZoomZ: spec.foregroundMaxZoomZ ?? spec.maxZoomZ ?? 0,
+              worldPx: spec.worldPx || targetScene.width || 4096,
+              tilePx: spec.tilePx || TILE_PX,
+              bounds: effectiveBounds,
+              sparseTiles: spec.foregroundTiles || null,
+              maxDim: maxImageDim,
+              signal
+            });
+            if (fgBlob) {
+              await ensureDirectoryRecursive(outDir);
+              const fname = `fg_${i}_${lvlSlug}.webp`;
+              const res = await uploadFileSilent(outDir, new File([fgBlob], fname, { type: "image/webp" }));
+              lvlPatch["foreground.src"] = res.path;
+              stitchedFg = true;
+              if (spec.foregroundTint) lvlPatch["foreground.tint"] = spec.foregroundTint;
+              if (Number.isFinite(spec.foregroundAlphaThreshold)) lvlPatch["foreground.alphaThreshold"] = spec.foregroundAlphaThreshold;
+            }
           }
         }
         if (Object.keys(lvlPatch).length) {
           // Baked pyramids already incorporate `level.textures` transforms (offset/scale/rotation/anchor/fit);
-          // reset them only when no untouched background or foreground texture still relies on them.
+          // reset them only when stitching from pyramid and no untouched or original-src texture still relies on them.
           const hasUntouchedBg = Boolean(dstLevel.background?.src && !lvlPatch["background.src"]);
           const hasUntouchedFg = Boolean(dstLevel.foreground?.src && !lvlPatch["foreground.src"]);
-          if (dstLevel.textures && !hasUntouchedBg && !hasUntouchedFg) {
+          if (dstLevel.textures && (stitchedBg || stitchedFg) && !hasUntouchedBg && !hasUntouchedFg && !restoredOrigBg && !restoredOrigFg) {
             lvlPatch["textures.offsetX"] = 0;
             lvlPatch["textures.offsetY"] = 0;
             lvlPatch["textures.scaleX"] = 1;
