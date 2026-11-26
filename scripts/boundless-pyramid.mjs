@@ -1136,9 +1136,10 @@ export const pyramidMethods = {
         changed = true;
       }
       if (e.z === 0) {
-        const wantPlugin = hasSurface ? null : "batch";
-        if (m.pluginName !== wantPlugin) {
-          m.pluginName = wantPlugin;
+        const wantBatch = !hasSurface && !m.restrictsLight && !m.restrictsWeather;
+        const isBatch = m.pluginName === "batch";
+        if (wantBatch !== isBatch) {
+          m.pluginName = wantBatch ? "batch" : null;
           changed = true;
         }
       }
@@ -1921,19 +1922,20 @@ export const pyramidMethods = {
       }
     }
 
-    // Incremental VRAM pruning strictly while camera is idle (max 4 textures/frame) to prevent D3D11/WebGL texture-delete pipeline stalls during zoom
-    if (this._pruneNeeded && !isMoving && this.pendingTileMounts.length === 0) {
-      if (!this.texMgr.needsPrune()) {
-        this._pruneNeeded = false;
-      } else {
-        const evicted = this.texMgr.prune(this._collectInUseTextures(), 4);
-        if (evicted === 0 || !this.texMgr.needsPrune()) {
+    if (!this._tilesDirty) {
+      // Incremental VRAM pruning strictly while camera is idle (max 4 textures/frame)
+      if (!isMoving && this.pendingTileMounts.length === 0 && (this._pruneNeeded || this.texMgr.needsPrune())) {
+        if (!this.texMgr.needsPrune()) {
           this._pruneNeeded = false;
+        } else {
+          const evicted = this.texMgr.prune(this._collectInUseTextures(), 4);
+          if (evicted === 0 || !this.texMgr.needsPrune()) {
+            this._pruneNeeded = false;
+          }
         }
       }
+      return;
     }
-
-    if (!this._tilesDirty) return;
 
     const safeDt = (Number.isFinite(dtMs) && dtMs > 0) ? Math.min(dtMs, 250) : 16.6;
     const step = safeDt / CROSSFADE_MS;
@@ -2109,11 +2111,12 @@ export const pyramidMethods = {
           if (ov.roofMesh && !ov.roofMesh.destroyed) {
             ov.roofMesh.restrictsLight = true;
             ov.roofMesh.restrictsWeather = true;
-            ov.roofMesh.occlusionMode = ov.ovSpec?.occlusionMode ?? CONST.OCCLUSION_MODES.FADE;
+            ov.roofMesh.occlusionMode = CONST.OCCLUSION_MODES.FADE | CONST.OCCLUSION_MODES.RADIAL | CONST.OCCLUSION_MODES.SURFACE;
             ov.roofMesh.hoverFade = ov.ovSpec?.hoverFade ?? true;
+            ov.roofMesh.updateCanvasTransform?.();
           }
           if (layer) layer.lastOverlayKey = "";
-          this._depthDirty = true;
+          this._markDepthDirty({ syncElev: true });
           this._occlusionDirty = true;
         } else {
           const z4Ready = !layer?.hasPyramid || Boolean(st?.visDesiredReady && st?.hasVisDesiredNonZero) || Boolean(st?.allReadyOpaque) || layer.lastTargetZ <= 0;
@@ -2182,5 +2185,17 @@ export const pyramidMethods = {
     }
 
     this._tilesDirty = stillActive;
+
+    // Run incremental VRAM pruning AFTER retired overlays and old LOD tiles have been removed from active maps
+    if (!isMoving && this.pendingTileMounts.length === 0 && (this._pruneNeeded || retiringOvKeys.length > 0 || toDelete.length > 0 || this.texMgr.needsPrune())) {
+      if (!this.texMgr.needsPrune()) {
+        this._pruneNeeded = false;
+      } else {
+        const evicted = this.texMgr.prune(this._collectInUseTextures(), 4);
+        if ((evicted === 0 && !stillActive) || !this.texMgr.needsPrune()) {
+          this._pruneNeeded = false;
+        }
+      }
+    }
   }
 };

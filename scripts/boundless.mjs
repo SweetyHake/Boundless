@@ -852,12 +852,17 @@ class MegaWorld1000 {
       this._webglContextLostView = glView;
       this._webglContextLostFn = () => {
         console.warn(`${MODULE_ID} | WebGL context lost; releasing non-pinned texture cache.`);
+        for (const item of this.pendingTileMounts) {
+          if (item?.key && this.tilesByKey.get(item.key) === item.entry && !item.entry?.ready) {
+            this.tilesByKey.delete(item.key);
+          }
+        }
         this.pendingTileMounts.length = 0;
         this.pendingOverlayMounts.length = 0;
         this._pendingOverlayKeys.clear();
         this.pendingVirtualTileMounts.length = 0;
         this._pendingVirtualTileKeys.clear();
-        this.texMgr.clear(false);
+        this.texMgr.clear(true);
       };
       this._webglContextRestoredFn = () => {
         const restoreGen = this._mountGen;
@@ -887,8 +892,8 @@ class MegaWorld1000 {
             }
           }
           for (const [k, e] of Array.from(this.tilesByKey.entries())) {
-            if (e?.mesh && !isTextureUsable(e.mesh.texture)) {
-              this.retireMesh(e.mesh);
+            if (!e?.ready || !e.mesh || !isTextureUsable(e.mesh.texture)) {
+              if (e?.mesh) this.retireMesh(e.mesh);
               this.tilesByKey.delete(k);
             }
           }
@@ -983,7 +988,7 @@ class MegaWorld1000 {
       return;
     }
 
-    const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+    const pxPerFt = canvas.dimensions.size / Math.max(0.001, Number(canvas.dimensions.distance) || 5);
     const hasAnyOverlays = layers.some(l => l.spec?.overlays && (Array.isArray(l.spec.overlays) ? l.spec.overlays.length > 0 : Object.keys(l.spec.overlays).length > 0));
     // Keep indoor lights suppressed briefly until pixel-accurate bakedRoofMask finishes (or roofs mount in depthMask)
     this._waitingForRoofsBeforeIndoor = hasAnyOverlays;
@@ -1330,13 +1335,16 @@ class MegaWorld1000 {
     for (const timerId of this.closingDoorTimers.values()) clearTimeout(timerId);
     this.closingDoorTimers.clear();
     this._pendingDoorCommits?.clear?.();
+    this._doorCommitQueue?.clear?.();
     this.simSectors.clear();
     this.doorStates.clear();
     this.openDoors.clear();
 
     for (const [lid, ls] of this.dynamicLights) {
       this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
-      ls.destroy();
+      if (ls && !ls.destroyed) {
+        try { ls.destroy(); } catch {}
+      }
     }
     this.dynamicLights.clear();
     this._lightFades.clear();

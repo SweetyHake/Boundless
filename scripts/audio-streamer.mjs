@@ -187,7 +187,7 @@ export class MegaAudioStreamer {
         for (const [sKey, ov] of lvlSoundEdits) {
           if (!ov) continue;
           const parts = sKey.split(":");
-          if (parts.length !== 3) continue;
+          if (parts.length !== 3 || parts[1] !== "s") continue;
           const [sk, , idxStr] = parts;
           if (visitedSectors.has(sk)) continue;
           const si = Number(idxStr);

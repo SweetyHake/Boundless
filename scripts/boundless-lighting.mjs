@@ -2,6 +2,7 @@ import { MegaLightBatch, LIGHT_PAD_WORLD_PX } from "./light-batch.mjs";
 import {
   MODULE_ID,
   getEffectiveScale,
+  getLevelBottomElevation,
   getLevelRoofElevation,
   buildEdgeThresholdPx,
   resolveFoundryRoute,
@@ -121,7 +122,7 @@ export const lightingMethods = {
     try {
       const EdgeCls = foundry.canvas.geometry.edges.Edge;
       const LightCls = CONFIG.Canvas.lightSourceClass;
-      const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+      const pxPerFt = canvas.dimensions.size / Math.max(0.001, Number(canvas.dimensions.distance) || 5);
       const darkness = canvas.environment?.darknessLevel ?? 0;
 
       // 1. Collect Dynamic PointLightSources FIRST so we guarantee their full light radius has wall edges in `level.edges`.
@@ -160,7 +161,8 @@ export const lightingMethods = {
             const sec = spec.sectors[sk];
             if (!sec?.l?.length) continue;
             for (let li = 0; li < sec.l.length; li++) {
-              const lid = `${door.levelId}::${sk}_${li}`;
+              const rawLid = `${door.levelId}::${sk}_${li}`;
+              const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
               const meta = this.lightBatch.lightMetaById.get(lid);
               if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
                 neededDynLights.add(lid);
@@ -174,7 +176,8 @@ export const lightingMethods = {
             if (!ov) continue;
             const parts = lKey.split(":");
             if (parts.length !== 3 || visitedDoorSectors.has(parts[0])) continue;
-            const lid = `${door.levelId}::${parts[0]}_${parts[2]}`;
+            const rawLid = `${door.levelId}::${parts[0]}_${parts[2]}`;
+            const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
             const meta = this.lightBatch.lightMetaById.get(lid);
             if (isMetaEligibleDyn(meta) && Math.hypot(meta.lx - door.x, meta.ly - door.y) <= meta.dimPx + 150) {
               neededDynLights.add(lid);
@@ -206,7 +209,8 @@ export const lightingMethods = {
               const sec = spec.sectors[sk];
               if (!sec?.l?.length) continue;
               for (let li = 0; li < sec.l.length; li++) {
-                const lid = `${vsLevelId}::${sk}_${li}`;
+                const rawLid = `${vsLevelId}::${sk}_${li}`;
+                const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
                 if (neededDynLights.has(lid)) continue;
                 const meta = this.lightBatch.lightMetaById.get(lid);
                 if (!isMetaEligibleDyn(meta, vs)) continue;
@@ -227,7 +231,8 @@ export const lightingMethods = {
               if (!ov) continue;
               const parts = lKey.split(":");
               if (parts.length !== 3 || visitedVsSectors.has(parts[0])) continue;
-              const lid = `${vsLevelId}::${parts[0]}_${parts[2]}`;
+              const rawLid = `${vsLevelId}::${parts[0]}_${parts[2]}`;
+              const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
               if (neededDynLights.has(lid)) continue;
               const meta = this.lightBatch.lightMetaById.get(lid);
               if (!isMetaEligibleDyn(meta, vs)) continue;
@@ -497,11 +502,20 @@ export const lightingMethods = {
 
       const actorSimKey = Array.from(neededSim.keys()).sort().join("|");
 
-      // Guarantee every active dynamic PointLightSource has all wall sectors within its full radius
+      // Guarantee every active & fading-out dynamic PointLightSource has all wall sectors within its full radius
       for (const lid of neededDynLights) {
         const meta = this.lightBatch.lightMetaById.get(lid);
         if (meta && meta.walls !== false) {
           addSimBubble(meta.levelId, meta.lx, meta.ly, meta.dimPx + 100);
+        }
+      }
+      if (this._lightFades?.size) {
+        for (const [lid, f] of this._lightFades) {
+          if (f?.dir !== "out" || neededDynLights.has(lid)) continue;
+          const meta = this.lightBatch.lightMetaById.get(lid);
+          if (meta && meta.walls !== false) {
+            addSimBubble(meta.levelId, meta.lx, meta.ly, meta.dimPx + 100);
+          }
         }
       }
 
@@ -637,7 +651,7 @@ export const lightingMethods = {
           if (!neededDynLights.has(lid)) {
             const meta = this.lightBatch.lightMetaById.get(lid);
             const suppressedByRoofOrDarkness = Boolean(
-              (hidingIndoors && meta?.isIndoor) ||
+              ((hidingIndoors || suppressUnseenIndoorForMacroRoof) && meta?.isIndoor) ||
               (meta && (curDarkness < (meta.darkMin ?? 0) || curDarkness > (meta.darkMax ?? 1)))
             );
             const canSmoothRetire = Boolean(
@@ -846,7 +860,7 @@ export const lightingMethods = {
         if (f.t >= 1.0 && retiresThisFrame < 2) {
           this._lightFades.delete(lid);
           this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
-          ls.destroy();
+          if (ls && !ls.destroyed) { try { ls.destroy(); } catch {} }
           this.dynamicLights.delete(lid);
           this.lightBatch.setLightWeight(lid, 1.0);
           retiredAny = true;
@@ -866,9 +880,10 @@ export const lightingMethods = {
     this._lightRebuildScheduled = true;
     const mountGen = this._mountGen;
     queueMicrotask(() => {
+      if (this._mountGen !== mountGen) return;
       this._lightRebuildScheduled = false;
-      if (!this.active || this._mountGen !== mountGen || !this.visibleLevelLayers.length || !canvas?.ready) return;
-      const pxPerFt = canvas.dimensions.size / canvas.dimensions.distance;
+      if (!this.active || !this.visibleLevelLayers.length || !canvas?.ready) return;
+      const pxPerFt = canvas.dimensions.size / Math.max(0.001, Number(canvas.dimensions.distance) || 5);
       const sceneId = canvas.scene?.id;
       const worldId = game.world?.id || "world";
       const visibleLevelIds = this.visibleLevelLayers.map(l => l.level.id);
@@ -1217,11 +1232,12 @@ export const lightingMethods = {
       if (!sender || sender.active === false) return false;
       if (sender.isGM) return true;
       if (game.paused) return false;
+      if (typeof sender.can === "function" && !sender.can("WALL_DOORS")) return false;
       const hasSceneAccess = Boolean(
         targetScene.active
         || targetScene.navigation
         || targetScene.testUserPermission?.(sender, "LIMITED")
-        || targetScene.tokens?.some?.(t => t?.testUserPermission?.(sender, "OBSERVER"))
+        || targetScene.tokens?.some?.(t => hasTokenPermissionLazy(t, sender, "OBSERVER"))
       );
       return hasSceneAccess;
     }
@@ -1278,7 +1294,9 @@ export const lightingMethods = {
       let raw = spec?.sectors?.[sk]?.d?.[idx];
       if (!raw && spec?.chunks?.baseUrl && spec.chunks.chunkWorldPx > 0) {
         const simGrid = spec.simGrid || 40;
-        const simSectorPx = spec.simSectorPx || Math.ceil((spec.worldPx || 100000) / simGrid);
+        const sg = spec.superGrid;
+        const sgWorldPx = sg ? Math.max((sg.cols || 1) * (sg.regionPx || 100000), (sg.rows || 1) * (sg.regionPx || 100000)) : 0;
+        const simSectorPx = spec.simSectorPx || Math.ceil((sgWorldPx || spec.worldPx || 100000) / simGrid);
         const cx = Math.floor(((sx + 0.5) * simSectorPx) / spec.chunks.chunkWorldPx);
         const cy = Math.floor(((sy + 0.5) * simSectorPx) / spec.chunks.chunkWorldPx);
         if (cx >= 0 && cy >= 0) {
@@ -1333,7 +1351,7 @@ export const lightingMethods = {
           ? this._normalizeDoorState(payload.ds, info.defaultDs)
           : (payload.isOpen ? 1 : 0);
         const curDs = this.getCurrentDoorState(info.dKey, info.defaultDs);
-        if (info.doorType === 2 || curDs === 2 || targetDs === 2) return;
+        if (info.doorType === 2 || curDs === 2 || targetDs === 2 || curDs === targetDs) return;
         this.requestDoorState(info.dKey, targetDs, { playSound: true });
         return;
       }
@@ -1348,42 +1366,75 @@ export const lightingMethods = {
     if (!info) return;
     const ds = this._normalizeDoorState(targetDs, info.defaultDs);
     const curDs = this.getCurrentDoorState(dKey, info.defaultDs);
+    if (curDs === ds) return;
 
     if (!game.user.isGM) {
+      if (game.paused) return;
+      if (typeof game.user.can === "function" && !game.user.can("WALL_DOORS")) return;
       if (info.doorType === 2 || curDs === 2 || ds === 2) return;
       if (!game.users?.activeGM) return;
     }
 
     if (game.user.isGM) {
+      if (!canvas.scene) return;
       this._pendingDoorCommits ??= new Map();
+      this._doorCommitQueue ??= new Map();
       const seq = (this._pendingDoorCommits.get(dKey) || 0) + 1;
       this._pendingDoorCommits.set(dKey, seq);
       this._applyDoorStateLocal(info, ds, { playSound });
-      canvas.scene?.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: ds })
-        .catch(err => {
-          console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
-          if (this._pendingDoorCommits?.get(dKey) === seq && this.active) {
-            const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
-            const revertDs = persisted !== undefined ? persisted : info.defaultDs;
-            this._applyDoorStateLocal(info, revertDs, { playSound: false, skipDeferRebake: true });
-          }
-        })
-        .finally(() => {
-          if (this._pendingDoorCommits?.get(dKey) === seq) {
-            this._pendingDoorCommits.delete(dKey);
-            // Reconcile with final authoritative scene flag if another GM/player toggled concurrently while in-flight
-            if (this.active) {
+
+      // Serialize per-door scene.update calls so rapid open->close double-clicks cannot short-circuit via diff:true
+      const existingQ = this._doorCommitQueue.get(dKey);
+      if (existingQ?.inFlight) {
+        existingQ.queuedDs = ds;
+        existingQ.queuedSeq = seq;
+        return;
+      }
+      const qState = { inFlight: true, queuedDs: null, queuedSeq: 0 };
+      this._doorCommitQueue.set(dKey, qState);
+      const flushDoorCommit = (commitDs, commitSeq) => {
+        const sc = canvas.scene;
+        if (!sc) {
+          this._doorCommitQueue?.delete?.(dKey);
+          if (this._pendingDoorCommits?.get(dKey) === commitSeq) this._pendingDoorCommits.delete(dKey);
+          return;
+        }
+        Promise.resolve(sc.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: commitDs }))
+          .catch(err => {
+            console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
+            if (this._pendingDoorCommits?.get(dKey) === commitSeq && qState.queuedDs === null && this.active) {
               const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
-              if (persisted !== undefined) {
-                const authDs = this._normalizeDoorState(persisted, info.defaultDs);
-                const curLocalDs = this.getCurrentDoorState(dKey, info.defaultDs);
-                if (authDs !== curLocalDs) {
-                  this._applyDoorStateLocal(info, authDs, { playSound: false });
+              const revertDs = persisted !== undefined ? persisted : info.defaultDs;
+              this._applyDoorStateLocal(info, revertDs, { playSound: false, skipDeferRebake: true });
+            }
+          })
+          .finally(() => {
+            if (qState.queuedDs !== null && this.active) {
+              const nextDs = qState.queuedDs;
+              const nextSeq = qState.queuedSeq;
+              qState.queuedDs = null;
+              qState.queuedSeq = 0;
+              flushDoorCommit(nextDs, nextSeq);
+              return;
+            }
+            if (this._doorCommitQueue?.get(dKey) === qState) this._doorCommitQueue.delete(dKey);
+            if (this._pendingDoorCommits?.get(dKey) === commitSeq) {
+              this._pendingDoorCommits.delete(dKey);
+              // Reconcile with final authoritative scene flag if another GM/player toggled concurrently while in-flight
+              if (this.active) {
+                const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
+                if (persisted !== undefined) {
+                  const authDs = this._normalizeDoorState(persisted, info.defaultDs);
+                  const curLocalDs = this.getCurrentDoorState(dKey, info.defaultDs);
+                  if (authDs !== curLocalDs) {
+                    this._applyDoorStateLocal(info, authDs, { playSound: false });
+                  }
                 }
               }
             }
-          }
-        });
+          });
+      };
+      flushDoorCommit(ds, seq);
     } else {
       game.socket?.emit(SOCKET_NAME, {
         type: "doorRequest",
@@ -1398,13 +1449,18 @@ export const lightingMethods = {
   _scheduleChunkBatchRefresh({ needPyramid = true, roofBakeLayer = null, roofBakeChunkData = null } = {}) {
     if (needPyramid) this._chunkRefreshNeedPyramid = true;
     if (roofBakeLayer) {
-      this._chunkRoofBakeLayer = roofBakeLayer;
-      this._chunkRoofBakeChunkData = roofBakeChunkData;
+      // Never let a lower-level chunk overwrite the viewed level's roof bake request
+      const prevLayer = this._chunkRoofBakeLayer;
+      if (!prevLayer || roofBakeLayer.level?.isView || !prevLayer.level?.isView) {
+        this._chunkRoofBakeLayer = roofBakeLayer;
+        this._chunkRoofBakeChunkData = roofBakeChunkData;
+      }
     }
     if (this._chunkRefreshQueued) return;
     this._chunkRefreshQueued = true;
     const mountGen = this._mountGen;
     queueMicrotask(() => {
+      if (this._mountGen !== mountGen) return;
       const doPyramid = Boolean(this._chunkRefreshNeedPyramid);
       const bakeLayer = this._chunkRoofBakeLayer;
       const bakeChunkData = this._chunkRoofBakeChunkData;
@@ -1412,45 +1468,57 @@ export const lightingMethods = {
       this._chunkRefreshNeedPyramid = false;
       this._chunkRoofBakeLayer = null;
       this._chunkRoofBakeChunkData = null;
-      if (!this.active || this._mountGen !== mountGen) return;
+      if (!this.active) return;
 
       if (bakeLayer && !bakeLayer.spec?.roofMaskUrl) {
-        const isSuperGrid = Boolean(bakeLayer.spec?.superGrid);
-        const regionPx = bakeLayer.spec?.superGrid?.regionPx || 100000;
-        const b = bakeChunkData?.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
-        const isFullSuperGridProvince = isSuperGrid && (b.w === regionPx && b.h === regionPx);
-        if (isFullSuperGridProvince) {
-          if (!this.lightBatch.bakedRoofMask && !this._roofMaskBaking && bakeChunkData?.overlays) {
-            const ovList = Array.isArray(bakeChunkData.overlays) ? bakeChunkData.overlays : Object.values(bakeChunkData.overlays);
-            this._bakeRoofMaskFromList(ovList, {
-              originX: b.x || 0,
-              originY: b.y || 0,
-              regionW: b.w || regionPx,
-              regionH: b.h || regionPx,
-              repeat: true,
-              roofElevation: getLevelRoofElevation(bakeLayer.level)
-            });
-          }
-        } else {
-          const allOvs = Object.values(bakeLayer.spec.overlays || {});
-          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-          for (const ov of allOvs) {
-            if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
-            const r = Math.hypot(ov.w || 0, ov.h || 0) * 0.5;
-            if (ov.cx - r < minX) minX = ov.cx - r;
-            if (ov.cy - r < minY) minY = ov.cy - r;
-            if (ov.cx + r > maxX) maxX = ov.cx + r;
-            if (ov.cy + r > maxY) maxY = ov.cy + r;
-          }
-          if (minX < maxX && minY < maxY) {
-            this._bakeRoofMaskFromList(allOvs, {
-              originX: minX,
-              originY: minY,
-              regionW: maxX - minX,
-              regionH: maxY - minY,
-              repeat: false,
-              roofElevation: getLevelRoofElevation(bakeLayer.level)
-            });
+        const viewedBottom = getLevelBottomElevation(canvas.level);
+        const topElev = getLevelRoofElevation(bakeLayer.level);
+        const hiddenUnderUpper = !bakeLayer.level?.isView && viewedBottom >= topElev;
+        if (!hiddenUnderUpper) {
+          const isSuperGrid = Boolean(bakeLayer.spec?.superGrid);
+          const regionPx = bakeLayer.spec?.superGrid?.regionPx || 100000;
+          const b = bakeChunkData?.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
+          const isFullSuperGridProvince = isSuperGrid && (b.w === regionPx && b.h === regionPx);
+          if (isFullSuperGridProvince) {
+            if (!this.lightBatch.bakedRoofMask && !this._roofMaskBaking && bakeChunkData?.overlays) {
+              const ovList = Array.isArray(bakeChunkData.overlays) ? bakeChunkData.overlays : Object.values(bakeChunkData.overlays);
+              this._bakeRoofMaskFromList(ovList, {
+                originX: b.x || 0,
+                originY: b.y || 0,
+                regionW: b.w || regionPx,
+                regionH: b.h || regionPx,
+                repeat: true,
+                roofElevation: topElev,
+                roofLevelId: bakeLayer.level?.id || null
+              });
+            }
+          } else {
+            const allOvs = Object.values(bakeLayer.spec.overlays || {});
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const ov of allOvs) {
+              if (!ov?.roof || ov.walls?.includes("anchor_")) continue;
+              const r = Math.hypot(ov.w || 0, ov.h || 0) * 0.5;
+              if (ov.cx - r < minX) minX = ov.cx - r;
+              if (ov.cy - r < minY) minY = ov.cy - r;
+              if (ov.cx + r > maxX) maxX = ov.cx + r;
+              if (ov.cy + r > maxY) maxY = ov.cy + r;
+            }
+            if (minX < maxX && minY < maxY) {
+              this._bakeRoofMaskFromList(allOvs, {
+                originX: minX,
+                originY: minY,
+                regionW: maxX - minX,
+                regionH: maxY - minY,
+                repeat: false,
+                roofElevation: topElev,
+                roofLevelId: bakeLayer.level?.id || null
+              });
+            } else {
+              // All roof chunks unloaded on non-superGrid chunked map — cancel in-flight bake and release stale mask
+              this._roofMaskGen = (this._roofMaskGen || 0) + 1;
+              this.lightBatch.disposeBakedRoofMask();
+              this._syncIndoorLightVisibility();
+            }
           }
         }
       }
@@ -1464,6 +1532,32 @@ export const lightingMethods = {
     });
   },
 
+  _invalidateChunkSimSectors(layer, chunkData = null) {
+    const lid = layer?.level?.id;
+    if (!lid || !this.simSectors?.size) return;
+    const prefix = `${lid}::`;
+    const sectorKeys = chunkData?.sectors ? Object.keys(chunkData.sectors) : null;
+    if (sectorKeys) {
+      for (let i = 0; i < sectorKeys.length; i++) {
+        const fk = `${prefix}${sectorKeys[i]}`;
+        const data = this.simSectors.get(fk);
+        if (data) {
+          for (const eid of data.edgeIds) data.level?.edges?.delete?.(eid);
+          this.simSectors.delete(fk);
+        }
+      }
+    } else {
+      for (const [fk, data] of Array.from(this.simSectors.entries())) {
+        if (!fk.startsWith(prefix)) continue;
+        const sk = fk.slice(prefix.length);
+        if (!layer.spec?.sectors?.[sk]) {
+          for (const eid of data.edgeIds) data.level?.edges?.delete?.(eid);
+          this.simSectors.delete(fk);
+        }
+      }
+    }
+  },
+
   onChunkLoaded(layer, chunkKey, chunkData) {
     if (!this.active || !layer) return;
     // Queue non-blocking time-sliced GPU light baking for this chunk (<= 6ms/frame)
@@ -1471,6 +1565,8 @@ export const lightingMethods = {
 
     // Reconcile persisted door states that belong to sectors in this newly loaded chunk
     this._reconcileChunkDoorStates(layer, chunkData);
+    // Drop cached simSectors for newly populated chunk sectors so walls/movedWalls rebuild cleanly
+    this._invalidateChunkSimSectors(layer, chunkData);
 
     // Invalidate spatial caches so roofs, walls, doors, audio, editors, and sim-bubbles pick up newly loaded sectors
     layer.lastOverlayKey = "";
@@ -1482,7 +1578,9 @@ export const lightingMethods = {
     this.audioStreamer.lastKey = null;
     this._roofTokenOccDirty = true;
 
-    const needsRoofBake = Boolean(chunkData?.overlays && !layer.spec?.roofMaskUrl);
+    const viewedBottom = getLevelBottomElevation(canvas.level);
+    const hiddenUnderUpper = !layer.level?.isView && viewedBottom >= getLevelRoofElevation(layer.level);
+    const needsRoofBake = Boolean(!hiddenUnderUpper && chunkData?.overlays && !layer.spec?.roofMaskUrl);
     this._scheduleChunkBatchRefresh({
       needPyramid: true,
       roofBakeLayer: needsRoofBake ? layer : null,
@@ -1493,6 +1591,8 @@ export const lightingMethods = {
   onChunkUnloaded(layer, chunkKey, { deferRefresh = false } = {}) {
     if (!layer) return;
     this.lightBatch.detachChunk(layer.level.id, chunkKey);
+    // Drop cached simSectors whose sectors were unloaded with this chunk
+    this._invalidateChunkSimSectors(layer, null);
     // Drop openDoors entries whose sectors were unloaded with this chunk
     const lid = layer.level.id;
     const sectors = layer.spec?.sectors;
@@ -1511,7 +1611,13 @@ export const lightingMethods = {
     this.audioStreamer.lastKey = null;
     this._roofTokenOccDirty = true;
     if (this.active) {
-      this._scheduleChunkBatchRefresh({ needPyramid: !deferRefresh && !this._inUpdatePyramid });
+      const viewedBottom = getLevelBottomElevation(canvas.level);
+      const hiddenUnderUpper = !layer.level?.isView && viewedBottom >= getLevelRoofElevation(layer.level);
+      const rebakeNonSuperGridRoof = Boolean(!hiddenUnderUpper && !layer.spec?.roofMaskUrl && !layer.spec?.superGrid);
+      this._scheduleChunkBatchRefresh({
+        needPyramid: !deferRefresh && !this._inUpdatePyramid,
+        roofBakeLayer: rebakeNonSuperGridRoof ? layer : null
+      });
     }
   }
 };

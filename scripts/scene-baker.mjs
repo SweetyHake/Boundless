@@ -992,7 +992,7 @@ function resolveWallItem(sk, kind, idx, raw, wallEditsObj, doorStatesObj, levelI
       sound: ov.sound ?? 20,
       dir: ov.dir || 0,
       door: ov.door || 0,
-      ds: liveDs !== undefined ? liveDs : (ov.ds || 0),
+      ds: ov.door ? (liveDs !== undefined ? liveDs : (ov.ds || 0)) : 0,
       doorSound: ov.doorSound || "",
       threshold: ov.threshold || null,
       animation: (ov.animation?.type && ov.animation?.texture) ? ov.animation : null
@@ -1207,16 +1207,16 @@ function resolveTileItem(tid, raw, tileEditsObj, defaultElev) {
 
 function indexTileIntoSectors(tileSpec, tid, ensureSec, simGrid, simSectorPx) {
   const rot = tileSpec.rot || 0;
-  const rawAx = tileSpec.anchorX !== undefined ? tileSpec.anchorX : 0.5;
-  const rawAy = tileSpec.anchorY !== undefined ? tileSpec.anchorY : 0.5;
+  const rawAx = tileSpec.anchorX != null ? tileSpec.anchorX : 0.5;
+  const rawAy = tileSpec.anchorY != null ? tileSpec.anchorY : 0.5;
   const sxVal = (Number.isFinite(tileSpec.scaleX) && tileSpec.scaleX !== 0) ? tileSpec.scaleX : 1;
   const syVal = (Number.isFinite(tileSpec.scaleY) && tileSpec.scaleY !== 0) ? tileSpec.scaleY : 1;
   const effAx = sxVal < 0 ? (1 - rawAx) : rawAx;
   const effAy = syVal < 0 ? (1 - rawAy) : rawAy;
   const effW = Math.abs(tileSpec.w || 0) * Math.abs(sxVal);
   const effH = Math.abs(tileSpec.h || 0) * Math.abs(syVal);
-  const pivX = tileSpec.anchorX === undefined ? (tileSpec.x + (tileSpec.w || 0) * 0.5) : tileSpec.x;
-  const pivY = tileSpec.anchorY === undefined ? (tileSpec.y + (tileSpec.h || 0) * 0.5) : tileSpec.y;
+  const pivX = tileSpec.anchorX == null ? (tileSpec.x + (tileSpec.w || 0) * 0.5) : tileSpec.x;
+  const pivY = tileSpec.anchorY == null ? (tileSpec.y + (tileSpec.h || 0) * 0.5) : tileSpec.y;
   const rad = (rot * Math.PI) / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
@@ -1308,8 +1308,8 @@ export function virtualSoundToDocData(item, levelId) {
 export function virtualTileToDocData(item, levelId) {
   const ax = item.anchorX ?? 0.5;
   const ay = item.anchorY ?? 0.5;
-  const docX = item.anchorX === undefined ? (item.x + item.w * 0.5) : item.x;
-  const docY = item.anchorY === undefined ? (item.y + item.h * 0.5) : item.y;
+  const docX = item.anchorX == null ? (item.x + item.w * 0.5) : item.x;
+  const docY = item.anchorY == null ? (item.y + item.h * 0.5) : item.y;
   return {
     x: docX,
     y: docY,
@@ -1532,8 +1532,10 @@ export function extractNativeDocsFromLevelSpec(spec, {
 
   const walls = [];
   const lights = [];
+  const lightGids = [];
   const sounds = [];
   const tiles = [];
+  const tileGids = [];
 
   for (const [sk, sec] of Object.entries(spec?.sectors || {})) {
     if (!sec) continue;
@@ -1552,7 +1554,10 @@ export function extractNativeDocsFromLevelSpec(spec, {
     if (sec.l?.length) {
       for (let li = 0; li < sec.l.length; li++) {
         const item = resolveLightItem(sk, li, sec.l[li], lEdits, baseElevation + 6);
-        if (item) lights.push(virtualLightToDocData(item, targetLevelId));
+        if (item) {
+          lights.push(virtualLightToDocData(item, targetLevelId));
+          lightGids.push(item.gid || null);
+        }
       }
     }
     if (sec.s?.length) {
@@ -1566,10 +1571,13 @@ export function extractNativeDocsFromLevelSpec(spec, {
   const rawTiles = Array.isArray(spec?.tiles) ? spec.tiles : [];
   for (let tid = 0; tid < rawTiles.length; tid++) {
     const item = resolveTileItem(tid, rawTiles[tid], tEdits, baseElevation);
-    if (item && item.src) tiles.push(virtualTileToDocData(item, targetLevelId));
+    if (item && item.src) {
+      tiles.push(virtualTileToDocData(item, targetLevelId));
+      tileGids.push(item.gid || null);
+    }
   }
 
-  return { walls, lights, sounds, tiles };
+  return { walls, lights, lightGids, sounds, tiles, tileGids };
 }
 
 function getSceneManifestInfo(scene) {
@@ -1812,6 +1820,19 @@ export function isSceneBoundlessEditable(scene) {
 }
 
 /**
+ * Return levels on a scene that are not yet backed by Boundless (supports incremental optimization of multi-level scenes).
+ */
+export function getUnbakedSceneLevels(scene) {
+  if (!scene) return [];
+  const sceneEnabled = Boolean(scene.flags?.[MODULE_ID]?.enabled);
+  const levels = Array.from(scene.levels || []);
+  return levels.filter(l => {
+    const lc = l?.flags?.[MODULE_ID];
+    return !(lc?.enabled === true || (sceneEnabled && lc?.enabled !== false));
+  });
+}
+
+/**
  * Bake accumulated virtual edits (`wallEdits`, `lightEdits`, `soundEdits`, `tileEdits`)
  * and optionally newly created native documents back into clean Boundless manifest JSON(s),
  * clearing the scene edit delta flags afterwards.
@@ -1972,6 +1993,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
     }
     let updatedManifest = rawManifest;
     let sceneManifestTouched = false;
+    const sceneTouchedLevelIds = [];
     if (rawManifest.levels && typeof rawManifest.levels === "object") {
       const nextLevels = { ...rawManifest.levels };
       for (const lvl of allLevels) {
@@ -1998,6 +2020,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         totalSounds += merged.counts.sounds;
         totalTiles += merged.counts.tiles;
         editedLevelIds.push(lid);
+        sceneTouchedLevelIds.push(lid);
         sceneManifestTouched = true;
       }
       updatedManifest = { ...rawManifest, levels: nextLevels };
@@ -2026,6 +2049,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
         totalSounds += merged.counts.sounds;
         totalTiles += merged.counts.tiles;
         editedLevelIds.push(lid);
+        sceneTouchedLevelIds.push(lid);
         sceneManifestTouched = true;
       }
     }
@@ -2034,7 +2058,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
       if (existingEntry) {
         existingEntry.manifest = updatedManifest;
         existingEntry.origUrls.add(sceneManifestUrl);
-        existingEntry.sceneTarget = { origUrl: sceneManifestUrl, redirected: sceneRedirected };
+        existingEntry.sceneTarget = { origUrl: sceneManifestUrl, redirected: sceneRedirected, levelIds: sceneTouchedLevelIds };
       } else {
         const entry = {
           kind: "file",
@@ -2043,7 +2067,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           manifest: updatedManifest,
           origUrls: new Set([sceneManifestUrl]),
           levelTargets: [],
-          sceneTarget: { origUrl: sceneManifestUrl, redirected: sceneRedirected }
+          sceneTarget: { origUrl: sceneManifestUrl, redirected: sceneRedirected, levelIds: sceneTouchedLevelIds }
         };
         pendingFileMap.set(sceneFileKey, entry);
         pendingWrites.push(entry);
@@ -2081,7 +2105,7 @@ export async function bakeSceneEditsToManifest(controller, scene, {
           }
         }
         if (w.sceneTarget) {
-          if (w.sceneTarget.levelId) committedLevelIds.push(w.sceneTarget.levelId);
+          if (w.sceneTarget.levelIds?.length) committedLevelIds.push(...w.sceneTarget.levelIds);
           if (w.sceneTarget.redirected || !sameUrl(w.sceneTarget.origUrl)) {
             scenePatch[`flags.${MODULE_ID}.manifestUrl`] = finalUrl;
           }
@@ -2208,7 +2232,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
       spec = lcfg.inlineManifest;
     } else if (lcfg?.manifestUrl) {
       const lm = await fetchManifestJson(lcfg.manifestUrl, signal);
-      spec = lm.levels?.[lvl.id] || lm;
+      spec = (lm.levels && typeof lm.levels === "object") ? (lm.levels[lvl.id] || null) : lm;
     } else if (cfg.enabled && sceneManifest) {
       if (sceneManifest.levels && typeof sceneManifest.levels === "object") {
         spec = sceneManifest.levels[lvl.id] || null;
@@ -2238,6 +2262,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     if (createCopy) {
       const cloneName = `${scene.name} (Native)`;
       targetScene = await scene.clone({ name: cloneName }, { save: true });
+      if (!targetScene) throw new Error("Failed to clone scene.");
       createdClone = true;
       const dstLevels = Array.from(targetScene.levels || []);
       for (let i = 0; i < srcLevels.length; i++) {
@@ -2246,6 +2271,9 @@ export async function unbakeSceneFromBoundless(controller, scene, {
       }
     } else {
       for (const l of srcLevels) levelIdMap.set(l.id, l.id);
+      if (globalThis.canvas?.ready && canvas.scene?.id === targetScene.id && controller?.active) {
+        controller.unmount();
+      }
     }
 
     const outDir = `${buildDefaultBakeDir(targetScene)}_unbaked`;
@@ -2253,6 +2281,13 @@ export async function unbakeSceneFromBoundless(controller, scene, {
     const allLights = [];
     const allSounds = [];
     const allTiles = [];
+    const lightsByGid = new Map();
+    const tilesByGid = new Map();
+    const docSigWithoutLevels = (doc) => {
+      const copy = { ...doc };
+      delete copy.levels;
+      return JSON.stringify(copy);
+    };
     const pendingLevelPatches = [];
 
     // 3. Extract native documents and optionally stitch pyramid textures back into background/foreground
@@ -2277,9 +2312,33 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         doorStates: prevFlags.doorStates
       });
       allWalls.push(...extracted.walls);
-      allLights.push(...extracted.lights);
+      for (let li = 0; li < extracted.lights.length; li++) {
+        const doc = extracted.lights[li];
+        const gid = extracted.lightGids?.[li];
+        if (gid) {
+          const prev = lightsByGid.get(gid);
+          if (prev && prev.sig === docSigWithoutLevels(doc)) {
+            if (!prev.doc.levels.includes(dstLid)) prev.doc.levels.push(dstLid);
+            continue;
+          }
+          lightsByGid.set(gid, { doc, sig: docSigWithoutLevels(doc) });
+        }
+        allLights.push(doc);
+      }
       allSounds.push(...extracted.sounds);
-      allTiles.push(...extracted.tiles);
+      for (let ti = 0; ti < extracted.tiles.length; ti++) {
+        const doc = extracted.tiles[ti];
+        const gid = extracted.tileGids?.[ti];
+        if (gid) {
+          const prev = tilesByGid.get(gid);
+          if (prev && prev.sig === docSigWithoutLevels(doc)) {
+            if (!prev.doc.levels.includes(dstLid)) prev.doc.levels.push(dstLid);
+            continue;
+          }
+          tilesByGid.set(gid, { doc, sig: docSigWithoutLevels(doc) });
+        }
+        allTiles.push(doc);
+      }
 
       if (restoreImages) {
         const lvlPatch = {};
@@ -2325,10 +2384,10 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         }
         if (Object.keys(lvlPatch).length) {
           // Baked pyramids already incorporate `level.textures` transforms (offset/scale/rotation/anchor/fit);
-          // reset them when restoring stitched images, unless an untouched video layer still depends on them.
-          const hasUntouchedVideoBg = Boolean(dstLevel.background?.src && isVideoPath(dstLevel.background.src));
-          const hasUntouchedVideoFg = Boolean(dstLevel.foreground?.src && isVideoPath(dstLevel.foreground.src));
-          if (dstLevel.textures && !hasUntouchedVideoBg && !hasUntouchedVideoFg) {
+          // reset them only when no untouched background or foreground texture still relies on them.
+          const hasUntouchedBg = Boolean(dstLevel.background?.src && !lvlPatch["background.src"]);
+          const hasUntouchedFg = Boolean(dstLevel.foreground?.src && !lvlPatch["foreground.src"]);
+          if (dstLevel.textures && !hasUntouchedBg && !hasUntouchedFg) {
             lvlPatch["textures.offsetX"] = 0;
             lvlPatch["textures.offsetY"] = 0;
             lvlPatch["textures.scaleX"] = 1;

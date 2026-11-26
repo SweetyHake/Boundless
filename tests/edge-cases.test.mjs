@@ -3221,3 +3221,212 @@ test("ChunkStreamer reserves viewport slots even when dispersed tokens exceed MA
   const needed = streamer._collectNeededChunks(st, { x0: 151000, y0: 151000, x1: 158000, y1: 158000, scale: 0.5 });
   assert.equal(needed.has("15_15"), true, "camera chunk must not be starved by dispersed tokens");
 });
+
+test("requestDoorState serializes rapid double-clicks and blocks non-GM users lacking WALL_DOORS or while paused", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+
+  const updates = [];
+  let releaseFirst;
+  const firstPending = new Promise(r => { releaseFirst = r; });
+
+  const makeCtrl = () => {
+    const state = { curDs: 0 };
+    const ctrl = Object.assign(Object.create(lightingMethods), {
+      active: true,
+      doorStates: new Map(),
+      openDoors: new Map(),
+      closingDoorTimers: new Map(),
+      _resolveDoorByKey(dKey) {
+        return dKey === "lvl1::0_0_0"
+          ? { dKey, levelId: "lvl1", sx: 0, sy: 0, idx: 0, doorType: 1, defaultDs: 0 }
+          : null;
+      },
+      getCurrentDoorState() { return state.curDs; },
+      _applyDoorStateLocal(_info, ds) { state.curDs = ds; }
+    });
+    return { ctrl, state };
+  };
+
+  // 1. GM rapid open -> close must serialize in _doorCommitQueue and finish closed (ds=0)
+  {
+    const { ctrl } = makeCtrl();
+    let callIdx = 0;
+    globalThis.game.user = { id: "gm1", isGM: true, can: () => true };
+    globalThis.canvas = {
+      scene: {
+        id: "sc1",
+        async update(data) {
+          const n = ++callIdx;
+          if (n === 1) await firstPending;
+          updates.push(data["flags.boundless.doorStates.lvl1::0_0_0"]);
+        }
+      }
+    };
+    ctrl.requestDoorState("lvl1::0_0_0", 1, { playSound: false });
+    ctrl.requestDoorState("lvl1::0_0_0", 0, { playSound: false });
+    releaseFirst();
+    for (let i = 0; i < 20 && ctrl._doorCommitQueue.has("lvl1::0_0_0"); i++) {
+      await Promise.resolve();
+    }
+    assert.deepEqual(updates, [1, 0], "serialized door commits must preserve rapid open->close order");
+  }
+
+  // 2. Player without WALL_DOORS or while paused must be rejected locally and remotely
+  {
+    const { ctrl } = makeCtrl();
+    let emitted = 0;
+    globalThis.game.socket = { emit() { emitted++; } };
+    globalThis.game.paused = false;
+    const noDoorPlayer = { id: "p1", isGM: false, active: true, can: (p) => p !== "WALL_DOORS" };
+    const okPlayer = { id: "p2", isGM: false, active: true, can: () => true };
+    globalThis.game.users = new Map([["p1", noDoorPlayer], ["p2", okPlayer]]);
+    globalThis.game.users.activeGM = { id: "gm1" };
+    globalThis.game.user = noDoorPlayer;
+    const targetScene = { id: "sc1", active: true };
+
+    ctrl.requestDoorState("lvl1::0_0_0", 1);
+    assert.equal(emitted, 0, "player without WALL_DOORS must not emit doorRequest");
+    assert.equal(ctrl._isAuthorizedDoorRequester({ senderId: "p1" }, targetScene), false, "GM must reject remote doorRequest without WALL_DOORS");
+    assert.equal(ctrl._isAuthorizedDoorRequester({ senderId: "p2" }, targetScene), true, "GM must allow remote doorRequest with WALL_DOORS");
+
+    globalThis.game.user = okPlayer;
+    globalThis.game.paused = true;
+    ctrl.requestDoorState("lvl1::0_0_0", 1);
+    assert.equal(emitted, 0, "player must not emit doorRequest while game is paused");
+  }
+});
+
+test("MegaLightBatch resolves multi-level sharedLightAlias and suppresses other-level indoor lights under bakedRoofMask", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+  const lb = new MegaLightBatch();
+
+  lb.sharedLightAlias.set("lvl2::0_0_0", "lvl1::0_0_0");
+  assert.equal(lb.resolveLightId("lvl2::0_0_0"), "lvl1::0_0_0");
+  assert.equal(lb.resolveLightId("lvl1::0_0_0"), "lvl1::0_0_0");
+
+  lb.bakedRoofMask = { destroyed: false, valid: true, baseTexture: { destroyed: false, valid: true } };
+  lb.useBakedRoofMask = true;
+  lb.bakedRoofLevelId = "lvl1";
+  lb._currentDarkness = 0.5;
+
+  const sameLvlIndoor = { levelId: "lvl1", isIndoor: true, darkMin: 0, darkMax: 1, baseWeight: 1 };
+  const otherLvlIndoor = { levelId: "lvl2", isIndoor: true, darkMin: 0, darkMax: 1, baseWeight: 1 };
+  const otherLvlOutdoor = { levelId: "lvl2", isIndoor: false, darkMin: 0, darkMax: 1, baseWeight: 1 };
+  assert.equal(lb._computeEffectiveWeight(sameLvlIndoor), 1, "same-level indoor light uses shader bakedRoofMask");
+  assert.equal(lb._computeEffectiveWeight(otherLvlIndoor), 0, "other-level indoor light must be suppressed when bakedRoofMask belongs to lvl1");
+  assert.equal(lb._computeEffectiveWeight(otherLvlOutdoor), 1, "other-level outdoor light remains visible");
+});
+
+test("getUnbakedSceneLevels & isHeavyStandardScene detect partially baked multi-level scenes and extractNativeDocsFromLevelSpec exposes gids", async () => {
+  installBaseGlobals();
+  const { getUnbakedSceneLevels, extractNativeDocsFromLevelSpec } = await import("../scripts/scene-baker.mjs");
+  const { isHeavyStandardScene } = await import("../scripts/perf-auto.mjs");
+
+  const scene = {
+    width: 8000,
+    height: 8000,
+    flags: { boundless: { enabled: true } },
+    levels: [
+      { id: "l1", flags: { boundless: { enabled: true } } },
+      { id: "l2", flags: { boundless: { enabled: false } } }
+    ]
+  };
+  const unbaked = getUnbakedSceneLevels(scene);
+  assert.deepEqual(unbaked.map(l => l.id), ["l2"]);
+  assert.equal(isHeavyStandardScene(scene), true, "heavy scene with an unbaked level must still report heavy");
+
+  const allBaked = {
+    ...scene,
+    levels: [{ id: "l1", flags: { boundless: { enabled: true } } }]
+  };
+  assert.deepEqual(getUnbakedSceneLevels(allBaked), []);
+  assert.equal(isHeavyStandardScene(allBaked), false);
+
+  const extracted = extractNativeDocsFromLevelSpec({
+    tiles: [{ src: "roof.webp", x: 100, y: 200, w: 300, h: 300, elevation: 10, gid: "tg_1" }],
+    sectors: {
+      "0_0": {
+        l: [[50, 60, 40, 20, "#ffaa00", 0.5, "torch", 6, { gid: "lg_1" }]]
+      }
+    }
+  }, { levelId: "l1", baseElevation: 0 });
+  assert.deepEqual(extracted.tileGids, ["tg_1"]);
+  assert.deepEqual(extracted.lightGids, ["lg_1"]);
+});
+
+test("LRUTextureManager._loadFallback uses transient backoff instead of permanent missingSrcs on load failures", async () => {
+  installBaseGlobals();
+  let calls = 0;
+  globalThis.foundry = {
+    canvas: {
+      loadTexture: async () => {
+        calls++;
+        if (calls <= 2) throw new Error("network_blip");
+        return { destroyed: false, valid: true, baseTexture: { destroyed: false, valid: true, realWidth: 64, realHeight: 64, update() {} } };
+      }
+    }
+  };
+  const { LRUTextureManager } = await import("../scripts/texture-manager.mjs");
+  const tm = new LRUTextureManager({ profile: "low" });
+  const r1 = await tm.load("flaky.svg");
+  const r2 = await tm.load("flaky.svg");
+  assert.equal(r1, null);
+  assert.equal(r2, null);
+  assert.equal(tm.missingSrcs.has("flaky.svg"), false, "transient fallback failures must not permanently blacklist src");
+  assert.ok(tm._fallbackRetryAfter.get("flaky.svg") > performance.now(), "backoff timestamp must be recorded");
+  // Simulate backoff expiry -> 3rd attempt succeeds
+  tm._fallbackRetryAfter.set("flaky.svg", performance.now() - 1);
+  const r3 = await tm.load("flaky.svg");
+  assert.ok(r3, "load must succeed after transient backoff expires");
+});
+
+test("CanvasVisibility#testVisibility returns true for players when tokenVision is false and keys cache by options.level", async () => {
+  installBaseGlobals();
+  let wrappedCalls = 0;
+  class MockCanvasVisibility {
+    constructor() { this.tokenVision = false; }
+    testVisibility(_points, options = {}) {
+      wrappedCalls++;
+      return options?.level === "lvl2";
+    }
+  }
+  globalThis.foundry = {
+    canvas: {
+      groups: { VisibilityCanvasGroup: null },
+      layers: { CanvasVisibility: MockCanvasVisibility }
+    }
+  };
+  globalThis.game.user = { id: "player1", isGM: false };
+  globalThis.canvas = {
+    level: { id: "lvl1", elevation: { base: 0 } },
+    effects: { visionSources: [] }
+  };
+
+  const { installCpuPerfEngine } = await import("../scripts/perf-cpu.mjs");
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const prevEnabled = PERF_CONFIG.perfEnabled;
+  const prevCpu = PERF_CONFIG.perfCpuPerception;
+  PERF_CONFIG.perfEnabled = true;
+  PERF_CONFIG.perfCpuPerception = true;
+  try {
+    installCpuPerfEngine();
+    const vis = new MockCanvasVisibility();
+    // 1. tokenVision === false with empty visionSources -> MUST return true even for non-GM player
+    assert.equal(vis.testVisibility({ x: 100, y: 100 }), true, "non-GM must see map when tokenVision is disabled");
+
+    // 2. tokenVision === true with active vision -> cache MUST separate options.level
+    vis.tokenVision = true;
+    globalThis.canvas.effects.visionSources = [{ active: true }];
+    assert.equal(vis.testVisibility({ x: 200, y: 200 }, { level: "lvl1" }), false);
+    assert.equal(vis.testVisibility({ x: 200, y: 200 }, { level: "lvl2" }), true, "options.level must not collide in _cellVisCache");
+    assert.equal(wrappedCalls, 2);
+    // Repeated call on lvl2 hits cache
+    assert.equal(vis.testVisibility({ x: 200, y: 200 }, { level: "lvl2" }), true);
+    assert.equal(wrappedCalls, 2);
+  } finally {
+    PERF_CONFIG.perfEnabled = prevEnabled;
+    PERF_CONFIG.perfCpuPerception = prevCpu;
+  }
+});

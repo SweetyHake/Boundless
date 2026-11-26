@@ -335,6 +335,17 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
               streamer.scheduleSync(null, true);
             }
           });
+        } else if (controller._roofHiddenTokens?.size) {
+          // Restore roof occlusion on mounted tokens temporarily un-culled by prepareMountedTokensForSelection that were not selected
+          let restoredRoof = false;
+          for (const tok of controller._roofHiddenTokens) {
+            if (tok && !tok.destroyed && !tok.controlled && tok.renderable) {
+              tok.renderable = false;
+              if (tok.mesh && !tok.mesh.destroyed) tok.mesh.renderable = false;
+              restoredRoof = true;
+            }
+          }
+          if (restoredRoof) controller._roofTokenOccDirty = true;
         }
       }
       return res;
@@ -380,6 +391,9 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
   };
 
   let lastSelectAllState = null;
+  if (typeof globalThis.Hooks?.on === "function") {
+    globalThis.Hooks.on("canvasTearDown", () => { lastSelectAllState = null; });
+  }
   if (PlaceablesLayerCls?.prototype?._onSelectAllKey) {
     const origSelectAllKey = PlaceablesLayerCls.prototype._onSelectAllKey;
     PlaceablesLayerCls.prototype._onSelectAllKey = function (event) {
@@ -393,7 +407,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         return origSelectAllKey.call(this, event);
       }
       const layerName = this.options?.name || this.constructor?.name || "";
-      const levelId = canvas?.level?.id || "";
+      const levelId = `${canvas?.scene?.id || ""}:${canvas?.level?.id || ""}`;
       const nowMs = performance.now();
       const vp = isBoundless ? controller.getViewportWorldRect(0.02) : getVisibleWorldRect(0.02);
 
@@ -419,6 +433,15 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         }
 
         if (plan.action === "viewport") {
+          if (inViewDocs.length > MAX_MARQUEE_MATERIALIZE) {
+            const cx = canvas.stage?.pivot?.x ?? ((vp.x0 + vp.x1) * 0.5);
+            const cy = canvas.stage?.pivot?.y ?? ((vp.y0 + vp.y1) * 0.5);
+            inViewDocs.sort((a, b) => {
+              const da = ((Number(a._source?.x ?? a.x ?? 0) - cx) ** 2) + ((Number(a._source?.y ?? a.y ?? 0) - cy) ** 2);
+              const db = ((Number(b._source?.x ?? b.x ?? 0) - cx) ** 2) + ((Number(b._source?.y ?? b.y ?? 0) - cy) ** 2);
+              return da - db;
+            });
+          }
           const res = streamer.materializeAndSelect(inViewDocs, {
             releaseOthers: true,
             maxCount: MAX_MARQUEE_MATERIALIZE,
@@ -615,7 +638,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
           if (hitDoc) {
             if (event.altKey) {
               if (hitDoc.canUserModify?.(game.user, "update") && hitDoc.sheet?.render) {
-                hitDoc.sheet.render(true);
+                hitDoc.sheet.render({ force: true });
                 return;
               }
             } else if (hitDoc.flags?.["item-piles"]?.data?.enabled) {
@@ -637,7 +660,7 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
                   sheet.maximize?.();
                   sheet.bringToFront?.();
                 } else {
-                  sheet.render(true, { token: hitDoc });
+                  sheet.render({ force: true, token: hitDoc });
                 }
                 return;
               }

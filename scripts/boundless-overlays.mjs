@@ -189,13 +189,14 @@ export const overlayMethods = {
       regionH,
       repeat: isSuperGrid,
       roofElevation,
+      roofLevelId: targetLayer.level?.id || null,
       roofMaskUrl: targetLayer.spec?.roofMaskUrl || null,
       sceneId,
       mountedLevelId
     });
   },
 
-  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity, roofMaskUrl = null, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
+  async _bakeRoofMaskFromList(ovList, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity, roofLevelId = null, roofMaskUrl = null, sceneId = canvas.scene?.id, mountedLevelId = canvas.level?.id } = {}) {
     const renderer = canvas?.app?.renderer;
     if (!renderer || (!ovList?.length && !roofMaskUrl)) return;
 
@@ -341,7 +342,8 @@ export const overlayMethods = {
         regionW,
         regionH,
         repeat,
-        roofElevation
+        roofElevation,
+        roofLevelId
       });
       rt = null;
       this._syncIndoorLightVisibility();
@@ -1339,8 +1341,10 @@ export const overlayMethods = {
     if (!this.active || !doc) return false;
     if (this.visibleLevelLayers.length > 1) return true;
     if (!this.activeOverlays.size && !this.activeVirtualTiles.size) return false;
-    const tx = (doc.x ?? 0) + ((doc.width ?? 1) * (canvas.dimensions?.size || 100) * 0.5);
-    const ty = (doc.y ?? 0) + ((doc.height ?? 1) * (canvas.dimensions?.size || 100) * 0.5);
+    const center = typeof doc.getCenterPoint === "function" ? doc.getCenterPoint() : null;
+    const sz = typeof doc.getSize === "function" ? doc.getSize() : null;
+    const tx = Number.isFinite(center?.x) ? center.x : ((doc.x ?? 0) + ((sz?.width ?? ((doc.width ?? 1) * (canvas.dimensions?.size || 100))) * 0.5));
+    const ty = Number.isFinite(center?.y) ? center.y : ((doc.y ?? 0) + ((sz?.height ?? ((doc.height ?? 1) * (canvas.dimensions?.size || 100))) * 0.5));
     for (const ov of this.activeOverlays.values()) {
       if (!ov.roofMesh?.visible) continue;
       const rx = Math.max(ov.roofMesh.width || 0, ov.roofMesh.height || 0) * 0.65 + 250;

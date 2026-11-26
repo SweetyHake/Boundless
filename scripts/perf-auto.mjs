@@ -362,7 +362,12 @@ export function updateStandardLightMeshCulling(vp = null) {
         continue;
       }
       const r = ls.radius ?? ls.data?.radius;
-      if (!Number.isFinite(r) || r <= 0) continue;
+      if (!Number.isFinite(r) || r <= 0) {
+        if (bg && !bg.destroyed) bg.renderable = true;
+        if (il && !il.destroyed) il.renderable = true;
+        if (co && !co.destroyed) co.renderable = true;
+        continue;
+      }
       const lx = ls.x ?? ls.data?.x;
       const ly = ls.y ?? ls.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
@@ -386,7 +391,10 @@ export function updateStandardLightMeshCulling(vp = null) {
         continue;
       }
       const r = ds._visualShape?.config?.radius ?? ((ds.radius ?? ds.data?.radius ?? 0) + (ds._padding ?? 0));
-      if (!Number.isFinite(r) || r <= 0) continue;
+      if (!Number.isFinite(r) || r <= 0) {
+        dk.renderable = true;
+        continue;
+      }
       const lx = ds.x ?? ds.data?.x;
       const ly = ds.y ?? ds.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
@@ -546,14 +554,17 @@ export function collectSceneActiveAssetUrls(scene) {
   const srcFg = scene._source ? (scene._source.foreground?.src ?? scene._source.foreground) : (scene.foreground?.src ?? scene.foreground);
   add(srcBg);
   add(srcFg);
+  add(scene._source?.fog?.overlay ?? scene.fog?.overlay);
 
   if (scene.levels) {
     for (const lvl of scene.levels) {
       add(lvl.background?.src);
       add(lvl.foreground?.src ?? lvl.foreground);
+      add(lvl.fog?.overlay);
       add(lvl.fog?.src);
     }
   }
+  for (const w of scene.walls ?? []) add(w.animation?.texture);
   for (const t of scene.tiles ?? []) add(t.texture?.src);
   for (const tok of scene.tokens ?? []) {
     add(tok.texture?.src);
@@ -582,14 +593,35 @@ export function disposeStaleSceneVramTextures() {
     const bt = t?.baseTexture ?? (t?.realWidth !== undefined ? t : null);
     if (bt) protectedBts.add(bt);
   };
+  const walkDisplayTree = (node, depth = 0) => {
+    if (!node || depth > 8) return;
+    protectTex(node.texture);
+    const u = node.shader?.uniforms;
+    if (u) {
+      protectTex(u.uSampler);
+      protectTex(u.ringTexture);
+      protectTex(u.subjectTexture);
+      protectTex(u.ringSubjectTexture);
+    }
+    const kids = node.children;
+    if (Array.isArray(kids)) {
+      for (let i = 0; i < kids.length; i++) walkDisplayTree(kids[i], depth + 1);
+    }
+  };
   protectTex(globalThis.CONFIG?.Token?.ring?.ringClass?.baseTexture);
   protectTex(globalThis.CONFIG?.Token?.ring?.spritesheet?.baseTexture);
-  // Protect every live BaseTexture currently attached to active scene display objects (including custom module assets)
+  // Recursively protect every live BaseTexture attached to active display trees (weatherEffects, fog, modules, doors, rings)
   const c = globalThis.canvas;
   protectTex(c?.primary?.background?.texture);
   protectTex(c?.primary?.foreground?.texture);
+  protectTex(c?.fog?.sprite?.texture);
   for (const lt of c?.primary?.levelTextures ?? []) protectTex(lt?.texture);
-  for (const ch of c?.primary?.children ?? []) protectTex(ch?.texture);
+  walkDisplayTree(c?.primary);
+  walkDisplayTree(c?.weather);
+  walkDisplayTree(c?.effects);
+  walkDisplayTree(c?.interface);
+  walkDisplayTree(c?.controls);
+  walkDisplayTree(c?.environment);
   for (const t of c?.tiles?.placeables ?? []) protectTex(t?.mesh?.texture);
   for (const tok of c?.tokens?.placeables ?? []) {
     protectTex(tok?.mesh?.texture);
@@ -599,7 +631,6 @@ export function disposeStaleSceneVramTextures() {
   for (const d of c?.drawings?.placeables ?? []) protectTex(d?.shape?.texture);
   for (const tpl of c?.templates?.placeables ?? []) protectTex(tpl?.texture);
   protectTex(c?.visibility?.visibilityOverlay?.texture);
-  for (const ch of c?.weather?.children ?? []) protectTex(ch?.texture);
 
   let disposed = 0;
   let bytes = 0;
@@ -619,8 +650,8 @@ export function disposeStaleSceneVramTextures() {
     const rawUrl = bt.resource?.url;
     if (!rawUrl || typeof rawUrl !== "string") continue;
     if (/\.(webm|mp4|m4v|ogg|ogv|mov)(?:[?#]|$)/i.test(rawUrl)) continue;
-    // Never evict global Foundry or module spritesheets (token rings, VFX, weather, UI atlases)
-    if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|more-dynamic-token-rings\/|cs-rings\/|showstopper\/|fxmaster\/|jb2a|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
+    // Never evict global Foundry or module spritesheets / token packs (token rings, Hero in a Box, VFX, weather, UI atlases)
+    if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|more-dynamic-token-rings\/|cs-rings\/|cs-hero-box\/|sh-hero-box[^/]*\/|showstopper\/|showstopper-plus\/|sequencer\/|fxmaster\/|fxmaster-plus\/|burn-living-map\/|jb2a|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
 
     const norm = normalizeAssetKey(rawUrl);
     if (!norm || activeUrls.has(norm)) continue;
@@ -708,7 +739,18 @@ function scheduleStandardLevelPrewarm() {
 // ---------------------------------------------------------------------------
 
 export function isHeavyStandardScene(scene) {
-  if (!scene || scene.flags?.[MODULE_ID]?.enabled) return false;
+  if (!scene) return false;
+  const sceneEnabled = Boolean(scene.flags?.[MODULE_ID]?.enabled);
+  const lvls = scene.levels ? Array.from(scene.levels) : [];
+  if (lvls.length > 0) {
+    const hasUnbaked = lvls.some((l) => {
+      const lc = l.flags?.[MODULE_ID];
+      return !(lc?.enabled === true || (sceneEnabled && lc?.enabled !== false));
+    });
+    if (!hasUnbaked) return false;
+  } else if (sceneEnabled) {
+    return false;
+  }
   const w = Number(scene.width) || 0;
   const h = Number(scene.height) || 0;
   const pixels = w * h;
@@ -717,10 +759,28 @@ export function isHeavyStandardScene(scene) {
   return pixels >= 36_000_000 || tiles >= 30 || lights >= 60;
 }
 
+let _hintTimer = null;
+
+export function cancelAutoPerfTimers() {
+  _prewarmGen++;
+  if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
+  if (_cullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
+    globalThis.cancelAnimationFrame(_cullRaf);
+    _cullRaf = null;
+  }
+  if (_lightCullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
+    globalThis.cancelAnimationFrame(_lightCullRaf);
+    _lightCullRaf = null;
+  }
+  if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
+  if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }
+  if (_hintTimer) { clearTimeout(_hintTimer); _hintTimer = null; }
+}
+
 function maybeHintHeavyScene(scene) {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfHeavySceneHint) return;
   if (!globalThis.game?.user?.isGM) return;
-  if (!isStandardSceneActive() || !scene?.id) return;
+  if (!isStandardSceneActive() || !scene?.id || globalThis.canvas?.scene?.id !== scene.id) return;
   if (_hintedScenes.has(scene.id)) return;
   if (!isHeavyStandardScene(scene)) return;
 
@@ -756,7 +816,12 @@ export function installAutoPerfEngine(controller) {
     updateStandardSceneCulling();
     scheduleVramCleanup();
     scheduleStandardLevelPrewarm();
-    setTimeout(() => maybeHintHeavyScene(c?.scene), 1500);
+    if (_hintTimer) clearTimeout(_hintTimer);
+    const readyScene = c?.scene;
+    _hintTimer = setTimeout(() => {
+      _hintTimer = null;
+      maybeHintHeavyScene(readyScene);
+    }, 1500);
   });
 
   Hooks.on("canvasPan", () => {
@@ -836,26 +901,15 @@ export function installAutoPerfEngine(controller) {
   Hooks.on("updateToken", (doc, changes) => {
     if (!isStandardSceneActive()) return;
     if ((globalThis.canvas?.effects?.lightSources?.size ?? 0) < 16 && (globalThis.canvas?.effects?.darknessSources?.size ?? 0) < 8) return;
-    if ((doc?.object?.light?.active || doc?.light?.negative) && changes && ("x" in changes || "y" in changes || "light" in changes || "level" in changes)) {
+    if (changes && ("light" in changes || ((doc?.object?.light?.active || doc?.light?.negative) && ("x" in changes || "y" in changes || "level" in changes)))) {
       scheduleLightMeshCulling();
     }
   });
 
   Hooks.on("canvasTearDown", () => {
-    _prewarmGen++;
+    cancelAutoPerfTimers();
     _hasFastBatchTiles = false;
     _hasStandardCulling = false;
     _tileShadersSynced = false;
-    if (_cullTimer) { clearTimeout(_cullTimer); _cullTimer = null; }
-    if (_cullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
-      globalThis.cancelAnimationFrame(_cullRaf);
-      _cullRaf = null;
-    }
-    if (_lightCullRaf !== null && typeof globalThis.cancelAnimationFrame === "function") {
-      globalThis.cancelAnimationFrame(_lightCullRaf);
-      _lightCullRaf = null;
-    }
-    if (_vramTimer) { clearTimeout(_vramTimer); _vramTimer = null; }
-    if (_prewarmTimer) { clearTimeout(_prewarmTimer); _prewarmTimer = null; }
   });
 }

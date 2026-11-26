@@ -120,6 +120,9 @@ export function isAgPerfCoreActive() {
 export function resolveFoundryClass(className) {
   const roots = [];
   if (globalThis.foundry) {
+    if (foundry.documents && typeof foundry.documents === "object") {
+      roots.push(["foundry.documents", foundry.documents]);
+    }
     if (foundry.dice && typeof foundry.dice === "object") {
       roots.push(["foundry.dice", foundry.dice]);
     }

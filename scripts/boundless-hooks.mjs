@@ -3,8 +3,8 @@ import { installLazyTokenLayerPatch } from "./token-streamer.mjs";
 import { installGlobalSelectionPatches } from "./boundless-selection.mjs";
 import { PERF_CONFIG } from "./perf-patcher.mjs";
 import { installGpuPerfEngine, refreshGpuPerfSettings } from "./perf-gpu.mjs";
-import { installCpuPerfEngine, resetCpuCaches } from "./perf-cpu.mjs";
-import { installAutoPerfEngine, updateStandardSceneCulling, restoreAllStandardCulling } from "./perf-auto.mjs";
+import { installCpuPerfEngine, resetCpuCaches, syncIdleFpsLimiter } from "./perf-cpu.mjs";
+import { installAutoPerfEngine, updateStandardSceneCulling, restoreAllStandardCulling, cancelAutoPerfTimers } from "./perf-auto.mjs";
 import { MAX_LOS_RADIUS_PX } from "./boundless-lighting.mjs";
 import { MODULE_ID } from "./utils.mjs";
 
@@ -165,12 +165,14 @@ export function registerBoundlessHooks(controller) {
         syncPerfConfigFromSettings();
         resetCpuCaches();
         refreshGpuPerfSettings();
+        syncIdleFpsLimiter();
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleLevelPrewarm) {
           controller._cancelIdleLevelPrewarm?.();
         }
         if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfAutoCulling) {
           updateStandardSceneCulling();
         } else {
+          cancelAutoPerfTimers();
           restoreAllStandardCulling();
         }
       };

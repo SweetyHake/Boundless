@@ -3,7 +3,8 @@ import {
   bakeSceneEditsToManifest,
   unbakeSceneFromBoundless,
   buildDefaultBakeDir,
-  isSceneBoundlessEditable
+  isSceneBoundlessEditable,
+  getUnbakedSceneLevels
 } from "./scene-baker.mjs";
 import { MODULE_ID, loc, escapeHtml } from "./utils.mjs";
 
@@ -121,12 +122,14 @@ export async function openOptimizeSceneDialog(controller, scene) {
   }
   if (!opts) return;
   const liveScene = game.scenes?.get?.(scene.id);
-  if (!liveScene || isSceneBoundlessEditable(liveScene)) return;
+  const unbaked = liveScene ? getUnbakedSceneLevels(liveScene) : [];
+  if (!liveScene || !unbaked.length) return;
+  const targetLevelIds = isSceneBoundlessEditable(liveScene) ? unbaked.map(l => l.id) : null;
 
   const outcome = await runWithProgressDialog("BOUNDLESS.Optimize.ProgressTitle", ({ signal, onProgress }) =>
     bakeSceneToBoundless(controller, liveScene, {
       targetDir: null,
-      levelIds: null,
+      levelIds: targetLevelIds,
       createCopy: opts.createCopy,
       removeOriginals: true,
       clearBackground: true,
@@ -330,17 +333,27 @@ export function registerConfigUI(controller) {
     };
 
     const isChunkedOrSuperGrid = (scene) => {
+      const normUrl = (u) => String(u).replaceAll("modules/sh-megamap/", `modules/${MODULE_ID}/`);
       const cfg = scene?.flags?.[MODULE_ID];
-      const url = cfg?.manifestUrl || (cfg?.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : null);
-      const cached = url ? controller?.manifestCache?.get?.(url) : null;
-      const man = cached || ((canvas?.scene?.id === scene?.id) ? controller?.manifest : null);
+      const urls = [];
+      const sUrl = cfg?.manifestUrl || (cfg?.enabled ? `modules/${MODULE_ID}/assets/pyramid/pyramid_manifest.json` : null);
+      if (sUrl) urls.push(normUrl(sUrl));
+      for (const lvl of scene?.levels || []) {
+        const lUrl = lvl?.flags?.[MODULE_ID]?.manifestUrl;
+        if (lUrl) urls.push(normUrl(lUrl));
+      }
+      for (const u of urls) {
+        const cached = controller?.manifestCache?.get?.(u);
+        if (cached?.chunks?.baseUrl || cached?.superGrid) return true;
+      }
+      const man = (canvas?.scene?.id === scene?.id) ? controller?.manifest : null;
       return Boolean(man?.chunks?.baseUrl || man?.superGrid);
     };
 
     const canOptimize = (li) => {
       if (!game.user?.isGM) return false;
       const scene = resolveSceneFromContextEl(li);
-      return Boolean(scene && !activeBakeScenes.has(scene.id) && !openBakeDialogs.has(scene.id) && !isSceneBoundlessEditable(scene));
+      return Boolean(scene && !activeBakeScenes.has(scene.id) && !openBakeDialogs.has(scene.id) && getUnbakedSceneLevels(scene).length > 0);
     };
 
     const canManageBoundless = (li) => {

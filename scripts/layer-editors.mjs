@@ -918,6 +918,7 @@ export class VirtualLayerEditors {
       existing.editsRev = curRev;
       if (existing.sig === nextSig) continue;
       existing.sig = nextSig;
+      const prevSrc = existing.doc.texture?.src || "";
       const ax = it.anchorX ?? 0.5;
       const ay = it.anchorY ?? 0.5;
       const patch = {
@@ -933,10 +934,32 @@ export class VirtualLayerEditors {
         restrictions: { light: Boolean(it.restrictsLight), weather: Boolean(it.restrictsWeather) }
       };
       existing.doc.updateSource(patch);
+      const srcChanged = (it.src || "") !== prevSrc;
       if (existing.placeable && !existing.placeable.destroyed) {
-        existing.placeable.renderFlags.set({ refresh: true });
-        existing.placeable.applyRenderFlags();
-        existing.placeable._updateQuadtree?.();
+        if (srcChanged) {
+          const gen = this._tileGen;
+          const targetSrc = it.src;
+          (async () => {
+            if (targetSrc && typeof foundry.canvas?.loadTexture === "function") {
+              try { await foundry.canvas.loadTexture(targetSrc, { fallback: "icons/svg/hazard.svg" }); } catch {}
+            }
+            if (gen !== this._tileGen || existing.placeable.destroyed || existing.doc.texture?.src !== targetSrc) return;
+            await existing.placeable.draw();
+            if (existing.placeable.destroyed) {
+              this._cleanupLeakedTileMesh(existing.placeable);
+            } else if (gen === this._tileGen) {
+              existing.placeable.renderFlags.set({ refresh: true });
+              existing.placeable.applyRenderFlags();
+              existing.placeable._updateQuadtree?.();
+            }
+          })().catch(() => {
+            if (existing.placeable?.destroyed) this._cleanupLeakedTileMesh(existing.placeable);
+          });
+        } else {
+          existing.placeable.renderFlags.set({ refresh: true });
+          existing.placeable.applyRenderFlags();
+          existing.placeable._updateQuadtree?.();
+        }
       }
       if (sheet?.rendered) {
         try {

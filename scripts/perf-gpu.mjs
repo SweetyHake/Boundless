@@ -1580,6 +1580,7 @@ function patchV14CoreRenderPasses() {
     let lastPrimaryLen = -1;
     let pcoListDirty = true;
     let lastStageWorldId = -1;
+    let lastDepthGlCtxGen = -1;
     let lastDepthSigH1 = 0;
     let lastDepthSigH2 = 0;
     let lastDepthSigCount = -1;
@@ -1774,6 +1775,20 @@ function patchV14CoreRenderPasses() {
       }
       // Use non-deprecated v14 hook "chatBubbleHTML" (fires before append, so force=true guarantees alignment!)
       Hooks.on("chatBubbleHTML", () => syncHudIfDirty(true));
+      // Watch direct third-party DOM insertions into #hud so custom overlays never appear misaligned after pan/zoom
+      let hudObserver = null;
+      const attachHudObserver = () => {
+        if (hudObserver) { try { hudObserver.disconnect(); } catch {} hudObserver = null; }
+        const hudEl = globalThis.canvas?.hud?.element;
+        if (!hudEl || typeof globalThis.MutationObserver !== "function") return;
+        hudObserver = new MutationObserver(() => syncHudIfDirty(true));
+        hudObserver.observe(hudEl, { childList: true });
+      };
+      Hooks.on("canvasReady", attachHudObserver);
+      Hooks.on("canvasTearDown", () => {
+        if (hudObserver) { try { hudObserver.disconnect(); } catch {} hudObserver = null; }
+      });
+      attachHudObserver();
       const BaseHudCls = globalThis.foundry?.applications?.hud?.BasePlaceableHUD;
       if (BaseHudCls?.prototype?._onRender) {
         results.push(wrapTargetMethod(BaseHudCls.prototype, "_onRender", "BasePlaceableHUD.prototype._onRender", function (wrapped, ...args) {
@@ -1880,11 +1895,12 @@ function patchV14CoreRenderPasses() {
       const sig = computeDepthSig();
       if (
         !this.renderDirty &&
-        (stageId !== lastStageWorldId || sig.forceDirty || sig.count !== lastDepthSigCount || sig.h1 !== lastDepthSigH1 || sig.h2 !== lastDepthSigH2)
+        (glCtxGen !== lastDepthGlCtxGen || stageId !== lastStageWorldId || sig.forceDirty || sig.count !== lastDepthSigCount || sig.h1 !== lastDepthSigH1 || sig.h2 !== lastDepthSigH2)
       ) {
         this.renderDirty = true;
       }
       if (this.renderDirty) {
+        lastDepthGlCtxGen = glCtxGen;
         lastStageWorldId = stageId;
         lastDepthSigCount = sig.forceDirty ? -1 : sig.count;
         lastDepthSigH1 = sig.h1;
@@ -1898,6 +1914,7 @@ function patchV14CoreRenderPasses() {
       lastPrimaryLen = -1;
       pcoListDirty = true;
       lastStageWorldId = -1;
+      lastDepthGlCtxGen = -1;
       lastDepthSigCount = -1;
     });
   }
@@ -2095,6 +2112,7 @@ export function installGpuPerfEngine() {
   if (_gpuInstalled) return;
   _gpuInstalled = true;
 
+  applyDisableUiBlur();
   if (globalThis.game?.settings?.get?.("core", "noCanvas")) return;
 
   const primeActive = isPrimePerfActive();

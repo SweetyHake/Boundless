@@ -336,7 +336,9 @@ function collectVisionRanges() {
     const metaMap = lb?.lightMetaById;
     if (metaMap?.size) {
       const activeLvlId = canvas.level?.id;
-      const maxLosSq = 4600 * 4600;
+      const cfgLos = Number(canvas.level?.flags?.[MODULE_ID]?.maxLosPx ?? canvas.scene?.flags?.[MODULE_ID]?.maxLosPx);
+      const maxLos = (Number.isFinite(cfgLos) && cfgLos > 0 ? Math.max(4500, cfgLos) : 4500) + 100;
+      const maxLosSq = maxLos * maxLos;
       for (const meta of metaMap.values()) {
         if (!meta || meta.dimPx <= 0) continue;
         if (activeLvlId && meta.levelId && meta.levelId !== activeLvlId) continue;
@@ -488,7 +490,8 @@ function patchVisibilityAndLos() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || options?.object) {
       return wrapped(points, options);
     }
-    // Match Foundry v14 core: when no active vision sources exist, visibility depends on GM status
+    // Fast-path when tokenVision is disabled (all players see the map), then match v14 when visionSources is empty
+    if (!this.tokenVision) return true;
     if (!globalThis.canvas?.effects?.visionSources?.some?.(s => s.active)) {
       return Boolean(globalThis.game?.user?.isGM);
     }
@@ -499,7 +502,9 @@ function patchVisibilityAndLos() {
     // Avoid polluting _cellVisCache with transient high-frequency mouse cursor coordinates from Canvas##onMouseMove
     if (p === globalThis.canvas?.mousePosition) return wrapped(points, options);
     const elev = p.elevation ?? globalThis.canvas?.level?.elevation?.base ?? 0;
-    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${globalThis.canvas?.level?.id ?? ""}|tv${this.tokenVision ? 1 : 0}|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
+    const optLvl = options?.level;
+    const lvlId = typeof optLvl === "string" ? optLvl : (optLvl?.id ?? globalThis.canvas?.level?.id ?? "");
+    const key = `${Math.round(p.x * 10)},${Math.round(p.y * 10)},${Math.round(elev * 10)}|${lvlId}|tv${this.tokenVision ? 1 : 0}|t${options.tolerance ?? 2}|v${_perceptionVer}|g${_geometryVersion}|e${_edgeVersion}`;
     const hit = _cellVisCache.get(key);
     if (hit !== undefined) {
       perfStats.cellVisHits++;
@@ -1485,7 +1490,7 @@ function patchMiscCpuGuards() {
     const statuses = isInitial ? this.statuses : null;
     for (const effect of this.allApplicableEffects()) {
       if (!effect?.active) continue;
-      if (effect.system?.changes?.length > 0) return wrapped(phase);
+      if ((effect.system?.changes?.length > 0) || (effect.changes?.length > 0)) return wrapped(phase);
       if (statuses && effect.statuses) {
         for (const statusId of effect.statuses) statuses.add(statusId);
       }
@@ -1806,7 +1811,12 @@ function restoreIdleFps() {
   if (!_idle.throttled) return;
   _idle.throttled = false;
   try {
-    const settingMax = _idle.savedMax !== undefined ? _idle.savedMax : (game.settings.get("core", "maxFPS") || 0);
+    let settingMax;
+    try {
+      settingMax = globalThis.game?.settings?.get?.("core", "maxFPS") || 0;
+    } catch {
+      settingMax = _idle.savedMax !== undefined ? _idle.savedMax : 0;
+    }
     const ticker = globalThis.canvas?.app?.ticker;
     if (ticker) ticker.maxFPS = settingMax;
   } catch {}
@@ -1830,9 +1840,9 @@ function attachIdleFpsLimiter() {
   if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) return;
   const ticker = globalThis.canvas?.app?.ticker;
   if (!ticker) return;
+  _idle.last = performance.now();
   if (!_idle.listenersAttached) {
     _idle.listenersAttached = true;
-    _idle.last = performance.now();
     const bump = () => {
       if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) return;
       _idle.last = performance.now();
@@ -1858,6 +1868,16 @@ function attachIdleFpsLimiter() {
   _idle.ticker = ticker;
   _idle.tickerFn = () => {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleFpsLimit) {
+      restoreIdleFps();
+      return;
+    }
+    const hasActiveAnim = Boolean(
+      (globalThis.foundry?.canvas?.animation?.CanvasAnimation?.animations?.size ?? 0) > 0 ||
+      globalThis.Boundless?.isCameraFlying ||
+      globalThis.game?.video?.playing
+    );
+    if (hasActiveAnim) {
+      _idle.last = performance.now();
       restoreIdleFps();
       return;
     }

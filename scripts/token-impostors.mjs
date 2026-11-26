@@ -980,8 +980,9 @@ export class TokenImpostorLayer {
       if (shouldClose) try { drawable?.close?.(); } catch {}
       if (!drawable && this.mounted && gen === this._gen && this.slotsByKey.get(slotKey) === slot) {
         if (aborted) {
-          // Release aborted slot so subsequent renders / context restores re-queue decode cleanly
-          this.slotsByKey.delete(slotKey);
+          // Keep slot in slotsByKey with immediate retry so its atlas cell (col, row) is never leaked
+          slot.failed = true;
+          slot.retryAfterMs = 0;
           this._decodeQueuedSet.delete(slotKey);
         } else {
           slot.failed = true;

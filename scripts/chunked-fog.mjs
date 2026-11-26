@@ -201,6 +201,12 @@ export class ChunkedFogManager {
       await this.saveNow();
     });
 
+    patchMethod(fog, "load", (origLoad) => async (...args) => {
+      const res = await origLoad.apply(fog, args);
+      if (this.enabled) this._hideCoreFogSprite();
+      return res;
+    });
+
     patchMethod(fog, "isPointExplored", (origIsPointExplored) => (point) => {
       if (!this.enabled) return origIsPointExplored.call(fog, point);
       return this.isPointExplored(point);
@@ -1053,14 +1059,17 @@ export class ChunkedFogManager {
     }
     if (!sharedKeys.length && !privateKeys.length) return;
 
-    // 1. Pre-encode both server payloads synchronously while chunks are still live, and prune fully empty chunks
+    // 1. Pre-encode both server payloads synchronously while chunks are still live
     const emptyToPrune = new Set();
     let sharedUpdate = null;
     if (isSharedMode && sharedKeys.length && game.user?.isGM) {
       const update = {};
       for (const key of sharedKeys) {
         const chunk = this.chunks.get(key);
-        if (!chunk) continue;
+        if (!chunk) {
+          update[`flags.${MODULE_ID}.sharedFog.${levelId}.-=${key}`] = null;
+          continue;
+        }
         const srcCanvas = chunk.sharedCanvas || chunk.canvas;
         const srcCtx = chunk.sharedCtx || chunk.ctx;
         if (isCanvasEmpty(srcCtx)) {
@@ -1078,7 +1087,10 @@ export class ChunkedFogManager {
       const update = {};
       for (const key of privateKeys) {
         const chunk = this.chunks.get(key);
-        if (!chunk) continue;
+        if (!chunk) {
+          update[`flags.${MODULE_ID}.fog.${sceneId}.${levelId}.-=${key}`] = null;
+          continue;
+        }
         const privCanvas = (isSharedMode && chunk.privateCanvas) ? chunk.privateCanvas : chunk.canvas;
         const privCtx = (isSharedMode && chunk.privateCtx) ? chunk.privateCtx : chunk.ctx;
         if (isCanvasEmpty(privCtx)) {

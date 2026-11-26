@@ -1,7 +1,7 @@
 import { MODULE_ID } from "./utils.mjs";
 import { PERF_CONFIG, perfStats, resetPerfStats } from "./perf-patcher.mjs";
 import { applyLightingRenderScale, applyDisableUiBlur, clearTokenUiBitmapCaches, refreshTokenBars } from "./perf-gpu.mjs";
-import { resetCpuCaches } from "./perf-cpu.mjs";
+import { resetCpuCaches, syncIdleFpsLimiter } from "./perf-cpu.mjs";
 import { restoreAllStandardCulling, updateStandardSceneCulling, syncDecorativeTileShaders } from "./perf-auto.mjs";
 
 /**
@@ -189,8 +189,10 @@ async function setPerfMode(enabled) {
  * the two OFF and two ON rounds to eliminate warmup/boost drift.
  */
 async function runABBA(runner) {
-  // Tiny warmup under OFF so JIT and shaders are already compiled
+  // Tiny warmup under both OFF and ON so JIT and shaders are compiled symmetrically
   await setPerfMode(false);
+  await runner(true);
+  await setPerfMode(true);
   await runner(true);
 
   const offRuns = [];
@@ -202,7 +204,6 @@ async function runABBA(runner) {
   await setPerfMode(true);
   onRuns.push(await runner(false));
 
-  await setPerfMode(true);
   onRuns.push(await runner(false));
 
   await setPerfMode(false);
@@ -299,9 +300,9 @@ async function runRealMouseDrag(tok, steps = 28) {
       prev = now;
     }
   } finally {
-    try { view.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0, buttons: 0, clientX: sx, clientY: sy, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
-    try { view.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
+    // Cancel drag strictly BEFORE releasing pointer so Foundry never commits a drop/fog update to the DB
     try { tok.mouseInteractionManager?.cancel?.(); } catch {}
+    try { view.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1, pointerType: "mouse", isPrimary: true })); } catch {}
     try { tok._finalizeDragLeft?.(); } catch {}
     await nextFrame();
   }
@@ -325,6 +326,7 @@ export async function benchmarkCurrentScene(opts = {}) {
   const savedIdleFpsLimit = PERF_CONFIG.perfIdleFpsLimit;
   const savedStats = { ...perfStats };
   PERF_CONFIG.perfIdleFpsLimit = false;
+  syncIdleFpsLimiter();
   const savedLayer = canvas.activeLayer;
   const savedCamera = {
     x: canvas.stage.pivot.x,
@@ -559,8 +561,10 @@ export async function benchmarkCurrentScene(opts = {}) {
 
     // M13: Showstopper Animated Door Compatibility & Speed (dynamic CanvasEdges leaf sweep check)
     {
+      const curLvlId = canvas.level?.id;
       const activeLs = Array.from(canvas.effects?.lightSources ?? []).find(
         (s) => s?.active && Number.isFinite(s.radius) && s.radius > 0 && s.data?.walls !== false
+          && (!curLvlId || !s.object?.document?.level || s.object.document.level === curLvlId)
       );
       const EdgeCls = foundry.canvas?.geometry?.edges?.Edge;
       const edges = canvas.level?.edges;
@@ -720,6 +724,7 @@ export async function benchmarkGameplayMechanics() {
   const savedIdleFpsLimit = PERF_CONFIG.perfIdleFpsLimit;
   const savedStats = { ...perfStats };
   PERF_CONFIG.perfIdleFpsLimit = false;
+  syncIdleFpsLimiter();
   const rows = [];
   const pushRow = (mechanic, offRes, onRes, thresholds = {}) => {
     const cls = classifyMetric(offRes.ms, onRes.ms, thresholds);
@@ -811,20 +816,23 @@ export async function benchmarkGameplayMechanics() {
       const wasOpen = Boolean(pc.sheet.rendered);
       const { off, on } = await runABBA(async (warmup) => {
         const t0 = performance.now();
+        let dt = 0;
         try {
           await pc.sheet.render({ force: true });
           if (!warmup) await pc.sheet.render();
+          dt = performance.now() - t0;
         } finally {
           if (!wasOpen) {
             try { await pc.sheet.close({ animate: false }); } catch {}
           }
         }
-        return { ms: performance.now() - t0 };
+        return { ms: dt };
       });
       pushRow(`G4. Actor Sheet Open+Render (${pc.items.size} items)`, off, on, { absToleranceMs: 8, warnPct: 8, failPct: 15 });
     }
   } finally {
     PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
+    syncIdleFpsLimiter();
     try { await setPerfMode(savedPerfEnabled); } catch {}
     Object.assign(perfStats, savedStats);
   }
@@ -868,6 +876,7 @@ export async function runPerfBenchmark(opts = {}) {
   }
   _benchmarkRunning = true;
   const origSceneId = globalThis.canvas?.scene?.id;
+  const origLevelId = globalThis.canvas?.level?.id;
   const origCam = globalThis.canvas?.stage ? {
     x: canvas.stage.pivot?.x,
     y: canvas.stage.pivot?.y,
@@ -886,7 +895,10 @@ export async function runPerfBenchmark(opts = {}) {
       if (!sc) continue;
       if (canvas.scene?.id !== id) {
         await sc.view();
-        await sleep(500);
+        if (globalThis.Boundless?._mountPromise) {
+          try { await globalThis.Boundless._mountPromise; } catch {}
+        }
+        await sleep(350);
       }
       const res = await benchmarkCurrentScene(opts);
       allRows.push(...res.rows);
@@ -896,9 +908,12 @@ export async function runPerfBenchmark(opts = {}) {
       allRows.push(...gpRows);
     }
   } finally {
-    if (origSceneId && canvas.scene?.id !== origSceneId) {
+    if (origSceneId && (canvas.scene?.id !== origSceneId || (origLevelId && canvas.level?.id !== origLevelId))) {
       try {
-        await game.scenes.get(origSceneId)?.view();
+        await game.scenes.get(origSceneId)?.view(origLevelId ? { level: origLevelId } : undefined);
+        if (globalThis.Boundless?._mountPromise) {
+          try { await globalThis.Boundless._mountPromise; } catch {}
+        }
         if (origCam && Number.isFinite(origCam.x) && Number.isFinite(origCam.y)) {
           canvas.pan?.(origCam);
         }

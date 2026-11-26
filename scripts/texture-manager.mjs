@@ -121,6 +121,7 @@ export class LRUTextureManager {
       }
       if (isTextureUsable(tex)) {
         this._fallbackFailures.delete(src);
+        this._fallbackRetryAfter?.delete?.(src);
         const prevOwned = this.workerOwned.get(src);
         if (prevOwned) {
           this.workerOwned.delete(src);
@@ -135,17 +136,24 @@ export class LRUTextureManager {
       const fails = (this._fallbackFailures.get(src) || 0) + 1;
       if (fails >= 2) {
         this._fallbackFailures.delete(src);
-        this.missingSrcs.add(src);
+        if (!this._fallbackRetryAfter) this._fallbackRetryAfter = new Map();
+        this._fallbackRetryAfter.set(src, performance.now() + 20000);
       } else {
         this._fallbackFailures.set(src, fails);
       }
       return null;
-    }).catch(() => {
+    }).catch((err) => {
       if (gen === this._gen) {
         const fails = (this._fallbackFailures.get(src) || 0) + 1;
         if (fails >= 2) {
           this._fallbackFailures.delete(src);
-          this.missingSrcs.add(src);
+          const isPermanent404 = Boolean(err?.notFound || /\b404\b/.test(String(err?.message || err || "")));
+          if (isPermanent404) {
+            this.missingSrcs.add(src);
+          } else {
+            if (!this._fallbackRetryAfter) this._fallbackRetryAfter = new Map();
+            this._fallbackRetryAfter.set(src, performance.now() + 20000);
+          }
         } else {
           this._fallbackFailures.set(src, fails);
         }
@@ -156,6 +164,11 @@ export class LRUTextureManager {
 
   load(src, { mipmap = true, isPinned = false, priority = 1, maxDim = 0 } = {}) {
     if (!src || this.missingSrcs.has(src)) return Promise.resolve(null);
+    const retryAfter = this._fallbackRetryAfter?.get?.(src);
+    if (retryAfter !== undefined) {
+      if (performance.now() < retryAfter) return Promise.resolve(null);
+      this._fallbackRetryAfter.delete(src);
+    }
     if (isPinned) this.pinned.add(src);
     const existing = this.getSync(src);
     if (existing) return Promise.resolve(existing);
@@ -297,6 +310,7 @@ export class LRUTextureManager {
     }
     this.missingSrcs.clear();
     this._fallbackFailures.clear();
+    this._fallbackRetryAfter?.clear?.();
     this.promises.clear();
   }
 

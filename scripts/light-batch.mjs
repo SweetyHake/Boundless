@@ -796,6 +796,8 @@ export class MegaLightBatch {
   useDepthTexture = false;
 
   lightMetaById = new Map(); // "${levelId}::${sk}_${li}" -> { id, levelId, elevation, sk, lx, ly, dimPx, vStart, vCount, weight, raw }
+  sharedLightAlias = new Map(); // duplicate multi-level lightId -> canonical lightId in lightMetaById
+  _sharedLightGroups = new Map(); // sharedKey -> Set<meta> (for multi-level chunked light deduplication)
   sectorBounds = [];         // [{ levelId, sk, minX, minY, maxX, maxY, idxStart, idxCount }]
   lastVisKey = "";
 
@@ -811,7 +813,12 @@ export class MegaLightBatch {
   bakedRoofRegion = new Float32Array([100000, 100000]);
   bakedRoofRepeat = false;
   bakedRoofElevation = Infinity;
+  bakedRoofLevelId = null;
   useBakedRoofMask = false;
+
+  resolveLightId(lightId) {
+    return this.sharedLightAlias?.get?.(lightId) || lightId;
+  }
 
   depthElevArray = null;
   depthElevBuffer = null;
@@ -1092,10 +1099,38 @@ export class MegaLightBatch {
   }
 
   _computeEffectiveWeight(meta) {
+    if (meta.sharedSuppressed) return 0.0;
     if (this.hideIndoorLights && meta.isIndoor) return 0.0;
+    if (this.useBakedRoofMask && this.bakedRoofLevelId && meta.isIndoor && meta.levelId && meta.levelId !== this.bakedRoofLevelId) {
+      return 0.0;
+    }
     const d = this._currentDarkness;
     if (d < meta.darkMin || d > meta.darkMax) return 0.0;
     return meta.baseWeight;
+  }
+
+  _reconcileSharedGroup(sharedKey, dirtyBatches = null) {
+    const grp = this._sharedLightGroups.get(sharedKey);
+    if (!grp || grp.size === 0) {
+      this._sharedLightGroups.delete(sharedKey);
+      return;
+    }
+    const viewLid = globalThis.canvas?.level?.id || null;
+    let canon = null;
+    for (const m of grp) {
+      if (!canon) { canon = m; continue; }
+      if (viewLid && m.levelId === viewLid && canon.levelId !== viewLid) canon = m;
+    }
+    for (const m of grp) {
+      const wantSup = m !== canon;
+      if (wantSup) this.sharedLightAlias.set(m.id, canon.id);
+      else this.sharedLightAlias.delete(m.id);
+      if (Boolean(m.sharedSuppressed) !== wantSup) {
+        m.sharedSuppressed = wantSup;
+        this._applyMetaEffectiveWeight(m);
+        if (dirtyBatches && m.batch) dirtyBatches.add(m.batch);
+      }
+    }
   }
 
   /**
@@ -1158,7 +1193,7 @@ export class MegaLightBatch {
     };
 
     const emptyRect = new PIXI.Rectangle(-1e9, -1e9, 1, 1);
-    const seenSharedLightKeys = visibleLevelLayers.length > 1 ? new Set() : null;
+    const seenSharedLightKeys = visibleLevelLayers.length > 1 ? new Map() : null;
     // Process currently viewed level first so shared multi-level lights bake shadows, dynamic bubbles, and edits on the active level!
     const orderedLevelLayers = visibleLevelLayers.length > 1
       ? visibleLevelLayers.slice().sort((a, b) => (b?.level?.isView ? 1 : 0) - (a?.level?.isView ? 1 : 0))
@@ -1403,6 +1438,18 @@ export class MegaLightBatch {
                 const bl = bakedLights[bi];
                 const lx = bl.lx + offX;
                 const ly = bl.ly + offY;
+                const lightId = `${levelId}::${sk}_${bl.li}`;
+                if (seenSharedLightKeys) {
+                  const lk = bl.extra?.gid
+                    ? ((cols > 1 || rows > 1) ? `g:${bl.extra.gid}:${gx}_${gy}` : `g:${bl.extra.gid}`)
+                    : `f:${lx}|${ly}|${bl.dimFt}|${bl.brightFt}|${bl.elevation}|${bl.colorHex || ""}|${bl.alpha ?? 0.5}|${bl.angle}|${bl.rotation}|${bl.anim || ""}`;
+                  const canonId = seenSharedLightKeys.get(lk);
+                  if (canonId) {
+                    this.sharedLightAlias.set(lightId, canonId);
+                    continue;
+                  }
+                  seenSharedLightKeys.set(lk, lightId);
+                }
                 const ph = encodeLightAnimPhase(bl.anim, bl.basePhase + phaseShift, bl.canRotateCone);
                 const effAlpha = bl.alpha * getAnimColorationGain(bl.anim);
                 const vStart = vertCursor;
@@ -1426,7 +1473,6 @@ export class MegaLightBatch {
                 }
 
                 const vCount = vertCursor - vStart;
-                const lightId = `${levelId}::${sk}_${bl.li}`;
                 const suppressed = Boolean(this._isSuppressedFn?.(lightId));
                 const rawEntry = [lx, ly, bl.dimFt, bl.brightFt, bl.colorHex, bl.alpha, bl.anim, bl.elevation];
                 if (bl.extra) rawEntry.push(bl.extra);
@@ -1538,12 +1584,17 @@ export class MegaLightBatch {
           if (dimPx <= 0 || angle <= 0) continue;
 
           const elevation = Number.isFinite(resolved.elevation) ? resolved.elevation : defaultLightElev;
+          const lightId = `${levelId}::${sk}_${li}`;
           if (seenSharedLightKeys) {
             const lk = extra?.gid
               ? `g:${extra.gid}`
               : `f:${lx}|${ly}|${dimFt}|${brightFt}|${elevation}|${colorHex || ""}|${alpha ?? 0.5}|${angle}|${rotation}|${anim || ""}`;
-            if (seenSharedLightKeys.has(lk)) continue;
-            seenSharedLightKeys.add(lk);
+            const canonId = seenSharedLightKeys.get(lk);
+            if (canonId) {
+              this.sharedLightAlias.set(lightId, canonId);
+              continue;
+            }
+            seenSharedLightKeys.set(lk, lightId);
           }
           const effectiveRaw = [lx, ly, dimFt, brightFt, colorHex, alpha, anim, elevation];
           if (extra) effectiveRaw.push(extra);
@@ -1556,7 +1607,6 @@ export class MegaLightBatch {
           }
           const basePhase = Math.abs(Math.sin(lx * 0.0137 + ly * 0.0193 + elevation * 0.31) * 100.0);
           const vStart = vertCursor;
-          const lightId = `${levelId}::${sk}_${li}`;
           const polySig = `${lx},${ly},${dimPx},${angle},${rotation},${useWalls ? 1 : 0}|${levelCacheSig}`;
           const cachedPoly = this._polyCache.get(lightId);
 
@@ -2402,11 +2452,16 @@ export class MegaLightBatch {
           if (darkMin > 0 || darkMax < 1) this._hasDarknessRangedLights = true;
           const lightId = `${job.levelId}::${sk}_${li}`;
           const suppressed = Boolean(this._isSuppressedFn?.(lightId));
+          const sharedKey = extra?.gid
+            ? `g:${extra.gid}`
+            : `f:${lx}|${ly}|${resolved.dim}|${resolved.bright}|${elevation}|${resolved.color || ""}|${aVal}|${angle}|${rotation}|${resolved.anim || ""}`;
           const rawEntry = [lx, ly, resolved.dim, resolved.bright, resolved.color, aVal, resolved.anim, elevation];
           if (extra) rawEntry.push(extra);
           job.metas.push({
             id: lightId,
             levelId: job.levelId,
+            sharedKey,
+            sharedSuppressed: false,
             elevation, sk, lx, ly, dimPx,
             vStart, vCount: job.vertCursor - vStart,
             weight: 1.0, baseWeight: suppressed ? 0.0 : 1.0, isIndoor,
@@ -2533,10 +2588,15 @@ export class MegaLightBatch {
 
     let addedLights = 0;
     const dirtyPrevBatches = new Set();
+    const touchedSharedKeys = new Set();
     for (const meta of job.metas) {
       const prevMeta = this.lightMetaById.get(meta.id);
       if (prevMeta && prevMeta.batch && prevMeta.batch !== batch) {
         // Retire duplicate border-sector light from the previous chunk so it doesn't leak GPU light or counters
+        if (prevMeta.sharedKey) {
+          this._sharedLightGroups.get(prevMeta.sharedKey)?.delete(prevMeta);
+          touchedSharedKeys.add(prevMeta.sharedKey);
+        }
         if (prevMeta.weight > 0.001) {
           this.activeLightsCount = Math.max(0, this.activeLightsCount - 1);
           prevMeta.batch.activeCount = Math.max(0, prevMeta.batch.activeCount - 1);
@@ -2552,6 +2612,12 @@ export class MegaLightBatch {
       batch.lightIds.push(meta.id);
       this.lightMetaById.set(meta.id, meta);
       addedLights++;
+      if (meta.sharedKey) {
+        let grp = this._sharedLightGroups.get(meta.sharedKey);
+        if (!grp) { grp = new Set(); this._sharedLightGroups.set(meta.sharedKey, grp); }
+        grp.add(meta);
+        if (grp.size > 1) touchedSharedKeys.add(meta.sharedKey);
+      }
       const eff = this._computeEffectiveWeight(meta);
       meta.weight = eff;
       if (eff > 0.001) {
@@ -2561,6 +2627,11 @@ export class MegaLightBatch {
         weights.fill(eff, meta.vStart, meta.vStart + meta.vCount);
         batch.weightsDirty = true;
       }
+    }
+    this.totalLights += addedLights;
+    this.activeLightsCount += batch.activeCount;
+    for (const sk of touchedSharedKeys) {
+      this._reconcileSharedGroup(sk, dirtyPrevBatches);
     }
     for (const pb of dirtyPrevBatches) {
       if (pb.weightsDirty) {
@@ -2575,8 +2646,6 @@ export class MegaLightBatch {
 
     this.chunkBatches.set(job.fullKey, batch);
     if (otherBatchesStale) this.syncDepthElevations(true);
-    this.totalLights += addedLights;
-    this.activeLightsCount += batch.activeCount;
     this.totalVertices += job.vertCursor;
 
     const initVis = batch.activeCount > 0 && Boolean(this._lastVp);
@@ -2605,12 +2674,30 @@ export class MegaLightBatch {
     if (!batch) return;
     this.chunkBatches.delete(fullKey);
 
+    const touchedSharedKeys = new Set();
     for (const lid of batch.lightIds) {
       const meta = this.lightMetaById.get(lid);
       if (meta && meta.batch === batch) {
+        if (meta.sharedKey) {
+          this._sharedLightGroups.get(meta.sharedKey)?.delete(meta);
+          touchedSharedKeys.add(meta.sharedKey);
+        }
+        this.sharedLightAlias.delete(lid);
         if (meta.weight > 0.001) this.activeLightsCount = Math.max(0, this.activeLightsCount - 1);
         this.totalLights = Math.max(0, this.totalLights - 1);
         this.lightMetaById.delete(lid);
+      }
+    }
+    if (touchedSharedKeys.size > 0) {
+      const dirtyOtherBatches = new Set();
+      for (const sk of touchedSharedKeys) {
+        this._reconcileSharedGroup(sk, dirtyOtherBatches);
+      }
+      for (const ob of dirtyOtherBatches) {
+        if (ob.weightsDirty) {
+          ob.weightBuffer?.update?.();
+          ob.weightsDirty = false;
+        }
       }
     }
     this.totalVertices = Math.max(0, this.totalVertices - (batch.weightArray?.length || 0));
@@ -2998,7 +3085,7 @@ export class MegaLightBatch {
     this._applyMetaEffectiveWeight(meta);
   }
 
-  setBakedRoofMask(rt, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity } = {}) {
+  setBakedRoofMask(rt, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity, roofLevelId = null } = {}) {
     if (this.bakedRoofMask && this.bakedRoofMask !== rt && !this.bakedRoofMask.destroyed) {
       this.bakedRoofMask.destroy(true);
     }
@@ -3009,20 +3096,40 @@ export class MegaLightBatch {
     this.bakedRoofRegion[1] = Math.max(1, regionH);
     this.bakedRoofRepeat = Boolean(repeat);
     this.bakedRoofElevation = Number.isFinite(roofElevation) ? roofElevation : Infinity;
+    this.bakedRoofLevelId = roofLevelId || null;
     this.syncDepthElevations(this.useDepthTexture);
+    if (this.useBakedRoofMask && this.bakedRoofLevelId) this._refreshMultiLevelRoofMaskWeights();
+  }
+
+  _refreshMultiLevelRoofMaskWeights() {
+    if (!this.weightArray && this.chunkBatches.size === 0) return;
+    let touched = false;
+    for (const meta of this.lightMetaById.values()) {
+      if (meta.isIndoor) {
+        this._applyMetaEffectiveWeight(meta);
+        touched = true;
+      }
+    }
+    if (touched) this.flushWeights();
   }
 
   setUseBakedRoofMask(enabled) {
-    this.useBakedRoofMask = Boolean(enabled && isTextureUsable(this.bakedRoofMask));
+    const next = Boolean(enabled && isTextureUsable(this.bakedRoofMask));
+    if (next === this.useBakedRoofMask) return;
+    this.useBakedRoofMask = next;
+    if (this.bakedRoofLevelId) this._refreshMultiLevelRoofMaskWeights();
   }
 
   disposeBakedRoofMask() {
+    const hadMultiLevelMask = Boolean(this.useBakedRoofMask && this.bakedRoofLevelId);
     this.useBakedRoofMask = false;
     this.bakedRoofElevation = Infinity;
+    this.bakedRoofLevelId = null;
     if (this.bakedRoofMask && !this.bakedRoofMask.destroyed) {
       this.bakedRoofMask.destroy(true);
     }
     this.bakedRoofMask = null;
+    if (hadMultiLevelMask) this._refreshMultiLevelRoofMaskWeights();
   }
 
   setIndoorLightsHidden(hidden) {
@@ -3204,6 +3311,8 @@ export class MegaLightBatch {
     this.visibleIndices = null;
     this.indexBuffer = null;
     this.lightMetaById.clear();
+    this.sharedLightAlias.clear();
+    this._sharedLightGroups.clear();
     this.sectorBounds = [];
     this.lastVisKey = "";
     this._lastCullBox = null;

@@ -26,6 +26,11 @@ self.onmessage = async (event) => {
   const ctrl = new AbortController();
   inflight.set(id, ctrl);
   const t0 = performance.now();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    try { ctrl.abort(); } catch {}
+  }, 15000);
 
   let bitmap = null;
   try {
@@ -42,8 +47,9 @@ self.onmessage = async (event) => {
       throw new Error(`HTTP ${resp.status}`);
     }
     const blob = await resp.blob();
+    clearTimeout(timeoutId);
     if (ctrl.signal.aborted) {
-      self.postMessage({ id, aborted: true });
+      self.postMessage(timedOut ? { id, error: "timeout" } : { id, aborted: true });
       return;
     }
 
@@ -80,12 +86,15 @@ self.onmessage = async (event) => {
     self.postMessage({ id, bitmap, decodeMs }, [bitmap]);
     bitmap = null;
   } catch (err) {
-    if (ctrl.signal.aborted || err?.name === "AbortError") {
+    if (timedOut) {
+      self.postMessage({ id, error: "timeout" });
+    } else if (ctrl.signal.aborted || err?.name === "AbortError") {
       self.postMessage({ id, aborted: true });
     } else {
       self.postMessage({ id, error: err?.message || String(err) });
     }
   } finally {
+    clearTimeout(timeoutId);
     if (bitmap) {
       try { bitmap.close(); } catch {}
     }

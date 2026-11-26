@@ -1078,7 +1078,9 @@ export class VirtualWallEditor {
           this.controller.doorStates.set(nextDKey, nextLiveDs);
           if (nextLiveDs === 1) {
             const skParts = String(entry.sk || "").split("_");
-            const eidStr = `${entry.kind === "w" ? "mw" : "md"}_${entry.sk}_${entry.idx}`;
+            const eidStr = entry.kind === "w"
+              ? `mw_${entry.levelId}_${entry.sk}_${entry.idx}`
+              : `md_${nextDKey}`;
             this.controller.openDoors.set(nextDKey, {
               levelId: entry.levelId,
               sx: Number(skParts[0]) || 0,

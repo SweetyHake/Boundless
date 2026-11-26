@@ -249,7 +249,9 @@ export const editsMethods = {
   applyVirtualLightChangesLocal() {
     for (const [lid, ls] of this.dynamicLights) {
       this._emit("dynamicLightRetire", { id: lid, light: ls, meta: this.lightBatch.lightMetaById.get(lid) || null });
-      ls.destroy();
+      if (ls && !ls.destroyed) {
+        try { ls.destroy(); } catch {}
+      }
     }
     this.dynamicLights.clear();
     this.lastDynLightKey = "";
@@ -274,6 +276,7 @@ export const editsMethods = {
         hidden: Boolean(ov.hidden)
       };
     }
+    if (!raw) return null;
     const [x, y, radius, path, volume, walls, easing, darkMin, darkMax, customElev, extra] = raw;
     const ex = extra && typeof extra === "object" ? extra : null;
     return {
@@ -532,7 +535,7 @@ export const editsMethods = {
   },
 
   async addPOI(poiSpec, scene = canvas.scene) {
-    if (!scene) return null;
+    if (!scene || !game.user?.isGM) return null;
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const kind = poiSpec.kind === "detail" ? "detail" : (poiSpec.kind === "minor" ? "minor" : "major");
     const dims = scene.getDimensions?.();
@@ -558,7 +561,7 @@ export const editsMethods = {
   },
 
   async updatePOI(poiId, patch, scene = canvas.scene) {
-    if (!scene || !poiId || !patch) return null;
+    if (!scene || !poiId || !patch || !game.user?.isGM) return null;
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene));
     const idx = existing.findIndex(p => p.id === poiId);
     if (idx < 0) return null;
@@ -577,14 +580,14 @@ export const editsMethods = {
   },
 
   async removePOI(poiId, scene = canvas.scene) {
-    if (!scene || !poiId) return false;
+    if (!scene || !poiId || !game.user?.isGM) return false;
     const existing = this._sanitizePoisForSave(this.getEffectivePOIs(scene)).filter(p => p.id !== poiId);
     await scene.update({ [`flags.${MODULE_ID}.pois`]: existing });
     return true;
   },
 
   async resetPOIs(scene = canvas.scene) {
-    if (!scene) return false;
+    if (!scene || !game.user?.isGM) return false;
     await scene.update({ [`flags.${MODULE_ID}.-=pois`]: null });
     return true;
   },
@@ -622,6 +625,7 @@ export const editsMethods = {
   },
 
   async configureLevel(levelId, config = {}) {
+    if (!game.user?.isGM) return null;
     const level = canvas.scene?.levels?.get(levelId);
     if (!level) throw new Error(`Level "${levelId}" not found on active scene.`);
     await level.update({ [`flags.${MODULE_ID}`]: config });
