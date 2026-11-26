@@ -3,6 +3,7 @@ import {
   isTextureUsable,
   resolveFoundryRoute,
   hasTokenPermissionLazy,
+  hasPlayerOwnerLazy,
   getLevelBaseElevation as getFiniteLevelBaseElevation,
   getLevelRoofElevation as getFiniteLevelRoofElevation
 } from "./utils.mjs";
@@ -278,7 +279,7 @@ function getTokenRenderSpec(doc) {
 function isPartyTokenDoc(doc) {
   if (!doc) return false;
   const base = doc.baseActor;
-  if (base?.hasPlayerOwner || base?.type === "character") return true;
+  if (hasPlayerOwnerLazy(doc) || base?.type === "character") return true;
   if (doc._source?.actorLink && base?.isOwner) return true;
   return false;
 }
@@ -691,7 +692,7 @@ export class TokenImpostorLayer {
         if (!this._decodeQueuedSet.has(spec.slotKey)) {
           this._decodeQueuedSet.add(spec.slotKey);
           this._decodeQueue.push(spec.slotKey);
-          this._pumpDecodeQueue();
+          this._pumpAtlasDecodes();
         }
       }
       return slot;

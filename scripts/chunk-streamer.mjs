@@ -348,12 +348,30 @@ export class ChunkStreamer {
         const perm = err?.status === 404 || err?.status === 410;
         st.failed?.set?.(ck, perm ? Infinity : (performance.now() + 15000));
         if (!perm && !this._retryTimer) {
-          this._retryTimer = setTimeout(() => {
-            this._retryTimer = null;
-            if (gen !== this._gen || this.states.size === 0) return;
-            this._lastUpdateQKey = "";
-            if (this._lastVp) this.update(this._lastVp);
-          }, 15100);
+          const scheduleRetry = (delayMs) => {
+            this._retryTimer = setTimeout(() => {
+              this._retryTimer = null;
+              if (gen !== this._gen || this.states.size === 0) return;
+              this._lastUpdateQKey = "";
+              if (this._lastVp) this.update(this._lastVp);
+              // Re-arm timer if other needed chunks failed later and still have pending retry backoff
+              const nowMs = performance.now();
+              let minRetryAfter = Infinity;
+              for (const state of this.states.values()) {
+                if (!state.failed?.size || !state.lastNeeded?.size) continue;
+                for (const key of state.lastNeeded) {
+                  const until = state.failed.get(key);
+                  if (Number.isFinite(until) && until > nowMs && until < minRetryAfter) {
+                    minRetryAfter = until;
+                  }
+                }
+              }
+              if (Number.isFinite(minRetryAfter) && !this._retryTimer) {
+                scheduleRetry(Math.max(200, Math.ceil(minRetryAfter - nowMs) + 100));
+              }
+            }, delayMs);
+          };
+          scheduleRetry(15100);
         }
         console.warn(`${MODULE_ID} | Failed to load chunk ${url}:`, err);
       });

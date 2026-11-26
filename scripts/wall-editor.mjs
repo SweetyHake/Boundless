@@ -421,8 +421,7 @@ export class VirtualWallEditor {
           if (parts.length !== 3) continue;
           const [sk, kind, idxStr] = parts;
           const idx = Number(idxStr);
-          const raw = spec.sectors[sk]?.[kind]?.[idx];
-          if (!raw) continue;
+          const raw = spec.sectors[sk]?.[kind]?.[idx] ?? null;
           const resolved = this.controller.resolveVirtualWall(lid, kind, sk, idx, raw);
           if (!resolved) continue;
           if (doorsOnly && !resolved.door) continue;
@@ -854,8 +853,11 @@ export class VirtualWallEditor {
       this._clearMountedWalls({ keepProtected: true });
       for (const entry of Array.from(this.mountedByKey.values())) {
         const entryLayer = this.controller?.levelLayers?.get?.(entry.levelId);
-        const raw = entryLayer?.spec?.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx];
-        const resolved = raw ? this.controller.resolveVirtualWall(entry.levelId, entry.kind, entry.sk, entry.idx, raw) : null;
+        const raw = entryLayer?.spec?.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] ?? null;
+        const ovMacro = this.controller.wallEdits?.get(entry.levelId)?.get(entry.wKey);
+        const resolved = (raw || (ovMacro !== undefined && ovMacro !== null))
+          ? this.controller.resolveVirtualWall(entry.levelId, entry.kind, entry.sk, entry.idx, raw)
+          : null;
         if (!resolved) {
           this._removeMountedEntry(entry, { closeSheet: true });
           continue;
@@ -893,8 +895,9 @@ export class VirtualWallEditor {
       const lvlWallEdits = !wrongLevel ? this.controller.wallEdits?.get(entry.levelId) : undefined;
       const ov = !wrongLevel ? lvlWallEdits?.get(entry.wKey) : undefined;
       const neededSeg = !wrongLevel ? needed.get(mKey) : null;
-      const raw = (!wrongLevel && !neededSeg) ? entryLayer.spec.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] : null;
-      const resolved = neededSeg || ((!wrongLevel && ov !== null && raw)
+      const raw = (!wrongLevel && !neededSeg) ? (entryLayer.spec.sectors?.[entry.sk]?.[entry.kind]?.[entry.idx] ?? null) : null;
+      const hasEdit = ov !== undefined && ov !== null;
+      const resolved = neededSeg || ((!wrongLevel && ov !== null && (raw || hasEdit))
         ? this.controller.resolveVirtualWall(entry.levelId, entry.kind, entry.sk, entry.idx, raw)
         : null);
       const isDeleted = ov === null || (!wrongLevel && !resolved);
@@ -1255,7 +1258,7 @@ export class VirtualWallEditor {
 
 export function registerWallEditorControls(controller) {
   Hooks.on("activateWallsLayer", () => {
-    if (!controller.active) return;
+    if (!controller.active || controller._mounting) return;
     if (!controller.wallEditor._patches) controller.wallEditor.mount();
     controller.wallEditor.activate();
   });

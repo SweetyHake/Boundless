@@ -730,6 +730,13 @@ export async function bakeSceneToBoundless(controller, sourceScene, {
           const prevManifest = await fetchManifestJson(existingUrl, signal);
           if (prevManifest?.levels && typeof prevManifest.levels === "object") {
             mergedLevelSpecs = { ...prevManifest.levels, ...levelSpecs };
+          } else if (prevManifest && typeof prevManifest === "object" && prevManifest.sectors) {
+            const prevLid = targetScene.flags?.[MODULE_ID]?.levelId
+              || targetLevels.find(l => !chosenLevels.includes(l))?.id;
+            if (prevLid && !levelSpecs[prevLid]) {
+              const { format: _fmt, ...flatSpec } = prevManifest;
+              mergedLevelSpecs = { [prevLid]: flatSpec, ...levelSpecs };
+            }
           }
         } catch {}
       }
@@ -2254,6 +2261,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
   // 2. Optionally clone scene first so original Boundless scene stays untouched
   let targetScene = scene;
   let createdClone = false;
+  let didUnmountActive = false;
   const levelIdMap = new Map();
   const createdDocIds = { Tile: [], Wall: [], AmbientLight: [], AmbientSound: [] };
 
@@ -2273,6 +2281,7 @@ export async function unbakeSceneFromBoundless(controller, scene, {
       for (const l of srcLevels) levelIdMap.set(l.id, l.id);
       if (globalThis.canvas?.ready && canvas.scene?.id === targetScene.id && controller?.active) {
         controller.unmount();
+        didUnmountActive = true;
       }
     }
 
@@ -2316,12 +2325,13 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         const doc = extracted.lights[li];
         const gid = extracted.lightGids?.[li];
         if (gid) {
-          const prev = lightsByGid.get(gid);
-          if (prev && prev.sig === docSigWithoutLevels(doc)) {
-            if (!prev.doc.levels.includes(dstLid)) prev.doc.levels.push(dstLid);
+          const mergeKey = `${gid}\0${docSigWithoutLevels(doc)}`;
+          const prevDoc = lightsByGid.get(mergeKey);
+          if (prevDoc) {
+            if (!prevDoc.levels.includes(dstLid)) prevDoc.levels.push(dstLid);
             continue;
           }
-          lightsByGid.set(gid, { doc, sig: docSigWithoutLevels(doc) });
+          lightsByGid.set(mergeKey, doc);
         }
         allLights.push(doc);
       }
@@ -2330,12 +2340,13 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         const doc = extracted.tiles[ti];
         const gid = extracted.tileGids?.[ti];
         if (gid) {
-          const prev = tilesByGid.get(gid);
-          if (prev && prev.sig === docSigWithoutLevels(doc)) {
-            if (!prev.doc.levels.includes(dstLid)) prev.doc.levels.push(dstLid);
+          const mergeKey = `${gid}\0${docSigWithoutLevels(doc)}`;
+          const prevDoc = tilesByGid.get(mergeKey);
+          if (prevDoc) {
+            if (!prevDoc.levels.includes(dstLid)) prevDoc.levels.push(dstLid);
             continue;
           }
-          tilesByGid.set(gid, { doc, sig: docSigWithoutLevels(doc) });
+          tilesByGid.set(mergeKey, doc);
         }
         allTiles.push(doc);
       }
@@ -2477,6 +2488,9 @@ export async function unbakeSceneFromBoundless(controller, scene, {
         if (createdDocIds[docName].length) {
           try { await targetScene.deleteEmbeddedDocuments(docName, createdDocIds[docName]); } catch {}
         }
+      }
+      if (didUnmountActive && globalThis.canvas?.ready && canvas.scene?.id === targetScene.id && !controller?.active) {
+        try { await controller.mount(targetScene); } catch {}
       }
     }
     throw err;

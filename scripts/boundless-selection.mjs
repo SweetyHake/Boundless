@@ -622,12 +622,13 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         !streamer._nativeTokensActive &&
         !this._draggedToken &&
         !this.hover &&
+        !canvas.controls?.ruler?.active &&
+        !CONFIG.Canvas?.rulerClass?.canMeasure &&
+        !event?.interactionData?.preview &&
         game.activeTool === "select" &&
         !event?.shiftKey &&
         !event?.ctrlKey &&
-        !event?.metaKey &&
-        !canvas.controls?.ruler?.active &&
-        !CONFIG.Canvas?.rulerClass?.canMeasure
+        !event?.metaKey
       ) {
         const origin = event?.interactionData?.origin ?? event?.getLocalPosition?.(this);
         if (origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)) {
@@ -684,6 +685,9 @@ export function installGlobalSelectionPatches(controller, PERF_CONFIG) {
         !streamer._nativeTokensActive &&
         !this._draggedToken &&
         !this.hover &&
+        !canvas.controls?.ruler?.active &&
+        !CONFIG.Canvas?.rulerClass?.canMeasure &&
+        !event?.interactionData?.preview &&
         game.activeTool === "select" &&
         !event?.ctrlKey &&
         !event?.metaKey

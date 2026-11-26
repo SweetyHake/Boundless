@@ -715,6 +715,7 @@ export class PoiManager {
       if (manifest.superGrid) {
         return manifest.pois.map(p => ({
           ...p,
+          _origKind: p.kind,
           kind: "major",
           _isSecondaryProvince: p.kind === "minor",
           targetScale: Number.isFinite(p.targetScale) ? p.targetScale : 0.085
@@ -1204,7 +1205,7 @@ export class PoiManager {
       if (canDrag) {
         this._startPinDrag(entry, ev);
       } else {
-        this.flyTo(poi);
+        Promise.resolve(this.flyTo(poi)).catch(() => {});
       }
     });
 
@@ -1284,7 +1285,7 @@ export class PoiManager {
       if (upEv.button !== 0) return;
       if (!moved) {
         cleanup(false, false);
-        if (!this.placementActive) this.flyTo(entry.poi);
+        if (!this.placementActive) Promise.resolve(this.flyTo(entry.poi)).catch(() => {});
         return;
       }
       const pt = toWorld(upEv.clientX, upEv.clientY);
@@ -1381,7 +1382,7 @@ export class PoiManager {
       id: "fly",
       icon: "fa-crosshairs",
       label: loc("BOUNDLESS.Config.PoiFly", "Перелететь"),
-      run: () => this.flyTo(poi)
+      run: () => Promise.resolve(this.flyTo(poi)).catch(() => {})
     });
 
     if (poi.journalUuid) {
@@ -1389,7 +1390,7 @@ export class PoiManager {
         id: "journal",
         icon: "fa-book-open",
         label: loc("BOUNDLESS.Config.PoiOpenJournal", "Открыть журнал"),
-        run: () => this._openLinkedJournal(poi.journalUuid)
+        run: () => Promise.resolve(this._openLinkedJournal(poi.journalUuid)).catch(() => {})
       });
     }
 
@@ -1399,7 +1400,7 @@ export class PoiManager {
         id: "edit",
         icon: "fa-pen-to-square",
         label: loc("BOUNDLESS.Config.PoiEdit", "Редактировать"),
-        run: () => openPoiEditorDialog(this.controller, canvas.scene, poi)
+        run: () => Promise.resolve(openPoiEditorDialog(this.controller, canvas.scene, poi)).catch(err => console.warn(`[${MODULE_ID}] POI edit failed:`, err))
       });
       items.push({
         id: "toggleHidden",
@@ -1407,14 +1408,14 @@ export class PoiManager {
         label: poi.hidden
           ? loc("BOUNDLESS.Config.PoiShowPlayers", "Показать игрокам")
           : loc("BOUNDLESS.Config.PoiHidePlayers", "Скрыть от игроков"),
-        run: () => this.controller?.updatePOI?.(poi.id, { hidden: !poi.hidden })
+        run: () => Promise.resolve(this.controller?.updatePOI?.(poi.id, { hidden: !poi.hidden })).catch(err => console.warn(`[${MODULE_ID}] POI toggle hidden failed:`, err))
       });
       items.push({
         id: "delete",
         icon: "fa-trash",
         danger: true,
         label: loc("BOUNDLESS.Config.PoiDelete", "Удалить"),
-        run: () => this.controller?.removePOI?.(poi.id)
+        run: () => Promise.resolve(this.controller?.removePOI?.(poi.id)).catch(err => console.warn(`[${MODULE_ID}] POI delete failed:`, err))
       });
     }
 
@@ -1522,7 +1523,9 @@ export class PoiManager {
           x: Math.round(worldPt.x),
           y: Math.round(worldPt.y),
           levelId: canvas.level?.id || null
-        })).finally(() => {
+        })).catch((err) => {
+          console.warn(`[${MODULE_ID}] POI creation failed:`, err);
+        }).finally(() => {
           this._poiDialogOpen = false;
         });
       };
@@ -1897,6 +1900,9 @@ export class PoiManager {
         if (this.controller?._mountPromise) {
           try { await this.controller._mountPromise; } catch {}
         }
+      } catch (err) {
+        console.warn(`[${MODULE_ID}] Failed to switch level during flyTo:`, err);
+        return false;
       } finally {
         if (this._pendingLevelSwitch?.seq === seq) this._pendingLevelSwitch = null;
       }

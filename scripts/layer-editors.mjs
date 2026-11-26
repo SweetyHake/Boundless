@@ -611,8 +611,7 @@ export class VirtualLayerEditors {
         if (parts.length !== 3) continue;
         const [sk, , idxStr] = parts;
         const idx = Number(idxStr);
-        const raw = spec.sectors[sk]?.l?.[idx];
-        if (!raw) continue;
+        const raw = spec.sectors[sk]?.l?.[idx] ?? null;
         const item = this.controller.resolveVirtualLight(lid, sk, idx, raw, level);
         if (!item) continue;
         if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
@@ -647,8 +646,10 @@ export class VirtualLayerEditors {
 
     for (const entry of Array.from(this.lightsByKey.values())) {
       const wrongLevel = entry.levelId !== lid;
-      const raw = !wrongLevel ? layer.spec.sectors?.[entry.sk]?.l?.[entry.idx] : null;
-      const resolved = (!wrongLevel && !needed.has(entry.key) && raw && lvlEdits?.get(entry.key) !== null)
+      const raw = !wrongLevel ? (layer.spec.sectors?.[entry.sk]?.l?.[entry.idx] ?? null) : null;
+      const ovL = !wrongLevel ? lvlEdits?.get(entry.key) : undefined;
+      const hasEditL = ovL !== undefined && ovL !== null;
+      const resolved = (!wrongLevel && !needed.has(entry.key) && ovL !== null && (raw || hasEditL))
         ? this.controller.resolveVirtualLight(lid, entry.sk, entry.idx, raw, level)
         : null;
       const isDeleted = !wrongLevel && (lvlEdits?.get(entry.key) === null || (!needed.has(entry.key) && !resolved));
@@ -817,8 +818,10 @@ export class VirtualLayerEditors {
     const lvlEdits = this.controller.lightEdits?.get(lid);
     for (const existing of Array.from(this.lightsByKey.values())) {
       const sheet = getExistingSheet(existing.doc);
-      const raw = existing.levelId === lid ? layer?.spec?.sectors?.[existing.sk]?.l?.[existing.idx] : null;
-      const it = (existing.levelId === lid && raw && lvlEdits?.get(existing.key) !== null)
+      const raw = existing.levelId === lid ? (layer?.spec?.sectors?.[existing.sk]?.l?.[existing.idx] ?? null) : null;
+      const ovLM = existing.levelId === lid ? lvlEdits?.get(existing.key) : undefined;
+      const hasEditLM = ovLM !== undefined && ovLM !== null;
+      const it = (existing.levelId === lid && ovLM !== null && (raw || hasEditLM))
         ? this.controller.resolveVirtualLight(lid, existing.sk, existing.idx, raw, level)
         : null;
       if (!it) {
@@ -863,8 +866,10 @@ export class VirtualLayerEditors {
     const lvlEdits = this.controller.soundEdits?.get(lid);
     for (const existing of Array.from(this.soundsByKey.values())) {
       const sheet = getExistingSheet(existing.doc);
-      const raw = existing.levelId === lid ? layer?.spec?.sectors?.[existing.sk]?.s?.[existing.idx] : null;
-      const it = (existing.levelId === lid && raw && lvlEdits?.get(existing.key) !== null)
+      const raw = existing.levelId === lid ? (layer?.spec?.sectors?.[existing.sk]?.s?.[existing.idx] ?? null) : null;
+      const ovSM = existing.levelId === lid ? lvlEdits?.get(existing.key) : undefined;
+      const hasEditSM = ovSM !== undefined && ovSM !== null;
+      const it = (existing.levelId === lid && ovSM !== null && (raw || hasEditSM))
         ? this.controller.resolveVirtualSound(lid, existing.sk, existing.idx, raw, level)
         : null;
       if (!it) {
@@ -1209,8 +1214,7 @@ export class VirtualLayerEditors {
         if (parts.length !== 3) continue;
         const [sk, , idxStr] = parts;
         const idx = Number(idxStr);
-        const raw = spec.sectors[sk]?.s?.[idx];
-        if (!raw) continue;
+        const raw = spec.sectors[sk]?.s?.[idx] ?? null;
         const item = this.controller.resolveVirtualSound(lid, sk, idx, raw, level);
         if (!item) continue;
         if (item.x < curVp.x0 - pad || item.x > curVp.x1 + pad ||
@@ -1245,8 +1249,10 @@ export class VirtualLayerEditors {
 
     for (const entry of Array.from(this.soundsByKey.values())) {
       const wrongLevel = entry.levelId !== lid;
-      const raw = !wrongLevel ? layer.spec.sectors?.[entry.sk]?.s?.[entry.idx] : null;
-      const resolved = (!wrongLevel && !needed.has(entry.key) && raw && lvlEdits?.get(entry.key) !== null)
+      const raw = !wrongLevel ? (layer.spec.sectors?.[entry.sk]?.s?.[entry.idx] ?? null) : null;
+      const ovS = !wrongLevel ? lvlEdits?.get(entry.key) : undefined;
+      const hasEditS = ovS !== undefined && ovS !== null;
+      const resolved = (!wrongLevel && !needed.has(entry.key) && ovS !== null && (raw || hasEditS))
         ? this.controller.resolveVirtualSound(lid, entry.sk, entry.idx, raw, level)
         : null;
       const isDeleted = !wrongLevel && (lvlEdits?.get(entry.key) === null || (!needed.has(entry.key) && !resolved));
@@ -1918,7 +1924,7 @@ export class VirtualLayerEditors {
 
 export function registerLayerEditorControls(controller) {
   Hooks.on("activateLightingLayer", () => {
-    if (!controller.active) return;
+    if (!controller.active || controller._mounting) return;
     if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateLighting();
   });
@@ -1927,7 +1933,7 @@ export function registerLayerEditorControls(controller) {
   });
 
   Hooks.on("activateSoundsLayer", () => {
-    if (!controller.active) return;
+    if (!controller.active || controller._mounting) return;
     if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateSounds();
   });
@@ -1936,7 +1942,7 @@ export function registerLayerEditorControls(controller) {
   });
 
   Hooks.on("activateTilesLayer", () => {
-    if (!controller.active) return;
+    if (!controller.active || controller._mounting) return;
     if (!controller.layerEditors._patches) controller.layerEditors.mount();
     controller.layerEditors.activateTiles();
   });

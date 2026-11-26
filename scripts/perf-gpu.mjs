@@ -466,6 +466,8 @@ function patchDoorControls() {
       bgSp.eventMode = "none";
       this._blDoorBg = bgSp;
       this.bg.addChild(bgSp);
+    } else if (bgSp.parent !== this.bg) {
+      this.bg.addChild(bgSp);
     }
     bgSp.visible = true;
     bgSp.position.set(x, y);
@@ -479,6 +481,8 @@ function patchDoorControls() {
       bdSp = new PIXI.Sprite(atlas.plainBorder);
       bdSp.eventMode = "none";
       this._blDoorBorder = bdSp;
+      this.border.addChild(bdSp);
+    } else if (bdSp.parent !== this.border) {
       this.border.addChild(bdSp);
     }
     bdSp.visible = true;
@@ -539,6 +543,8 @@ function patchDnd5eMapLocationIcons() {
       shSp.eventMode = "none";
       this._blShadowSp = shSp;
       this.shadow.addChild(shSp);
+    } else if (shSp.parent !== this.shadow) {
+      this.shadow.addChild(shSp);
     }
     shSp.visible = true;
     shSp.position.set(r + 8, r + 8);
@@ -553,6 +559,8 @@ function patchDnd5eMapLocationIcons() {
       exSp.anchor.set(0.5);
       exSp.eventMode = "none";
       this._blExtrudeSp = exSp;
+      this.extrude.addChild(exSp);
+    } else if (exSp.parent !== this.extrude) {
       this.extrude.addChild(exSp);
     }
     exSp.visible = true;
@@ -569,6 +577,8 @@ function patchDnd5eMapLocationIcons() {
       fillSp.eventMode = "none";
       this._blFillSp = fillSp;
       this.bg.addChild(fillSp);
+    } else if (fillSp.parent !== this.bg) {
+      this.bg.addChild(fillSp);
     }
     fillSp.visible = true;
     fillSp.position.set(r, r);
@@ -581,6 +591,8 @@ function patchDnd5eMapLocationIcons() {
       stSp.anchor.set(0.5);
       stSp.eventMode = "none";
       this._blStrokeSp = stSp;
+      this.bg.addChild(stSp);
+    } else if (stSp.parent !== this.bg) {
       this.bg.addChild(stSp);
     }
     stSp.visible = true;
@@ -800,7 +812,7 @@ function attachTokenUiBatcher() {
     if (count < 4) return wrapped(renderer);
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
-    const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
+    const vp = (PERF_CONFIG.perfAutoCulling && !renderer?.renderTexture?.current) ? getStageViewportWorldRect(260) : null;
     batchTokens.length = 0;
     let passMask = 0;
 
@@ -902,7 +914,7 @@ function attachLightingLayerBatcher() {
     if (count < 8) return wrapped(renderer);
     if (this.sortableChildren && this.sortDirty) this.sortChildren();
 
-    const vp = PERF_CONFIG.perfAutoCulling ? getStageViewportWorldRect(260) : null;
+    const vp = (PERF_CONFIG.perfAutoCulling && !renderer?.renderTexture?.current) ? getStageViewportWorldRect(260) : null;
     const distPx = globalThis.canvas?.dimensions?.distancePixels || 20;
     visLights.length = 0;
     complexLights.length = 0;
@@ -1172,7 +1184,7 @@ function patchTokenUiCaching() {
         }
       }
       // Verify bg only holds standard black rounded-rect backdrops before replacing with atlas sprites
-      let bgIsStandardRRect = allStandard && statusIcons.length >= 1 && statusIcons.length <= 4;
+      let bgIsStandardRRect = allStandard && statusIcons.length >= 1;
       if (bgIsStandardRRect) {
         const gData = bg.geometry?.graphicsData;
         if (!Array.isArray(gData) || gData.length !== statusIcons.length) {
@@ -1189,7 +1201,7 @@ function patchTokenUiCaching() {
         }
       }
       if (bgIsStandardRRect) {
-        // Batch 1-4 status effect backgrounds onto shared _uiAtlas sprites (merges all combat tokens into 1 draw call!)
+        // Batch all status effect backgrounds onto shared _uiAtlas sprites (crisp at all zoom scales, zero cacheAsBitmap blur)
         const atlas = getUiAtlas();
         if (atlas?.effectBg) {
           const s = globalThis.canvas?.dimensions?.uiScale || 1;
@@ -1218,10 +1230,6 @@ function patchTokenUiCaching() {
           }
           perfStats.tokenEffectsCached++;
         }
-      } else if (allStandard && !fx.overlay && statusIcons.length >= 5) {
-        fx.cacheAsBitmapResolution = getBitmapCacheResolution();
-        fx.cacheAsBitmap = true;
-        perfStats.tokenEffectsCached++;
       }
     }
     return res;
@@ -1322,22 +1330,25 @@ export function clearTokenUiBitmapCaches() {
   const placeables = globalThis.canvas?.tokens?.placeables;
   if (!placeables) return;
   for (const tok of placeables) {
-    if (tok.bars) {
+    if (!tok || tok.destroyed) continue;
+    if (tok.bars && !tok.bars.destroyed) {
       tok.bars.cacheAsBitmap = false;
-      if (tok.bars.bar1) {
+      if (tok.bars.bar1 && !tok.bars.bar1.destroyed) {
         tok.bars.bar1.cacheAsBitmap = false;
         hideBar3SliceSprites(tok.bars.bar1);
       }
-      if (tok.bars.bar2) {
+      if (tok.bars.bar2 && !tok.bars.bar2.destroyed) {
         tok.bars.bar2.cacheAsBitmap = false;
         hideBar3SliceSprites(tok.bars.bar2);
       }
     }
-    if (tok.effects) {
+    if (tok.effects && !tok.effects.destroyed) {
       tok.effects.cacheAsBitmap = false;
       const arr = tok.effects.bg?._blFxBgSprites;
       if (arr) {
-        for (let i = 0; i < arr.length; i++) arr[i].visible = false;
+        for (let i = 0; i < arr.length; i++) {
+          if (arr[i] && !arr[i].destroyed) arr[i].visible = false;
+        }
       }
     }
     if (tok._blBorderDirty) {
@@ -1543,7 +1554,8 @@ function patchV14CoreRenderPasses() {
         PERF_CONFIG.perfEnabled &&
         (!this.effects || this.effects.size === 0) &&
         (!this.weatherEffects || this.weatherEffects.children.length === 0) &&
-        this.children.length <= 2
+        this.children.length <= 2 &&
+        (!this.filters || this.filters.length <= 2)
       ) {
         return;
       }
@@ -2199,7 +2211,7 @@ export function refreshGpuPerfSettings() {
   if (doors?.length) {
     for (const d of doors) {
       if (d && !d.destroyed && typeof d.draw === "function") {
-        try { d.draw(); } catch {}
+        try { Promise.resolve(d.draw()).catch(() => {}); } catch {}
       }
     }
   }

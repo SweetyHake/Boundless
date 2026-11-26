@@ -163,7 +163,7 @@ export function registerBoundlessHooks(controller) {
     if (game.settings?.register) {
       const onPerfChange = () => {
         syncPerfConfigFromSettings();
-        resetCpuCaches();
+        resetCpuCaches({ flushPending: true });
         refreshGpuPerfSettings();
         syncIdleFpsLimiter();
         if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfIdleLevelPrewarm) {
@@ -509,10 +509,13 @@ export function registerBoundlessHooks(controller) {
     }
   });
 
-  Hooks.on("updateActor", (_actor, changes) => {
+  Hooks.on("updateActor", (actor, changes) => {
     if (!isRuntimeReady()) return;
     if ("img" in changes || "name" in changes || "ownership" in changes) {
       controller.charPins.onUserOrActorUpdated();
+    }
+    if ("ownership" in changes) {
+      controller.tokenStreamer?.onActorUpdated?.(actor, changes);
     }
   });
   Hooks.on("deleteActor", () => {
@@ -545,7 +548,7 @@ export function registerBoundlessHooks(controller) {
       if (!isRuntimeReady()) return;
       controller.charPins._lastSidebarCheckMs = 0;
       controller.charPins.updateViewport();
-    }, 180);
+    }, 320);
   });
 
   const onResizeSync = (syncPyramid = false) => {

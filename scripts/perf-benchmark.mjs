@@ -696,6 +696,7 @@ export async function benchmarkCurrentScene(opts = {}) {
     PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
     try { await game.settings.set("core", "tokenDragPreview", savedDragPreview); } catch {}
     try { await setPerfMode(savedPerfEnabled); } catch {}
+    syncIdleFpsLimiter();
     Object.assign(perfStats, savedStats);
     if (globalThis.canvas?.scene?.id === scene.id) {
       try { savedLayer?.activate?.(); } catch {}
@@ -832,8 +833,8 @@ export async function benchmarkGameplayMechanics() {
     }
   } finally {
     PERF_CONFIG.perfIdleFpsLimit = savedIdleFpsLimit;
-    syncIdleFpsLimiter();
     try { await setPerfMode(savedPerfEnabled); } catch {}
+    syncIdleFpsLimiter();
     Object.assign(perfStats, savedStats);
   }
 

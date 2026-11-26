@@ -134,7 +134,7 @@ export const lightingMethods = {
       const suppressIndoorDyn = Boolean(this.lightBatch.hideIndoorLights);
 
       const isMetaEligibleDyn = (meta, visionSource = null) => {
-        if (!meta) return false;
+        if (!meta || meta.sharedSuppressed) return false;
         if (suppressIndoorDyn && meta.isIndoor) return false;
         if (suppressUnseenIndoorForMacroRoof && meta.isIndoor) {
           const canSeeIndoor = Boolean(visionSource?.los?.contains?.(meta.lx, meta.ly));
@@ -287,6 +287,7 @@ export const lightingMethods = {
             const sx1 = Math.min(simGrid - 1, Math.floor((vpSticky.x1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             const sy1 = Math.min(simGrid - 1, Math.floor((vpSticky.y1 + LIGHT_PAD_WORLD_PX) / simSectorPx));
             const visitedVpSectors = new Set();
+            const seenVpIds = new Set();
             for (let sy = sy0; sy <= sy1; sy++) {
               for (let sx = sx0; sx <= sx1; sx++) {
                 const sk = `${sx}_${sy}`;
@@ -294,10 +295,12 @@ export const lightingMethods = {
                 const sec = spec.sectors[sk];
                 if (!sec?.l?.length) continue;
                 for (let idx = 0; idx < sec.l.length; idx++) {
-                  const lid = `${levelId}::${sk}_${idx}`;
-                  if (neededDynLights.has(lid)) continue;
+                  const rawLid = `${levelId}::${sk}_${idx}`;
+                  const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
+                  if (neededDynLights.has(lid) || seenVpIds.has(lid)) continue;
                   const meta = this.lightBatch.lightMetaById.get(lid);
                   if (!meta || !meta.raw?.[6] || !isMetaEligibleDyn(meta)) continue;
+                  seenVpIds.add(lid);
                   const r = meta.dimPx || 0;
                   const alreadyDyn = this.dynamicLights.has(lid);
                   const box = alreadyDyn ? vpSticky : vp;
@@ -322,10 +325,12 @@ export const lightingMethods = {
                 if (!ov) continue;
                 const parts = lKey.split(":");
                 if (parts.length !== 3 || visitedVpSectors.has(parts[0])) continue;
-                const lid = `${levelId}::${parts[0]}_${parts[2]}`;
-                if (neededDynLights.has(lid)) continue;
+                const rawLid = `${levelId}::${parts[0]}_${parts[2]}`;
+                const lid = this.lightBatch.resolveLightId?.(rawLid) || rawLid;
+                if (neededDynLights.has(lid) || seenVpIds.has(lid)) continue;
                 const meta = this.lightBatch.lightMetaById.get(lid);
                 if (!meta || !meta.raw?.[6] || !isMetaEligibleDyn(meta)) continue;
+                seenVpIds.add(lid);
                 const r = meta.dimPx || 0;
                 const alreadyDyn = this.dynamicLights.has(lid);
                 const box = alreadyDyn ? vpSticky : vp;
@@ -651,6 +656,7 @@ export const lightingMethods = {
           if (!neededDynLights.has(lid)) {
             const meta = this.lightBatch.lightMetaById.get(lid);
             const suppressedByRoofOrDarkness = Boolean(
+              meta?.sharedSuppressed ||
               ((hidingIndoors || suppressUnseenIndoorForMacroRoof) && meta?.isIndoor) ||
               (meta && (curDarkness < (meta.darkMin ?? 0) || curDarkness > (meta.darkMax ?? 1)))
             );
@@ -1390,26 +1396,29 @@ export const lightingMethods = {
         existingQ.queuedSeq = seq;
         return;
       }
+      const originScene = canvas.scene;
+      const originSceneId = originScene.id;
+      const originMountGen = this._mountGen;
+      const isSameMount = () => Boolean(this.active && this._mountGen === originMountGen && canvas.scene?.id === originSceneId);
       const qState = { inFlight: true, queuedDs: null, queuedSeq: 0 };
       this._doorCommitQueue.set(dKey, qState);
       const flushDoorCommit = (commitDs, commitSeq) => {
-        const sc = canvas.scene;
-        if (!sc) {
-          this._doorCommitQueue?.delete?.(dKey);
+        if (!originScene) {
+          if (this._doorCommitQueue?.get(dKey) === qState) this._doorCommitQueue.delete(dKey);
           if (this._pendingDoorCommits?.get(dKey) === commitSeq) this._pendingDoorCommits.delete(dKey);
           return;
         }
-        Promise.resolve(sc.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: commitDs }))
+        Promise.resolve(originScene.update({ [`flags.${MODULE_ID}.doorStates.${dKey}`]: commitDs }))
           .catch(err => {
             console.warn(`${MODULE_ID} | Failed to persist door state:`, err);
-            if (this._pendingDoorCommits?.get(dKey) === commitSeq && qState.queuedDs === null && this.active) {
-              const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
+            if (isSameMount() && this._doorCommitQueue?.get(dKey) === qState && this._pendingDoorCommits?.get(dKey) === commitSeq && qState.queuedDs === null) {
+              const persisted = originScene.flags?.[MODULE_ID]?.doorStates?.[dKey];
               const revertDs = persisted !== undefined ? persisted : info.defaultDs;
               this._applyDoorStateLocal(info, revertDs, { playSound: false, skipDeferRebake: true });
             }
           })
           .finally(() => {
-            if (qState.queuedDs !== null && this.active) {
+            if (qState.queuedDs !== null && isSameMount() && this._doorCommitQueue?.get(dKey) === qState) {
               const nextDs = qState.queuedDs;
               const nextSeq = qState.queuedSeq;
               qState.queuedDs = null;
@@ -1418,17 +1427,15 @@ export const lightingMethods = {
               return;
             }
             if (this._doorCommitQueue?.get(dKey) === qState) this._doorCommitQueue.delete(dKey);
-            if (this._pendingDoorCommits?.get(dKey) === commitSeq) {
+            if (isSameMount() && this._pendingDoorCommits?.get(dKey) === commitSeq) {
               this._pendingDoorCommits.delete(dKey);
               // Reconcile with final authoritative scene flag if another GM/player toggled concurrently while in-flight
-              if (this.active) {
-                const persisted = canvas.scene?.flags?.[MODULE_ID]?.doorStates?.[dKey];
-                if (persisted !== undefined) {
-                  const authDs = this._normalizeDoorState(persisted, info.defaultDs);
-                  const curLocalDs = this.getCurrentDoorState(dKey, info.defaultDs);
-                  if (authDs !== curLocalDs) {
-                    this._applyDoorStateLocal(info, authDs, { playSound: false });
-                  }
+              const persisted = originScene.flags?.[MODULE_ID]?.doorStates?.[dKey];
+              if (persisted !== undefined) {
+                const authDs = this._normalizeDoorState(persisted, info.defaultDs);
+                const curLocalDs = this.getCurrentDoorState(dKey, info.defaultDs);
+                if (authDs !== curLocalDs) {
+                  this._applyDoorStateLocal(info, authDs, { playSound: false });
                 }
               }
             }
@@ -1474,7 +1481,13 @@ export const lightingMethods = {
         const viewedBottom = getLevelBottomElevation(canvas.level);
         const topElev = getLevelRoofElevation(bakeLayer.level);
         const hiddenUnderUpper = !bakeLayer.level?.isView && viewedBottom >= topElev;
-        if (!hiddenUnderUpper) {
+        const ownedByViewedLevel = Boolean(
+          !bakeLayer.level?.isView &&
+          this.lightBatch.bakedRoofLevelId &&
+          this.lightBatch.bakedRoofLevelId === canvas.level?.id &&
+          this.lightBatch.bakedRoofLevelId !== bakeLayer.level?.id
+        );
+        if (!hiddenUnderUpper && !ownedByViewedLevel) {
           const isSuperGrid = Boolean(bakeLayer.spec?.superGrid);
           const regionPx = bakeLayer.spec?.superGrid?.regionPx || 100000;
           const b = bakeChunkData?.bounds || { x: 0, y: 0, w: regionPx, h: regionPx };
@@ -1513,7 +1526,7 @@ export const lightingMethods = {
                 roofElevation: topElev,
                 roofLevelId: bakeLayer.level?.id || null
               });
-            } else {
+            } else if (!this.lightBatch.bakedRoofLevelId || this.lightBatch.bakedRoofLevelId === bakeLayer.level?.id) {
               // All roof chunks unloaded on non-superGrid chunked map — cancel in-flight bake and release stale mask
               this._roofMaskGen = (this._roofMaskGen || 0) + 1;
               this.lightBatch.disposeBakedRoofMask();

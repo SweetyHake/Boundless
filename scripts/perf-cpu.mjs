@@ -182,6 +182,28 @@ function makeTickerThrottle(methodName, getMs, statKeys, opts = {}) {
       }
       return false;
     },
+    flushIfDirty: (guardFn = null) => {
+      if (!st.dirty) return false;
+      if (st.timerId !== null) { clearTimeout(st.timerId); st.timerId = null; }
+      const self = st.lastSelf;
+      const args2 = st.lastArgs;
+      st.lastSelf = null;
+      st.lastArgs = null;
+      st.dirty = false;
+      if (!self || typeof self[methodName] !== "function") return false;
+      if (guardFn && !guardFn(self)) return false;
+      perfStats[statKeys.trail]++;
+      st.inTrailing = true;
+      try {
+        self[methodName](...(args2 ?? []));
+        return true;
+      } catch (err) {
+        console.error(`${MODULE_ID} | throttle flush error:`, err);
+        return false;
+      } finally {
+        st.inTrailing = false;
+      }
+    },
     reset: () => {
       if (st.timerId !== null) { clearTimeout(st.timerId); st.timerId = null; }
       st.last = 0;
@@ -586,11 +608,19 @@ function fogVisionMovedFar() {
     const x = vs.data?.x ?? vs.x;
     const y = vs.data?.y ?? vs.y;
     const r = vs.radius ?? vs.data?.radius ?? 0;
+    const rot = vs.data?.rotation ?? vs.rotation ?? 0;
+    const ang = vs.data?.angle ?? 360;
+    const elev = vs.elevation ?? vs.data?.elevation ?? 0;
+    const lvl = vs.level?.id ?? vs.data?.level ?? "";
     const prev = _fogGuardSnap.get(id);
     if (prev === undefined) return true;
     const dx = x - prev.x;
     const dy = y - prev.y;
-    if ((dx * dx + dy * dy) >= px * px || r !== prev.r) return true;
+    if ((dx * dx + dy * dy) >= px * px || r !== prev.r || elev !== prev.elev || lvl !== prev.lvl || ang !== prev.ang) return true;
+    if (ang < 360) {
+      const dRot = Math.abs((((rot - prev.rot) % 360) + 540) % 360 - 180);
+      if (dRot >= 10) return true;
+    }
   }
   return false;
 }
@@ -603,7 +633,11 @@ function fogSnapshot() {
     _fogGuardSnap.set(vs.sourceId ?? vs.uuid, {
       x: vs.data?.x ?? vs.x,
       y: vs.data?.y ?? vs.y,
-      r: vs.radius ?? vs.data?.radius ?? 0
+      r: vs.radius ?? vs.data?.radius ?? 0,
+      rot: vs.data?.rotation ?? vs.rotation ?? 0,
+      ang: vs.data?.angle ?? 360,
+      elev: vs.elevation ?? vs.data?.elevation ?? 0,
+      lvl: vs.level?.id ?? vs.data?.level ?? ""
     });
   }
 }
@@ -797,8 +831,13 @@ function patchDragAndMovement() {
     return wrapped(...args);
   }, { type: "WRAPPER" });
 
+  const okDragClick = wrapFoundryMethod("Token", "_onDragClickLeft", function (wrapped, event, ...rest) {
+    flushDragDestination(true, event);
+    return wrapped(event, ...rest);
+  }, { type: "WRAPPER" });
+
   const okRemoveWp = wrapFoundryMethod("Token", "_removeDragWaypoint", function (wrapped, ...args) {
-    clearDragPending();
+    flushDragDestination(true);
     return wrapped(...args);
   }, { type: "WRAPPER" });
 
@@ -817,8 +856,8 @@ function patchDragAndMovement() {
   const cloneMeasureResult = (r) => {
     if (!r || typeof r !== "object") return r;
     const out = { ...r };
-    if (Array.isArray(r.spaces)) out.spaces = r.spaces.slice();
-    if (Array.isArray(r.waypoints)) out.waypoints = r.waypoints.slice();
+    if (Array.isArray(r.spaces)) out.spaces = r.spaces.map((o) => (o && typeof o === "object" ? { ...o } : o));
+    if (Array.isArray(r.waypoints)) out.waypoints = r.waypoints.map((o) => (o && typeof o === "object" ? { ...o } : o));
     return out;
   };
 
@@ -826,8 +865,10 @@ function patchDragAndMovement() {
     if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfDragCoalesce || !Array.isArray(waypoints) || waypoints.length < 2) {
       return wrapped(waypoints, options);
     }
-    const key = buildMeasureCacheKey(waypoints, options);
-    if (key === null) return wrapped(waypoints, options);
+    const baseKey = buildMeasureCacheKey(waypoints, options);
+    if (baseKey === null) return wrapped(waypoints, options);
+    const dragAct = globalThis.canvas?.tokens?._dragMovementAction ?? this.document?.movementAction ?? "";
+    const key = `${baseKey}|da:${dragAct}`;
     let cache = _measureCaches.get(this);
     if (!cache) {
       cache = new Map();
@@ -1011,7 +1052,7 @@ function patchMiscCpuGuards() {
     const darkLevel = Number(((env?.darknessLevel ?? 0)).toFixed(4));
     const globalLightActive = env?.globalLightSource?.active ? 1 : 0;
     const darkSrcCount = globalThis.canvas?.effects?.darknessSources?.size || 0;
-    const isDarknessSrc = Boolean(this.requiresEdges === true || this.constructor?.name?.includes?.("Darkness"));
+    const isDarknessSrc = Boolean(this.constructor?.sourceType === "darkness" || this.constructor?.name?.includes?.("Darkness"));
     const isPriorityLight = !isDarknessSrc && Boolean((this.data?.priority ?? 0) > 0 || (data?.priority ?? 0) > 0);
     const stateSig = quickStateSig(this);
     // Split priority-light vs darkness versions so multiple darkness sources or multiple Daylight sources
@@ -1033,7 +1074,7 @@ function patchMiscCpuGuards() {
     const result = wrapped(data, options);
     this.__blLastDark = darkLevel;
     this.__blLastGlobal = globalLightActive;
-    const postIsDarkness = Boolean(this.requiresEdges === true || this.constructor?.name?.includes?.("Darkness"));
+    const postIsDarkness = Boolean(this.constructor?.sourceType === "darkness" || this.constructor?.name?.includes?.("Darkness"));
     const postIsPrioLight = !postIsDarkness && Boolean((this.data?.priority ?? 0) > 0);
     const postEnvDep = `${postIsPrioLight ? "" : _priorityLightVersion}:${postIsDarkness ? "" : _darknessSourceVersion}`;
     this.__blSweepV = `${_geometryVersion}|${_edgeVersion}|${postEnvDep}|${darkLevel}|${globalLightActive}|${darkSrcCount}|${quickStateSig(this)}`;
@@ -1062,7 +1103,7 @@ function patchMiscCpuGuards() {
     const pts = shape?.points;
     const origin = shape?.origin;
     const radius = shape?.config?.radius ?? 0;
-    if (!pts || pts.length < 6 || !origin || !(radius > 0)) {
+    if (!pts || pts.length < 6 || !origin || !Number.isFinite(radius) || !(radius > 0)) {
       this.__blGeomKey = null;
       return wrapped();
     }
@@ -1345,7 +1386,7 @@ function patchMiscCpuGuards() {
     // or system enrichers [[/...]] tied to a relativeTo document (whose actor/item stats can change)
     if (o.relativeTo && !o.relativeTo.uuid) return wrapped(content, options);
     if (o.rolls !== false && /\[\[(?!\/)/.test(content)) return wrapped(content, options);
-    if (o.custom !== false && o.relativeTo && content.includes("[[/")) return wrapped(content, options);
+    if (o.custom !== false && o.relativeTo && (content.includes("[[") || content.includes("&Reference"))) return wrapped(content, options);
     if (o.embeds !== false && content.includes("@Embed[")) return wrapped(content, options);
     for (const k in o) {
       if (!_enrichAllowedKeys.has(k)) return wrapped(content, options);
@@ -1474,7 +1515,7 @@ function patchMiscCpuGuards() {
 
   // Lazy Actor#applyActiveEffects: skip 2x Actor#getRollData() + Map + expandObject on actors with 0 active AE changes (80-90% of NPCs)
   wrapFoundryMethod("Actor", "applyActiveEffects", function (wrapped, phase) {
-    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception) return wrapped(phase);
+    if (!PERF_CONFIG.perfEnabled || !PERF_CONFIG.perfCpuPerception || globalThis.game?.modules?.get?.("dae")?.active) return wrapped(phase);
     const ActiveEffect = globalThis.foundry?.documents?.ActiveEffect?.implementation;
     if (
       typeof phase !== "string" ||
@@ -1501,7 +1542,7 @@ function patchMiscCpuGuards() {
 
   // Lazy TokenDocument#applyActiveEffects: v14 calls actor.getRollData() BEFORE checking if tokenActiveEffectChanges[phase] is empty!
   wrapFoundryMethod("TokenDocument", "applyActiveEffects", function (wrapped, phase) {
-    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception) {
+    if (PERF_CONFIG.perfEnabled && PERF_CONFIG.perfCpuPerception && !globalThis.game?.modules?.get?.("dae")?.active) {
       const raw = this.actor?.tokenActiveEffectChanges?.[phase];
       if (!raw || raw.length === 0) return;
     }
@@ -1871,10 +1912,20 @@ function attachIdleFpsLimiter() {
       restoreIdleFps();
       return;
     }
+    let hasPlayingVideo = false;
+    const vidMeshes = globalThis.canvas?.primary?.videoMeshes;
+    if (vidMeshes?.size) {
+      for (const m of vidMeshes) {
+        if (m?.sourceElement && !m.sourceElement.paused && !m.sourceElement.ended) {
+          hasPlayingVideo = true;
+          break;
+        }
+      }
+    }
     const hasActiveAnim = Boolean(
       (globalThis.foundry?.canvas?.animation?.CanvasAnimation?.animations?.size ?? 0) > 0 ||
       globalThis.Boundless?.isCameraFlying ||
-      globalThis.game?.video?.playing
+      hasPlayingVideo
     );
     if (hasActiveAnim) {
       _idle.last = performance.now();
@@ -1919,7 +1970,12 @@ export function invalidateCpuGeometry() {
   _geometryVersion++;
 }
 
-export function resetCpuCaches() {
+export function resetCpuCaches({ flushPending = false } = {}) {
+  if (flushPending && globalThis.canvas?.ready) {
+    _fogThrottle.flushIfDirty(() => Boolean(globalThis.canvas?.visibility?.vision));
+    _occMaskThrottle.flushIfDirty();
+    _occObjThrottle.flushIfDirty();
+  }
   _losCache.clear();
   _perceptionVer++;
   _exploredVer++;
@@ -1961,6 +2017,8 @@ export function installCpuPerfEngine() {
     syncIdleFpsLimiter();
   });
   Hooks.on("canvasTearDown", () => {
+    // Flush any throttled fog exploration before Foundry's CanvasVisibility#_tearDown calls fog.save()
+    _fogThrottle.flushIfDirty(() => Boolean(globalThis.canvas?.visibility?.vision && !globalThis.canvas.visibility.vision.destroyed));
     if (_fogExploredTarget) {
       try { _fogExploredTarget.removeEventListener("explored", _onFogExplored); } catch {}
       _fogExploredTarget = null;
@@ -1969,7 +2027,7 @@ export function installCpuPerfEngine() {
     restoreIdleFps();
   });
 
-  for (const h of ["createWall", "updateWall", "deleteWall", "createRegion", "updateRegion", "deleteRegion", "createLevel", "updateLevel", "deleteLevel", "updateScene"]) {
+  for (const h of ["createWall", "updateWall", "deleteWall", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createLevel", "updateLevel", "deleteLevel", "updateScene"]) {
     Hooks.on(h, () => {
       _geometryVersion++;
       _perceptionVer++;
@@ -1988,7 +2046,7 @@ export function installCpuPerfEngine() {
       if (h !== "lightingRefresh" && h !== "visibilityRefresh") _losCache.clear();
     });
   }
-  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "controlToken", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
+  for (const h of ["createWall", "updateWall", "deleteWall", "updateScene", "updateLevel", "createRegion", "updateRegion", "deleteRegion", "createRegionBehavior", "updateRegionBehavior", "deleteRegionBehavior", "createToken", "updateToken", "deleteToken", "controlToken", "sightRefresh", "visibilityRefresh", "updateActor", "updateActiveEffect", "createActiveEffect", "deleteActiveEffect", "updateSetting"]) {
     Hooks.on(h, () => { _measureCaches = new WeakMap(); });
   }
   Hooks.on("updateActor", (_doc, changes) => {
@@ -1997,7 +2055,7 @@ export function installCpuPerfEngine() {
       _enrichCache.clear();
     }
   });
-  for (const h of ["deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "updateJournalEntry", "updateJournalEntryPage", "deleteJournalEntry", "updateScene", "updateMacro", "updateRollTable", "updateUser"]) {
+  for (const h of ["createActor", "deleteActor", "createItem", "updateItem", "deleteItem", "createActiveEffect", "updateActiveEffect", "deleteActiveEffect", "createJournalEntry", "updateJournalEntry", "deleteJournalEntry", "createJournalEntryPage", "updateJournalEntryPage", "deleteJournalEntryPage", "createScene", "updateScene", "deleteScene", "createMacro", "updateMacro", "deleteMacro", "createRollTable", "updateRollTable", "deleteRollTable", "updateUser"]) {
     Hooks.on(h, () => { _enrichCache.clear(); });
   }
 

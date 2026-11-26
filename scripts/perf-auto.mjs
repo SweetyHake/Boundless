@@ -85,47 +85,48 @@ export function rectsIntersect(ax0, ay0, ax1, ay1, vp) {
   return ax1 >= vp.minX && ax0 <= vp.maxX && ay1 >= vp.minY && ay0 <= vp.maxY;
 }
 
+const applyStdCull = (obj, inView) => {
+  if (!obj || obj.destroyed) return false;
+  if (!inView) {
+    if (obj.renderable) {
+      obj.renderable = false;
+      obj._blStdCulled = true;
+    }
+    return true;
+  }
+  if (obj._blStdCulled) {
+    obj.renderable = true;
+    obj._blStdCulled = false;
+  }
+  return false;
+};
+
+const restoreStdCull = (obj) => {
+  if (obj && !obj.destroyed && obj._blStdCulled) {
+    obj.renderable = true;
+    obj._blStdCulled = false;
+  }
+};
+
 export function restoreAllStandardCulling() {
   const c = globalThis.canvas;
   if (!c) return;
   if (_hasFastBatchTiles || _tileShadersSynced) syncDecorativeTileShaders(false);
   if (!_hasStandardCulling) return;
   _hasStandardCulling = false;
-  for (const tile of c.tiles?.placeables ?? []) {
-    if (tile.mesh && !tile.mesh.destroyed && tile.mesh._blStdCulled) {
-      tile.mesh.renderable = true;
-      tile.mesh._blStdCulled = false;
-    }
-  }
-  for (const al of c.lighting?.placeables ?? []) {
-    const icon = al.controls ?? al.controlIcon;
-    if (icon && !icon.destroyed) icon.renderable = true;
-  }
-  for (const as of c.sounds?.placeables ?? []) {
-    const icon = as.controls ?? as.controlIcon;
-    if (icon && !icon.destroyed) icon.renderable = true;
-  }
-  for (const note of c.notes?.placeables ?? []) {
-    const icon = note.controlIcon ?? note.controls;
-    if (icon && !icon.destroyed) icon.renderable = true;
-  }
-  for (const door of c.controls?.doors?.children ?? []) {
-    if (door && !door.destroyed) door.renderable = true;
-  }
-  for (const wall of c.walls?.placeables ?? []) {
-    if (wall && !wall.destroyed) wall.renderable = true;
-  }
+  for (const tile of c.tiles?.placeables ?? []) restoreStdCull(tile.mesh);
+  for (const al of c.lighting?.placeables ?? []) restoreStdCull(al.controls ?? al.controlIcon);
+  for (const as of c.sounds?.placeables ?? []) restoreStdCull(as.controls ?? as.controlIcon);
+  for (const note of c.notes?.placeables ?? []) restoreStdCull(note.controlIcon ?? note.controls);
+  for (const door of c.controls?.doors?.children ?? []) restoreStdCull(door);
+  for (const wall of c.walls?.placeables ?? []) restoreStdCull(wall);
   for (const ls of c.effects?.lightSources ?? []) {
-    const bg = ls.layers?.background?.mesh;
-    const il = ls.layers?.illumination?.mesh;
-    const co = ls.layers?.coloration?.mesh;
-    if (bg && !bg.destroyed) bg.renderable = true;
-    if (il && !il.destroyed) il.renderable = true;
-    if (co && !co.destroyed) co.renderable = true;
+    restoreStdCull(ls.layers?.background?.mesh);
+    restoreStdCull(ls.layers?.illumination?.mesh);
+    restoreStdCull(ls.layers?.coloration?.mesh);
   }
   for (const ds of c.effects?.darknessSources ?? []) {
-    const dk = ds.layers?.darkness?.mesh;
-    if (dk && !dk.destroyed) dk.renderable = true;
+    restoreStdCull(ds.layers?.darkness?.mesh);
   }
 }
 
@@ -215,21 +216,17 @@ export function updateStandardSceneCulling() {
       const icon = al.controls ?? al.controlIcon;
       if (!icon || icon.destroyed) continue;
       if (lightsHi || al.controlled || al.hover || al.isPreview) {
-        icon.renderable = true;
+        restoreStdCull(icon);
         continue;
       }
       const x = al.document?.x ?? 0;
       const y = al.document?.y ?? 0;
       const r = al.radius || 0;
       const inView = (x + r >= vp.minX) && (x - r <= vp.maxX) && (y + r >= vp.minY) && (y - r <= vp.maxY);
-      icon.renderable = inView;
-      if (!inView) culledLights++;
+      if (applyStdCull(icon, inView)) culledLights++;
     }
   } else if (lightsVisible) {
-    for (let i = 0; i < lights.length; i++) {
-      const icon = lights[i].controls ?? lights[i].controlIcon;
-      if (icon && !icon.destroyed) icon.renderable = true;
-    }
+    for (let i = 0; i < lights.length; i++) restoreStdCull(lights[i].controls ?? lights[i].controlIcon);
   }
 
   // Sound control icons: skip when SoundsLayer container is hidden
@@ -242,21 +239,17 @@ export function updateStandardSceneCulling() {
       const icon = as.controls ?? as.controlIcon;
       if (!icon || icon.destroyed) continue;
       if (soundsHi || as.controlled || as.hover || as.isPreview) {
-        icon.renderable = true;
+        restoreStdCull(icon);
         continue;
       }
       const x = as.document?.x ?? 0;
       const y = as.document?.y ?? 0;
       const r = as.radius || 0;
       const inView = (x + r >= vp.minX) && (x - r <= vp.maxX) && (y + r >= vp.minY) && (y - r <= vp.maxY);
-      icon.renderable = inView;
-      if (!inView) culledSounds++;
+      if (applyStdCull(icon, inView)) culledSounds++;
     }
   } else if (soundsVisible) {
-    for (let i = 0; i < sounds.length; i++) {
-      const icon = sounds[i].controls ?? sounds[i].controlIcon;
-      if (icon && !icon.destroyed) icon.renderable = true;
-    }
+    for (let i = 0; i < sounds.length; i++) restoreStdCull(sounds[i].controls ?? sounds[i].controlIcon);
   }
 
   // Note control icons: skip when NotesLayer is hidden
@@ -269,18 +262,15 @@ export function updateStandardSceneCulling() {
       const icon = n.controlIcon ?? n.controls;
       if (!icon || icon.destroyed) continue;
       if (notesHi || n.controlled || n.hover || n.isPreview) {
-        icon.renderable = true;
+        restoreStdCull(icon);
         continue;
       }
       const x = n.document?.x ?? 0;
       const y = n.document?.y ?? 0;
-      icon.renderable = (x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY);
+      applyStdCull(icon, x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY);
     }
   } else if (notesVisible) {
-    for (let i = 0; i < notes.length; i++) {
-      const icon = notes[i].controlIcon ?? notes[i].controls;
-      if (icon && !icon.destroyed) icon.renderable = true;
-    }
+    for (let i = 0; i < notes.length; i++) restoreStdCull(notes[i].controlIcon ?? notes[i].controls);
   }
 
   // DoorControl icons: engage when scene has >= 12 doors
@@ -291,13 +281,10 @@ export function updateStandardSceneCulling() {
       const d = doors[i];
       if (!d || d.destroyed) continue;
       const inView = d.x >= vp.minX && d.x <= vp.maxX && d.y >= vp.minY && d.y <= vp.maxY;
-      d.renderable = inView;
-      if (!inView) culledDoors++;
+      if (applyStdCull(d, inView)) culledDoors++;
     }
   } else {
-    for (let i = 0; i < doors.length; i++) {
-      if (doors[i] && !doors[i].destroyed) doors[i].renderable = true;
-    }
+    for (let i = 0; i < doors.length; i++) restoreStdCull(doors[i]);
   }
 
   // WallsLayer frustum culling: skip when WallsLayer is hidden (saves O(N) walk of 1000+ walls on every gameplay pan!)
@@ -309,7 +296,7 @@ export function updateStandardSceneCulling() {
       const w = walls[i];
       if (!w || w.destroyed) continue;
       if (wallsHi || w.controlled || w.hover || w.isPreview) {
-        w.renderable = true;
+        restoreStdCull(w);
         continue;
       }
       const coords = w.document?.c;
@@ -318,12 +305,10 @@ export function updateStandardSceneCulling() {
       const maxX = coords[0] > coords[2] ? coords[0] : coords[2];
       const minY = coords[1] < coords[3] ? coords[1] : coords[3];
       const maxY = coords[1] > coords[3] ? coords[1] : coords[3];
-      w.renderable = rectsIntersect(minX, minY, maxX, maxY, vp);
+      applyStdCull(w, rectsIntersect(minX, minY, maxX, maxY, vp));
     }
   } else if (wallsVisible) {
-    for (let i = 0; i < walls.length; i++) {
-      if (walls[i] && !walls[i].destroyed) walls[i].renderable = true;
-    }
+    for (let i = 0; i < walls.length; i++) restoreStdCull(walls[i]);
   }
 
   // Offscreen PointLightSource / PointDarknessSource mesh culling (skips offscreen light shader passes!)
@@ -356,25 +341,25 @@ export function updateStandardLightMeshCulling(vp = null) {
       const co = ls.layers?.coloration?.mesh;
       const animating = Boolean(ls.object?.movementAnimationPromise || ls.object?.animationContexts?.size > 0);
       if (!cullLs || animating) {
-        if (bg && !bg.destroyed) bg.renderable = true;
-        if (il && !il.destroyed) il.renderable = true;
-        if (co && !co.destroyed) co.renderable = true;
+        restoreStdCull(bg);
+        restoreStdCull(il);
+        restoreStdCull(co);
         continue;
       }
       const r = ls.radius ?? ls.data?.radius;
       if (!Number.isFinite(r) || r <= 0) {
-        if (bg && !bg.destroyed) bg.renderable = true;
-        if (il && !il.destroyed) il.renderable = true;
-        if (co && !co.destroyed) co.renderable = true;
+        restoreStdCull(bg);
+        restoreStdCull(il);
+        restoreStdCull(co);
         continue;
       }
       const lx = ls.x ?? ls.data?.x;
       const ly = ls.y ?? ls.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
       const inView = (lx + r >= bounds.minX) && (lx - r <= bounds.maxX) && (ly + r >= bounds.minY) && (ly - r <= bounds.maxY);
-      if (bg && !bg.destroyed) bg.renderable = inView;
-      if (il && !il.destroyed) il.renderable = inView;
-      if (co && !co.destroyed) co.renderable = inView;
+      applyStdCull(bg, inView);
+      applyStdCull(il, inView);
+      applyStdCull(co, inView);
       if (!inView) culledLightMeshes++;
     }
   }
@@ -387,20 +372,19 @@ export function updateStandardLightMeshCulling(vp = null) {
       if (!dk || dk.destroyed) continue;
       const animating = Boolean(ds.object?.movementAnimationPromise || ds.object?.animationContexts?.size > 0);
       if (!cullDs || animating) {
-        dk.renderable = true;
+        restoreStdCull(dk);
         continue;
       }
       const r = ds._visualShape?.config?.radius ?? ((ds.radius ?? ds.data?.radius ?? 0) + (ds._padding ?? 0));
       if (!Number.isFinite(r) || r <= 0) {
-        dk.renderable = true;
+        restoreStdCull(dk);
         continue;
       }
       const lx = ds.x ?? ds.data?.x;
       const ly = ds.y ?? ds.data?.y;
       if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
       const inView = (lx + r >= bounds.minX) && (lx - r <= bounds.maxX) && (ly + r >= bounds.minY) && (ly - r <= bounds.maxY);
-      dk.renderable = inView;
-      if (!inView) culledLightMeshes++;
+      if (applyStdCull(dk, inView)) culledLightMeshes++;
     }
   }
   perfStats.autoCulledLightMeshes = culledLightMeshes;
@@ -622,6 +606,7 @@ export function disposeStaleSceneVramTextures() {
   walkDisplayTree(c?.interface);
   walkDisplayTree(c?.controls);
   walkDisplayTree(c?.environment);
+  walkDisplayTree(c?.overlay);
   for (const t of c?.tiles?.placeables ?? []) protectTex(t?.mesh?.texture);
   for (const tok of c?.tokens?.placeables ?? []) {
     protectTex(tok?.mesh?.texture);
@@ -649,7 +634,8 @@ export function disposeStaleSceneVramTextures() {
     // Require a real URL-backed resource so CanvasResource / dynamic spritesheets are never evicted
     const rawUrl = bt.resource?.url;
     if (!rawUrl || typeof rawUrl !== "string") continue;
-    if (/\.(webm|mp4|m4v|ogg|ogv|mov)(?:[?#]|$)/i.test(rawUrl)) continue;
+    if (/\.(webm|mp4|m4v|ogg|ogv|mov|ktx2|dds|basis)(?:[?#]|$)/i.test(rawUrl)) continue;
+    if (bt.resource?.constructor?.name?.includes?.("Compressed")) continue;
     // Never evict global Foundry or module spritesheets / token packs (token rings, Hero in a Box, VFX, weather, UI atlases)
     if (/(^|\/)(canvas\/tokens\/|multiple-rings\/|more-dynamic-token-rings\/|cs-rings\/|cs-hero-box\/|sh-hero-box[^/]*\/|showstopper\/|showstopper-plus\/|sequencer\/|fxmaster\/|fxmaster-plus\/|burn-living-map\/|jb2a|rings-[^/]+\.(webp|png))/i.test(rawUrl)) continue;
 

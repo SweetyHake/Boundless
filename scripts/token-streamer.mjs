@@ -1,5 +1,5 @@
 import { TokenImpostorLayer } from "./token-impostors.mjs";
-import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy } from "./utils.mjs";
+import { MODULE_ID, getShowstopperMovementApi, getEffectiveScale, getLevelBaseElevation, hasTokenPermissionLazy, hasPlayerOwnerLazy } from "./utils.mjs";
 import { invalidateTokenLayerCache } from "./perf-gpu.mjs";
 
 const TOKEN_SECTOR_PX = 4000;       // 40x40 cells per spatial bucket
@@ -59,7 +59,7 @@ function isAlwaysMountedTokenDoc(doc, combatTokenIds = undefined) {
   if (!doc) return true;
   if (doc.actorLink) return true;
   const base = doc.baseActor;
-  if (base?.hasPlayerOwner || base?.type === "character") return true;
+  if (hasPlayerOwnerLazy(doc) || base?.type === "character") return true;
   if (!game.user?.isGM && hasTokenPermissionLazy(doc, game.user, "OWNER")) return true;
   if (!game.user?.isGM && (doc.sight?.enabled ?? doc._source?.sight?.enabled) && hasTokenPermissionLazy(doc, game.user, "OBSERVER")) return true;
   if (doc.flags?.[MODULE_ID]?.pinned) return true;
@@ -294,7 +294,7 @@ export class TokenStreamer {
     this._gen++;
     lazyFilteredViewKey = null;
     const curScale = canvas?.stage?.scale?.x ?? 1;
-    this._nativeTokensActive = curScale >= MOUNT_ENTER_SCALE;
+    this._nativeTokensActive = getEffectiveScale(curScale) >= MOUNT_ENTER_SCALE;
 
     // Build O(1) spatial hash of all native TokenDocuments without touching `doc.actor`
     const iterable = scene.tokens?.values?.() ?? scene.tokens ?? [];
@@ -361,12 +361,16 @@ export class TokenStreamer {
           if (obj.parent !== layer.objects) layer.objects.addChild(obj);
           await obj.draw();
           if (gen !== this._gen || this.enabled || !canvas?.ready || canvas.scene?.id !== scene.id) return;
-          if (!scene.tokens?.has?.(doc.id) || obj.destroyed) {
+          if (!scene.tokens?.has?.(doc.id) || !doc.viewed || obj.destroyed) {
             if (!obj.destroyed) {
               try {
                 layer.objects.removeChild(obj);
                 obj.destroy({ children: true });
               } catch {}
+            }
+            if (doc._object === obj) {
+              doc._object = null;
+              doc._destroyed = false;
             }
             continue;
           }
@@ -552,7 +556,7 @@ export class TokenStreamer {
   prewarmTarget(worldX, worldY, targetScale) {
     if (!this.enabled || !canvas?.ready || !canvas.scene?.tokens) return;
     const minScale = this._nativeTokensActive ? MOUNT_EXIT_SCALE : MOUNT_ENTER_SCALE;
-    if ((targetScale || 0) < minScale) return;
+    if (getEffectiveScale(targetScale || 0) < minScale) return;
 
     const [sw = 1600, sh = 1000] = canvas.screenDimensions || [];
     const safeScale = Math.max(MOUNT_EXIT_SCALE, targetScale || 0.45);
@@ -864,6 +868,7 @@ export class TokenStreamer {
     const startMs = performance.now();
     let drawnThisFrame = 0;
     let anyVisionDrawn = false;
+    let anyLightDrawn = false;
     let deferredWaitingTex = 0;
 
     try {
@@ -970,15 +975,27 @@ export class TokenStreamer {
             abortedPump = true;
             break;
           }
-          if (!canvas.scene?.tokens?.has?.(doc.id) || obj.destroyed) {
+          if (!canvas.scene?.tokens?.has?.(doc.id) || !doc.viewed || obj.destroyed) {
             if (!obj.destroyed) {
               try {
                 layer.objects.removeChild(obj);
                 obj.destroy({ children: true });
               } catch {}
             }
+            if (doc._object === obj) {
+              doc._object = null;
+              doc._destroyed = false;
+            }
             this.impostors.setFadeOverride(doc.id, null);
             continue;
+          }
+
+          if ((doc.sight?.enabled ?? doc._source?.sight?.enabled) && (obj.controlled || hasPlayerOwnerLazy(doc) || hasTokenPermissionLazy(doc, game.user, "OBSERVER"))) {
+            anyVisionDrawn = true;
+          }
+          const tokLight = doc.light ?? doc._source?.light;
+          if ((Number(tokLight?.dim) || 0) > 0 || (Number(tokLight?.bright) || 0) > 0) {
+            anyLightDrawn = true;
           }
 
           const latestVp = this._lastVp;
@@ -1008,9 +1025,6 @@ export class TokenStreamer {
           }
 
           this.lastSeenMs.set(doc.id, performance.now());
-          if ((doc.sight?.enabled ?? doc._source?.sight?.enabled) && (obj.controlled || doc.baseActor?.hasPlayerOwner || hasTokenPermissionLazy(doc, game.user, "OBSERVER"))) {
-            anyVisionDrawn = true;
-          }
 
           // Immediately suppress newly drawn token if sitting beneath an unmounted/baked roof BEFORE starting any 160ms crossfade
           if (this.controller?.isTokenUnderBakedRoof?.(obj)) {
@@ -1082,8 +1096,11 @@ export class TokenStreamer {
 
       if (drawnThisFrame > 0 && this.enabled && gen === this._gen && canvas?.ready) {
         this.controller._roofTokenOccDirty = true;
-        if (anyVisionDrawn) {
-          canvas.perception?.update?.({ refreshVision: true, refreshOcclusion: true });
+        if (anyVisionDrawn || anyLightDrawn) {
+          canvas.perception?.update?.({
+            ...(anyVisionDrawn ? { refreshVision: true, refreshOcclusion: true } : {}),
+            ...(anyLightDrawn ? { initializeLighting: true, refreshLighting: true } : {})
+          });
         }
       }
     } finally {
@@ -1286,6 +1303,34 @@ export class TokenStreamer {
     else queueMicrotask(finish);
   }
 
+  onActorUpdated(actor, changes) {
+    if (!this.enabled || !actor?.id || !changes || !("ownership" in changes)) return;
+    const scene = canvas?.scene;
+    if (!scene?.tokens || scene.id !== this.sceneId) return;
+    let queuedAny = false;
+    let touchedAny = false;
+    for (const doc of scene.tokens) {
+      if (!doc || (doc.actorId ?? doc._source?.actorId) !== actor.id) continue;
+      touchedAny = true;
+      this.impostors.queueUpsertToken(doc);
+      const needsMount = !doc._object || doc._object.destroyed || doc._object.parent !== canvas?.tokens?.objects;
+      if (needsMount && doc.viewed && isAlwaysMountedTokenDoc(doc)) {
+        if (!this._queuedIds.has(doc.id) && !this._drawingIds.has(doc.id)) {
+          this._drawQueue.unshift({ doc, distSq: 0 });
+          this._queuedIds.add(doc.id);
+          queuedAny = true;
+        }
+      }
+    }
+    if (queuedAny) {
+      this._primeQueueTextures();
+      this._scheduleDrawPump();
+    }
+    if (touchedAny) {
+      this.onVisibilityChanged();
+    }
+  }
+
   onCombatChanged() {
     if (!this.enabled || !canvas?.ready || !canvas.scene?.tokens) return;
     const sceneId = canvas.scene.id;
@@ -1453,12 +1498,16 @@ export class TokenStreamer {
       doc._object = obj;
       if (obj.parent !== layer.objects) layer.objects.addChild(obj);
       await obj.draw();
-      if (!this.enabled || gen !== this._gen || !canvas?.ready || !canvas.scene?.tokens?.has?.(doc.id) || obj.destroyed) {
-        if (obj && !obj.destroyed && !canvas?.scene?.tokens?.has?.(doc.id)) {
+      if (!this.enabled || gen !== this._gen || !canvas?.ready || !canvas.scene?.tokens?.has?.(doc.id) || !doc.viewed || obj.destroyed) {
+        if (obj && !obj.destroyed && (!canvas?.scene?.tokens?.has?.(doc.id) || !doc.viewed)) {
           try {
             layer.objects?.removeChild?.(obj);
             obj.destroy({ children: true });
           } catch {}
+          if (doc._object === obj) {
+            doc._object = null;
+            doc._destroyed = false;
+          }
         }
         return null;
       }
@@ -1715,6 +1764,7 @@ export class TokenStreamer {
           if (gen === this._gen) {
             this._inflightTexLoads.delete(src);
             this._decodedTexSrcs.add(src);
+            if (this.enabled && this._drawQueue.length > 0) this._scheduleDrawPump();
           }
         });
         this._inflightTexLoads.set(src, p);
@@ -1782,12 +1832,16 @@ export class TokenStreamer {
             }
             break;
           }
-          if (obj.destroyed || !canvas.scene?.tokens?.has?.(doc.id)) {
+          if (obj.destroyed || !canvas.scene?.tokens?.has?.(doc.id) || !doc.viewed) {
             if (!obj.destroyed) {
               try {
                 layer.objects.removeChild(obj);
                 obj.destroy({ children: true });
               } catch {}
+            }
+            if (doc._object === obj) {
+              doc._object = null;
+              doc._destroyed = false;
             }
             continue;
           }

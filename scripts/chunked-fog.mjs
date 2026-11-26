@@ -657,10 +657,13 @@ export class ChunkedFogManager {
     return hasSceneAccess;
   }
 
-  _filterReasonablePolygons(polygons) {
+  _filterReasonablePolygons(polygons, targetScene = null) {
     const dimW = Number(globalThis.canvas?.dimensions?.width) || 0;
     const dimH = Number(globalThis.canvas?.dimensions?.height) || 0;
-    const MAX_SPAN = Math.max(12000, this.worldW || 0, this.worldH || 0, dimW, dimH);
+    const tPad = Math.max(0, Number(targetScene?.padding) || 0);
+    const sceneW = Number(targetScene?.dimensions?.width) || ((Number(targetScene?.width) || 0) * (1 + tPad * 2));
+    const sceneH = Number(targetScene?.dimensions?.height) || ((Number(targetScene?.height) || 0) * (1 + tPad * 2));
+    const MAX_SPAN = Math.max(12000, this.worldW || 0, this.worldH || 0, dimW, dimH, sceneW, sceneH);
     const out = [];
     const cap = Math.min(polygons.length, 64);
     for (let i = 0; i < cap; i++) {
@@ -708,7 +711,7 @@ export class ChunkedFogManager {
       if (!this.isSharedMode || !Array.isArray(payload.polygons)) return true;
       const curScene = game.scenes?.get?.(this.sceneId) ?? canvas?.scene;
       if (!this._isAuthorizedFogSender(payload.senderId, curScene, this.levelId)) return true;
-      const safePolys = this._filterReasonablePolygons(payload.polygons);
+      const safePolys = this._filterReasonablePolygons(payload.polygons, curScene);
       if (!safePolys.length) return true;
       // Only activeGM needs to mark shared chunks dirty for DB persistence
       const isAuthoritativeGM = game.users?.activeGM?.id === game.user?.id;
@@ -755,7 +758,7 @@ export class ChunkedFogManager {
         || "default";
     }
     if (!this._isAuthorizedFogSender(payload.senderId, targetScene, targetLevelId)) return Promise.resolve();
-    const safePolys = this._filterReasonablePolygons(payload.polygons);
+    const safePolys = this._filterReasonablePolygons(payload.polygons, targetScene);
     if (!safePolys.length) return Promise.resolve();
     const queueKey = `${sceneId}::${targetLevelId}`;
 
@@ -804,7 +807,10 @@ export class ChunkedFogManager {
         !targetScene.tokenVision ||
         targetScene.flags?.[MODULE_ID]?.chunkedFog === false ||
         getSceneFogMode(targetScene) !== getFogModes().SHARED
-      ) break;
+      ) {
+        q.polygons.length = 0;
+        break;
+      }
       const resetAtBefore = Number(targetScene.flags?.[MODULE_ID]?.fogResetAt?.[targetLevelId]) || 0;
       // If activeGM switched to this exact (sceneId, targetLevelId), apply locally instead of racing with stale flags
       if (this.enabled && this.sceneId === sceneId && this.levelId === targetLevelId) {
@@ -900,7 +906,10 @@ export class ChunkedFogManager {
         ctx.restore();
         update[`flags.${MODULE_ID}.sharedFog.${targetLevelId}.${ck}`] = encodeCanvas(c);
       }
-      if (aborted) break;
+      if (aborted) {
+        q.polygons.length = 0;
+        break;
+      }
       // Final check: if GM switched to this level while decoding, route through live local chunks instead of clobbering
       if (this.enabled && this.sceneId === sceneId && this.levelId === targetLevelId) {
         this._applyPolygons(batchPolys.slice(0, 64), { target: "shared", markDirty: true, maxChunks: MAX_REMOTE_CHUNKS_PER_BATCH });
@@ -940,7 +949,7 @@ export class ChunkedFogManager {
     const nextResetAt = Number(fogResetAtChanges[this.levelId]) || 0;
     if (nextResetAt > this._lastHandledResetAt) {
       this._lastHandledResetAt = nextResetAt;
-      this.reset({ broadcast: false, persist: false });
+      this.reset({ broadcast: false, persist: false, allLevels: false, clearOwnFlags: true });
     }
   }
 
@@ -1364,13 +1373,26 @@ export class ChunkedFogManager {
 
     const sceneId = this.sceneId;
     const levelId = this.levelId;
-    if (clearOwnFlags && sceneId && game.user?.flags?.[MODULE_ID]?.fog?.[sceneId]) {
-      try {
-        await game.user.update({
-          [`flags.${MODULE_ID}.fog.-=${sceneId}`]: null,
-          [`flags.${MODULE_ID}.fogMeta.-=${sceneId}`]: null
-        });
-      } catch {}
+    if (clearOwnFlags && sceneId) {
+      const userFog = game.user?.flags?.[MODULE_ID]?.fog?.[sceneId];
+      const userMeta = game.user?.flags?.[MODULE_ID]?.fogMeta?.[sceneId];
+      if (allLevels) {
+        if (userFog || userMeta) {
+          try {
+            await game.user.update({
+              [`flags.${MODULE_ID}.fog.-=${sceneId}`]: null,
+              [`flags.${MODULE_ID}.fogMeta.-=${sceneId}`]: null
+            });
+          } catch {}
+        }
+      } else if (levelId && (userFog?.[levelId] || userMeta?.[levelId])) {
+        try {
+          await game.user.update({
+            [`flags.${MODULE_ID}.fog.${sceneId}.-=${levelId}`]: null,
+            [`flags.${MODULE_ID}.fogMeta.${sceneId}.-=${levelId}`]: null
+          });
+        } catch {}
+      }
     }
     if (persist && sceneId && levelId) {
       const scene = game.scenes?.get?.(sceneId) ?? (canvas?.scene?.id === sceneId ? canvas.scene : null);
@@ -1627,6 +1649,9 @@ export class ChunkedFogManager {
     const onKeyDown = (ev) => {
       if (!this.brushActive) return;
       if (ev.key === "Escape") {
+        const ae = document.activeElement;
+        if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT" || ae.isContentEditable)) return;
+        if (document.querySelector("dialog[open], .dialog.application.open")) return;
         ev.preventDefault();
         ev.stopPropagation();
         this.setBrushActive(false);

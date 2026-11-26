@@ -1127,6 +1127,9 @@ export class MegaLightBatch {
       else this.sharedLightAlias.delete(m.id);
       if (Boolean(m.sharedSuppressed) !== wantSup) {
         m.sharedSuppressed = wantSup;
+        if (!wantSup) {
+          m.baseWeight = this._isSuppressedFn?.(m.id) ? 0.0 : 1.0;
+        }
         this._applyMetaEffectiveWeight(m);
         if (dirtyBatches && m.batch) dirtyBatches.add(m.batch);
       }
@@ -2597,6 +2600,7 @@ export class MegaLightBatch {
           this._sharedLightGroups.get(prevMeta.sharedKey)?.delete(prevMeta);
           touchedSharedKeys.add(prevMeta.sharedKey);
         }
+        this.sharedLightAlias.delete(prevMeta.id);
         if (prevMeta.weight > 0.001) {
           this.activeLightsCount = Math.max(0, this.activeLightsCount - 1);
           prevMeta.batch.activeCount = Math.max(0, prevMeta.batch.activeCount - 1);
@@ -2633,10 +2637,14 @@ export class MegaLightBatch {
     for (const sk of touchedSharedKeys) {
       this._reconcileSharedGroup(sk, dirtyPrevBatches);
     }
+    const showDetailSync = !this.macroBatch || !this._lastVp || getEffectiveScale(this._lastVp.scale) >= 0.020;
     for (const pb of dirtyPrevBatches) {
       if (pb.weightsDirty) {
         pb.weightBuffer?.update?.();
         pb.weightsDirty = false;
+        const hasVis = showDetailSync && pb.visibleIndexCount > 0 && pb.activeCount > 0;
+        if (pb.illumMesh) pb.illumMesh.visible = hasVis;
+        if (pb.colorMesh) pb.colorMesh.visible = hasVis;
       }
     }
     if (batch.weightsDirty) {
@@ -2693,10 +2701,14 @@ export class MegaLightBatch {
       for (const sk of touchedSharedKeys) {
         this._reconcileSharedGroup(sk, dirtyOtherBatches);
       }
+      const showDetailSync = !this.macroBatch || !this._lastVp || getEffectiveScale(this._lastVp.scale) >= 0.020;
       for (const ob of dirtyOtherBatches) {
         if (ob.weightsDirty) {
           ob.weightBuffer?.update?.();
           ob.weightsDirty = false;
+          const hasVis = showDetailSync && ob.visibleIndexCount > 0 && ob.activeCount > 0;
+          if (ob.illumMesh) ob.illumMesh.visible = hasVis;
+          if (ob.colorMesh) ob.colorMesh.visible = hasVis;
         }
       }
     }
@@ -3079,17 +3091,21 @@ export class MegaLightBatch {
   }
 
   setLightWeight(lightId, weight) {
-    const meta = this.lightMetaById.get(lightId);
+    const resolvedId = this.resolveLightId(lightId);
+    const meta = this.lightMetaById.get(resolvedId);
     if (!meta || (!meta.batch && !this.weightArray)) return;
     meta.baseWeight = Math.max(0, Math.min(1, weight));
     this._applyMetaEffectiveWeight(meta);
   }
 
   setBakedRoofMask(rt, { originX = 0, originY = 0, regionW = 100000, regionH = 100000, repeat = false, roofElevation = Infinity, roofLevelId = null } = {}) {
+    const prevUse = this.useBakedRoofMask;
+    const prevRoofLevelId = this.bakedRoofLevelId;
     if (this.bakedRoofMask && this.bakedRoofMask !== rt && !this.bakedRoofMask.destroyed) {
       this.bakedRoofMask.destroy(true);
     }
     this.bakedRoofMask = rt || null;
+    if (!isTextureUsable(this.bakedRoofMask)) this.useBakedRoofMask = false;
     this.bakedRoofOrigin[0] = originX;
     this.bakedRoofOrigin[1] = originY;
     this.bakedRoofRegion[0] = Math.max(1, regionW);
@@ -3098,7 +3114,9 @@ export class MegaLightBatch {
     this.bakedRoofElevation = Number.isFinite(roofElevation) ? roofElevation : Infinity;
     this.bakedRoofLevelId = roofLevelId || null;
     this.syncDepthElevations(this.useDepthTexture);
-    if (this.useBakedRoofMask && this.bakedRoofLevelId) this._refreshMultiLevelRoofMaskWeights();
+    if ((this.useBakedRoofMask || prevUse) && (this.bakedRoofLevelId || prevRoofLevelId)) {
+      this._refreshMultiLevelRoofMaskWeights();
+    }
   }
 
   _refreshMultiLevelRoofMaskWeights() {

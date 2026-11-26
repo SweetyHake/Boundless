@@ -475,7 +475,7 @@ export const editsMethods = {
       }
     }
 
-    if ("pois" in flagChanges || "-=pois" in flagChanges || "showPois" in flagChanges || "-=showPois" in flagChanges) {
+    if ("pois" in flagChanges || "-=pois" in flagChanges || "showPois" in flagChanges || "-=showPois" in flagChanges || "showSubPois" in flagChanges || "-=showSubPois" in flagChanges) {
       const showPois = scene?.flags?.[MODULE_ID]?.showPois !== false;
       if (showPois && !this.poiManager.container) {
         this.poiManager.mount(scene, this.manifest);
@@ -528,6 +528,8 @@ export const editsMethods = {
   _sanitizePoisForSave(pois) {
     return (pois || []).map(p => {
       const clean = { ...p };
+      if (clean._origKind !== undefined) clean.kind = clean._origKind;
+      delete clean._origKind;
       delete clean._isSecondaryProvince;
       delete clean._virtualSub;
       return clean;
@@ -881,6 +883,7 @@ export const editsMethods = {
    * into an inline Boundless spatial sector manifest on `level.flags["boundless"]`.
    */
   async bakeNativeToLevel(levelId = canvas.level?.id, { removeOriginals = false, simGrid = null, scene = canvas.scene } = {}) {
+    if (!game.user?.isGM) return null;
     const targetScene = scene || canvas.scene;
     const level = targetScene?.levels?.get(levelId);
     if (!targetScene || !level) throw new Error(`Level "${levelId}" not found.`);

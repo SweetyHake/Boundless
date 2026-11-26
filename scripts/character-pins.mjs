@@ -1,4 +1,4 @@
-import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform, isTextureUsable, resolveFoundryRoute } from "./utils.mjs";
+import { MODULE_ID, smoothstep, escapeHtml, loc, getLiveStageTransform, isTextureUsable, resolveFoundryRoute, hasTokenPermissionLazy } from "./utils.mjs";
 
 const CHAR_PIN_FADE_START = 0.38; // Begin showing world-space character portrait below this scale
 const CHAR_PIN_FADE_FULL = 0.20;  // 100% opaque at or below this scale
@@ -249,16 +249,18 @@ export class CharacterPinManager {
     const results = [];
     const seenTokenIds = new Set();
 
-    // Single O(T) pass to index best token per actorId (viewed level preferred)
+    // Single O(T) pass to index best token per actorId (linked actor + viewed level preferred; permission-checked for players)
     const bestTokenByActorId = new Map();
+    const tokenScore = (tok) => (tok.actorLink ? 2 : 0) + (viewedLevelId && tok.level === viewedLevelId ? 1 : 0);
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
       if (!tok?.actorId) continue;
-      if (!isGM && tok.hidden) continue;
+      if (!isGM) {
+        if (tok.hidden) continue;
+        if (!hasTokenPermissionLazy(tok, game.user, "OBSERVER")) continue;
+      }
       const prev = bestTokenByActorId.get(tok.actorId);
-      if (!prev) {
-        bestTokenByActorId.set(tok.actorId, tok);
-      } else if (viewedLevelId && tok.level === viewedLevelId && prev.level !== viewedLevelId) {
+      if (!prev || tokenScore(tok) > tokenScore(prev)) {
         bestTokenByActorId.set(tok.actorId, tok);
       }
     }
@@ -575,13 +577,13 @@ export class CharacterPinManager {
     root.on("pointerdown", (ev) => {
       if (ev.button !== 0) return;
       ev.stopPropagation();
-      this.focusEntry(entry, { instant: Boolean(ev.shiftKey) });
+      Promise.resolve(this.focusEntry(entry, { instant: Boolean(ev.shiftKey) })).catch(() => {});
     });
 
     edgeEl.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      this.focusEntry(entry, { instant: Boolean(ev.shiftKey) });
+      Promise.resolve(this.focusEntry(entry, { instant: Boolean(ev.shiftKey) })).catch(() => {});
     });
 
     this.container.addChild(root);
@@ -674,8 +676,17 @@ export class CharacterPinManager {
       const lcRect = leftCol?.getBoundingClientRect?.();
       this._cachedLeftInset = (lcRect && lcRect.right > 20) ? Math.round(lcRect.right + 34) : 116;
       const sidebar = document.getElementById("sidebar");
-      const sbRect = sidebar?.getBoundingClientRect?.();
-      this._cachedRightInset = (sbRect && sbRect.width > 50) ? Math.round(sbRect.width + 34) : 76;
+      const sbContent = document.getElementById("sidebar-content");
+      const sbExpanded = Boolean(sbContent?.classList?.contains?.("expanded"));
+      const sbRect = (sbExpanded ? sbContent : sidebar)?.getBoundingClientRect?.();
+      const swNow = window.innerWidth || 1280;
+      if (sbExpanded && sbRect && sbRect.width > 0) {
+        this._cachedRightInset = Math.round(Math.max(sbRect.width, swNow - sbRect.left) + 34);
+      } else {
+        const tabsRect = document.getElementById("sidebar-tabs")?.getBoundingClientRect?.() || sbRect;
+        const collapsedW = (tabsRect && tabsRect.width > 0) ? Math.max(tabsRect.width, swNow - tabsRect.left) : 42;
+        this._cachedRightInset = Math.round(Math.min(140, collapsedW) + 34);
+      }
     }
     const sw = window.innerWidth || 1280;
     const sh = window.innerHeight || 720;
@@ -945,8 +956,11 @@ export class CharacterPinManager {
     if (completed && doc.parent?.id === canvas.scene?.id) {
       try {
         this.controller?.tokenStreamer?.scheduleSync?.(this.controller.getViewportWorldRect(0.28), true);
-        const tokObj = doc._object || canvas.tokens?.get?.(doc.id);
-        if (tokObj && !tokObj.destroyed && tokObj.isOwner && (!doc.level || doc.level === canvas.level?.id)) {
+        let tokObj = doc._object || canvas.tokens?.get?.(doc.id);
+        if ((!tokObj || tokObj.destroyed) && this.controller?.tokenStreamer?.enabled && (!doc.level || doc.level === canvas.level?.id)) {
+          tokObj = await this.controller.tokenStreamer.materializeDoc(doc);
+        }
+        if (canvas?.ready && doc.parent?.id === canvas.scene?.id && tokObj && !tokObj.destroyed && tokObj.isOwner && (!doc.level || doc.level === canvas.level?.id)) {
           tokObj.control({ releaseOthers: true });
         }
       } catch {}
@@ -1070,7 +1084,7 @@ export function installCharacterSwitchPatch(controller) {
     if (targetToken) {
       const doc = targetToken.document || targetToken;
       if (shouldUseGtaSwitch(doc)) {
-        controller.charPins?.focusTokenObject?.(targetToken);
+        Promise.resolve(controller.charPins?.focusTokenObject?.(targetToken)).catch(() => {});
       } else {
         // Token is nearby on screen: keep crisp native Foundry pan without lifting the camera
         controller.poiManager?.cancelFlight?.();
@@ -1080,7 +1094,7 @@ export function installCharacterSwitchPatch(controller) {
           origAnimatePan.call(canvas, { x: targetToken.center.x, y: targetToken.center.y });
         }
       }
-      return next;
+      return next || targetToken;
     }
 
     // If no controllable token exists on the currently viewed level, fly back to the user's assigned character
@@ -1090,7 +1104,7 @@ export function installCharacterSwitchPatch(controller) {
       if (!pins.entries?.length && canvas.scene) pins.rebuild(canvas.scene);
       const fallbackEntry = pins.entries?.find?.(e => e.isSelf) || pins.entries?.[0] || null;
       if (fallbackEntry) {
-        pins.focusEntry(fallbackEntry);
+        Promise.resolve(pins.focusEntry(fallbackEntry)).catch(() => {});
         return fallbackEntry.tokenDoc?._object || fallbackEntry.tokenDoc || true;
       }
     }

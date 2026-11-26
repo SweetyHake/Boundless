@@ -3430,3 +3430,163 @@ test("CanvasVisibility#testVisibility returns true for players when tokenVision 
     PERF_CONFIG.perfCpuPerception = prevCpu;
   }
 });
+
+test("TokenImpostorLayer._requestAtlasSlot retries failed slot via _pumpAtlasDecodes without throwing", async () => {
+  installBaseGlobals();
+  const { TokenImpostorLayer } = await import("../scripts/token-impostors.mjs");
+  const imp = new TokenImpostorLayer({}, {});
+  let pumpCalls = 0;
+  imp._pumpAtlasDecodes = () => { pumpCalls++; };
+  imp.slotsByKey.set("k1", {
+    col: 0, row: 0, ready: false, decoding: false, failed: true, retryAfterMs: 0, lastUsedMs: 0
+  });
+  const slot = imp._requestAtlasSlot({ slotKey: "k1", artSrc: "portrait.webp" });
+  assert.ok(slot);
+  assert.equal(slot.failed, false);
+  assert.equal(pumpCalls, 1, "retry must call _pumpAtlasDecodes");
+});
+
+test("MegaLightBatch.setLightWeight resolves sharedLightAlias and setBakedRoofMask(null) restores other-level indoor weights", async () => {
+  installBaseGlobals();
+  const { MegaLightBatch } = await import("../scripts/light-batch.mjs");
+  const lb = new MegaLightBatch();
+  lb.weightArray = new Float32Array(8);
+  lb.weightBuffer = { update() {} };
+  lb._currentDarkness = 0.5;
+  const canon = { id: "lvl1::0_0_0", levelId: "lvl1", vStart: 0, vCount: 4, baseWeight: 1, weight: 1, isIndoor: false, darkMin: 0, darkMax: 1, batch: null };
+  const otherIndoor = { id: "lvl2::0_0_1", levelId: "lvl2", vStart: 4, vCount: 4, baseWeight: 1, weight: 0, isIndoor: true, darkMin: 0, darkMax: 1, batch: null };
+  lb.lightMetaById.set(canon.id, canon);
+  lb.lightMetaById.set(otherIndoor.id, otherIndoor);
+  lb.sharedLightAlias.set("lvl2::0_0_0", canon.id);
+
+  lb.setLightWeight("lvl2::0_0_0", 0.25);
+  assert.equal(canon.baseWeight, 0.25, "setLightWeight via alias must update canonical light meta");
+
+  lb.bakedRoofMask = { destroyed: false, valid: true, baseTexture: { destroyed: false, valid: true }, destroy() {} };
+  lb.useBakedRoofMask = true;
+  lb.bakedRoofLevelId = "lvl1";
+  lb.setBakedRoofMask(null, {});
+  assert.equal(lb.useBakedRoofMask, false, "setBakedRoofMask(null) must disable useBakedRoofMask");
+  assert.equal(otherIndoor.weight, 1, "other-level indoor light must restore to weight 1 after clearing roof mask");
+});
+
+test("requestDoorState does not write queued commit to a newly switched Scene B", async () => {
+  installBaseGlobals();
+  const { lightingMethods } = await import("../scripts/boundless-lighting.mjs");
+  let releaseSceneA;
+  const sceneAPending = new Promise(r => { releaseSceneA = r; });
+  const sceneAUpdates = [];
+  const sceneBUpdates = [];
+  const sceneA = { id: "scA", async update(d) { await sceneAPending; sceneAUpdates.push(d); } };
+  const sceneB = { id: "scB", async update(d) { sceneBUpdates.push(d); } };
+
+  let curDs = 0;
+  const ctrl = Object.assign(Object.create(lightingMethods), {
+    active: true,
+    _mountGen: 1,
+    doorStates: new Map(),
+    openDoors: new Map(),
+    closingDoorTimers: new Map(),
+    _resolveDoorByKey(dKey) { return { dKey, levelId: "lvl1", sx: 0, sy: 0, idx: 0, doorType: 1, defaultDs: 0 }; },
+    getCurrentDoorState() { return curDs; },
+    _applyDoorStateLocal(_info, ds) { curDs = ds; }
+  });
+  globalThis.game.user = { id: "gm1", isGM: true, can: () => true };
+  globalThis.canvas = { scene: sceneA };
+
+  ctrl.requestDoorState("lvl1::0_0_0", 1, { playSound: false });
+  ctrl.requestDoorState("lvl1::0_0_0", 0, { playSound: false });
+
+  // Simulate scene switch to Scene B while Scene A update is still in flight
+  ctrl._mountGen = 2;
+  ctrl._doorCommitQueue.clear();
+  globalThis.canvas.scene = sceneB;
+  releaseSceneA();
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+
+  assert.equal(sceneAUpdates.length, 1);
+  assert.equal(sceneBUpdates.length, 0, "queued door commit from Scene A must NEVER write to Scene B");
+});
+
+test("CharacterPinManager._collectTrackedTargets hides unlinked unauthorized PC clones and prefers actorLink", async () => {
+  installBaseGlobals();
+  const player = { id: "p1", isGM: false, character: { id: "actorPC" }, color: "#ffffff" };
+  globalThis.game.user = player;
+  globalThis.game.users = [player];
+  globalThis.foundry = { utils: { Color: { from: () => ({ valid: true, valueOf: () => 0xffffff }) } } };
+  globalThis.canvas = { level: { id: "lvl1" } };
+
+  const { CharacterPinManager } = await import("../scripts/character-pins.mjs");
+  const mgr = new CharacterPinManager({ active: true });
+  const baseActor = { id: "actorPC", name: "Hero", type: "character", ownership: { p1: 3, default: 0 }, testUserPermission: (u) => u?.id === "p1" };
+  const hostileClone = {
+    id: "tokClone", name: "Illusion", actorId: "actorPC", actorLink: false, hidden: false, level: "lvl1",
+    isLazyDelta: true, baseActor, _source: { actorId: "actorPC", delta: { ownership: { p1: 0, default: 0 } } }
+  };
+  const realPc = {
+    id: "tokReal", name: "Hero", actorId: "actorPC", actorLink: true, hidden: false, level: "lvl2",
+    isLazyDelta: false, actor: baseActor, baseActor, _source: { actorId: "actorPC" }
+  };
+
+  // Clone alone -> player must NOT get a pin pointing at unauthorized clone
+  const resCloneOnly = mgr._collectTrackedTargets({ tokens: new Set([hostileClone]) });
+  assert.equal(resCloneOnly.length, 0, "unauthorized unlinked clone must not leak position to non-GM");
+
+  // Clone + real linked PC -> must pick linked PC
+  const resBoth = mgr._collectTrackedTargets({ tokens: new Set([hostileClone, realPc]) });
+  assert.equal(resBoth.length, 1);
+  assert.equal(resBoth[0].id, "tokReal");
+});
+
+test("PoiManager + _sanitizePoisForSave preserves minor kind on superGrid secondary provinces", async () => {
+  installBaseGlobals();
+  const { PoiManager } = await import("../scripts/poi.mjs");
+  const { editsMethods } = await import("../scripts/boundless-edits.mjs");
+
+  const pm = new PoiManager({ active: true });
+  const resolved = pm.resolvePois({ flags: {} }, {
+    superGrid: { cols: 2, rows: 2 },
+    pois: [{ id: "p1", name: "SubProv", kind: "minor", x: 1000, y: 1000 }]
+  });
+  assert.equal(resolved[0].kind, "major", "runtime superGrid renders secondary province as major");
+  assert.equal(resolved[0]._isSecondaryProvince, true);
+
+  const sanitized = editsMethods._sanitizePoisForSave(resolved);
+  assert.equal(sanitized[0].kind, "minor", "saving POIs must restore original minor kind");
+  assert.equal("_origKind" in sanitized[0], false);
+  assert.equal("_isSecondaryProvince" in sanitized[0], false);
+});
+
+test("restoreAllStandardCulling preserves third-party renderable=false objects via _blStdCulled", async () => {
+  installBaseGlobals();
+  const { updateStandardSceneCulling, restoreAllStandardCulling } = await import("../scripts/perf-auto.mjs");
+  const { PERF_CONFIG } = await import("../scripts/perf-patcher.mjs");
+  const prevE = PERF_CONFIG.perfEnabled;
+  const prevC = PERF_CONFIG.perfAutoCulling;
+  PERF_CONFIG.perfEnabled = true;
+  PERF_CONFIG.perfAutoCulling = true;
+  try {
+    const thirdPartyHiddenDoor = { x: 50000, y: 50000, renderable: false, destroyed: false };
+    const visibleOffscreenDoor = { x: 50000, y: 50000, renderable: true, destroyed: false };
+    const extraDoors = Array.from({ length: 12 }, (_, i) => ({ x: i * 10, y: 0, renderable: true, destroyed: false }));
+    globalThis.canvas = {
+      ready: true,
+      scene: { flags: {} },
+      level: { flags: {} },
+      stage: { scale: { x: 1, y: 1 }, pivot: { x: 500, y: 500 }, worldTransform: { a: 1, d: 1, tx: 0, ty: 0 } },
+      app: { renderer: { screen: { width: 1000, height: 1000 } } },
+      controls: { doors: { children: [thirdPartyHiddenDoor, visibleOffscreenDoor, ...extraDoors] } }
+    };
+    updateStandardSceneCulling();
+    assert.equal(visibleOffscreenDoor.renderable, false);
+    assert.equal(visibleOffscreenDoor._blStdCulled, true);
+    assert.equal(thirdPartyHiddenDoor._blStdCulled, undefined, "already-hidden door must not be marked _blStdCulled");
+
+    restoreAllStandardCulling();
+    assert.equal(visibleOffscreenDoor.renderable, true, "Boundless-culled door must restore to renderable=true");
+    assert.equal(thirdPartyHiddenDoor.renderable, false, "third-party hidden door must stay renderable=false");
+  } finally {
+    PERF_CONFIG.perfEnabled = prevE;
+    PERF_CONFIG.perfAutoCulling = prevC;
+  }
+});
